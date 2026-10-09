@@ -882,7 +882,12 @@ class TestRouting(unittest.TestCase):
         self.assertEqual(len(self.node.desired_senders()), 1, "without the channel it would send")
 
         self.node.config.listen = True
-        self.assertEqual(self.node.desired_senders(), [], "a listener must not transmit at all")
+        # 旧行为是「只听 = 完全不发送」。那会把普通点对点路由的发送端一起关掉，
+        # 现场表现就是：在发送端打开只听之后，点对点的声音凭空消失，对方什么都收不到。
+        # 现在只拦广播通道的发送（那才是回环的来源），普通路由照常发送。
+        wanted = {key.split("|", 1)[0] for key, _t, _r in self.node.desired_senders()}
+        self.assertIn("up", wanted, "只听模式下普通路由的发送端必须保留")
+        self.assertNotIn("channel", wanted, "只听模式下不该往广播通道发送")
         sinks = self.node.desired_sinks()
         self.assertIn("channel", sinks)
         self.assertEqual(sinks["channel"]["rule"]["kind"], "listen")
@@ -2073,6 +2078,23 @@ class TestTodayRegressions(unittest.TestCase):
         self.assertEqual(info["route_id"], "secondary")
         self.assertEqual(info["device_selector"], "设备名")
         self.assertIn("feeds_into", info)
+
+    def test_listen_only_does_not_kill_ordinary_route_senders(self) -> None:
+        """只听只该停掉广播通道的发送，不该停点对点。
+
+        现场故障：发送端打开只听之后，点对点的声音凭空消失（对方什么都收不到）。
+        原因是 desired_senders() 在只听模式下直接 return []，把所有路由的发送端
+        一起关掉了。
+        """
+        self.node.registry.add_manual("127.0.0.1", 47990, "peer-1")
+        self.node.config.listen = True
+        self.node.config.broadcast = False
+        self.node.set_routes([
+            {"id": "p2p", "from": ["self"], "to": ["peer-1"]},
+        ], persist=False)
+        wanted = {key.split("|", 1)[0] for key, _t, _r in self.node.desired_senders()}
+        self.assertIn("p2p", wanted, "只听模式下点对点的发送端必须保留")
+        self.assertNotIn("channel", wanted, "只听模式下不该往广播通道发送")
 
     def test_the_default_sink_is_a_real_sound_card(self) -> None:
         """默认播放后端必须是真实声卡，绝不能是写文件。"""

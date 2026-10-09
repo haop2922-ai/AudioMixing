@@ -420,6 +420,41 @@ class WaveLinkNode:
             return False
         return na in nb or nb in na
 
+    def _pick_live_capture(self) -> str:
+        """挑一个能真正出数据的采集设备名。
+
+        与 _best_loopback_selector 的区别：这个会跳过已知"打开了却没数据"的设备
+        （断开的蓝牙耳机就常这样）。没有可用记录时退回真实输出设备。
+        """
+        silent = getattr(self, "_silent_captures", {}) or {}
+        for item in (self.devices or []):
+            try:
+                if item.kind != audio_base.KIND_SINK:
+                    continue
+                name = str(item.name or "")
+                if name and name not in silent and not self._looks_virtual(name):
+                    return name
+            except Exception:
+                continue
+        return self._best_loopback_selector()
+
+    def _best_loopback_selector(self) -> str:
+        """挑一块真实输出设备的名字，用来做本机回环采集。
+
+        听广播、放点对点、播手机声音都需要从某块输出设备上采声音。
+        这里返回的是设备名（不是 @default），调用方在解析不到默认设备时用它兜底。
+        """
+        picked = self._default_render_name()
+        if picked:
+            return picked
+        try:
+            for item in (self.devices or []):
+                if item.kind == audio_base.KIND_SINK and not self._looks_virtual(str(item.name or "")):
+                    return str(item.name or "")
+        except Exception:
+            pass
+        return ""
+
     def _selector_is_loopback(self, selector: str) -> bool:
         """这个选择器指的是不是一块输出设备（我们采它的回环）。
 
@@ -896,14 +931,18 @@ class WaveLinkNode:
         stream. Keying only by route id made later targets silently overwrite earlier
         ones, so a multi-target route played on a single speaker.
         """
-        if self.config.listen and not self.config.broadcast:
-            # Listen-only: a receiver does not transmit. This is what makes the LAN
-            # channel loop-free, and it also switches off every ordinary route's
-            # sender - deliberately, because that is what "只听" means.
-            return []
+        listen_only = bool(self.config.listen) and not bool(self.config.broadcast)
+        # 只听 = 不再往广播通道里送声音（这是防止通道自我循环的关键），
+        # 但它不该把普通路由的发送端也关掉。以前的实现直接 return []，
+        # 结果是在发送端打开「只听」会让点对点的声音凭空消失：对方什么都收不到。
+        # 现场就是这样：开启点对点后，发送端再开广播或只听，音频直接消失。
         out: list[tuple[str, PeerEndpoints, dict[str, Any]]] = []
         for rule in self.effective_routes():
             if rule.get("kind") == "listen":
+                continue
+            if listen_only and rule.get("kind") == "broadcast":
+                # 只听模式下不往广播通道发送：通道会把自己刚收到的声音再发回去，
+                # 造成回环。普通点对点路由不受影响。
                 continue
             if rule["mute"] or not self._is_origin_for(rule):
                 continue
