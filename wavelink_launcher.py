@@ -186,7 +186,7 @@ def _wait_for_monitor_window(seconds: float) -> bool:
 def _close_panel_windows() -> int:
     """关掉我们打开过的监控窗和控制台窗，返回关掉几个。
 
-    这些窗口是 Edge 的应用模式，启动时带了 WaveLink 自己的配置目录，
+    这些窗口是 Edge 的应用模式，启动时带了 Audio Mixing 自己的配置目录，
     所以命令行里有独一无二的标记，可以精确识别。用户自己的浏览器窗口
     没有这个标记，不会被误关。
     """

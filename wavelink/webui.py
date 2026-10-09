@@ -273,7 +273,7 @@ class WaveLinkApi:
         lines = [x.strip() for x in rules.splitlines() if x.strip()]
         tcp = any("|TCP" in x.upper() and "|Allow|" in x for x in lines)
         udp = any("|UDP" in x.upper() and "|Allow|" in x for x in lines)
-        howto = ("右键右下角托盘里的 WaveLink 图标，点「放行防火墙（需管理员）」，"
+        howto = ("右键右下角托盘里的 Audio Mixing 图标，点「放行防火墙（需管理员）」，"
                  "在弹窗里点「是」，然后重新检查")
         add("入站 TCP 放行", tcp,
             "；".join(lines) if tcp else
@@ -282,7 +282,7 @@ class WaveLinkApi:
             "没放行 UDP，收不到对方的发现广播，对端不知道你在哪。" + howto)
 
         # 正在跑的 exe 路径：规则是绑路径的，换了目录旧规则就失效
-        exe = ps("(Get-Process -Name WaveLink -ErrorAction SilentlyContinue | "
+        exe = ps("(Get-Process -Name AudioMixing -ErrorAction SilentlyContinue | "
                  "Select-Object -First 1 -ExpandProperty Path)")
         add("当前程序路径", bool(exe), exe or "读不到")
         if exe:
@@ -758,7 +758,7 @@ class WaveLinkApi:
             raise ApiError("missing host")
         if not disc.is_lan_address(host):
             raise ApiError(
-                "%s 不是局域网地址。WaveLink 只在同一局域网内工作（不做穿透/中继）。" % host,
+                "%s 不是局域网地址。Audio Mixing 只在同一局域网内工作（不做穿透/中继）。" % host,
                 400,
             )
         port = int(payload.get("port") or self.node.config.discovery_port)
@@ -989,7 +989,7 @@ def ws_frame(payload: bytes, opcode: int = 0x2) -> bytes:
 
 
 class _Handler(BaseHTTPRequestHandler):
-    server_version = "WaveLink/0.1"
+    server_version = "AudioMixing/1.0"
     api: WaveLinkApi
     quiet = True
 
@@ -1017,7 +1017,7 @@ class _Handler(BaseHTTPRequestHandler):
         """Hand the phone the app itself, over the same LAN the audio uses."""
         apk = apk_path()
         if apk is None:
-            self._json(404, {"error": "这台电脑上还没有手机端安装包（wavelink-mic.apk）"})
+            self._json(404, {"error": "这台电脑上还没有手机端安装包（AudioMixing-mic.apk）"})
             return
         try:
             # The same bytes the version stamp describes, from one place.
@@ -1275,7 +1275,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "bytes": (info or {}).get("bytes", 0),
                 })
                 return
-            if path in ("/app/download", "/app/wavelink-mic.apk"):
+            if path in ("/app/download", "/app/AudioMixing-mic.apk", "/app/wavelink-mic.apk"):
                 self._send_apk()
                 return
             if path == "/api/mic":
@@ -1303,7 +1303,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(
                     200,
                     (
-                        "WaveLink OK\n"
+                        "Audio Mixing OK\n"
                         "server=%s\n"
                         "web_port=%d\n"
                         "time=%s\n"
@@ -1327,7 +1327,7 @@ class _Handler(BaseHTTPRequestHandler):
                         "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
                         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
                         "<title>Audio Mixing 测试页</title></head><body>"
-                        "<h1>WaveLink 可以访问</h1>"
+                        "<h1>Audio Mixing 可以访问</h1>"
                         "<p>这个页面没有任何 JavaScript 和 CSS。你能看到这段文字，说明：</p>"
                         "<ul><li>手机和电脑网络互通</li><li>HTTP 正常</li><li>页面能渲染</li></ul>"
                         "<p>那问题就在完整控制台的脚本渲染上，请把这句话告诉我。</p>"
@@ -1700,7 +1700,7 @@ FALLBACK_HTML = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>Audio Mixing</title>
 <style>body{background:#0b0e14;color:#e8eef7;font:14px/1.7 system-ui,"Microsoft YaHei";padding:40px;max-width:720px;margin:auto}
 code{background:#1a202c;padding:2px 6px;border-radius:4px}a{color:#60a5fa}</style></head><body>
-<h2>WaveLink 控制台页面文件缺失</h2>
+<h2>Audio Mixing 控制台页面文件缺失</h2>
 <p>后端正在运行，但没找到 <code>wavelink/ui/index.html</code>。接口仍然可用：</p>
 <ul>
   <li><a href="/api/status">/api/status</a> — 节点状态</li>
@@ -1780,8 +1780,10 @@ def apk_path() -> Path | None:
         candidates.append(Path(env))
     base = getattr(sys, "_MEIPASS", None)
     if base:
-        candidates.append(Path(base) / "wavelink" / "ui" / "wavelink-mic.apk")
+        candidates.append(Path(base) / "wavelink" / "ui" / "AudioMixing-mic.apk")
+    candidates.append(Path(base) / "wavelink" / "ui" / "wavelink-mic.apk")
     here = Path(__file__).resolve().parent
+    candidates.append(here / "ui" / "AudioMixing-mic.apk")
     candidates.append(here / "ui" / "wavelink-mic.apk")
     try:
         candidates.append(Path(sys.executable).resolve().parent / "wavelink-mic.apk")
@@ -1957,7 +1959,7 @@ def monitor_html() -> str:
 </style></head>
 <body>
 <header>
-  <h1><span class="dot">●</span> WaveLink</h1>
+  <h1><span class="dot">●</span> Audio Mixing</h1>
   <nav class="tabs">
     <a class="tab on" href="/monitor">监控</a>
     <a class="tab" href="/">控制台</a>
@@ -2124,7 +2126,7 @@ FALLBACK_LISTEN_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Audio Mixing 收音机</title></head>
 <body style="background:#0e1116;color:#e8edf5;font:15px system-ui;padding:24px">
-<h1>WaveLink 收音机</h1>
+<h1>Audio Mixing 收音机</h1>
 <p>这个页面需要 WebSocket 支持。请用手机上的 Chrome / Safari 打开本机地址的 <code>/listen</code>，
 例如 <code>http://192.168.x.x:17800/listen</code>。</p>
 </body></html>"""

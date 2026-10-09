@@ -875,7 +875,7 @@ function renderDragList(){
       <span class="nm">${esc(n.name)}</span>
       <span class="tags">${tags.map(t=>`<span>${esc(t)}</span>`).join('')}</span>
     </div>`;
-  }).join('') || '<div class="empty">还没有发现别的设备。在另一台电脑上也启动 WaveLink，或在上方手动填它的 IP。</div>';
+  }).join('') || '<div class="empty">还没有发现别的设备。在另一台电脑上也启动 Audio Mixing，或在上方手动填它的 IP。</div>';
   // Delegated once per render; the list is rebuilt on every refresh.
   $('dragList').querySelectorAll('.drag').forEach(el => el.addEventListener('pointerdown', beginDrag));
 }
@@ -1079,7 +1079,7 @@ function showTemplates(){
     '3) 办公室：把 3 台手机 + 2 台电脑都收进自己的耳机\n' +
     '     要听谁的 = 勾选所有其它设备（多选）\n' +
     '     用谁的耳机听 = 本机\n\n' +
-    (has ? '' : '提示：现在只发现了一台设备，先在另一台电脑上也启动 WaveLink。')
+    (has ? '' : '提示：现在只发现了一台设备，先在另一台电脑上也启动 Audio Mixing。')
   );
 }
 
@@ -1520,7 +1520,7 @@ async function loadBluetooth(){
         <span class="chip ${map[1]}"><span class="k">${map[0]}</span></span>
         <button class="tiny ${map[2] ? 'danger' : 'primary'}" onclick="btToggle(${i})">${map[2] ? '断开' : '连接'}</button>
         <button class="tiny ${btAutoList.includes(d.name) ? 'primary' : 'ghost'}" onclick="btAuto(${i})"
-                title="启动 WaveLink 时自动连接这台手机">${btAutoList.includes(d.name) ? '自启 ✓' : '自启'}</button>
+                title="启动 Audio Mixing 时自动连接这台手机">${btAutoList.includes(d.name) ? '自启 ✓' : '自启'}</button>
         <button class="tiny ghost" onclick="btHide(${i})" title="不再显示（不影响 Windows 里的配对）">隐藏</button>
       </div>${hint}`;
     }).join('') + footer;
