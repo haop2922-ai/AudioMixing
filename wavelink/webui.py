@@ -1372,6 +1372,22 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 self._json(400, {"error": "不支持的断开类型: %r" % kind})
                 return
+            if path == "/qr":
+                # 手机上扫一下就进来，省得手输 IP。参数 what=listen|app，
+                # 地址用访问这个页面时用的那个主机名，天然就是局域网地址。
+                from urllib.parse import parse_qs as _parse_qs
+
+                query = _parse_qs(parsed.query)
+                what = (query.get("what") or ["listen"])[0]
+                host = (query.get("host") or [self.headers.get("Host") or ""])[0]
+                tail = "/app" if what == "app" else "/listen"
+                target = "http://%s%s" % (host or "127.0.0.1:17800", tail)
+                png = _qr_png(target)
+                if png is None:
+                    self._json(503, {"error": "二维码库不可用"})
+                    return
+                self._send(200, png, "image/png")
+                return
             if path == "/api/monitor":
                 self._json(200, self.api.monitor())
                 return
@@ -1762,6 +1778,21 @@ def apk_info() -> dict | None:
     return _APK_INFO
 
 
+
+def _qr_png(text: str) -> bytes | None:
+    """把一段文字生成二维码 PNG。库不在就返回 None，页面会显示提示。"""
+    try:
+        import io as _io
+
+        import qrcode
+
+        image = qrcode.make(text, border=2)
+        buffer = _io.BytesIO()
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+    except Exception:
+        return None
+
 def monitor_html() -> str:
     """监控窗。谁给谁、走哪个通道、多少数据、延迟多少。"""
     return """<!doctype html>
@@ -1819,6 +1850,30 @@ def monitor_html() -> str:
   <tbody id="rows"></tbody>
 </table>
 <div class="empty" id="empty" style="display:none">现在没有任何数据在流动</div>
+<section style="margin:16px 20px 0;padding:14px 16px;background:var(--card);
+        border:1px solid var(--line);border-radius:10px">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+    <b style="font-size:13px">手机扫码</b>
+    <span class="dim" style="font-size:12px">手机相机扫一下，不用输 IP</span>
+  </div>
+  <div style="display:flex;gap:26px;align-items:flex-start;flex-wrap:wrap">
+    <div style="text-align:center">
+      <img src="/qr?what=listen" width="150" height="150" alt="扫码收听"
+           style="background:#fff;border-radius:8px;padding:6px">
+      <div class="dim" style="font-size:12px;margin-top:6px">扫这个：手机当喇叭</div>
+    </div>
+    <div style="text-align:center">
+      <img src="/qr?what=app" width="150" height="150" alt="扫码装APK"
+           style="background:#fff;border-radius:8px;padding:6px">
+      <div class="dim" style="font-size:12px;margin-top:6px">扫这个：装手机端 APK</div>
+    </div>
+    <div class="dim" style="font-size:12px;max-width:320px;line-height:1.7">
+      手机要和这台电脑连同一个 Wi-Fi。<br>
+      第一个码打开听众页，点一下就开始播放（电脑要先打开「广播我的声音」）。<br>
+      第二个码下载手机端，用来把手机的声音送到电脑。
+    </div>
+  </div>
+</section>
 <section id="checks" style="margin:16px 20px 0;padding:14px 16px;background:var(--card);
         border:1px solid var(--line);border-radius:10px">
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">

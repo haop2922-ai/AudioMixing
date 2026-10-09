@@ -245,6 +245,8 @@ def main() -> int:
            "--hidden-import", "wavelink.audio.opus",
            "--hidden-import", "opuslib_next",
            "--collect-all", "pyogg",
+           "--hidden-import", "qrcode",
+           "--collect-all", "qrcode",
            "--hidden-import",
         "wavelink.audio.backends.wasapi",
         "--hidden-import",
