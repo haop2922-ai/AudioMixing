@@ -74,11 +74,11 @@ def audit_environment() -> None:
     # panel and exits by itself, while a zombie serves nothing.
     if sys.platform == "win32":
         try:
-            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq WaveLink.exe", "/FO", "CSV", "/NH"],
+            out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq AudioMixing.exe", "/FO", "CSV", "/NH"],
                                  capture_output=True, text=True, timeout=20).stdout
         except (OSError, subprocess.TimeoutExpired):
             out = ""
-        if "WaveLink.exe" in out:
+        if "AudioMixing.exe" in out:
             count = out.lower().count("wavelink.exe")
             ports: list[str] = []
             try:
@@ -98,13 +98,13 @@ def audit_environment() -> None:
                 except Exception:
                     continue
             if live:
-                print("[ok] process    WaveLink.exe up (%d process = onefile parent+child), "
+                print("[ok] process    AudioMixing.exe up (%d process = onefile parent+child), "
                       "panel http://127.0.0.1:%s answers" % (count, live))
             else:
-                report("WARN", "process", "%d WaveLink.exe process(es) but no panel answers - "
+                report("WARN", "process", "%d AudioMixing.exe process(es) but no panel answers - "
                                            "kill them and start a single instance" % count)
         else:
-            print("[ok] process    no WaveLink.exe running")
+            print("[ok] process    no AudioMixing.exe running")
 
     # 2. config file
     appdata = os.environ.get("APPDATA")
@@ -296,19 +296,19 @@ def audit_project() -> None:
         print("[ok] dead-code  no orphaned functions (%d documented exceptions)" % len(ALLOWED_UNUSED))
 
     # 5. is the packaged exe stale?
-    exe = ROOT / "dist" / "WaveLink.exe"
+    exe = ROOT / "dist" / "AudioMixing.exe"
     newest_src = max((p.stat().st_mtime for p in PKG.rglob("*.py")), default=0)
     ui = PKG / "ui" / "index.html"
     if ui.is_file():
         newest_src = max(newest_src, ui.stat().st_mtime)
     if exe.is_file():
         if exe.stat().st_mtime < newest_src:
-            report("ERROR", "package", "dist/WaveLink.exe is OLDER than the newest source file - rebuild it (python tools/build_exe.py)")
+            report("ERROR", "package", "dist/AudioMixing.exe is OLDER than the newest source file - rebuild it (python tools/build_exe.py)")
         else:
             age_min = (time.time() - exe.stat().st_mtime) / 60.0
-            print("[ok] package    dist/WaveLink.exe is newer than all sources (built %.0f min ago)" % age_min)
+            print("[ok] package    dist/AudioMixing.exe is newer than all sources (built %.0f min ago)" % age_min)
     else:
-        report("WARN", "package", "dist/WaveLink.exe does not exist")
+        report("WARN", "package", "dist/AudioMixing.exe does not exist")
 
     # 7. critical API surface: an editing accident once removed a dozen functions
     #    from audio/format.py (sine/chirp generators, Resampler, the device format
