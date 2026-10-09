@@ -1403,6 +1403,29 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, "bat": bat,
                                  "note": "已请求以管理员身份放行。若没看到管理员确认窗口，"
                                          "请右键运行 " + bat})
+            elif path == "/api/monitor/disconnect":
+                # 监控页每行的"断开"。必须放在 POST 分支：页面用的是 POST，
+                # 只写进 GET 分支的话点按钮只会拿到 404（放行防火墙踩过同一个坑）。
+                kind = str(body.get("kind") or "")
+                target = str(body.get("id") or "")
+                if kind == "broadcast":
+                    self.api.set_settings({"broadcast": False})
+                    self._json(200, {"ok": True, "note": "已停止广播"})
+                elif kind == "route" and target:
+                    self.api.update_route({"id": target, "mute": True})
+                    self._json(200, {"ok": True, "note": "已静音这条路由"})
+                elif kind == "bluetooth" and target:
+                    from . import bluetooth as bt
+
+                    result = bt.disconnect(target)
+                    self._json(200, {"ok": bool(result.get("ok")),
+                                     "note": result.get("state") or result.get("error") or ""})
+                elif kind == "incoming":
+                    self._json(200, {"ok": False,
+                                     "note": "收到的流由对方决定是否发送：请在对方那台停止广播，"
+                                             "或删掉/静音对端那条路由"})
+                else:
+                    self._json(400, {"error": "不支持的断开类型: %r" % kind})
             elif path == "/api/routes":
                 self._json(200, self.api.set_routes(body))
             elif path == "/api/routes/add":
