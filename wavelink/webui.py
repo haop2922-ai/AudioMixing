@@ -8,8 +8,9 @@ isolated LAN); this module only serves it and exposes the JSON API it talks to.
     http://<this-machine>:17800
 """
 
-import html as _html
 from __future__ import annotations
+
+import html as _html
 
 import base64
 import hashlib
@@ -526,9 +527,11 @@ class WaveLinkApi:
             amount = int(info.get("bytes") or info.get("sent_bytes") or 0)
             rate = round(float(info.get("kbps") or 0.0), 1)
             device = str(info.get("source") or "")
-            # "本机声音"说的是谁在给数据，设备名放进说明里：把设备名当成来源
-            # 写进"从谁"那一列，会让人以为声音来自耳机本身。
-            source_label = "本机声音" + ("（采自 %s）" % device if device else "")
+            # "从谁"这一列写的是**谁在发**，也就是这台机器的节点名（配置里那个名字），
+            # 不是采集设备的名字。设备名放进说明里，免得让人以为声音来自耳机。
+            node_name = str(getattr(node, "name", "") or "本机")
+            source_label = node_name
+            where = ("采自 " + device) if device else ""
             stale = bool(live_ids) and not is_channel and str(rid) not in live_ids
             if is_channel:
                 flows.append({
@@ -539,7 +542,7 @@ class WaveLinkApi:
                     "bytes": amount,
                     "rate_kbps": rate,
                     "latency_ms": None,
-                    "detail": "手机和电脑里的听众都能收到",
+                    "detail": ("手机和电脑里的听众都能收到" + (("，" + where) if where else "")),
                 })
                 continue
             flows.append({
@@ -550,8 +553,8 @@ class WaveLinkApi:
                 "bytes": amount,
                 "rate_kbps": rate,
                 "latency_ms": None,
-                "detail": "应该停止却没停，属于引擎的清理问题，正在修" if stale
-                          else str(info.get("error") or ""),
+                "detail": ("残留：这条路由已经删了但它还在发" if stale
+                           else (where or str(info.get("error") or ""))),
             })
 
         # 广播的听众：谁在听这条广播
