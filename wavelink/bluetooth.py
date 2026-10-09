@@ -135,6 +135,7 @@ try {
 """
 
 
+# HWHHYN 用 DEEPSEEK 制作
 def available() -> bool:
     """True on Windows with a usable PowerShell - i.e. where this can work at all."""
     return sys.platform == "win32" and bool(POWERSHELL)

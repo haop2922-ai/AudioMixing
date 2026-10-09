@@ -27,8 +27,9 @@ if not getattr(sys, "frozen", False):
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
 
+# HWHHYN 用 DEEPSEEK 制作
 def _log_path() -> str:
-    base = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "WaveLink")
+    base = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "Audio Mixing")
     try:
         os.makedirs(base, exist_ok=True)
     except OSError:
@@ -58,6 +59,7 @@ def _silence_std_streams() -> None:
     if sys.stderr is None:
         sys.stderr = _NullWriter()
 
+# HWHHYN 用 DEEPSEEK 制作
 
 def _enable_dpi_awareness() -> None:
     if sys.platform != "win32":
@@ -93,7 +95,7 @@ def _window_handle() -> int:
     try:
         import ctypes
 
-        return int(ctypes.windll.user32.FindWindowW(None, "WaveLink 监控") or 0)
+        return int(ctypes.windll.user32.FindWindowW(None, "Audio Mixing 监控") or 0)
     except Exception:
         return 0
 
@@ -148,7 +150,7 @@ def _stop_port_owner(port: int) -> bool:
 
 
 def _wait_for_monitor_window(seconds: float) -> bool:
-    """等监控窗出现。标题带「WaveLink 监控」就算出现。"""
+    """等监控窗出现。标题带「Audio Mixing 监控」就算出现。"""
     if sys.platform != "win32":
         return True
     deadline = time.time() + max(0.0, seconds)
@@ -167,7 +169,7 @@ def _wait_for_monitor_window(seconds: float) -> bool:
                 if user32.IsWindowVisible(hwnd):
                     buf = ctypes.create_unicode_buffer(256)
                     user32.GetWindowTextW(hwnd, buf, 256)
-                    if "WaveLink" in buf.value:
+                    if "Audio Mixing" in buf.value:
                         found[0] = True
                         return False
                 return True
@@ -227,7 +229,7 @@ def open_monitor(address: str) -> None:
     if edge:
         try:
             profile = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
-                                   "WaveLink", "panel-profile")
+                                   "Audio Mixing", "panel-profile")
             args = [edge, "--app=" + url, "--window-size=1000,700",
                     "--no-first-run", "--no-default-browser-check"]
             try:

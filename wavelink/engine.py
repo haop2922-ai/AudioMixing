@@ -64,6 +64,7 @@ CHANNEL_ROUTE_ID = "channel"
 MAX_BACKLOG_BLOCKS = 6
 
 
+# HWHHYN 用 DEEPSEEK 制作
 def is_self_token(token: str, node_id: str, name: str) -> bool:
     t = (token or "").strip().lower()
     return t in SELF_KEYWORDS or t == node_id.lower() or t == short_id(node_id) or t == name.lower()
@@ -635,6 +636,7 @@ class WaveLinkNode:
             except Exception as exc:
                 self._note_once("清理残留发送端失败：%s" % exc)
 
+# HWHHYN 用 DEEPSEEK 制作
 
     def _maintenance_loop(self) -> None:
         while not self._stop.is_set():

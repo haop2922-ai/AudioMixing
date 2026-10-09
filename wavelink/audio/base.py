@@ -35,6 +35,7 @@ class AudioDevice:
     is_default: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
+    # HWHHYN 用 DEEPSEEK 制作
     def to_json(self) -> dict[str, Any]:
         return {
             "id": self.id,

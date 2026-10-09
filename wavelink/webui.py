@@ -37,6 +37,7 @@ _LAST_FORCED_BT = 0.0
 
 
 class ApiError(Exception):
+    # HWHHYN 用 DEEPSEEK 制作
     def __init__(self, message: str, status: int = 400) -> None:
         super().__init__(message)
         self.status = status
@@ -310,7 +311,7 @@ class WaveLinkApi:
             lines.append("")
             lines.append("===== %s =====" % title)
 
-        lines.append("WaveLink 诊断报告")
+        lines.append("Audio Mixing 诊断报告")
         lines.append("生成时间 %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
         try:
             import platform
@@ -426,7 +427,7 @@ class WaveLinkApi:
         path = ""
         try:
             base = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
-                                "WaveLink")
+                                "Audio Mixing")
             os.makedirs(base, exist_ok=True)
             path = os.path.join(base, "诊断报告.txt")
             with open(path, "w", encoding="utf-8") as fh:
@@ -674,6 +675,7 @@ class WaveLinkApi:
             "node": str(getattr(node, "name", "")),
         }
 
+# HWHHYN 用 DEEPSEEK 制作
 
     def streams(self) -> dict[str, Any]:
         stats = self.node.receiver.stats()
@@ -1272,7 +1274,7 @@ class _Handler(BaseHTTPRequestHandler):
                     (
                         "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
                         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-                        "<title>WaveLink 测试页</title></head><body>"
+                        "<title>Audio Mixing 测试页</title></head><body>"
                         "<h1>WaveLink 可以访问</h1>"
                         "<p>这个页面没有任何 JavaScript 和 CSS。你能看到这段文字，说明：</p>"
                         "<ul><li>手机和电脑网络互通</li><li>HTTP 正常</li><li>页面能渲染</li></ul>"
@@ -1316,7 +1318,7 @@ class _Handler(BaseHTTPRequestHandler):
                 # 不用新窗口链接（应用窗口会把它拦掉，点了没反应），也不依赖脚本。
                 data = self.api.diagnose()
                 body = ("<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">"
-                        "<title>WaveLink 诊断</title><style>"
+                        "<title>Audio Mixing 诊断</title><style>"
                         "body{margin:0;background:#0e1116;color:#e8edf5;"
                         "font:13px/1.6 'Microsoft YaHei UI',system-ui,sans-serif}"
                         "header{display:flex;align-items:center;gap:8px;padding:14px 20px}"
@@ -1326,7 +1328,7 @@ class _Handler(BaseHTTPRequestHandler):
                         "pre{margin:0 20px 24px;padding:14px;background:#171c24;"
                         "border:1px solid #242c38;border-radius:10px;white-space:pre-wrap;"
                         "word-break:break-all}</style></head><body><header>"
-                        "<b>WaveLink</b>"
+                        "<b>Audio Mixing</b>"
                         "<a class=\"tab\" href=\"/monitor\">监控</a>"
                         "<a class=\"tab\" href=\"/\">控制台</a>"
                         "<a class=\"tab on\" href=\"/diagnose\">诊断</a>"
@@ -1621,7 +1623,7 @@ class WebUI:
 # placeholder below is only used if the file is genuinely missing, so the server
 # can still explain itself instead of returning a stack trace.
 FALLBACK_HTML = """<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8"><title>WaveLink</title>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>Audio Mixing</title>
 <style>body{background:#0b0e14;color:#e8eef7;font:14px/1.7 system-ui,"Microsoft YaHei";padding:40px;max-width:720px;margin:auto}
 code{background:#1a202c;padding:2px 6px;border-radius:4px}a{color:#60a5fa}</style></head><body>
 <h2>WaveLink 控制台页面文件缺失</h2>
@@ -1764,7 +1766,7 @@ def monitor_html() -> str:
     """监控窗。谁给谁、走哪个通道、多少数据、延迟多少。"""
     return """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
-<title>WaveLink 监控</title>
+<title>Audio Mixing 监控</title>
 <style>
  :root{--bg:#0e1116;--card:#171c24;--line:#242c38;--fg:#e8edf5;--dim:#8b97a8;
        --ok:#3fb950;--warn:#d29922;--accent:#2f81f7}
@@ -1960,7 +1962,7 @@ _MIC_CACHE: str | None = None
 FALLBACK_LISTEN_HTML = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WaveLink 收音机</title></head>
+<title>Audio Mixing 收音机</title></head>
 <body style="background:#0e1116;color:#e8edf5;font:15px system-ui;padding:24px">
 <h1>WaveLink 收音机</h1>
 <p>这个页面需要 WebSocket 支持。请用手机上的 Chrome / Safari 打开本机地址的 <code>/listen</code>，

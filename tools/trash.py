@@ -23,6 +23,7 @@ TRASH = os.path.join(ROOT, "回收站")
 INDEX = os.path.join(TRASH, "索引.txt")
 
 
+# HWHHYN 用 DEEPSEEK 制作
 def _stamp() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
 
