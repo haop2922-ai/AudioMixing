@@ -8,6 +8,7 @@ isolated LAN); this module only serves it and exposes the JSON API it talks to.
     http://<this-machine>:17800
 """
 
+import html as _html
 from __future__ import annotations
 
 import base64
@@ -1232,6 +1233,29 @@ class _Handler(BaseHTTPRequestHandler):
                                  "note": "已请求以管理员身份放行。若没看到管理员确认窗口，"
                                          "请右键运行 " + path})
                 return
+            if path in ("/diagnose", "/diagnose.html"):
+                # 单独一页，纯文本放在 pre 里，附一个返回监控的入口。
+                # 不用新窗口链接（应用窗口会把它拦掉，点了没反应），也不依赖脚本。
+                data = self.api.diagnose()
+                body = ("<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">"
+                        "<title>WaveLink 诊断</title><style>"
+                        "body{margin:0;background:#0e1116;color:#e8edf5;"
+                        "font:13px/1.6 'Microsoft YaHei UI',system-ui,sans-serif}"
+                        "header{display:flex;align-items:center;gap:8px;padding:14px 20px}"
+                        "a.tab{padding:4px 12px;border-radius:8px;background:#1d2634;"
+                        "color:#e8edf5;text-decoration:none;font-size:13px}"
+                        "a.tab.on{background:#2f81f7;color:#06121f;font-weight:600}"
+                        "pre{margin:0 20px 24px;padding:14px;background:#171c24;"
+                        "border:1px solid #242c38;border-radius:10px;white-space:pre-wrap;"
+                        "word-break:break-all}</style></head><body><header>"
+                        "<b>WaveLink</b>"
+                        "<a class=\"tab\" href=\"/monitor\">监控</a>"
+                        "<a class=\"tab\" href=\"/\">控制台</a>"
+                        "<a class=\"tab on\" href=\"/diagnose\">诊断</a>"
+                        "<span style=\"color:#8b97a8\">全选这段文字即可复制</span>"
+                        "</header><pre>" + _html.escape(data["text"]) + "</pre></body></html>")
+                self._send(200, body.encode("utf-8"), "text/html; charset=utf-8")
+                return
             if path == "/api/diagnose":
                 data = self.api.diagnose()
                 self._send(200, data["text"].encode("utf-8"),
@@ -1647,8 +1671,8 @@ def monitor_html() -> str:
     <a class="tab" href="/">控制台</a>
   </nav>
   <span class="dim" id="who"></span>
-  <a id="dgLink" href="/api/diagnose" target="_blank"
-     title="把当前状态整理成一份文字报告，在新页面打开，可以直接全选复制"
+  <a id="dgLink" href="/diagnose"
+     title="把当前状态整理成一份文字报告，在同一窗口打开，全选即可复制"
      style="padding:4px 12px;border-radius:8px;background:#1d2634;color:#e8edf5;
             text-decoration:none">诊断</a>
   <button id="fw" title="点对点或广播不通时，多半是本机防火墙挡了入站。点这里放行。"
