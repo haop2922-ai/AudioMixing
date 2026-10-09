@@ -503,10 +503,15 @@ class WaveLinkNode:
         now = time.time()
         for key, session in list((getattr(self.sender, "sessions", {}) or {}).items()):
             rid = str(key).split("|", 1)[0]
-            if not rid or rid in live:
+            if not rid:
                 continue
+            # 关键：只要"零字节"就说明它是死的。
+            # 真正的静音也会照常出数据（字节数照涨），所以零字节只可能是：
+            # 采集端没工作、对端早就走了、或者会话已经没人用了。
+            # 以前这里还额外要求"路由不在表里"，只要表里残留一条同名记录就永远清不掉 ——
+            # 现场就是界面上挂着一行 0 B 的残留，一直不消失。
             if rid.startswith("channel"):
-                # 广播通道由开关控制，不归路由管
+                # 广播通道由开关控制：开关关着、且零字节，才清
                 if self.config.broadcast or self.config.listen:
                     continue
             sent = 0
@@ -530,13 +535,13 @@ class WaveLinkNode:
             started = float(getattr(session, "started_at", 0.0) or 0.0)
             if started > 0:
                 age = max(age, now - started)
-            if age < 20.0:
+            if age < 8.0:
                 continue
             # 会话还在，就把记录清掉，避免长期占用
             seen.pop(key, None)
             try:
                 self.sender.remove(key)
-                self.note("清掉残留发送端 %s（路由已不存在，且从未发出数据）" % key)
+                self.note("清掉残留发送端 %s（一直没有数据，判定为死会话）" % key)
             except Exception as exc:
                 self._note_once("清理残留发送端失败：%s" % exc)
 
