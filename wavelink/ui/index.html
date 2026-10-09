@@ -528,7 +528,27 @@ html:not(.fullui) .card .body { padding-top: 6px; }
     </section>
 
     <!-- ④ 传输 -->
-    <section class="card full">
+          <section class="card">
+        <h2>手机扫码<span class="sub">手机相机扫一下，不用输 IP</span></h2>
+        <div style="display:flex;gap:22px;flex-wrap:wrap;align-items:flex-start">
+          <div style="text-align:center">
+            <img src="/qr?what=listen" width="132" height="132" alt="扫码收听"
+                 style="background:#fff;border-radius:8px;padding:5px">
+            <div style="font-size:12px;opacity:.7;margin-top:4px">手机当喇叭</div>
+          </div>
+          <div style="text-align:center">
+            <img src="/qr?what=app" width="132" height="132" alt="扫码装APK"
+                 style="background:#fff;border-radius:8px;padding:5px">
+            <div style="font-size:12px;opacity:.7;margin-top:4px">装手机端 APK</div>
+          </div>
+          <div style="font-size:12px;opacity:.72;line-height:1.8;max-width:330px">
+            手机要和这台电脑连同一个 Wi-Fi。<br>
+            左边：打开听众页，点一下手机就开始放这台电脑的声音（先打开「广播我的声音」）。<br>
+            右边：下载手机端，用来把手机的声音送到这台电脑。
+          </div>
+        </div>
+      </section>
+<section class="card full">
       <h2><span class="n">④</span>正在传输的声音</h2>
       <div class="body"><div class="rows" id="streamsBox"></div></div>
     </section>

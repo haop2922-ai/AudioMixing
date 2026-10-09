@@ -1110,11 +1110,14 @@ class _Handler(BaseHTTPRequestHandler):
         tap = self.api.node.tap
         sid = tap.subscribe()
         block_s = 480 / 48000.0
+        # 手机听众这条路走 WebSocket，未压缩 48k 立体声是 1536 KB/s，
+        # 手机上根本吃不下：缓冲涨到一秒就开丢。这里降成 24k 单声道，
+        # 数据量变四分之一，够放音乐和视频，手机也能跟上。
         try:
             while True:
                 payload = tap.drain(sid)
                 if payload:
-                    conn.sendall(ws_frame(payload))
+                    conn.sendall(ws_frame(_to_24k_mono(payload)))
                 # Read whatever the client sent (close/ping) so it cannot pile up.
                 ready, _, _ = select.select([conn], [], [], 0)
                 if ready:
@@ -1831,6 +1834,23 @@ def _qr_png(text: str) -> bytes | None:
         return buffer.getvalue()
     except Exception:
         return None
+
+
+def _to_24k_mono(pcm16: bytes) -> bytes:
+    """把 48kHz 立体声 PCM16 变成 24kHz 单声道 PCM16。
+
+    每两个立体声帧取一个，并只留左声道 —— 这就是"隔点取样 + 降混"，
+    数据量变成原来的四分之一，听感上放音乐和视频够用。
+    """
+    try:
+        import array as _array
+
+        samples = _array.array("h")
+        samples.frombytes(pcm16[: len(pcm16) - (len(pcm16) % 4)])
+        out = _array.array("h", [samples[i] for i in range(0, len(samples) - 1, 4)])
+        return out.tobytes()
+    except Exception:
+        return pcm16
 
 def monitor_html() -> str:
     """监控窗。谁给谁、走哪个通道、多少数据、延迟多少。"""
