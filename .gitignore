@@ -1,0 +1,7 @@
+﻿dist/
+build/
+__pycache__/
+*.pyc
+.testappdata/
+release/*.zip
+
