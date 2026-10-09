@@ -1351,7 +1351,7 @@ class WaveLinkNode:
                 late = int(stream.get("late") or 0)
                 out.append({
                     "path": "p2p",
-                    "path_label": "点对点",
+                    "path_label": "点对点/广播",
                     "name": str(stream.get("node_name") or stream.get("source") or ""),
                     "state": "正在接收",
                     "score": int(max(0.0, 100.0 - min(100.0, lost * 5.0 + late * 2.0))),
