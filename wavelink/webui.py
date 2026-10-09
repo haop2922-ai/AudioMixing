@@ -361,11 +361,25 @@ class WaveLinkApi:
                 "　【这条是静音的，不会出声】" if r.get("mute") else ""))
 
         head("发送端（本机往外送）")
-        senders = st.get("senders") or {}
-        if not senders:
+        senders = st.get("senders") or []
+        # senders 是列表，不是字典。以前这里按字典读，于是"正在广播"的时候
+        # 报告里写"没有"，让人以为没在发。
+        if isinstance(senders, dict):
+            entries = list(senders.items())
+        else:
+            entries = [(str(x.get("route_id") or ""), x) for x in senders
+                       if isinstance(x, dict)]
+        if not entries:
             lines.append("没有。若你的角色是把声音送出去，说明路由的「从」没有指向本机。")
-        for rid, info in (senders.items() if isinstance(senders, dict) else []):
-            lines.append("%s -> %s" % (rid[:8], json.dumps(info, ensure_ascii=False)[:200]))
+        for rid, info in entries:
+            is_channel = str(rid).startswith("channel")
+            kind = "广播通道" if is_channel else "点对点"
+            lines.append("[%s] %s → %s:%s  速率=%s KB/s 包=%s 字节=%s" % (
+                kind, info.get("source"), info.get("host"), info.get("port"),
+                info.get("kbps"), info.get("packets"), info.get("bytes")))
+            if is_channel:
+                lines.append("      广播通道不依赖路由：它由「广播我的声音」开关和音源清单决定。"
+                             "对端只有在打开「只听」时才会播放它。")
 
         head("接收端（本机收进来的流）")
         recv = (self.streams().get("receiver") or {}).get("streams") or []
