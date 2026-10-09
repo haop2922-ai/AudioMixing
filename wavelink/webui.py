@@ -1909,30 +1909,7 @@ def monitor_html() -> str:
   <tbody id="rows"></tbody>
 </table>
 <div class="empty" id="empty" style="display:none">现在没有任何数据在流动</div>
-<section style="margin:16px 20px 0;padding:14px 16px;background:var(--card);
-        border:1px solid var(--line);border-radius:10px">
-  <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
-    <b style="font-size:13px">手机扫码</b>
-    <span class="dim" style="font-size:12px">手机相机扫一下，不用输 IP</span>
-  </div>
-  <div style="display:flex;gap:26px;align-items:flex-start;flex-wrap:wrap">
-    <div style="text-align:center">
-      <img src="/qr?what=listen" width="150" height="150" alt="扫码收听"
-           style="background:#fff;border-radius:8px;padding:6px">
-      <div class="dim" style="font-size:12px;margin-top:6px">扫这个：手机当喇叭</div>
-    </div>
-    <div style="text-align:center">
-      <img src="/qr?what=app" width="150" height="150" alt="扫码装APK"
-           style="background:#fff;border-radius:8px;padding:6px">
-      <div class="dim" style="font-size:12px;margin-top:6px">扫这个：装手机端 APK</div>
-    </div>
-    <div class="dim" style="font-size:12px;max-width:320px;line-height:1.7">
-      手机要和这台电脑连同一个 Wi-Fi。<br>
-      第一个码打开听众页，点一下就开始播放（电脑要先打开「广播我的声音」）。<br>
-      第二个码下载手机端，用来把手机的声音送到电脑。
-    </div>
-  </div>
-</section>
+
 <section id="checks" style="margin:16px 20px 0;padding:14px 16px;background:var(--card);
         border:1px solid var(--line);border-radius:10px">
   <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
