@@ -250,9 +250,12 @@ class WaveLinkApi:
         prof = ps("Get-NetConnectionProfile | ForEach-Object { $_.Name + '|' + "
                   "$_.NetworkCategory }")
         public = [line for line in prof.splitlines() if line.strip().endswith("Public")]
-        add("网络位置", not public,
-            ("；".join(line.strip() for line in prof.splitlines() if line.strip())
-             or "读不到") + ("　（公用网络会挡入站，建议改成专用）" if public else ""))
+        # "公用网络"本身不是错误：只要放行规则覆盖了公用，入站照样能通。
+        # 以前这里一律标红，害得人以为必须去改网络位置。
+        detail = "；".join(line.strip() for line in prof.splitlines() if line.strip()) or "读不到"
+        if public:
+            detail += "　（有公用网络；只要下面的入站规则覆盖了公用，就不影响使用）"
+        add("网络位置", True, detail)
 
         # 防火墙总开关
         fw = ps("Get-NetFirewallProfile | ForEach-Object { $_.Name + '=' + $_.Enabled }")
@@ -1710,6 +1713,12 @@ def monitor_html() -> str:
     <button id="runChk" style="padding:3px 10px;border-radius:6px;border:0;
             background:#1d2634;color:#e8edf5;cursor:pointer">检查</button>
     <span class="dim" id="chkNote">连不通的时候点一下，看是哪一项没过</span>
+  </div>
+  <div class="dim" style="font-size:12px;margin-bottom:6px">
+    规则：<b>广播</b>要对方打开「只听」才会播放，它不依赖路由；
+    <b>点对点</b>只要路由在就播放，不需要对方配合。
+    </div>
+  <div style="display:none">
   </div>
   <div id="chkRows" class="dim" style="font-size:12px">还没有检查</div>
 </section>
