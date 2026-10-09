@@ -489,39 +489,56 @@ class WaveLinkApi:
         except Exception:
             pass
 
-        # 本机送给别的电脑
+        # 本机送给别的电脑。注意 senders 是**列表**，不是字典：
+        # 以前这里按字典读，一条都匹配不上，于是"声音在传但监控什么都不显示"。
         try:
             senders = (node.sender.stats() or {})
         except Exception:
             senders = {}
-        for rid, info in (senders.items() if isinstance(senders, dict) else []):
+        if isinstance(senders, dict):
+            entries = list(senders.items())
+        elif isinstance(senders, list):
+            entries = [(str(item.get("route_id") or ""), item)
+                       for item in senders if isinstance(item, dict)]
+        else:
+            entries = []
+        for rid, info in entries:
             if not isinstance(info, dict):
                 continue
-            # 广播的发送端在引擎里也是"发送端"，它的标识以 channel 开头
-            # （例如 channel|<节点ID>）。以前这里一律写成点对点，于是监控页
+            # 广播的发送端在引擎里也是"发送端"，标识以 channel 开头
+            # （例如 channel|<节点ID>）。以前一律写成点对点，于是监控页
             # 把广播显示成点对点，而真正的广播流一条都不显示。
-            is_channel = str(rid).startswith("channel")
+            is_channel = str(rid).startswith("channel") or str(
+                info.get("route_id") or "").startswith("channel")
             raw_state = str(info.get("state") or "")
+            target = str(info.get("target") or info.get("peer") or "")
+            if not target:
+                host = str(info.get("host") or "")
+                port = info.get("port")
+                target = (host + (":" + str(port) if port else "")) or rid
+            amount = int(info.get("bytes") or info.get("sent_bytes") or 0)
+            rate = round(float(info.get("kbps") or 0.0), 1)
+            bad = bool(info.get("error")) or raw_state == "error" or info.get("running") is False
             if is_channel:
                 flows.append({
-                    "from": "本机声音",
+                    "from": str(info.get("source") or "本机声音"),
                     "to": "全网设备（广播）",
                     "channel": "广播",
-                    "state": "正在广播" if raw_state != "error" else "出错",
-                    "bytes": int(info.get("sent_bytes") or info.get("bytes") or 0),
-                    "rate_kbps": round(float(info.get("kbps") or 0.0), 1),
+                    "state": "出错" if bad and info.get("error") else "正在广播",
+                    "bytes": amount,
+                    "rate_kbps": rate,
                     "latency_ms": None,
                     "detail": "手机和电脑里的听众都能收到" + (
                         "：" + str(info.get("error")) if info.get("error") else ""),
                 })
                 continue
             flows.append({
-                "from": "本机",
-                "to": str(info.get("target") or info.get("peer") or rid),
+                "from": str(info.get("source") or "本机"),
+                "to": target,
                 "channel": "点对点",
-                "state": "正在发送" if raw_state != "error" else "出错",
-                "bytes": int(info.get("sent_bytes") or info.get("bytes") or 0),
-                "rate_kbps": round(float(info.get("kbps") or 0.0), 1),
+                "state": "出错" if info.get("error") else "正在发送",
+                "bytes": amount,
+                "rate_kbps": rate,
                 "latency_ms": None,
                 "detail": str(info.get("error") or ""),
             })
