@@ -1379,7 +1379,9 @@ class _Handler(BaseHTTPRequestHandler):
 
                 query = _parse_qs(parsed.query)
                 what = (query.get("what") or ["listen"])[0]
-                host = (query.get("host") or [self.headers.get("Host") or ""])[0]
+                # 一律用局域网地址：在电脑上用 127.0.0.1 打开监控页时，
+                # 如果用请求里的地址生成二维码，手机扫了会连到自己，永远打不开。
+                host = _lan_host(self.api, self.headers.get("Host") or "")
                 tail = "/app" if what == "app" else "/listen"
                 target = "http://%s%s" % (host or "127.0.0.1:17800", tail)
                 png = _qr_png(target)
@@ -1778,6 +1780,43 @@ def apk_info() -> dict | None:
     return _APK_INFO
 
 
+
+
+def _lan_host(api, fallback: str = "") -> str:
+    """这台机器的局域网地址（带网页端口），拿不到就用 fallback。
+
+    只认私有网段的 IPv4：127.0.0.1、公网地址、虚拟网卡（Radmin 之类）都不要，
+    因为手机连不上它们。
+    """
+    port = 17800
+    try:
+        node = api.node
+        port = int(getattr(node.config, "web_port", 0) or 17800)
+    except Exception:
+        pass
+    try:
+        from .net import discovery as _disc
+
+        report = _disc.lan_report()
+        candidates = []
+        for item in report.get("interfaces") or []:
+            if str(item.get("kind")) != "private":
+                continue
+            addr = str(item.get("address") or "")
+            if not addr or addr.startswith("127.") or addr.startswith("169.254."):
+                continue
+            candidates.append(addr)
+        if candidates:
+            # 优先 192.168 / 10. 网段，其次 172.16~31
+            candidates.sort(key=lambda a: (not a.startswith("192.168."),
+                                           not a.startswith("10.")))
+            return "%s:%d" % (candidates[0], port)
+    except Exception:
+        pass
+    host = fallback.split(":")[0] if fallback else ""
+    if host and not host.startswith("127."):
+        return "%s:%d" % (host, port)
+    return ""
 
 def _qr_png(text: str) -> bytes | None:
     """把一段文字生成二维码 PNG。库不在就返回 None，页面会显示提示。"""
