@@ -497,15 +497,54 @@ class WaveLinkApi:
         for rid, info in (senders.items() if isinstance(senders, dict) else []):
             if not isinstance(info, dict):
                 continue
+            # 广播的发送端在引擎里也是"发送端"，它的标识以 channel 开头
+            # （例如 channel|<节点ID>）。以前这里一律写成点对点，于是监控页
+            # 把广播显示成点对点，而真正的广播流一条都不显示。
+            is_channel = str(rid).startswith("channel")
+            raw_state = str(info.get("state") or "")
+            if is_channel:
+                flows.append({
+                    "from": "本机声音",
+                    "to": "全网设备（广播）",
+                    "channel": "广播",
+                    "state": "正在广播" if raw_state != "error" else "出错",
+                    "bytes": int(info.get("sent_bytes") or info.get("bytes") or 0),
+                    "rate_kbps": round(float(info.get("kbps") or 0.0), 1),
+                    "latency_ms": None,
+                    "detail": "手机和电脑里的听众都能收到" + (
+                        "：" + str(info.get("error")) if info.get("error") else ""),
+                })
+                continue
             flows.append({
                 "from": "本机",
                 "to": str(info.get("target") or info.get("peer") or rid),
                 "channel": "点对点",
-                "state": "正在发送" if info.get("state") != "error" else "出错",
+                "state": "正在发送" if raw_state != "error" else "出错",
                 "bytes": int(info.get("sent_bytes") or info.get("bytes") or 0),
                 "rate_kbps": round(float(info.get("kbps") or 0.0), 1),
                 "latency_ms": None,
                 "detail": str(info.get("error") or ""),
+            })
+
+        # 广播的听众：谁在听这条广播
+        try:
+            channel = node.channel_state() or {}
+        except Exception:
+            channel = {}
+        for listener in (channel.get("listeners") or channel.get("clients") or []):
+            name = str(listener if not isinstance(listener, dict)
+                       else listener.get("name") or listener.get("node_name") or "")
+            if not name:
+                continue
+            flows.append({
+                "from": "本机声音",
+                "to": name,
+                "channel": "广播",
+                "state": "正在收听",
+                "bytes": None,
+                "rate_kbps": None,
+                "latency_ms": None,
+                "detail": "通过网页或手机收听这条广播",
             })
 
         # 别的电脑送给本机
