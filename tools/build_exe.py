@@ -30,7 +30,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 DIST = ROOT / "dist"
 BUILD = ROOT / "build"
 ICON = ROOT / "tools" / "wavelink.ico"
-NAME = "WaveLink"
+NAME = "AudioMixing"
 
 
 # HWHHYN 用 DEEPSEEK 制作
