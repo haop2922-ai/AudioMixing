@@ -502,6 +502,12 @@ class WaveLinkApi:
                        for item in senders if isinstance(item, dict)]
         else:
             entries = []
+        live_ids = set()
+        try:
+            for rule in (node.routes or []):
+                live_ids.add(str(rule.get("id") or ""))
+        except Exception:
+            pass
         for rid, info in entries:
             if not isinstance(info, dict):
                 continue
@@ -518,29 +524,33 @@ class WaveLinkApi:
                 target = (host + (":" + str(port) if port else "")) or rid
             amount = int(info.get("bytes") or info.get("sent_bytes") or 0)
             rate = round(float(info.get("kbps") or 0.0), 1)
-            bad = bool(info.get("error")) or raw_state == "error" or info.get("running") is False
+            device = str(info.get("source") or "")
+            # "本机声音"说的是谁在给数据，设备名放进说明里：把设备名当成来源
+            # 写进"从谁"那一列，会让人以为声音来自耳机本身。
+            source_label = "本机声音" + ("（采自 %s）" % device if device else "")
+            stale = bool(live_ids) and not is_channel and str(rid) not in live_ids
             if is_channel:
                 flows.append({
-                    "from": str(info.get("source") or "本机声音"),
+                    "from": source_label,
                     "to": "全网设备（广播）",
                     "channel": "广播",
-                    "state": "出错" if bad and info.get("error") else "正在广播",
+                    "state": "正在广播",
                     "bytes": amount,
                     "rate_kbps": rate,
                     "latency_ms": None,
-                    "detail": "手机和电脑里的听众都能收到" + (
-                        "：" + str(info.get("error")) if info.get("error") else ""),
+                    "detail": "手机和电脑里的听众都能收到",
                 })
                 continue
             flows.append({
-                "from": str(info.get("source") or "本机"),
+                "from": source_label,
                 "to": target,
                 "channel": "点对点",
-                "state": "出错" if info.get("error") else "正在发送",
+                "state": "残留（这条路由已经删了，但它还在发）" if stale else "正在发送",
                 "bytes": amount,
                 "rate_kbps": rate,
                 "latency_ms": None,
-                "detail": str(info.get("error") or ""),
+                "detail": "应该停止却没停，属于引擎的清理问题，正在修" if stale
+                          else str(info.get("error") or ""),
             })
 
         # 广播的听众：谁在听这条广播
