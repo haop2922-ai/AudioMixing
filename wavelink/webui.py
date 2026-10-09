@@ -561,6 +561,8 @@ class WaveLinkApi:
             stale = bool(live_ids) and not is_channel and str(rid) not in live_ids
             if is_channel:
                 flows.append({
+                    "disconnect": "broadcast",
+                    "hint": "停止广播",
                     "from": source_label,
                     "to": "全网设备（广播）",
                     "channel": "广播",
@@ -572,6 +574,9 @@ class WaveLinkApi:
                 })
                 continue
             flows.append({
+                "disconnect": "route",
+                "route_id": str(rid).split("|", 1)[0],
+                "hint": "静音这条路由",
                 "from": source_label,
                 "to": target,
                 "channel": "点对点",
@@ -1328,6 +1333,34 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/netcheck":
                 self._json(200, self.api.netcheck())
                 return
+            if path == "/api/monitor/disconnect":
+                # 监控页每行的"断开"。三种都走这里，按 kind 分派：
+                #   broadcast 关掉广播开关；route 静音那条路由；bluetooth 断开手机。
+                body = self._read_json() if method == "POST" else {}
+                kind = str(body.get("kind") or "")
+                target = str(body.get("id") or "")
+                if kind == "broadcast":
+                    self.api.set_settings({"broadcast": False})
+                    self._json(200, {"ok": True, "note": "已停止广播"})
+                    return
+                if kind == "route" and target:
+                    self.api.update_route({"id": target, "mute": True})
+                    self._json(200, {"ok": True, "note": "已静音这条路由"})
+                    return
+                if kind == "bluetooth" and target:
+                    from . import bluetooth as bt
+
+                    result = bt.disconnect(target)
+                    self._json(200, {"ok": bool(result.get("ok")),
+                                     "note": result.get("state") or result.get("error") or ""})
+                    return
+                if kind == "incoming":
+                    self._json(200, {"ok": False,
+                                     "note": "收到的流由对方决定是否发送：请在对方那台停止广播，"
+                                             "或删掉/静音对端那条路由"})
+                    return
+                self._json(400, {"error": "不支持的断开类型: %r" % kind})
+                return
             if path == "/api/monitor":
                 self._json(200, self.api.monitor())
                 return
@@ -1724,6 +1757,8 @@ def monitor_html() -> str:
  .bt{background:rgba(63,185,80,.16);color:#7ee787}
  .p2p{background:rgba(210,153,34,.16);color:#e3b341}
  .num{font-family:Consolas,monospace}
+ .disc{padding:2px 10px;border-radius:6px;border:1px solid #3d2a2a;background:#2a1a1a;
+       color:#ffb3b3;cursor:pointer;font-size:12px}
  .empty{padding:30px 20px;color:var(--dim)}
  footer{padding:14px 20px;color:var(--dim);font-size:12px}
 </style></head>
@@ -1746,7 +1781,7 @@ def monitor_html() -> str:
 </header>
 <table>
   <thead><tr><th>从谁</th><th>给谁</th><th>通道</th><th>状态</th>
-  <th>数据量</th><th>速率</th><th>延迟</th></tr></thead>
+  <th>数据量</th><th>速率</th><th>延迟</th><th></th></tr></thead>
   <tbody id="rows"></tbody>
 </table>
 <div class="empty" id="empty" style="display:none">现在没有任何数据在流动</div>
@@ -1792,6 +1827,9 @@ async function tick(){
         <td class="num">${fmtBytes(f.bytes)}</td>
         <td class="num">${f.rate_kbps == null ? '-' : f.rate_kbps + ' KB/s'}</td>
         <td class="num">${f.latency_ms == null ? '-' : f.latency_ms + ' ms'}</td>
+        <td>${f.disconnect ? '<button class="disc" data-kind="' + f.disconnect +
+             '" data-id="' + (f.route_id || '') + '" title="' +
+             (f.hint || '断开') + '">断开</button>' : ''}</td>
       </tr>`).join('');
     const peak = d.local_peak;
     document.getElementById('foot').textContent =
@@ -1833,6 +1871,21 @@ on('runChk', 'click', async () => {
     }).join('');
     document.getElementById('chkNote').textContent = d.ok ? '全部通过' : '有项目没过，见下面';
   }catch(e){ box.textContent = '检查失败：' + e; }
+});
+document.getElementById('rows').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest ? ev.target.closest('button.disc') : null;
+  if(!btn) return;
+  const kind = btn.dataset.kind, id = btn.dataset.id || '';
+  btn.disabled = true;
+  try{
+    const r = await (await fetch('/api/monitor/disconnect', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({kind: kind, id: id})
+    })).json();
+    if(r && r.ok === false){ alert(r.note || '没能断开'); }
+    tick();
+  }catch(e){ alert('断开失败：' + e); }
+  finally{ btn.disabled = false; }
 });
 on('fw', 'click', async () => {
   try{
