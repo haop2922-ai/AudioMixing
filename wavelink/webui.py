@@ -613,6 +613,18 @@ class WaveLinkApi:
         for stream in streams:
             if not isinstance(stream, dict):
                 continue
+            # 缓冲细节：音质出问题时，能一眼看出是不是在反复裁剪/欠载。
+            bits = []
+            if stream.get("depth_ms") is not None:
+                bits.append("缓冲 %s 毫秒" % stream.get("depth_ms"))
+            if stream.get("target_ms") is not None:
+                bits.append("目标 %s 毫秒" % stream.get("target_ms"))
+            for label, field in (("裁剪", "trimmed"), ("欠载", "underruns"),
+                                 ("迟到", "late"), ("溢出", "overflow"),
+                                 ("重同步", "resyncs")):
+                value = stream.get(field)
+                if value:
+                    bits.append("%s %s" % (label, value))
             flows.append({
                 "from": str(stream.get("node_name") or stream.get("source") or "其它电脑"),
                 "to": "本机耳机",
@@ -623,7 +635,27 @@ class WaveLinkApi:
                 "bytes": int(stream.get("bytes") or 0),
                 "rate_kbps": round(float(stream.get("kbps") or 0.0), 1),
                 "latency_ms": round(float(stream.get("depth_ms") or 0.0), 1),
-                "detail": "丢包 %s 迟到 %s" % (stream.get("lost", 0), stream.get("late", 0)),
+                "detail": "　".join(bits) or "丢包 %s 迟到 %s" % (
+                    stream.get("lost", 0), stream.get("late", 0)),
+            })
+
+        try:
+            clocks = (node.receiver.stats() or {}).get("clocks") or []
+        except Exception:
+            clocks = []
+        for item in clocks:
+            if not isinstance(item, dict):
+                continue
+            flows.append({
+                "from": str(item.get("peer") or "")[:8] or "对端",
+                "to": "时钟对齐",
+                "channel": "时钟",
+                "state": "已对齐",
+                "bytes": None,
+                "rate_kbps": None,
+                "latency_ms": None,
+                "detail": "墙钟差 %s 毫秒（已在对齐里扣除）　往返 %s 毫秒　样本 %s" % (
+                    item.get("offset_ms"), item.get("rtt_ms"), item.get("samples")),
             })
 
         local = status.get("local") or {}

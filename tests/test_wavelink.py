@@ -1900,3 +1900,94 @@ class TestWedgedCapture(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class TestTodayRegressions(unittest.TestCase):
+    """今天真实出过的问题，钉在这里，避免再犯。
+
+    每一条都对应一次现场故障：
+      * 删掉路由之后发送端还在跑 —— 界面上就是一行"残留"，对端收不到东西；
+      * 同一块设备被广播和点对点各开一路采集 —— 两路抢设备，声音时有时无；
+      * 默认播放后端被解析成 "file" —— 两台电脑的声音全被写进文件，一点声音都没有。
+    """
+
+    def setUp(self) -> None:
+        from wavelink.config import Config
+        from wavelink.engine import WaveLinkNode
+
+        cfg = Config()
+        cfg.node_id = "self-node"
+        cfg.name = "self"
+        cfg.routes = []
+        cfg.broadcast = False
+        cfg.listen = False
+        self.node = WaveLinkNode(cfg, audio_port=47899, discovery_port=47898, simulate=False)
+        self.node.devices = []
+
+    def test_removing_a_route_stops_its_sender(self) -> None:
+        """删掉路由后，sender.sessions 里不能再留着它。"""
+        self.node.set_routes([{"id": "r1", "from": ["self"], "to": ["*"], "gain": 1.0}],
+                            persist=False)
+        self.node.apply_routes()
+        # 没有可用的对端，所以不会有会话；直接造一个假的来验证清理逻辑。
+        class _Fake:
+            host = "127.0.0.1"
+            port = 47831
+            node_id = "peer-x"
+            source_name = "@default"
+            started_at = 0.0
+
+            def stats(self):
+                return {"bytes": 0}
+
+            def stop(self):
+                pass
+
+        self.node.sender.sessions["r1|peer-x"] = _Fake()
+        self.node.apply_routes()
+        self.assertNotIn("r1|peer-x", self.node.sender.sessions,
+                         "路由被删后，它的发送端必须被停掉")
+
+    def test_the_dead_session_sweep_removes_zero_byte_leftovers(self) -> None:
+        """兜底清扫：路由已不存在、且零字节的会话必须被清掉。"""
+        class _Fake:
+            host = "127.0.0.1"
+            port = 47831
+            source_name = "@default"
+            started_at = 0.0
+
+            def stats(self):
+                return {"bytes": 0}
+
+            def stop(self):
+                pass
+
+        self.node.sender.sessions["gone|peer-y"] = _Fake()
+        # 第一次看见它只是登记时间；清扫有 20 秒宽限期，所以这里把时间往前挪，
+        # 再跑一次，模拟"它已经挂了很久"。
+        self.node._sweep_dead_senders()
+        self.assertIn("gone|peer-y", self.node.sender.sessions, "刚出现的会话给宽限期")
+        self.node._session_first_seen["gone|peer-y"] = time.time() - 30.0
+        self.node._sweep_dead_senders()
+        self.assertNotIn("gone|peer-y", self.node.sender.sessions,
+                         "零字节且路由不存在的会话必须被清扫掉")
+
+    def test_two_readers_of_one_device_share_a_single_capture(self) -> None:
+        """同一规格的采集只应打开一次，广播和点对点共用它。"""
+        spec = {"backend": "null", "device": "silence"}
+        first = self.node.hub.reader(spec, name="a")
+        second = self.node.hub.reader(spec, name="b")
+        self.assertIsNot(first, second, "读取器是每路一个包装")
+        # 关键是底层采集只有一路：hub 按 (后端, 设备) 复用，两个读取者共用它。
+        stats = self.node.hub.stats()
+        names = [str(x.get("device") or x.get("endpoint") or "") for x in stats] \
+            if isinstance(stats, list) else list(stats or {})
+        self.assertEqual(len(stats), 1,
+                         "同一设备只应有一路采集，否则广播和点对点会抢设备：%s" % (stats,))
+
+    def test_the_default_sink_is_a_real_sound_card(self) -> None:
+        """默认播放后端必须是真实声卡，绝不能是写文件。"""
+        from wavelink.audio import base as audio_base
+
+        spec = self.node.default_sink_spec()
+        self.assertIn(spec["backend"], ("wasapi", "null", "coreaudio", "pipewire", "pulse"),
+                      "默认播放不能落到 file 后端，否则声音会被写进文件")
