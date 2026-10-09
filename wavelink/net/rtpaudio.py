@@ -597,7 +597,9 @@ class Receiver:
             self.packets_rejected += 1
             return
         samples = decoder(pkt.payload) if pkt.payload else []
-        if not samples:
+        # 用 len 判空，不用真值判断：numpy 数组的真值判断会抛异常，
+        # 那样每个包都会被当成坏包丢掉，症状是"这条编码完全没声音"。
+        if samples is None or len(samples) == 0:
             return
         offset = cs.offset_ns if cs.ready else 0.0
         if DEBUG_JITTER and self.packets_received % 40 == 0:
