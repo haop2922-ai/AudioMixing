@@ -933,50 +933,6 @@ class WaveLinkNode:
                     nodes.append(local)
         return nodes
 
-    def _playing_peers(self) -> set[str]:
-        """正在播放其声音的对端节点 id。
-
-        判定依据：接收端里这条流已经往抖动缓冲写过数据（written > 0），
-        说明它的声音正在被本机播放。接收端本身会淘汰超时的流，所以不需要再看时间。
-        """
-        out: set[str] = set()
-        try:
-            stats = self.receiver.stats() or {}
-        except Exception:
-            return out
-        for item in stats.get("streams") or []:
-            if not isinstance(item, dict):
-                continue
-            node_id = str(item.get("node_id") or "")
-            if not node_id:
-                continue
-            try:
-                played = int(item.get("written") or 0)
-            except Exception:
-                played = 0
-            if played > 0:
-                out.add(node_id)
-        return out
-
-    def _send_muted_to(self, node_id: str) -> bool:
-        """这一轮要不要因为"正在听它"而停止发给它。
-
-        带 3 秒滞回：对方安静之后再多停一会儿，避免两台来回抖。
-        """
-        now = time.monotonic()
-        until = getattr(self, "_listen_hold", None)
-        if until is None:
-            until = self._listen_hold = {}
-        if node_id in self._playing_peers():
-            until[node_id] = now + 3.0
-            return True
-        deadline = float(until.get(node_id) or 0.0)
-        if deadline > now:
-            return True
-        until.pop(node_id, None)
-        return False
-
-
     def desired_senders(self) -> list[tuple[str, PeerEndpoints, dict[str, Any]]]:
         """[(session_key, target_node, rule)] this node should be sending right now.
 
@@ -1004,12 +960,6 @@ class WaveLinkNode:
                 if target.node_id == self.node_id:
                     continue
                 if not target.online or not target.audio_port:
-                    continue
-                # 正在说就不听、正在听就不说：本机正在放这个对端的声音时，
-                # 不把同一段声音发回给它（否则它听到自己的回音，音量还会叠加）。
-                if self._send_muted_to(target.node_id):
-                    self._note_once("正在播放 %s 的声音，暂时不往它发送（避免回音）"
-                                    % (target.name or target.node_id[:8]))
                     continue
                 if rule["sink_device"] and target.sinks:
                     if not any(rule["sink_device"].lower() in (s.get("name") or "").lower() or rule["sink_device"] == s.get("id") for s in target.sinks):
