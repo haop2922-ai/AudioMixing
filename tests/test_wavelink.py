@@ -1984,6 +1984,29 @@ class TestTodayRegressions(unittest.TestCase):
         self.assertEqual(len(stats), 1,
                          "同一设备只应有一路采集，否则广播和点对点会抢设备：%s" % (stats,))
 
+    def test_opus_decoder_output_survives_the_receiver_check(self) -> None:
+        """解码结果必须能通过接收端的判空。
+
+        接收端写的是 if not samples: return。PCM 解码器返回列表没问题，
+        但返回 numpy 数组时真值判断会抛异常，整包被丢弃 —— 现场就是
+        "Opus 编码的点对点完全没声音"。这条测试直接守住那个写法。
+        """
+        from wavelink.audio import opus as op
+
+        if not op.available():
+            self.skipTest("这台机器没有 Opus 库")
+        enc = op.OpusEncoder(channels=2)
+        dec = op.OpusDecoder(channels=2)
+        samples = dec.decode(enc.encode([0.0] * 960 * 2))
+        self.assertTrue(samples, "解码结果不能为空")
+        self.assertEqual(len(samples), 960 * 2)
+        truthy = True
+        try:
+            truthy = bool(not samples)
+        except Exception as exc:      # numpy 数组会在这里抛
+            self.fail("解码结果不能触发真值判断异常：%s" % exc)
+        self.assertFalse(truthy)
+
     def test_opus_round_trip_compresses_a_lot(self) -> None:
         """Opus 往返：能压很多倍，而且还原出来的样本数对得上。
 

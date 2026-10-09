@@ -173,4 +173,7 @@ class OpusDecoder:
             return []
         self.packets += 1
         data = _np.frombuffer(pcm, dtype="<i2").astype(_np.float32) / 32768.0
-        return data
+        # 必须返回普通列表，不能返回 numpy 数组：接收端用 `if not samples` 判空，
+        # 而对数组做真值判断会抛 ValueError，整包被当成坏包丢掉 —— 表现就是
+        # "用 Opus 时完全没声音"，而单元测试里直接调解码器是看不出这个问题的。
+        return data.tolist()
