@@ -211,6 +211,9 @@ class WaveLinkNode:
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._wake = threading.Event()
+        # 被显式删掉的路由 id。拉取回来的表里若还带着它，不要复活：
+        # 否则推送删一次、拉取加一次，播放端会反复开关。
+        self._dropped_ids: set[str] = set()
         self._shared_sinks: dict[str, Any] = {}
         self.beacon: BeaconService | None = None
         self.devices: list[audio_base.AudioDevice] = []
@@ -717,6 +720,7 @@ class WaveLinkNode:
         author_name: str = "",
         drop: Iterable[str] = (),
     ) -> list[dict[str, Any]]:
+        self._dropped_ids.update(str(x) for x in drop)
         """Replace `author`'s share of the route table and reconcile.
 
         The route table is shared by every node on the LAN, but each node owns the
@@ -808,6 +812,12 @@ class WaveLinkNode:
             routes = data.get("routes") if isinstance(data, dict) else data
             if not isinstance(routes, list) or not routes:
                 continue
+            # 已经被显式删掉的路由不要再拉回来，否则会和推送的删除来回打架
+            kept = [r for r in routes
+                    if str(r.get("id") or "") not in self._dropped_ids]
+            if not kept:
+                continue
+            routes = kept
             try:
                 self.set_routes(routes, persist=False, author_id=peer_id,
                                 author_name=str(peer.get("name") or ""))
