@@ -231,35 +231,6 @@ class WaveLinkNode:
             self.last_error = "device enumeration failed: %s" % exc
         return self.devices
 
-    def _pick_live_capture(self) -> str:
-        """挑一个真正能出数据的采集设备。
-
-        正常情况下就是 Windows 当前的默认播放设备。但如果它是个"打开了却没数据"的
-        设备（典型例子：已经断开的蓝牙耳机，Windows 仍把它报成可用），继续用它等于
-        采一片空白。这时换同一台机器上其它可用的输出设备。
-        """
-        silent = getattr(self, "_silent_captures", {})
-        try:
-            devices = self.sink_list() or []
-        except Exception:
-            devices = []
-        default = ""
-        for item in devices:
-            name = str(item.get("name") or "")
-            if not name:
-                continue
-            if item.get("is_default"):
-                default = name
-            if item.get("is_default") and name not in silent:
-                return "@default"
-        # 默认那个被标记为静默，换一个没被标记的
-        for item in devices:
-            name = str(item.get("name") or "")
-            if name and name not in silent:
-                self._note_once("默认输出设备采不到数据，改用 %s" % name)
-                return name
-        return "@default"
-
     def default_source_spec(self) -> dict[str, Any]:
         backend = audio_base.default_backend_name()
         if self.simulate:
