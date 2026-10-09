@@ -296,7 +296,12 @@ class WaveLinkNode:
         优先用配置里明确写的设备。没写就用系统默认，但如果系统默认是虚拟声卡，
         就换一块真实的输出设备 —— 虚拟声卡永远不出声。
         """
-        backend = audio_base.default_backend_name()
+        # 播放必须走真实声卡。旧版这里写死 wasapi，我重建时改成了
+        # default_backend_name()，而那个函数返回的是"第一个可用的后端"（file 排在最前），
+        # 结果两台电脑收到的声音都被写进了文件，扬声器一点声音都没有。
+        if self.simulate or "wasapi" not in audio_base.available_backends():
+            return {"backend": "null", "device": "null"}
+        backend = "wasapi"
         configured = str(self.config.sink_device or "").strip()
         if configured and configured.lower() not in ("default", "@default"):
             # 指定的设备是什么后端就用什么后端：写 WAV 文件的测试设备不能当成声卡去
