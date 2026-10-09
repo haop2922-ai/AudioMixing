@@ -78,6 +78,7 @@ class SourceState:
 
 
 @dataclass
+
 class SinkEngine:
     route_id: str
     device_selector: str
@@ -109,6 +110,56 @@ class SinkEngine:
             "error": self.error,
             "peak": round(self.peak, 4),
             "device": device,
+        }
+
+
+class _SinkFeed:
+    """一条路由借用别人的播放端时的占位对象。
+
+    它不进设备、不开线程，只说明"这条路由的声音由哪个播放端负责"。
+    保留这个对象是必要的：路由表、监控和测试都按 route_id 找播放端，
+    对象不存在会被当成"这条路由没有输出"。
+    """
+
+    def __init__(self, route_id: str, device_selector: str, feeds_into: Any) -> None:
+        self.route_id = route_id
+        self.device_selector = device_selector
+        self.feeds_into = feeds_into
+        self.gain = 1.0
+        self.mute = False
+        self.peak = 0.0
+        self.error = ""
+        self.thread = None
+        self.sink = None
+        self.frames_written = 0
+        self.underruns = 0
+        self.dropped_frames = 0
+        # 停止流程会对每个播放端 set stop_event 并 join 线程，
+        # 占位对象没有线程，但要能安全地走完同一套代码。
+        self.stop_event = threading.Event()
+        self.started_ns = time.monotonic()
+
+    def describe(self) -> dict[str, Any]:
+        """和 SinkEngine.describe 同样的形状。
+
+        状态接口对 self.sinks 里的每个对象都调用它。少这个方法时，
+        /api/status 会直接 500 —— 现场就是"一打开只听监控页就报错"。
+        """
+        holder = getattr(self.feeds_into, "route_id", "")
+        return {
+            "route_id": self.route_id,
+            "device_selector": self.device_selector,
+            "gain": self.gain,
+            "mute": self.mute,
+            "frames_written": self.frames_written,
+            "underruns": self.underruns,
+            "dropped_frames": self.dropped_frames,
+            "running": bool(getattr(self.feeds_into, "thread", None)
+                            and self.feeds_into.thread.is_alive()),
+            "error": self.error,
+            "peak": round(self.peak, 4),
+            "device": {"device": self.device_selector},
+            "feeds_into": holder,
         }
 
 
@@ -160,6 +211,7 @@ class WaveLinkNode:
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._wake = threading.Event()
+        self._shared_sinks: dict[str, Any] = {}
         self.beacon: BeaconService | None = None
         self.devices: list[audio_base.AudioDevice] = []
         self.devices_refreshed_at = 0.0
@@ -1067,6 +1119,15 @@ class WaveLinkNode:
         desired = self.desired_sinks()
         for rid in list(self.sinks.keys()):
             if rid not in desired:
+                engine = self.sinks.get(rid)
+                feeds = getattr(engine, "feeds_into", None)
+                if feeds is not None:
+                    extra = getattr(feeds, "extra_routes", None)
+                    if extra and rid in extra:
+                        extra.remove(rid)
+                    self.sinks.pop(rid, None)
+                    self.note("sink %s 不再复用 %s 的设备" % (rid, feeds.route_id))
+                    continue
                 self._stop_sink(rid)
                 self.note("closed sink %s" % rid)
         for rid, entry in desired.items():
@@ -1088,6 +1149,30 @@ class WaveLinkNode:
                     self.note("sink %s moved to %s" % (rid, wanted_selector or "?"))
                     engine = None
             if engine is None:
+                # 同一块设备只让一个播放端真正持有。别的路由把自己的混音交给它，
+                # 而不是再打开一次设备。
+                shared = None
+                for other in list(self.sinks.values()):
+                    if other is engine or getattr(other, "feeds_into", None) is not None:
+                        continue
+                    if wanted_selector:
+                        if self._same_endpoint(other.device_selector, wanted_selector):
+                            shared = other
+                            break
+                    elif not other.device_selector:
+                        shared = other
+                        break
+                if shared is not None:
+                    extra = getattr(shared, "extra_routes", None)
+                    if extra is None:
+                        extra = []
+                        shared.extra_routes = extra
+                    if rid not in extra:
+                        extra.append(rid)
+                    self.sinks[rid] = _SinkFeed(rid, wanted_selector, shared)
+                    self.note("sink %s 复用 %s 的设备 %s"
+                              % (rid, shared.route_id, wanted_selector or "默认"))
+                    continue
                 if wanted_selector and any(self._same_endpoint(wanted_selector, s) for s in self._capture_selectors()):
                     self.note("note: %s is captured and played at once - the other side will hear itself; "
                               "pick a different output to avoid the echo" % wanted_selector)
@@ -1750,8 +1835,8 @@ class WaveLinkNode:
         if engine is None:
             return
         engine.stop_event.set()
-        if engine.thread is not None:
-            engine.thread.join(timeout=2.0)
+        if getattr(engine, "thread", None) is not None:
+            getattr(engine, "thread", None).join(timeout=2.0)
         if engine.sink is not None:
             try:
                 engine.sink.stop()
@@ -1790,10 +1875,20 @@ class WaveLinkNode:
         while not engine.stop_event.is_set():
             try:
                 if offset >= len(pending) // CHANNELS:
-                    blocks = self.receiver.mix_by_route(frames, routes=[engine.route_id])
-                    block = blocks.get(engine.route_id)
-                    if block is None:
+                    # 一块声卡只能有一条写入路径。广播通道和点对点如果各开一个
+                    # 播放端、各写各的混音，就会互相踩：广播那头没人发时写的是静音，
+                    # 会把点对点整个淹没（听起来"完全没声音"），两边都有内容时
+                    # 混叠失真（听起来"音质极差"）。所以这里把同一块设备上的
+                    # 多条路由的混音相加，只写这一次。
+                    routes = [engine.route_id] + list(getattr(engine, "extra_routes", ()) or ())
+                    blocks = self.receiver.mix_by_route(frames, routes=routes)
+                    parts = [blocks.get(r) for r in routes if blocks.get(r) is not None]
+                    if not parts:
                         block = [0.0] * chunk
+                    elif len(parts) == 1:
+                        block = parts[0]
+                    else:
+                        block = sum(parts[1:], parts[0])
                     pending = as_float_array(block)
                     offset = 0
                     if engine.mute:

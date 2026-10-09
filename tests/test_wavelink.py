@@ -2056,6 +2056,24 @@ class TestTodayRegressions(unittest.TestCase):
         back = dec.decode(packet)
         self.assertEqual(len(back), frames * 2, "还原的样本数必须和输入一致")
 
+    def test_a_shared_sink_still_describes_itself(self) -> None:
+        """借用的播放端也要能 describe()。
+
+        状态接口对 self.sinks 里每个对象都调 describe()。占位对象少了这个方法，
+        /api/status 直接 500 —— 现场就是"一打开只听，监控页就报错"。
+        """
+        from wavelink.engine import _SinkFeed
+
+        class _Holder:
+            route_id = "primary"
+            thread = None
+
+        feed = _SinkFeed("secondary", "设备名", _Holder())
+        info = feed.describe()
+        self.assertEqual(info["route_id"], "secondary")
+        self.assertEqual(info["device_selector"], "设备名")
+        self.assertIn("feeds_into", info)
+
     def test_the_default_sink_is_a_real_sound_card(self) -> None:
         """默认播放后端必须是真实声卡，绝不能是写文件。"""
         from wavelink.audio import base as audio_base
