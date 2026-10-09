@@ -520,9 +520,20 @@ class WaveLinkNode:
                 sent = 0
             if sent:
                 continue
-            started = float(getattr(session, "started_at", 0.0) or 0.0) or now
-            if now - started < 20.0:
+            # 会话自己不一定带开始时间，所以自己记一笔"第一次见到它"的时间。
+            # 以前写的是 started_at or now，遇到 0 就当成刚创建，于是永远扫不掉。
+            seen = getattr(self, "_session_first_seen", None)
+            if seen is None:
+                seen = self._session_first_seen = {}
+            first_seen = seen.setdefault(key, now)
+            age = now - first_seen
+            started = float(getattr(session, "started_at", 0.0) or 0.0)
+            if started > 0:
+                age = max(age, now - started)
+            if age < 20.0:
                 continue
+            # 会话还在，就把记录清掉，避免长期占用
+            seen.pop(key, None)
             try:
                 self.sender.remove(key)
                 self.note("清掉残留发送端 %s（路由已不存在，且从未发出数据）" % key)
