@@ -130,7 +130,7 @@ def add_firewall_rules() -> str:
     # 不带 chcp：批处理文件用系统编码写，控制台保持系统编码，中文路径才不会变乱码
     lines = ["@echo off"]
     for proto in ("TCP", "UDP"):
-        name = "WaveLink " + proto
+        name = "Audio Mixing " + proto
         lines.append('netsh advfirewall firewall delete rule name="%s" >nul 2>&1' % name)
         lines.append('netsh advfirewall firewall add rule name="%s" dir=in action=allow '
                      'program="%s" protocol=%s enable=yes profile=any'
@@ -142,10 +142,10 @@ def add_firewall_rules() -> str:
     lines.append("echo 已为下面这个程序放行入站与出站 TCP/UDP：")
     lines.append("echo %s" % exe)
     lines.append("echo.")
-    lines.append("netsh advfirewall firewall show rule name=\"WaveLink TCP\" | findstr /C:\"WaveLink TCP\"")
+    lines.append("netsh advfirewall firewall show rule name=\"Audio Mixing TCP\" | findstr /C:\"Audio Mixing TCP\"")
     lines.append("pause")
 
-    path = os.path.join(tempfile.gettempdir(), "wavelink-firewall.bat")
+    path = os.path.join(tempfile.gettempdir(), "audiomixing-firewall.bat")
     text = "\r\n".join(lines) + "\r\n"
     try:
         with open(path, "w", encoding="mbcs", errors="replace") as fh:
