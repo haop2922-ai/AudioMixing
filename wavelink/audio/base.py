@@ -139,19 +139,8 @@ def available_backends() -> dict[str, bool]:
 
 
 def default_backend_name() -> str:
-    """The backend to use when nothing more specific is asked for.
-
-    It must be a *real audio device* backend, not "the first one that happens to be
-    registered". The registry order is file, netmic, null, wasapi, so returning the
-    first available name handed callers "file" - meaning audio that should have gone to
-    the speakers was silently written into a file, and every route played nothing.
-    """
-    available = available_backends()
-    for name in ("wasapi", "coreaudio", "pipewire", "pulse"):
-        if available.get(name):
-            return name
-    for name, ok in available.items():
-        if ok and name not in ("null", "file"):
+    for name, ok in available_backends().items():
+        if ok and name != "null":
             return name
     return "null"
 
