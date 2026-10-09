@@ -1947,6 +1947,33 @@ class TestTodayRegressions(unittest.TestCase):
         self.assertNotIn("r1|peer-x", self.node.sender.sessions,
                          "路由被删后，它的发送端必须被停掉")
 
+    def test_a_zero_byte_session_is_swept_even_if_a_route_still_mentions_it(self) -> None:
+        """路由表里还留着同名记录时，零字节的会话也必须被清掉。
+
+        现场就是这样：界面上挂着一行 0 B 的残留，路由列表里已经看不到它，
+        但对端每次推路由表又会把它带回来，于是"路由不存在"这个条件永远不成立，
+        清扫永远不动手。所以判定标准只能是"有没有数据"。
+        """
+        class _Fake:
+            host = "127.0.0.1"
+            port = 47831
+            source_name = "@default"
+            started_at = 0.0
+
+            def stats(self):
+                return {"bytes": 0}
+
+            def stop(self):
+                pass
+
+        self.node.routes = [{"id": "keep", "from": ["self"], "to": ["*"], "gain": 1.0}]
+        self.node.sender.sessions["keep|peer-z"] = _Fake()
+        self.node._sweep_dead_senders()
+        self.node._session_first_seen["keep|peer-z"] = time.time() - 30.0
+        self.node._sweep_dead_senders()
+        self.assertNotIn("keep|peer-z", self.node.sender.sessions,
+                         "零字节的会话必须被清掉，哪怕路由表里还留着它的名字")
+
     def test_the_dead_session_sweep_removes_zero_byte_leftovers(self) -> None:
         """兜底清扫：路由已不存在、且零字节的会话必须被清掉。"""
         class _Fake:
