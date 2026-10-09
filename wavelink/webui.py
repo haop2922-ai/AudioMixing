@@ -606,7 +606,9 @@ class WaveLinkApi:
             flows.append({
                 "from": str(stream.get("node_name") or stream.get("source") or "其它电脑"),
                 "to": "本机耳机",
-                "channel": "点对点",
+                # 收到的流可能来自广播通道，也可能来自点对点路由；协议里不带这个信息，
+                # 所以不猜：写清楚两种都可能，要看本机是否开着「只听」（只听只影响广播）。
+                "channel": "点对点/广播",
                 "state": "正在接收",
                 "bytes": int(stream.get("bytes") or 0),
                 "rate_kbps": round(float(stream.get("kbps") or 0.0), 1),
