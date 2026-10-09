@@ -1364,6 +1364,22 @@ class WaveLinkNode:
                 missing.append(selector)
         return usable, missing
 
+    def _tap_wanted(self) -> bool:
+        """现在有没有人需要这份音频：广播开着，或者有听众连着网页。"""
+        try:
+            if self.config.broadcast:
+                return True
+        except Exception:
+            pass
+        try:
+            stats = self.tap.stats() or {}
+            if int(stats.get("listeners") or 0) > 0:
+                return True
+        except Exception:
+            pass
+        return False
+
+
     def _local_loop_spec(self) -> tuple[Any, dict[str, Any], tuple]:
         """(source, sink spec, change key) for the local capture->render path."""
         channels, missing = self._live_channel_sources()
@@ -1735,13 +1751,23 @@ class WaveLinkNode:
             # 手机走蓝牙进来时，声音由 Windows 直接送到耳机，本来就在响；
             # 我们再开一路回环采集并静音播放，只会多占一份设备和 CPU，
             # 听感就是开始还行、越听越卡。
-            self._local_note = ("音源 %s 就是输出设备本身，声音由系统直接播放，"
-                                "这里不再重复处理。" % "、".join(dropped))
-            if self._loop is not None:
-                self._loop.stop()
-                self._loop = None
-                self._loop_key = None
-            return
+            if self._tap_wanted():
+                # 有人在听：按原设计保留采集，但输出指向 null。
+                # 手机/网页听众听得到，本机不会重复播放，所以既不啸叫也不叠音。
+                sink_spec = {"backend": "null", "device": "null"}
+                key = key + ("tap-only",)
+                self._local_note = ("音源 %s 就是输出设备本身：本机不再重复播放，"
+                                    "正在采集一份送给广播听众" % "、".join(dropped))
+                self._note_once("广播开着（或有人在听），开始把本机声音送给听众")
+            else:
+                # 没人听：真的停掉，省一份设备和 CPU，也不打扰蓝牙那条路
+                self._local_note = ("音源 %s 就是输出设备本身，声音由系统直接播放，"
+                                    "这里不再重复处理。" % "、".join(dropped))
+                if self._loop is not None:
+                    self._loop.stop()
+                    self._loop = None
+                    self._loop_key = None
+                return
         if self._loop is not None and self._loop_key == key and not self._loop_needs_restart():
             self._loop.gain = float(self.config.channel_gain)
             # The pass-through is the one thing that is always running when audio should
