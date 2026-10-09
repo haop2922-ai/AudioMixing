@@ -59,7 +59,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let ws = null, ctx = null, gain = null, playAt = 0, playing = false;
-let lost = 0, recv = 0, startedAt = 0, rate = 48000, ch = 2;
+let lost = 0, recv = 0, startedAt = 0, rate = 24000, ch = 1;
 
 function setState(text, cls){
   $('state').textContent = text;
@@ -113,7 +113,7 @@ async function start(){
     // click handler, which is exactly what it needs.
     ctx = new (window.AudioContext || window.webkitAudioContext)();
     await ctx.resume().catch(()=>{});
-    rate = ctx.sampleRate || 48000;
+    rate = 24000;
     gain = ctx.createGain();
     gain.gain.value = Number($('vol').value);
     gain.connect(ctx.destination);
@@ -132,7 +132,7 @@ function openSocket(){
   ws.onopen = () => {
     $('btn').textContent = '停止收听';
     setState('已连接，等待声音…', 'on');
-    $('fmt').textContent = 'PCM16 · ' + (ch) + 'ch · 48000Hz（服务端）';
+    $('fmt').textContent = 'PCM16 · ' + (ch) + 'ch · 24000Hz（服务端已降采样）';
   };
   ws.onmessage = (ev) => {
     if(!ctx || !gain) return;
@@ -140,7 +140,7 @@ function openSocket(){
     const frames = bytes.length / 2 / ch;
     if(!frames) return;
     recv++;
-    const buf = ctx.createBuffer(ch, frames, 48000);
+    const buf = ctx.createBuffer(ch, frames, 24000);
     for(let c = 0; c < ch; c++){
       const out = buf.getChannelData(c);
       for(let i = 0, p = c * 2; i < frames; i++, p += ch * 2){
