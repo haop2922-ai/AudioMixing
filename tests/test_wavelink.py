@@ -739,6 +739,11 @@ class TestRouting(unittest.TestCase):
         """
         self._add_peer("peer-1", "伴侣电脑", 47990)
         self.node.devices = []  # no device table here, so skip the sink-name filter
+        # The route below names a made-up device ("devA"), which no real backend can
+        # open. Stub the sink spec the same way this test already stubs the source spec,
+        # so what it exercises stays "the reconciler rebuilds the stream" and not
+        # "which backend happens to accept a nonsense device name".
+        self.node.default_sink_spec = lambda: {"backend": "null", "device": "@default"}  # type: ignore[method-assign]
         self.node.set_routes([
             {"id": "up", "from": ["self"], "to": ["peer-1"]},
             {"id": "down", "from": ["peer-1"], "to": ["self"], "sink_device": "devA"},
