@@ -16,6 +16,7 @@ from .net.discovery import default_node_id
 CONFIG_VERSION = 1
 
 
+# HWHHYN 用 DEEPSEEK 制作
 def config_dir() -> Path:
     override = os.environ.get("WAVELINK_HOME")
     if override:

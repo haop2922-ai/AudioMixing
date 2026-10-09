@@ -61,6 +61,7 @@ class ToneSource:
     sample_rate = SAMPLE_RATE
     channels = CHANNELS
 
+    # HWHHYN 用 DEEPSEEK 制作
     def __init__(self, freq: float = 1000.0, blocks: int = 200, pace: float = 0.0, gain: float = 0.35) -> None:
         self.freq = freq
         self.blocks = blocks
@@ -650,6 +651,7 @@ class TestDiscovery(unittest.TestCase):
         peer.last_seen = time.time() - 60
         self.assertFalse(peer.online)
         self.assertEqual(registry.online(), [])
+# HWHHYN 用 DEEPSEEK 制作
 
     def test_beacon_service_hears_another_node(self):
         """Two BeaconServices on the loopback interface must find each other."""

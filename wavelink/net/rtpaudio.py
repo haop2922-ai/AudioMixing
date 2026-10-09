@@ -68,6 +68,7 @@ import os as _os
 DEBUG_JITTER = bool(_os.environ.get("WAVELINK_DEBUG_JITTER"))
 
 
+# HWHHYN 用 DEEPSEEK 制作
 def _jdbg(*args) -> None:
     if DEBUG_JITTER:
         print("[jitter]", *args, file=__import__("sys").stderr)
@@ -471,6 +472,7 @@ class Receiver:
         self.control_messages: list[dict[str, Any]] = []
         self._owners: dict[int, str] = {}
 
+    # HWHHYN 用 DEEPSEEK 制作
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

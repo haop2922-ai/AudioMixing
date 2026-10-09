@@ -78,6 +78,7 @@ class WNDCLASSW(ctypes.Structure):
     ]
 
 
+# HWHHYN 用 DEEPSEEK 制作
 def _open_url(url: str) -> None:
     """用应用模式打开页面；不行就退回默认浏览器。"""
     try:
@@ -89,7 +90,7 @@ def _open_url(url: str) -> None:
     if edge:
         try:
             profile = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
-                                   "WaveLink", "panel-profile")
+                                   "Audio Mixing", "panel-profile")
             args = [edge, "--app=" + url, "--window-size=1000,700",
                     "--no-first-run", "--no-default-browser-check"]
             try:
@@ -165,7 +166,7 @@ def open_diagnose(address: str) -> None:
     """打开诊断报告，方便复制发人。"""
     url = address.rstrip("/") + "/api/diagnose"
     path = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
-                        "WaveLink", "诊断报告.txt")
+                        "Audio Mixing", "诊断报告.txt")
     try:
         with urllib.request.urlopen(url, timeout=20) as resp:
             text = resp.read().decode("utf-8")
@@ -284,12 +285,12 @@ class Tray:
         cls = WNDCLASSW()
         cls.lpfnWndProc = ctypes.cast(self._wndproc, ctypes.c_void_p)
         cls.hInstance = hinstance
-        cls.lpszClassName = "WaveLinkTrayWnd"
+        cls.lpszClassName = "AudioMixingTrayWnd"
         if not self.user32.RegisterClassW(ctypes.byref(cls)):
             err = self.kernel32.GetLastError()
             if err != 1410:                      # 1410 = 类已注册
                 return False
-        self.hwnd = self.user32.CreateWindowExW(0, "WaveLinkTrayWnd", "WaveLink", 0,
+        self.hwnd = self.user32.CreateWindowExW(0, "AudioMixingTrayWnd", "Audio Mixing", 0,
                                                 0, 0, 0, 0, None, None, hinstance, None)
         return bool(self.hwnd)
 
@@ -313,7 +314,7 @@ class Tray:
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         data.uCallbackMessage = WM_TRAY
         data.hIcon = self._icon()
-        data.szTip = "WaveLink 正在运行，双击打开监控"
+        data.szTip = "Audio Mixing 正在运行，双击打开监控"
         return bool(self.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(data)))
 
     def _remove_icon(self) -> None:

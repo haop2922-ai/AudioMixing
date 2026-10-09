@@ -1,4 +1,4 @@
-"""Build a single-file WaveLink.exe that a non-technical user can double-click.
+"""Build a single-file AudioMixing.exe that a non-technical user can double-click.
 
     python tools/build_exe.py
 
@@ -33,6 +33,7 @@ ICON = ROOT / "tools" / "wavelink.ico"
 NAME = "WaveLink"
 
 
+# HWHHYN 用 DEEPSEEK 制作
 def make_icon() -> pathlib.Path | None:
     """Draw a simple speaker/wave icon so the exe is recognisable in Explorer."""
     try:
@@ -66,7 +67,7 @@ def make_icon() -> pathlib.Path | None:
 
 
 def stop_running() -> bool:
-    """Stop a previous WaveLink.exe. Returns True when one was actually running.
+    """Stop a previous AudioMixing.exe. Returns True when one was actually running.
 
     PyInstaller cannot overwrite a running exe (and the onefile bootloader leaves a
     child process behind if it is only terminated, not killed with its tree), so this
@@ -79,19 +80,19 @@ def stop_running() -> bool:
         return False
     try:
         out = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq WaveLink.exe", "/FO", "CSV", "/NH"],
+            ["tasklist", "/FI", "IMAGENAME eq AudioMixing.exe", "/FO", "CSV", "/NH"],
             capture_output=True, text=True, timeout=20,
         ).stdout
     except (OSError, subprocess.TimeoutExpired):
         return False
-    if "WaveLink.exe" not in out:
+    if "AudioMixing.exe" not in out:
         return False
-    print("[build] 检测到 WaveLink.exe 还在运行，先结束它（否则无法覆盖文件）")
+    print("[build] 检测到 AudioMixing.exe 还在运行，先结束它（否则无法覆盖文件）")
     # No /T: the Bluetooth helpers are children of the node, and killing the whole tree
     # took every phone connection down with it - which is why audio "suddenly stopped"
-    # after a rebuild. Both halves of a onefile build are called WaveLink.exe, so the
+    # after a rebuild. Both halves of a onefile build are called AudioMixing.exe, so the
     # image-name form is enough.
-    subprocess.run(["taskkill", "/IM", "WaveLink.exe", "/F"], capture_output=True, text=True, timeout=20)
+    subprocess.run(["taskkill", "/IM", "AudioMixing.exe", "/F"], capture_output=True, text=True, timeout=20)
     import time as _time
 
     _time.sleep(1.0)
@@ -124,7 +125,7 @@ def relaunch(exe: pathlib.Path) -> None:
                     return
         except Exception:
             _time.sleep(1.0)
-    print("[build] 面板未在 90 秒内响应，请双击 dist\\WaveLink.exe，失败原因写在 %%APPDATA%%\\WaveLink\\launcher.log")
+    print("[build] 面板未在 90 秒内响应，请双击 dist\\AudioMixing.exe，失败原因写在 %%APPDATA%%\\WaveLink\\launcher.log")
 
 
 def _verify_imports() -> bool:
@@ -282,7 +283,7 @@ def main() -> int:
     if was_running and "--no-relaunch" not in sys.argv:
         relaunch(exe)
     else:
-        print("[build] 提示: 双击 dist\\WaveLink.exe 即可启动（面板 http://127.0.0.1:17800）")
+        print("[build] 提示: 双击 dist\\AudioMixing.exe 即可启动（面板 http://127.0.0.1:17800）")
     print("[build] 验证命令: python tools/verify_exe.py --quick")
     return 0
 

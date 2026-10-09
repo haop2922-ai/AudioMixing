@@ -33,6 +33,7 @@ _opus: Any = None
 _load_error = ""
 
 
+# HWHHYN 用 DEEPSEEK 制作
 def _candidate_dirs() -> list[str]:
     dirs: list[str] = []
     here = os.path.dirname(os.path.abspath(__file__))

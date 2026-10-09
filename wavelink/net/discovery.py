@@ -38,6 +38,7 @@ BEACON_INTERVAL_S = 2.0
 NODE_TIMEOUT_S = 15.0
 
 
+# HWHHYN 用 DEEPSEEK 制作
 def default_node_id() -> str:
     return str(uuid.uuid4())
 

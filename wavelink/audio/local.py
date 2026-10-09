@@ -17,6 +17,7 @@ from typing import Any
 from .format import CHANNELS, apply_gain
 
 
+# HWHHYN 用 DEEPSEEK 制作
 def _dc_block(samples, state: list, cutoff_hz: float = 25.0):
     """One-pole high-pass, one state per channel.
 
