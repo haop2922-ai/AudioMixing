@@ -271,6 +271,12 @@ class WaveLinkNode:
             # where somebody asked for it.
             return {"backend": "null", "device": "silence", "freq": 440.0}
         selector = (self.config.source_device or "").strip() or "@default"
+        if selector.lower() in ("default", "@default"):
+            # 系统默认输出若是虚拟声卡，采它就是采一片空白（日志里那句"默认输出设备
+            # 采不到数据"就是这么来的），而且它往往是回声源。换成真实的输出设备。
+            picked = self._default_render_name()
+            if picked:
+                selector = picked
         # 返回单个规格字典（调用方要的是 dict，不是 list）。
         # 选的是麦克风就按输入打开，选的是输出设备才采它的回环。
         return {"backend": "wasapi", "device": selector,
@@ -289,6 +295,30 @@ class WaveLinkNode:
             if marker in text:
                 return True
         return False
+
+    def _default_render_name(self) -> str:
+        """系统默认输出设备的名字；若它是虚拟声卡，换一块真实的。
+
+        虚拟声卡（Steam 串流、虚拟音频线、远程串流）可以被设成系统默认，但它永远
+        不出声 —— 采它等于采一片空白，而且它常常是个回声源。播放和采集都走这条判断，
+        这样"默认设备"在两边的含义是一致的。返回空串表示看不出来，调用方按原样处理。
+        """
+        try:
+            render = [d for d in self.devices
+                      if d.kind == audio_base.KIND_SINK
+                      and (d.kind_detail or "").lower() == "render"]
+        except Exception:
+            render = []
+        default = next((d for d in render if d.is_default), None)
+        if default is not None and not self._looks_virtual(str(default.name or "")):
+            return str(default.name or "")
+        for item in render:
+            name = str(item.name or "")
+            if name and not self._looks_virtual(name):
+                self._note_once("系统默认是虚拟声卡（%s），改用 %s"
+                                % (str(getattr(default, "name", "") or "?"), name))
+                return name
+        return str(getattr(default, "name", "") or "")
 
     def default_sink_spec(self) -> dict[str, Any]:
         """本机默认往哪块设备放声音。
@@ -314,23 +344,9 @@ class WaveLinkNode:
             return {"backend": backend, "device": configured}
         # sink_list() 不带 is_default 字段（它按名字排序给界面用），
         # 默认设备要从 devices 原始列表里找，否则永远找不到默认的那一块。
-        try:
-            render = [d for d in self.devices
-                      if d.kind == audio_base.KIND_SINK
-                      and (d.kind_detail or "").lower() == "render"]
-        except Exception:
-            render = []
-        default = next((d for d in render if d.is_default), None)
-        if default is not None and not self._looks_virtual(str(default.name or "")):
-            return {"backend": backend, "device": str(default.name or "")}
-        for item in render:
-            name = str(item.name or "")
-            if name and not self._looks_virtual(name):
-                self._note_once("系统默认是虚拟声卡（%s），改用 %s"
-                                % (str(getattr(default, "name", "") or "?"), name))
-                return {"backend": backend, "device": name}
-        if default is not None:
-            return {"backend": backend, "device": str(default.name or "")}
+        picked = self._default_render_name()
+        if picked:
+            return {"backend": backend, "device": picked}
         return {"backend": backend, "device": "@default"}
 
     def autoconnect_phones(self) -> list[str]:
