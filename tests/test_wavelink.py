@@ -446,7 +446,7 @@ class TestAudioFormat(unittest.TestCase):
 
         from wavelink.config import Config
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             path = os.path.join(tmp, "mix.wav")
             cfg = Config()
             cfg.node_id = "recorder"
