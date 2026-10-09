@@ -151,6 +151,9 @@ class WaveLinkNode:
         self._loop: LocalLoop | None = None
         self._loop_key: tuple | None = None
         self._local_note = ""
+        # 打开成功却一直拿不到数据的采集设备。蓝牙耳机断开后 Windows 有时仍把它
+        # 报成可用，打开不报错但永远没有数据，表现就是"连上了却没声音"。
+        self._silent_captures: dict[str, float] = {}
         # 打开成功但一帧都拿不到的输出设备。蓝牙耳机断开后 Windows 有时
         # 仍然把它报成可用，打开也不报错，就是没有数据。记下来，下次换一个。
         self._silent_captures: dict[str, float] = {}
@@ -271,10 +274,84 @@ class WaveLinkNode:
             # where somebody asked for it.
             return {"backend": "null", "device": "silence", "freq": 440.0}
         selector = (self.config.source_device or "").strip() or "@default"
+        # 已经确认采不到数据的设备不要再用。典型例子：断开后 Windows 仍列为可用的
+        # 蓝牙耳机 —— 打开不报错，就是永远没有数据，表现是"连上了但没声音"。
+        silent = getattr(self, "_silent_captures", {})
+        if selector in silent:
+            replacement = self._first_live_loopback()
+            if replacement:
+                self._note_once("采集设备 %s 取不到数据，改用 %s" % (selector, replacement))
+                selector = replacement
         # 返回单个规格字典（调用方要的是 dict，不是 list）。
         # 选的是麦克风就按输入打开，选的是输出设备才采它的回环。
         return {"backend": "wasapi", "device": selector,
                 "loopback": self._selector_is_loopback(selector)}
+
+    def _first_live_loopback(self) -> str:
+        """换一块还没被标记为"采不到数据"的输出设备。"""
+        silent = getattr(self, "_silent_captures", {})
+        try:
+            candidates = [d for d in (self.devices or [])
+                          if d.kind == audio_base.KIND_SOURCE
+                          and (d.kind_detail or "").lower() == "loopback"
+                          and not self._looks_virtual(str(d.name or ""))]
+        except Exception:
+            candidates = []
+        for item in candidates:
+            name = str(item.name or "")
+            if name and name not in silent:
+                return name
+        for item in candidates:
+            name = str(item.name or "")
+            if name:
+                return name
+        return ""
+
+    def _watch_capture_health(self) -> None:
+        """采集端开着却一直没数据，就记下这个设备，下次换一个。
+
+        判定依据是"一个字节都没发出去"。注意：真正的静音也会照常出数据，
+        所以"零字节"等价于"采集端没在工作"，不会把安静的音频误判成故障。
+        """
+        silent = getattr(self, "_silent_captures", None)
+        if silent is None:
+            return
+        try:
+            self._watch_capture_health_inner(silent)
+        except Exception as exc:
+            # 看门狗自己绝不能把维护线程带走：它一死，采集和播放的收尾都不会再发生，
+            # 表现就是文件不关闭、设备不释放，比它要防的问题更严重。
+            self._note_once("采集健康检查出错（已忽略）：%s" % exc)
+
+    def _watch_capture_health_inner(self, silent: dict) -> None:
+        now = time.time()
+        sessions = list((getattr(self.sender, "sessions", {}) or {}).items())
+        for _key, session in sessions:
+            try:
+                started = float(getattr(session, "started_at", 0.0) or 0.0) or now
+            except Exception:
+                started = now
+            if now - started < 15.0:
+                continue
+            sent = 0
+            stats = None
+            try:
+                stats = session.stats() if hasattr(session, "stats") else None
+            except Exception:
+                stats = None
+            if isinstance(stats, dict):
+                for field in ("packets", "bytes", "sent", "frames", "blocks"):
+                    try:
+                        sent = max(sent, int(stats.get(field) or 0))
+                    except Exception:
+                        pass
+            if sent:
+                continue
+            device = str(getattr(session, "source_name", "") or "")
+            if device and device not in silent:
+                silent[device] = now
+                self._note_once("采集设备 %s 超过 15 秒没有任何数据，已标记，稍后换用其它设备"
+                                % device)
 
     def _looks_virtual(self, name: str) -> bool:
         """是不是一块虚拟声卡。
@@ -1079,6 +1156,8 @@ class WaveLinkNode:
                                             % device)
             except Exception:
                 pass
+            # 看门狗：采集端开着却零字节，就把它记下来，下次换设备
+            self._watch_capture_health()
             now_mono = time.monotonic()
             if now_mono - getattr(self, "_last_route_pull", 0.0) >= 6.0:
                 self._last_route_pull = now_mono
