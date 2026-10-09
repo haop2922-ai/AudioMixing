@@ -254,6 +254,18 @@ def open_monitor(address: str) -> None:
         _log("打不开监控页: %s" % exc)
 
 
+def _existing_node_address() -> str:
+    """已经有节点在跑就返回它的地址，否则空串。"""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:17800/healthz",
+                                    timeout=2.5) as resp:
+            if json.loads(resp.read().decode("utf-8")):
+                return "http://127.0.0.1:17800"
+    except Exception:
+        pass
+    return ""
+
+
 def run_service() -> int:
     """起节点并打开监控窗，自己不占窗口。"""
     try:
@@ -305,7 +317,15 @@ def run_service() -> int:
             return 0
         _log("托盘不可用，退化为无界面常驻")
     except Exception:
-        _log("启动失败\n" + traceback.format_exc())
+        detail = traceback.format_exc()
+        # 端口被占是最常见的一种：另一个实例已经在这个端口上跑着，
+        # 这时不该报错，而应该打开那个实例的监控窗然后安静退出。
+        existing = _existing_node_address()
+        if existing:
+            _log("已经有节点在 %s 上运行，改为打开它的监控窗" % existing)
+            open_monitor(existing)
+            return 0
+        _log("启动失败\n" + detail)
         return 1
 
     try:
@@ -336,6 +356,12 @@ def main(argv: list[str] | None = None) -> int:
         running = True
     except Exception:
         running = False
+
+    if not running:
+        # 健康检查失败也可能只是那一瞬间忙：再看一眼是不是端口被占着
+        existing = _existing_node_address()
+        if existing:
+            running = True
 
     if running:
         # 服务在跑：把监控窗叫到前面就够了，不要再起一个
