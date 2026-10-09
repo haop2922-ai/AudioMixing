@@ -488,6 +488,48 @@ class WaveLinkNode:
         if wake is not None:
             wake.set()
 
+    def _sweep_dead_senders(self) -> None:
+        """清掉"路由已经不存在、而且一直没发出任何数据"的发送端。
+
+        apply_routes 每轮都会停掉不该存在的发送端，正常情况下这就够了。但实测里
+        出现过一种情况：会话对象留在那里、路由已经删掉、字节数一直是 0 —— 界面上
+        就是一行"残留"，对端也收不到东西。这里做一次兜底清扫，不看路由从哪来，
+        只看两个事实：路由不在当前表里 + 这个会话一个字节都没发出去。
+        """
+        try:
+            live = {str(r.get("id") or "") for r in (self.routes or [])}
+        except Exception:
+            return
+        now = time.time()
+        for key, session in list((getattr(self.sender, "sessions", {}) or {}).items()):
+            rid = str(key).split("|", 1)[0]
+            if not rid or rid in live:
+                continue
+            if rid.startswith("channel"):
+                # 广播通道由开关控制，不归路由管
+                if self.config.broadcast or self.config.listen:
+                    continue
+            sent = 0
+            try:
+                stats = session.stats() if hasattr(session, "stats") else None
+                if isinstance(stats, dict):
+                    for field in ("bytes", "packets", "frames", "sent"):
+                        sent = max(sent, int(stats.get(field) or 0))
+                sent = max(sent, int(getattr(session, "bytes_sent", 0) or 0))
+            except Exception:
+                sent = 0
+            if sent:
+                continue
+            started = float(getattr(session, "started_at", 0.0) or 0.0) or now
+            if now - started < 20.0:
+                continue
+            try:
+                self.sender.remove(key)
+                self.note("清掉残留发送端 %s（路由已不存在，且从未发出数据）" % key)
+            except Exception as exc:
+                self._note_once("清理残留发送端失败：%s" % exc)
+
+
     def _maintenance_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -519,6 +561,13 @@ class WaveLinkNode:
         self.refresh_devices()
         self._apply_pushed_routes()
         self.apply_routes()
+
+        # 兜底清扫放在 tick 里：tick 每半秒跑一次，是唯一稳定被执行的地方。
+        # 单独包一层，任何异常都不能影响调和本身。
+        try:
+            self._sweep_dead_senders()
+        except Exception as exc:
+            self._note_once("残留清扫出错（已忽略）：%s" % exc)
 
     def _apply_pushed_routes(self) -> None:
         """Accept route tables pushed by another node's control panel.
