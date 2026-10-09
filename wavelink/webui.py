@@ -1117,7 +1117,12 @@ class _Handler(BaseHTTPRequestHandler):
             while True:
                 payload = tap.drain(sid)
                 if payload:
-                    conn.sendall(ws_frame(_to_24k_mono(payload)))
+                    # 一块一块地重切，保证客户端每次收到的长度完全一样。
+                    mono = _to_24k_mono(payload)
+                    for off in range(0, len(mono), BLOCK_BYTES_MONO):
+                        piece = mono[off : off + BLOCK_BYTES_MONO]
+                        if len(piece) == BLOCK_BYTES_MONO:
+                            conn.sendall(ws_frame(piece))
                 # Read whatever the client sent (close/ping) so it cannot pile up.
                 ready, _, _ = select.select([conn], [], [], 0)
                 if ready:
@@ -1836,21 +1841,37 @@ def _qr_png(text: str) -> bytes | None:
         return None
 
 
-def _to_24k_mono(pcm16: bytes) -> bytes:
-    """把 48kHz 立体声 PCM16 变成 24kHz 单声道 PCM16。
+BLOCK_BYTES_MONO = 480  # 24kHz 单声道 10 毫秒
 
-    每两个立体声帧取一个，并只留左声道 —— 这就是"隔点取样 + 降混"，
-    数据量变成原来的四分之一，听感上放音乐和视频够用。
+
+def _to_24k_mono(pcm16: bytes) -> bytes:
+    """把 48kHz 立体声 PCM16 变成 24kHz 单声道，并按固定长度重新切块。
+
+    规则（照现场量出来的问题定的）：
+      * 只认 48k 立体声 4 字节一帧的输入；长度不是 4 的倍数就裁掉尾巴。
+      * 每两个立体声帧取一帧，只留左声道 -> 24kHz 单声道，每帧 2 字节。
+      * 输出一律重新切成 480 字节一块（24kHz 的 10 毫秒）。
+        客户端最怕同一条流里长短不一：它会按一种长度播，另一种就变调。
+
+    转换不成就返回空，让调用方丢掉这一块 —— 绝不把旧格式混进去。
     """
     try:
         import array as _array
 
-        samples = _array.array("h")
-        samples.frombytes(pcm16[: len(pcm16) - (len(pcm16) % 4)])
-        out = _array.array("h", [samples[i] for i in range(0, len(samples) - 1, 4)])
-        return out.tobytes()
+        usable = len(pcm16) - (len(pcm16) % 4)
+        if usable <= 0:
+            return b""
+        frames = _array.array("h")
+        frames.frombytes(pcm16[:usable])
+        mono = _array.array("h", [frames[i] for i in range(0, len(frames) - 1, 4)])
+        raw = mono.tobytes()
+        if len(raw) % BLOCK_BYTES_MONO:
+            raw += b"\x00" * (BLOCK_BYTES_MONO - (len(raw) % BLOCK_BYTES_MONO))
+        return raw
     except Exception:
-        return pcm16
+        return b""
+
+
 
 def monitor_html() -> str:
     """监控窗。谁给谁、走哪个通道、多少数据、延迟多少。"""
