@@ -299,6 +299,13 @@ class WaveLinkNode:
         backend = audio_base.default_backend_name()
         configured = str(self.config.sink_device or "").strip()
         if configured and configured.lower() not in ("default", "@default"):
+            # 指定的设备是什么后端就用什么后端：写 WAV 文件的测试设备不能当成声卡去
+            # 打开，反之亦然。找不到这个设备时退回默认后端。
+            for item in (self.devices or []):
+                if (item.kind == audio_base.KIND_SINK
+                        and str(item.name or "") == configured
+                        and str(item.backend or "")):
+                    return {"backend": str(item.backend), "device": configured}
             return {"backend": backend, "device": configured}
         # sink_list() 不带 is_default 字段（它按名字排序给界面用），
         # 默认设备要从 devices 原始列表里找，否则永远找不到默认的那一块。
