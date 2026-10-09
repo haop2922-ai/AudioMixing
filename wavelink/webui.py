@@ -837,8 +837,17 @@ class WaveLinkApi:
                         node.beacon.name = node.name
         for key in ("broadcast", "listen", "local", "auto_play"):
             if key in payload:
-                setattr(node.config, key, bool(payload[key]))
+                value = bool(payload[key])
+                setattr(node.config, key, value)
                 changed.append(key)
+                # 广播与只听互斥：要么说，要么听。这是功能层的规则，
+                # 放在这里做，引擎的发送逻辑保持原样，正常的双向点对点不受影响。
+                if value and key == "broadcast" and node.config.listen:
+                    node.config.listen = False
+                    changed.append("listen")
+                elif value and key == "listen" and node.config.broadcast:
+                    node.config.broadcast = False
+                    changed.append("broadcast")
         if "open_panel_on_start" in payload:
             want = str(payload["open_panel_on_start"] or "none").strip().lower()
             if want not in ("none", "simple", "full"):

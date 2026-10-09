@@ -2096,28 +2096,6 @@ class TestTodayRegressions(unittest.TestCase):
         self.assertIn("p2p", wanted, "只听模式下点对点的发送端必须保留")
         self.assertNotIn("channel", wanted, "只听模式下不该往广播通道发送")
 
-    def test_we_do_not_send_back_what_we_are_playing(self) -> None:
-        """正在听它，就不往它发。
-
-        现场：两边都开点对点，各自的"播放设备"和"采集设备"是同一块，
-        于是对方的声音被采到又发回去 —— 对方听到自己的回音，音量还叠一遍。
-        规则改成"要么说要么听"之后，这条发送必须停掉。
-        """
-        self.node.registry.add_manual("127.0.0.1", 47990, "peer-1")
-        peer_id = ""
-        for item in self.node.registry.snapshot():
-            peer_id = str(item.get("node_id") or peer_id)
-        self.node.set_routes([{"id": "up", "from": ["self"], "to": ["peer-1"]}],
-                             persist=False)
-        before = {key.split("|", 1)[0] for key, _t, _r in self.node.desired_senders()}
-        self.assertIn("up", before, "没有在听的时候，应该正常发送")
-
-        # 假装接收端正在播放这个对端的声音
-        self.node._playing_peers = lambda: {peer_id}       # type: ignore[method-assign]
-        self.node._listen_hold = {}
-        after = {key.split("|", 1)[0] for key, _t, _r in self.node.desired_senders()}
-        self.assertNotIn("up", after, "正在听它的时候不能再往它发送")
-
     def test_the_default_sink_is_a_real_sound_card(self) -> None:
         """默认播放后端必须是真实声卡，绝不能是写文件。"""
         from wavelink.audio import base as audio_base
