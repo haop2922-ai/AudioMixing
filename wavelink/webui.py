@@ -1079,6 +1079,50 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "frames": frames, "queued_frames": state["queued_frames"],
                          "dropped_frames": state["dropped_frames"]})
 
+    def _stream_pcm(self) -> None:
+        """把本机正在播放的声音按固定块长分块推给手机（24kHz 单声道 PCM16）。
+
+        响应头里带上采样率和声道数，手机端不用猜；块长固定 480 字节。
+        没人听的时候 tap 里没有数据，这里就静静地等，不占 CPU。
+        """
+        conn = self.connection
+        tap = self.api.node.tap
+        sid = tap.subscribe()
+        try:
+            conn.sendall(
+                (
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/octet-stream\r\n"
+                    "Transfer-Encoding: chunked\r\n"
+                    "Cache-Control: no-store\r\n"
+                    "X-Sample-Rate: 24000\r\n"
+                    "X-Channels: 1\r\n"
+                    "X-Block-Bytes: %d\r\n"
+                    "Connection: close\r\n\r\n" % BLOCK_BYTES_MONO
+                ).encode("ascii")
+            )
+        except OSError:
+            tap.unsubscribe(sid)
+            return
+        self.close_connection = True
+        try:
+            while True:
+                payload = tap.drain(sid)
+                if payload:
+                    mono = _to_24k_mono(payload)
+                    for off in range(0, len(mono), BLOCK_BYTES_MONO):
+                        piece = mono[off : off + BLOCK_BYTES_MONO]
+                        if len(piece) != BLOCK_BYTES_MONO:
+                            continue
+                        # 分块传输：十六进制长度 + CRLF + 数据 + CRLF
+                        conn.sendall(b"%x\r\n" % len(piece) + piece + b"\r\n")
+                else:
+                    time.sleep(0.005)
+        except OSError:
+            pass
+        finally:
+            tap.unsubscribe(sid)
+
     def _websocket_audio(self) -> None:
         """Stream this node's output to a browser as raw PCM16, over WebSocket.
 
@@ -1397,6 +1441,10 @@ class _Handler(BaseHTTPRequestHandler):
                     self._json(503, {"error": "二维码库不可用"})
                     return
                 self._send(200, png, "image/png")
+                return
+            if path == "/audio.pcm":
+                # 手机 APK 用的低门槛入口：普通 HTTP 分块传输，读就行。
+                self._stream_pcm()
                 return
             if path == "/api/monitor":
                 self._json(200, self.api.monitor())
