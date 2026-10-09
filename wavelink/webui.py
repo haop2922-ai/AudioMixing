@@ -537,10 +537,19 @@ class WaveLinkApi:
                 info.get("route_id") or "").startswith("channel")
             raw_state = str(info.get("state") or "")
             target = str(info.get("target") or info.get("peer") or "")
+            host = str(info.get("host") or "")
+            port = info.get("port")
+            if not target and host:
+                # "给谁"要写对端的节点名，不是 IP:端口 ——
+                # 端口是内部细节，写出来只会让人以为是故障。
+                for peer in (getattr(node, "registry", None).snapshot()
+                             if getattr(node, "registry", None) is not None else []) or []:
+                    if str(peer.get("host") or "") == host and peer.get("name"):
+                        target = str(peer.get("name"))
+                        break
             if not target:
-                host = str(info.get("host") or "")
-                port = info.get("port")
-                target = (host + (":" + str(port) if port else "")) or rid
+                target = host or rid
+            endpoint = (host + (":" + str(port) if port else "")) if host else ""
             amount = int(info.get("bytes") or info.get("sent_bytes") or 0)
             rate = round(float(info.get("kbps") or 0.0), 1)
             device = str(info.get("source") or "")
@@ -570,8 +579,9 @@ class WaveLinkApi:
                 "bytes": amount,
                 "rate_kbps": rate,
                 "latency_ms": None,
-                "detail": ("残留：这条路由已经删了但它还在发" if stale
-                           else (where or str(info.get("error") or ""))),
+                "detail": ("残留：这条路由已经删了但它还在发　对端 " + endpoint if stale
+                           else ("　".join(x for x in (where, ("对端 " + endpoint) if endpoint else "")
+                                           if x) or str(info.get("error") or ""))),
             })
 
         # 广播的听众：谁在听这条广播
