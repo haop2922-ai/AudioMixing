@@ -1917,6 +1917,7 @@ class WaveLinkNode:
                 "simulate": self.simulate,
             },
             "backends": audio_base.available_backends(),
+            "opus": _opus_state(),
             "devices": {
                 "sources": self.source_list(),
                 "sinks": self.sink_list(),
@@ -1940,3 +1941,12 @@ class WaveLinkNode:
             "last_error": self.last_error,
             "captures": self.hub.stats(),
         }
+def _opus_state() -> dict[str, Any]:
+    """Opus 能不能用。打包后靠这个确认库有没有被带进去。"""
+    try:
+        from .audio import opus as _opus
+
+        return {"available": bool(_opus.available()), "error": _opus.load_error()}
+    except Exception as exc:
+        return {"available": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+

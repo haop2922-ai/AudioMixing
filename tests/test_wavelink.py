@@ -1984,6 +1984,28 @@ class TestTodayRegressions(unittest.TestCase):
         self.assertEqual(len(stats), 1,
                          "同一设备只应有一路采集，否则广播和点对点会抢设备：%s" % (stats,))
 
+    def test_opus_round_trip_compresses_a_lot(self) -> None:
+        """Opus 往返：能压很多倍，而且还原出来的样本数对得上。
+
+        这条测试守着"多一台设备就糊"的根因：未压缩 1536 KB/s，
+        三台就吃满 Wi-Fi。Opus 之后每路十几 KB/s。
+        """
+        import numpy as np
+
+        from wavelink.audio import opus as op
+
+        if not op.available():
+            self.skipTest("这台机器没有 Opus 库：%s" % op.load_error())
+        enc = op.OpusEncoder(channels=2)
+        dec = op.OpusDecoder(channels=2)
+        frames = 960
+        tone = np.zeros(frames * 2, dtype=np.float32)
+        packet = enc.encode(tone)
+        self.assertLess(len(packet), frames * 2 * 2 / 4,
+                        "一个 20 毫秒的包应该远小于原始 PCM")
+        back = dec.decode(packet)
+        self.assertEqual(len(back), frames * 2, "还原的样本数必须和输入一致")
+
     def test_the_default_sink_is_a_real_sound_card(self) -> None:
         """默认播放后端必须是真实声卡，绝不能是写文件。"""
         from wavelink.audio import base as audio_base
