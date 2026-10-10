@@ -1,7 +1,31 @@
-﻿dist/
+# 构建产物：不进仓库，走 GitHub Releases 上传
+dist/
 build/
-__pycache__/
-*.pyc
-.testappdata/
+*.spec
+release/*.exe
 release/*.zip
+release/*.apk
+release/历史版本/
 
+# 改代码前的快照（本地用，噪音大）
+回收站/
+
+# 开发时的同步快照
+dev/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本地临时文件
+*.log
+*.wav
+*.tmp
+.netcheck.json
+
+# 编辑器
+.vscode/
+.idea/
