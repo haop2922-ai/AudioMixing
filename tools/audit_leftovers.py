@@ -82,7 +82,7 @@ def audit_environment() -> None:
             count = out.lower().count("audiomixing.exe")
             ports: list[str] = []
             try:
-                cfg = pathlib.Path(os.environ.get("APPDATA", "")) / "WaveLink" / "config.json"
+                cfg = pathlib.Path(os.environ.get("APPDATA", "")) / "AudioMixing" / "config.json"
                 if cfg.is_file():
                     ports.append(str(json.loads(cfg.read_text(encoding="utf-8")).get("web_port") or ""))
             except (OSError, ValueError):
@@ -108,7 +108,7 @@ def audit_environment() -> None:
 
     # 2. config file
     appdata = os.environ.get("APPDATA")
-    cfg_path = pathlib.Path(appdata) / "WaveLink" / "config.json" if appdata else None
+    cfg_path = pathlib.Path(appdata) / "AudioMixing" / "config.json" if appdata else None
     if cfg_path and cfg_path.is_file():
         try:
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))

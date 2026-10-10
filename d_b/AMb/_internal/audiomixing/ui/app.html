@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e1116">
+<title>WaveLink 手机端</title>
+<style>
+  :root{--bg:#0e1116;--card:#171c24;--line:#242c38;--fg:#e8edf5;--dim:#8b97a8;--acc:#4da3ff;--ok:#3ddc84}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",sans-serif;
+       padding:max(16px,env(safe-area-inset-top)) 16px max(16px,env(safe-area-inset-bottom))}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:14px}
+  .big{display:block;width:100%;padding:18px;border:0;border-radius:12px;font-size:18px;font-weight:600;
+       background:var(--acc);color:#06121f;cursor:pointer;text-align:center;text-decoration:none}
+  .big.ghost{background:transparent;color:var(--fg);border:1px solid var(--line)}
+  ol{padding-left:20px;margin:10px 0 0}
+  li{margin-bottom:6px}
+  .dim{color:var(--dim);font-size:12.5px}
+  .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+  .ok{color:var(--ok)}
+</style>
+</head>
+<body>
+<div id="buildStamp" style="font-size:12px;color:#8b97a8;margin:10px 0">读取中…</div>
+<h1>WaveLink 手机端</h1>
+<div class="sub" id="host">把这部手机的声音（麦克风或系统声音）送进电脑</div>
+
+<div class="card" id="dlCard">
+  <a class="big" id="dl" href="/app/download">下载并安装 App</a>
+  <div class="dim" id="size" style="margin-top:8px"></div>
+</div>
+
+<div class="card">
+  <b>装好之后</b>
+  <ol>
+    <li>打开 App，填<b>电脑地址</b>（面板上那串局域网地址）</li>
+    <li>勾「发送系统声音」= 把手机里播放的声音送过去；不勾 = 只送麦克风</li>
+    <li>点「开始发送」，安卓会弹一次授权（系统要求，只能点一次）</li>
+    <li>回到电脑面板 <b>⑥ 频道 → 音源</b>，勾上这部手机</li>
+  </ol>
+  <div class="dim" style="margin-top:10px">
+    小米/红米用户请把本应用设为<b>允许后台运行</b>并关闭电池优化，否则系统会掐断发送。
+  </div>
+</div>
+
+<div class="card">
+  <b>不想装 App？</b>
+  <a class="big ghost" href="/mic" style="margin-top:10px">用浏览器当麦克风</a>
+  <div class="dim" style="margin-top:8px">
+    网页版只能发送<b>麦克风</b>声音（浏览器拿不到系统声音）。想送手机里播放的视频/音乐，必须用上面的 App。
+  </div>
+</div>
+
+<script>
+fetch('/api/app', {cache:'no-store'}).then(r => r.json()).then(d => {
+  if(!d.available){
+    document.getElementById('dlCard').innerHTML =
+      '<div class="dim">这台电脑上还没有手机端安装包。把 <span class="mono">wavelink-mic.apk</span> '
+      + '放到程序目录下，或者用上面的浏览器方式。</div>';
+    return;
+  }
+  document.getElementById('size').textContent = '安装包 ' + d.size_mb + ' MB（' + d.name + '）';
+  document.getElementById('host').textContent = '下载后按提示安装（安卓会问一次"允许安装未知应用"）';
+}).catch(() => {});
+</script>
+<script>
+(async () => {
+  const box = document.getElementById('buildStamp');
+  try {
+    const info = await (await fetch('/api/app')).json();
+    box.innerHTML = info.available
+      ? ('这个安装包的版本：<b>' + info.sha1 + '</b> · 构建于 ' + info.built_at +
+         ' · ' + info.size_kb + ' KB' +
+         '<br>下载后如果版本号不是这个，就是浏览器拿了缓存：点下面的按钮，或长按刷新。')
+      : '安装包还没生成。';
+    const link = document.querySelector('a[href*="/app/download"]');
+    if (link && info.sha1) { link.href = '/app/download?v=' + info.sha1; }
+  } catch (e) { box.textContent = '读不到安装包信息：' + e; }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,2009 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audio Mixing · 局域网声音投射</title>
+<style>
+:root{
+  --bg:#0b0e14; --card:#141922; --card2:#1a202c; --line:#242c3a; --line2:#2f3a4d;
+  --fg:#e8eef7; --dim:#8b97a8; --dim2:#5e6b7d;
+  --acc:#4ade80; --acc2:#60a5fa; --warn:#fbbf24; --bad:#f87171;
+  --r:12px; --r2:9px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--fg); min-height:100vh;
+  font:14px/1.6 "Segoe UI Variable","Segoe UI",-apple-system,system-ui,"Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+code,.mono{font-family:ui-monospace,"Cascadia Code",Consolas,monospace;font-variant-numeric:tabular-nums}
+
+/* ---------- top bar ---------- */
+.top{
+  position:sticky; top:0; z-index:30; display:flex; align-items:center; gap:12px;
+  padding:11px 22px; background:rgba(11,14,20,.86); backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--line);
+}
+.brand{display:flex; align-items:center; gap:9px; font-weight:650; font-size:15.5px; letter-spacing:.2px}
+.brand .mark{
+  width:24px;height:24px;border-radius:7px;flex:0 0 auto;
+  background:linear-gradient(140deg,var(--acc),var(--acc2));
+  box-shadow:0 0 16px rgba(74,222,128,.28);
+  display:grid;place-items:center;color:#07110b;font-size:13px;font-weight:800;
+}
+.spacer{flex:1}
+.tag{
+  display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;
+  background:var(--card2);border:1px solid var(--line);color:var(--dim);
+  font-size:12px;white-space:nowrap;
+}
+.tag b{color:var(--fg);font-weight:600}
+.tag.live{color:var(--acc);border-color:rgba(74,222,128,.35);background:rgba(74,222,128,.08)}
+.tag.off{color:var(--dim2)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--dim2);flex:0 0 auto}
+.dot.on{background:var(--acc);box-shadow:0 0 8px var(--acc)}
+.dot.self{background:var(--acc2);box-shadow:0 0 8px var(--acc2)}
+.dot.off{background:var(--warn)}
+
+/* ---------- buttons ---------- */
+button{
+  font:inherit;font-size:13px;cursor:pointer;color:var(--fg);
+  background:var(--card2);border:1px solid var(--line);border-radius:var(--r2);
+  padding:7px 13px;transition:.14s ease;white-space:nowrap;
+}
+button:hover{border-color:var(--line2);background:#202836}
+button:active{transform:translateY(1px)}
+button:disabled{opacity:.55;cursor:default;transform:none}
+button.primary{background:linear-gradient(180deg,#2f7d4f,#256b42);border-color:#2f8a55;font-weight:600}
+button.primary:hover{background:linear-gradient(180deg,#37945c,#2a7a4a)}
+button.ghost{background:transparent}
+button.ghost:hover{background:var(--card2)}
+button.icon{padding:7px 9px}
+button.danger:hover{border-color:var(--bad);color:var(--bad)}
+button.tiny{padding:3px 8px;font-size:11.5px;border-radius:7px}
+
+/* ---------- LAN banner ---------- */
+.banner{
+  display:none; align-items:center; gap:14px; flex-wrap:wrap;
+  padding:13px 22px; border-bottom:1px solid rgba(74,222,128,.22);
+  background:linear-gradient(90deg,rgba(74,222,128,.09),rgba(96,165,250,.05) 55%,transparent);
+}
+.banner.show{display:flex}
+.banner .k{font-size:12.5px;color:var(--dim)}
+.banner .v{
+  font-family:ui-monospace,Consolas,monospace;font-size:16.5px;font-weight:700;
+  color:var(--acc);letter-spacing:.2px;
+  background:rgba(4,18,10,.75);border:1px solid rgba(74,222,128,.3);
+  border-radius:var(--r2);padding:5px 12px;cursor:pointer;
+}
+.banner .v:hover{border-color:var(--acc)}
+.banner .hint{font-size:12.5px;color:var(--dim);max-width:620px}
+.banner.no{background:linear-gradient(90deg,rgba(251,191,36,.1),transparent);border-bottom-color:rgba(251,191,36,.25)}
+.banner.no .v{color:var(--warn);border-color:rgba(251,191,36,.3);background:rgba(26,20,5,.7)}
+
+/* ---------- layout ---------- */
+.wrap{max-width:1520px;margin:0 auto;padding:22px;display:grid;grid-template-columns:minmax(0,1.95fr) minmax(0,1fr);gap:22px;align-items:start}
+@media(max-width:1150px){.wrap{grid-template-columns:1fr;gap:18px}}
+.col{display:flex;flex-direction:column;gap:18px;min-width:0}
+
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+.card>h2{
+  display:flex;align-items:center;gap:9px;
+  margin:0;padding:14px 18px;font-size:13.5px;font-weight:600;letter-spacing:.01em;
+  border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.022),transparent);
+}
+.card>h2 .n{
+  display:grid;place-items:center;width:20px;height:20px;border-radius:6px;flex:0 0 auto;
+  background:var(--card2);border:1px solid var(--line);color:var(--dim);
+  font-size:11.5px;font-weight:700;
+}
+.card>h2 .sub{font-weight:400;color:var(--dim);font-size:12.5px}
+.card>h2 .right{margin-left:auto;display:flex;gap:8px;align-items:center}
+.body{padding:16px 18px}
+.body.tight{padding:12px 18px}
+
+/* ---------- device table ---------- */
+table{width:100%;border-collapse:collapse}
+th{
+  text-align:left;padding:0 12px 9px;font-size:11.5px;font-weight:600;color:var(--dim2);
+  text-transform:none;letter-spacing:.02em;white-space:nowrap;
+}
+th small{display:block;font-weight:400;color:var(--dim2);opacity:.75;font-size:11px}
+td{padding:11px 12px;border-top:1px solid var(--line);vertical-align:top;font-size:13px}
+tr:hover td{background:rgba(255,255,255,.016)}
+td.name{font-weight:600;white-space:nowrap}
+td.addr{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--dim);white-space:nowrap}
+
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.btrow{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--line)}
+.btrow:last-child{border-bottom:0}
+.btrow .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bthint{color:#ffcc66;font-size:12px;line-height:1.6;padding:2px 0 8px}
+.chip{
+  display:inline-flex;align-items:center;gap:6px;padding:3px 9px 3px 7px;border-radius:7px;
+  background:var(--card2);border:1px solid var(--line);font-size:12px;
+}
+.chip .k{font-size:10.5px;padding:1px 5px;border-radius:4px;font-weight:600;letter-spacing:.02em}
+.chip.sys .k{background:rgba(74,222,128,.14);color:#7ee7a4}
+.chip.out .k{background:rgba(96,165,250,.15);color:#93c5fd}
+.chip .x{color:var(--dim2);font-size:11px}
+
+.more{margin-top:7px;font-size:11.5px;color:var(--dim2)}
+.more summary{cursor:pointer;color:var(--dim);list-style:none;display:inline-flex;gap:5px;align-items:center}
+.more summary::-webkit-details-marker{display:none}
+.more summary:hover{color:var(--fg)}
+.more[open] summary{margin-bottom:5px}
+.more .list{display:flex;flex-wrap:wrap;gap:5px;padding-top:2px}
+.more .list span{background:rgba(255,255,255,.035);border:1px solid var(--line);border-radius:6px;padding:2px 7px;font-size:11.5px}
+
+/* ---------- route list ---------- */
+.routes{display:flex;flex-direction:column;gap:9px}
+.route{
+  display:flex;align-items:center;gap:12px;padding:12px 14px;
+  background:var(--card2);border:1px solid var(--line);border-radius:var(--r2);
+}
+.route.mute{opacity:.55}
+.route .flow{display:flex;align-items:center;gap:9px;flex:1;min-width:0;flex-wrap:wrap}
+.route .node{
+  display:inline-flex;align-items:center;gap:7px;padding:4px 10px;border-radius:7px;
+  background:rgba(96,165,250,.1);border:1px solid rgba(96,165,250,.22);
+  font-size:12.5px;font-weight:600;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.route .node.dst{background:rgba(74,222,128,.1);border-color:rgba(74,222,128,.24)}
+.route .arrow{color:var(--dim2);font-size:15px}
+.route .meta{font-size:11.5px;color:var(--dim2);white-space:nowrap}
+.route .acts{display:flex;gap:6px;flex:0 0 auto}
+.route .gainbox{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--dim)}
+.route input[type=range]{width:74px;accent-color:var(--acc)}
+
+/* ---------- drag & drop route builder ---------- */
+.builder{display:grid;grid-template-columns:minmax(0,1fr) 34px minmax(0,1fr);gap:12px;align-items:stretch}
+@media(max-width:760px){.builder{grid-template-columns:1fr;gap:10px}.builder .mid{display:none}}
+.panel{
+  display:flex;flex-direction:column;gap:9px;padding:13px;
+  background:var(--card2);border:1px solid var(--line);border-radius:var(--r2);min-height:150px;
+}
+.panel .head{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--dim)}
+.panel .head b{color:var(--fg);font-size:13px;font-weight:600}
+.builder .mid{display:grid;place-items:center;color:var(--dim2);font-size:18px}
+
+.drop{
+  flex:1;display:flex;flex-direction:column;gap:7px;padding:10px;border-radius:9px;
+  border:1.5px dashed var(--line2);background:rgba(0,0,0,.18);
+  min-height:76px;transition:.15s;position:relative;
+}
+.drop.hot{border-color:var(--acc);background:rgba(74,222,128,.09);box-shadow:inset 0 0 22px rgba(74,222,128,.08)}
+.drop .ph{color:var(--dim2);font-size:12px;margin:auto;text-align:center;line-height:1.7;pointer-events:none}
+.drop .ph b{color:var(--dim);font-weight:600}
+.drop.bad{border-color:rgba(248,113,113,.5);background:rgba(248,113,113,.06)}
+
+.dchip{
+  display:inline-flex;align-items:center;gap:8px;align-self:flex-start;max-width:100%;
+  padding:5px 9px 5px 11px;border-radius:8px;font-size:12.5px;font-weight:600;
+  background:rgba(96,165,250,.13);border:1px solid rgba(96,165,250,.3);color:#cfe3ff;
+}
+.dchip.dst{background:rgba(74,222,128,.13);border-color:rgba(74,222,128,.32);color:#c9f7da}
+.dchip .rm{
+  cursor:pointer;color:var(--dim);font-size:14px;line-height:1;padding:0 2px;border-radius:4px;
+}
+.dchip .rm:hover{color:var(--bad)}
+.dchip .kind{font-size:10.5px;font-weight:600;padding:1px 5px;border-radius:4px;background:rgba(255,255,255,.09);color:var(--dim)}
+
+/* the draggable device cards on the left */
+.srcgrid{display:flex;flex-direction:column;gap:7px;margin-top:12px;padding-top:13px;border-top:1px solid var(--line)}
+.srcgrid .title{font-size:12px;color:var(--dim);display:flex;align-items:center;gap:7px}
+.drag{
+  display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:9px;cursor:grab;
+  background:#0f141c;border:1px solid var(--line);transition:.14s;user-select:none;touch-action:none;
+}
+.drag:hover{border-color:var(--line2);background:#131a24;transform:translateX(2px)}
+.drag:active{cursor:grabbing}
+.drag.dragging{opacity:.4}
+.drag .grip{color:var(--dim2);font-size:13px;letter-spacing:-1px;line-height:1}
+.drag .nm{font-weight:600;font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.drag .tags{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}
+.drag .tags span{font-size:10.5px;padding:1px 6px;border-radius:4px;background:rgba(74,222,128,.12);color:#7ee7a4}
+.drag.self .tags span{background:rgba(96,165,250,.12);color:#93c5fd}
+
+#ghost{
+  position:fixed;z-index:200;pointer-events:none;opacity:.92;
+  padding:8px 13px;border-radius:9px;font-size:12.5px;font-weight:600;
+  background:#1f2a38;border:1px solid var(--acc);color:#d7f7e3;
+  box-shadow:0 12px 34px rgba(0,0,0,.55);transform:translate(-50%,-140%);
+  display:none;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+body.dragging{cursor:grabbing}
+
+.fields{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
+.f{display:flex;flex-direction:column;gap:5px}
+.f label{font-size:11.5px;color:var(--dim)}
+.f.grow{flex:1;min-width:150px}
+input[type=text],input[type=number],select{
+  font:inherit;font-size:13px;color:var(--fg);background:#0d1219;
+  border:1px solid var(--line);border-radius:8px;padding:7px 10px;width:100%;
+}
+input:focus,select:focus{outline:none;border-color:var(--acc2);box-shadow:0 0 0 3px rgba(96,165,250,.13)}
+
+.note{
+  margin-top:13px;padding:11px 13px;border-radius:var(--r2);font-size:12.5px;line-height:1.75;
+  background:rgba(96,165,250,.06);border:1px solid rgba(96,165,250,.16);color:#b9c6d8;
+}
+.note b{color:var(--fg)}
+.note code{background:rgba(0,0,0,.35);padding:1px 5px;border-radius:4px;font-size:12px;color:#a7d8ff}
+
+/* ---------- stats ---------- */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:10px}
+.stat{background:var(--card2);border:1px solid var(--line);border-radius:var(--r2);padding:11px 12px}
+.stat .k{font-size:11px;color:var(--dim2);margin-bottom:3px}
+.stat .v{font-size:17px;font-weight:700;font-variant-numeric:tabular-nums}
+.stat .v.sm{font-size:14px}
+.stat .v.ok{color:var(--acc)}
+.stat .v.warn{color:var(--warn)}
+
+.rows{display:flex;flex-direction:column;gap:7px;margin-top:3px}
+.row{display:flex;align-items:center;gap:9px;font-size:12.5px;padding:8px 11px;background:var(--card2);border:1px solid var(--line);border-radius:8px}
+.row .grow{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .num{font-variant-numeric:tabular-nums;color:var(--dim)}
+.row .num.bad{color:var(--bad)}
+.row .num.ok{color:var(--acc)}
+
+pre{
+  background:#080b11;border:1px solid var(--line);border-radius:var(--r2);
+  padding:12px 14px;overflow:auto;max-height:230px;font-size:11.5px;line-height:1.75;color:#93a1b3;
+  font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all;
+}
+.msg{font-size:12.5px;color:var(--dim);min-height:1.2em}
+.warnbox{padding:10px 13px;border-radius:8px;font-size:12.5px;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.25);color:#fca5a5;margin-top:10px}
+
+.toast{
+  position:fixed;left:50%;bottom:28px;transform:translate(-50%,18px);opacity:0;pointer-events:none;
+  padding:11px 20px;border-radius:var(--r2);font-size:13px;z-index:100;transition:.22s ease;
+  background:#1c2431;border:1px solid var(--line2);box-shadow:0 10px 34px rgba(0,0,0,.5);max-width:80vw;
+}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+.toast.ok{border-color:rgba(74,222,128,.45)}
+.toast.err{border-color:rgba(248,113,113,.5)}
+/* ---------------- display modes ----------------
+   简洁 is the default: three things a person actually decides (谁在线 / 听什么 / 播到哪),
+   with every explanation, table, counter and log tucked behind 详细. Nothing is removed
+   from the DOM, only hidden, so the scripts keep finding every element they need. */
+html:not(.fullui) .full,
+html:not(.fullui) .note,
+html:not(.fullui) .tip,
+html:not(.fullui) .warn,
+html:not(.fullui) .tech { display: none !important; }
+/* These two live inside a .note but are the point of the card in 简洁: the current
+   state, and the address to open on a phone. */
+html:not(.fullui) #chState,
+html:not(.fullui) #phoneUrl { display: block !important; }
+/* The peer list has two shapes: a one-line-per-device list for 简洁 and the full table
+   (with every device each peer can capture or play) for 详细, which is what the
+   drag-and-drop route builder needs. */
+html.fullui .brief { display: none !important; }
+.peerline { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.peerline:last-child { border-bottom: 0; }
+.peerline .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Level sparkline: the one reading that tells a person "is sound flowing right now",
+   which no counter does. Kept in 简洁 too, because that is where it matters most. */
+.spark { background: #111722; border: 1px solid var(--line); border-radius: 11px; padding: 6px 8px 2px; margin-bottom: 12px; }
+.spark svg { display: block; width: 100%; height: 46px; }
+/* 简洁 is the default: the controls, and the state of things. Every explanation,
+   table, counter, log and hint lives behind 详细. */
+html:not(.fullui) .full,
+html:not(.fullui) .note,
+html:not(.fullui) .tip,
+html:not(.fullui) .warn,
+html:not(.fullui) .tech,
+html:not(.fullui) .mini,
+html:not(.fullui) .bthint,
+html:not(.fullui) .more,
+html:not(.fullui) .sub,
+html:not(.fullui) #backendTag { display: none !important; }
+html:not(.fullui) .fullonly { display: none !important; }
+/* ...except a notice that something is actually wrong and can be fixed with one click:
+   hiding that is how "the phone is sending but nothing plays it" stayed invisible. */
+html:not(.fullui) .action { display: block !important; }
+.action {
+  color: #ffcc66; font-size: 12.5px; line-height: 1.7;
+  border-left: 2px solid #ffcc66; padding: 4px 0 4px 8px; margin-top: 8px;
+}
+.meta { color: #6b7785; font-size: 12px; white-space: nowrap; }
+/* Per-path quality curves: the arrival/write interval over time, with a dashed line for
+   the ideal. A volume meter showed that something was playing; this shows which link is
+   misbehaving, which is the question that actually comes up. */
+.micgain { width: 96px; vertical-align: middle; }
+.btrow { flex-wrap: wrap; row-gap: 6px; }
+.btrow .nm { flex: 0 0 auto; min-width: 84px; font-weight: 600; }
+.btrow .chip .k { white-space: nowrap; }
+.btrow input[type=range] { width: 84px; }
+.qbox { margin-top: 12px; }
+.qchart { width: 100%; height: 36px; display: block; background: #0e141d;
+          border: 1px solid var(--line); border-radius: 8px; }
+.qchart.inline { width: 150px; height: 30px; display: inline-block; vertical-align: middle; }
+.qmeta { font-size: 11.5px; color: #8a96a3; margin-top: 5px; line-height: 1.5; }
+.qmeta b { color: #cfe0f5; }
+.linkbtn {
+  display: inline-flex; align-items: center; padding: 7px 12px; border-radius: 10px;
+  border: 1px solid var(--line); background: #1d2634; color: var(--fg);
+  font-size: 12.5px; text-decoration: none; white-space: nowrap;
+}
+.linkbtn:hover { border-color: var(--acc); color: var(--acc); }
+/* Cards are arranged by hand: ⠿ moves one, ⤢ widens it to the full row. Free pixel
+   resizing would fight the responsive columns - a width picked at one window size is
+   wrong at the next - so the layout remembers *order* and *span* instead. */
+.cardtools { display: inline-flex; gap: 2px; align-items: center; margin-left: 8px; }
+.cardtools button { padding: 1px 7px; line-height: 1.5; }
+.grip { cursor: grab; touch-action: none; }
+.card.dragging { opacity: .55; outline: 2px dashed var(--acc); outline-offset: 2px; }
+/* ⤢ gives a card a column to itself - the useful meaning now that columns are packed
+   by height: a long card stops pushing a hole under its short neighbours. */
+.card.wide { }
+/* Columns are packed in JavaScript by measured height (see packColumns): a tall card
+   gets a column to itself while the short ones stack beside it, so nothing is left with
+   a hole under it. A grid cannot do that - every card in a row becomes as tall as the
+   tallest one, which is exactly the empty space this replaces. */
+html:not(.fullui) .wrap { max-width: 1320px; display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; }
+html.fullui .wrap { max-width: none; display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; }
+.wrap > .col { flex: 1 1 0; min-width: 300px; display: flex; flex-direction: column; gap: 14px; }
+html:not(.fullui) .card { margin-bottom: 0; }
+html.fullui .card { margin-bottom: 0; }
+html.fullui .body { padding: 11px 13px; }
+html.fullui .body.tight { padding: 9px 13px; }
+html.fullui table td, html.fullui table th { padding: 4px 7px; font-size: 12.5px; }
+.mini { color: #6b7785; font-size: 12px; line-height: 1.7; }
+
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.seg button {
+  border: 0; background: transparent; color: var(--dim); font: inherit; font-size: 12.5px;
+  padding: 4px 11px; cursor: pointer; line-height: 1.5;
+}
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button.on { background: var(--acc); color: #06121f; font-weight: 600; }
+.seg button:not(.on):hover { color: var(--fg); background: #1d242f; }
+
+/* A little air: the panel is mostly cards, so the spacing between them carries the
+   hierarchy better than any border or colour does. */
+.card { border-radius: 14px; }
+.card > h2 { letter-spacing: .01em; }
+.card > h2 .n {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 19px; height: 19px; border-radius: 6px; font-size: 11.5px;
+  background: #1e2735; color: var(--acc); font-weight: 600;
+}
+html:not(.fullui) .card > h2 { margin-bottom: 2px; }
+html:not(.fullui) .card .body { padding-top: 6px; }
+</style>
+</head>
+<body>
+
+<div id="boot" style="padding:22px;font:14px/1.7 system-ui,'Microsoft YaHei',sans-serif;color:#8b97a8">
+  <b style="color:#e8eef7">WaveLink 页面已下载，正在连接本机服务…</b><br>
+  如果这段文字一直停在这里没有消失，说明页面的脚本没有跑起来。<br>
+  <span style="color:#5e6b7d">请把这个情况告诉我，并顺便在手机浏览器里打开 <code>/plain</code> 试试。</span>
+</div>
+
+<noscript>
+  <div style="padding:22px;font:15px/1.9 system-ui,'Microsoft YaHei',sans-serif;color:#fbbf24;background:#1a1405;border-bottom:1px solid #5c4a12">
+    <b>这个页面需要开启 JavaScript</b>（控制台靠它实时刷新状态）。<br>
+    请在浏览器设置里允许本站点的 JavaScript 后刷新。
+  </div>
+</noscript>
+
+<div class="top">
+  <div class="brand"><span class="mark">W</span>Audio Mixing</div>
+  <span class="tag" id="nodeTag"><b>…</b></span>
+  <span class="spacer"></span>
+          <a class="linkbtn" href="/monitor" title="看谁给谁数据、走哪个通道、数据量与延迟" style="flex:0 0 auto">监控</a>
+        <span class="seg" id="modeSeg">
+    <button class="on" data-mode="simple" onclick="setUiMode('simple')">简洁</button>
+    <button data-mode="full" onclick="setUiMode('full')">详细</button>
+  </span>
+  <span class="tag" id="backendTag">音频后端 …</span>
+  <span class="tag" id="peerTag">设备 0</span>
+  <span class="tag" id="streamTag">流 0</span>
+  <button id="testBtn" onclick="testTone()" title="在本机默认输出播 2 秒测试音，确认耳机/音箱是通的">测试音箱</button>
+  <button class="ghost icon" onclick="refreshAll()" title="立即刷新">⟳</button>
+</div>
+
+<div class="banner" id="lanBanner">
+  <span class="k">别的电脑/手机用这个网址打开：</span>
+  <span class="v" id="lanUrl" onclick="copyLanUrl()" title="点击复制">—</span>
+  <button class="tiny" onclick="copyLanUrl()">复制</button>
+  <span class="hint" id="lanHint"></span>
+</div>
+
+<div class="wrap">
+  <div class="col">
+
+    <!-- ① 设备 -->
+    <section class="card">
+      <h2><span class="n">①</span>局域网里的设备
+        <span class="sub">两台设备要连同一个 Wi-Fi</span>
+        <span class="right"><span class="tag off" id="discoveryTag">发现中…</span></span>
+      </h2>
+      <div class="body tight">
+        <div id="peersBox"></div>
+        <div class="fields" style="margin-top:12px;padding-top:12px">
+          <div class="f grow"><label>手动添加设备 IP</label>
+            <input type="text" id="peerHost" placeholder="192.168.0.102"></div>
+          <button onclick="addPeer()">添加设备</button>
+        </div>
+        <details class="more" style="margin-top:12px">
+          <summary>▸ 为什么手机上装着浏览器、却不能被添加成设备？</summary>
+          <div style="padding:10px 2px 2px;font-size:12.5px;line-height:1.85;color:#9aa7b8">
+            WaveLink 要求<b>每台设备都运行一个节点程序</b>。手机上的浏览器只能<b>打开这个页面</b>
+            （当遥控器），它本身不是一个节点，所以：<br>
+            · 手机可以看这个控制台、可以当"音响"播放（如果装了客户端）<br>
+            · 手机<b>不能</b>被 ping 通，也<b>不能</b>被添加成设备——它上面没有任何东西在监听<br><br>
+            <b>想分享手机的声音</b>，先把手机声音送进任意一台电脑，再交给 WaveLink：<br>
+            · <b>蓝牙</b>：手机蓝牙连电脑，或使用 Phone Link 的声音投射<br>
+            · <b>数据线</b>：手机耳机口 → 电脑 Line-in / USB 声卡<br>
+            声音一旦进入电脑，WASAPI 环回采集会<b>自动抓到它</b>，在路由里把"声音来自"选成那台电脑即可。<br><br>
+            <span style="color:#6b7785">Android 10+ 与 iOS 强制要求用户授权才能采集其它 App 的声音，
+            这是系统隐私策略，任何程序都无法绕过——所以手机端需要单独开发一个 App。</span>
+          </div>
+        </details>
+        <div class="note" id="netBox"></div>
+      </div>
+    </section>
+
+    <!-- ② 路由 -->
+    <section class="card">
+      <h2><span class="n">②</span>路由
+        <span class="sub">把谁的声音，送到谁的耳机</span>
+        <span class="right"><button class="tiny ghost" onclick="showTemplates()">常用例子</button></span>
+      </h2>
+      <div class="body">
+        <div class="qbox">
+          <svg class="qchart" id="qP2p" viewBox="0 0 200 36" preserveAspectRatio="none"></svg>
+          <div class="qmeta" id="qP2pText">等待数据…</div>
+        </div>
+        <div class="routes" id="routesBox"></div>
+
+        <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--line)">
+          <div class="builder">
+            <div class="panel" id="panelFrom">
+              <div class="head">🎧 <b>要听谁的</b><span class="mini">把设备拖进来 · 可多个混音</span></div>
+              <div class="drop" id="dropFrom" data-slot="from">
+                <div class="ph"><b>拖到这里</b><span class="mini"><br>例：伴侣的电脑</span></div>
+              </div>
+            </div>
+            <div class="mid">→</div>
+            <div class="panel" id="panelTo">
+              <div class="head">🔊 <b>用谁的耳机听</b><span class="mini">可拖多个 · 同时出声</span></div>
+              <div class="drop" id="dropTo" data-slot="to">
+                <div class="ph"><b>拖到这里</b><span class="mini"><br>例：本机</span></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="srcgrid">
+            <div class="title">可拖拽的设备 <span style="color:var(--dim2)">按住卡片拖到上面的框里</span></div>
+            <div id="dragList"></div>
+            <div id="multiHint"></div>
+          </div>
+
+          <div class="fields">
+            <div class="f grow"><label>输出设备</label>
+              <input type="text" id="newSinkDevice" placeholder="留空 = 系统默认"></div>
+            <div class="f"><label>音量</label>
+              <input type="number" id="newGain" value="1" min="0" max="4" step="0.1" style="width:84px"></div>
+            <div class="f"><label>编码</label>
+              <select id="newCodec" style="width:180px">
+                <option value="pcm_s16">PCM 16bit（低延迟，推荐）</option>
+                <option value="opus">Opus（省带宽 ~64kbps）</option>
+              </select></div>
+            <button class="primary" onclick="addRoute()">添加这条路由</button>
+            <button class="ghost" onclick="clearDraft()">清空</button>
+          </div>
+
+          <div class="note">
+            <b>拖两个框就是一条路由。</b>「用谁的耳机听」里放多台设备 → 同一路声音会<b>同时</b>在那些设备上响
+            （例如你自己 + 客厅音箱）。<br>
+            想<b>听别的电脑</b> → 左 <code>伴侣的电脑</code>，右 <code>本机</code>。<br>
+            想<b>把自己电脑的声音送到伴侣耳机</b> → 左 <code>本机</code>，右 <code>伴侣的电脑</code>。<br>
+            <span style="color:#8b97a8">两边都放 <code>本机</code> 没有意义（自己的声音放给自己听），程序会拒绝。</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="col">
+    <!-- ③ 本机状态 -->
+    <section class="card">
+      <h2><span class="n">③</span>本机状态<span class="sub" id="levelText">音量 —</span></h2>
+      <div class="body">
+        <div class="rows" id="inputsBox" style="margin-top:12px"></div>
+        <div class="qbox">
+          <div class="qmeta" style="margin:0 0 5px">输出段（喂声卡）—— 与音频走蓝牙还是有线无关</div>
+          <svg class="qchart" id="qBt" viewBox="0 0 200 36" preserveAspectRatio="none"></svg>
+          <div class="qmeta" id="qBtText">等待数据…</div>
+        </div>
+        <div class="stats" id="statsBox"></div>
+        <div class="rows" id="statusRows"></div>
+        <div id="errBox"></div>
+      </div>
+    </section>
+
+    <!-- ④ 传输 -->
+          <section class="card">
+        <h2>手机扫码<span class="sub">手机相机扫一下，不用输 IP</span></h2>
+        <div style="display:flex;gap:22px;flex-wrap:wrap;align-items:flex-start">
+          <div style="text-align:center">
+            <img src="/qr?what=listen" width="132" height="132" alt="扫码收听"
+                 style="background:#fff;border-radius:8px;padding:5px">
+            <div style="font-size:12px;opacity:.7;margin-top:4px">手机当喇叭</div>
+          </div>
+          <div style="text-align:center">
+            <img src="/qr?what=app" width="132" height="132" alt="扫码装APK"
+                 style="background:#fff;border-radius:8px;padding:5px">
+            <div style="font-size:12px;opacity:.7;margin-top:4px">装手机端 APK</div>
+          </div>
+          <div style="font-size:12px;opacity:.72;line-height:1.8;max-width:330px">
+            手机要和这台电脑连同一个 Wi-Fi。<br>
+            左边：打开听众页，点一下手机就开始放这台电脑的声音（先打开「广播我的声音」）。<br>
+            右边：下载手机端，用来把手机的声音送到这台电脑。
+          </div>
+        </div>
+      </section>
+<section class="card full">
+      <h2><span class="n">④</span>正在传输的声音</h2>
+      <div class="body"><div class="rows" id="streamsBox"></div></div>
+    </section>
+
+    <!-- ⑤ 设备 -->
+    <section class="card full">
+      <h2><span class="n">⑤</span>本机音频设备</h2>
+      <div class="body tight"><div id="devicesBox"></div></div>
+    </section>
+
+    <!-- ⑥ 设置 -->
+    <section class="card">
+      <h2><span class="n">⑥</span>频道（局域网广播）</h2>
+      <div class="body">
+        <div class="fields" style="margin-top:0;padding-top:0;border:0">
+          <label class="chk"><input type="checkbox" id="chBroadcast" onchange="saveChannel()"> 广播我的声音</label>
+          <label class="chk"><input type="checkbox" id="chListen" onchange="saveChannel()"> 只听（收听频道，且不发送本机声音）</label>
+          <label class="chk"><input type="checkbox" id="chLocal" onchange="saveChannel()"> 本机直通（把音源直接放到本机耳机）</label>
+          <div class="f"><label>频道音量</label>
+            <input type="range" id="chGain" min="0" max="2" step="0.05" value="1"
+                   oninput="chGainLabel(); setChannelGain(this.value)" style="width:150px">
+            <span class="mono" id="chGainVal">1.00</span></div>
+        </div>
+        <div class="fields full" style="margin-top:10px">
+          <div class="f grow"><label>音源：要送出去的到底是哪个声音（可多选，会混成一路）</label>
+            <select id="chSources" multiple size="4" style="width:100%;min-width:260px;font-size:12.5px"
+                    onchange="saveChannelSources()"></select></div>
+          <button class="ghost" onclick="saveChannelSources()">保存音源</button>
+        </div>
+        <div class="note" style="margin-top:10px">
+          像收音机一样：一台机器「广播」，其它机器「收听」即可听到它，<b>不需要配路由</b>。<br>
+          <b>收听时不发送本机声音</b>（电台不会反过来播音），所以<b>不会产生回声</b>——这正是它和"双向路由"的区别。<br>
+          多台一起广播 → 收听方会把它们<b>混在一起</b>播出（多台电脑的声音汇到一副耳机）。<br>
+          <span style="color:#8b97a8">两个都勾 = 会议模式（互相都听得到）。若收发用的是同一块声卡，那会和双向路由一样产生回声。</span>
+          <span style="color:#8b97a8;display:block;margin-top:6px">
+            <b>接手机（蓝牙，手机不用装 App）</b>：先用系统里的「Bluetooth Audio Receiver」把手机连上（手机把它当成音箱），
+            然后到 <b>设置 → 采集设备</b> 选 <code>麦克风 (&lt;手机名&gt; A2DP SNK)</code>，再勾「广播我的声音」。
+            蓝牙是点对点的，<b>一块适配器同时只能接一路手机</b>；要同时接多台，就插多个 USB 蓝牙适配器。
+          </span>
+          <span id="netMicLine" style="display:block;margin-top:6px"></span>
+          <span id="chState" style="display:block;margin-top:6px"></span>
+          <span id="phoneUrl" style="display:block;margin-top:8px"></span>
+          <span class="mini" style="display:block;margin-top:6px" id="outHint">
+            音源默认是<b>系统声音</b>（这台电脑放的一切，含手机蓝牙进来的声音），输出跟着 Windows 默认播放设备<span id="outDevice"></span>。
+            要单独指定某块声卡/麦克风、换输出设备、改抖动缓冲或编码，点右上角 <b>详细</b> → ⑥ 音源 / ⑧ 设置。
+            <br><b>这三个开关会被记住</b>：下次启动 WaveLink 时自动恢复到你现在选的状态。
+          </span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ⑦ 蓝牙 -->
+    <section class="card">
+      <h2><span class="n">⑦</span>蓝牙（手机的声音）
+        <span class="right"><button class="tiny ghost" onclick="loadBluetooth()">刷新</button></span>
+      </h2>
+      <div class="body">
+        <div class="mini">
+          这里的曲线已移到 ③ 本机状态的「输出段」——蓝牙链路自身的卡顿（丢包、重传）
+          Windows 不提供任何计数，任何画在这里的"蓝牙质量曲线"都只能是假的。
+        </div>
+
+        <div id="btList" class="list">正在读取…</div>
+        <div class="note" style="margin-top:10px">
+          点「连接」后，<b>手机就把它当成一个蓝牙音箱</b>（手机上会出现这个电脑的名字，选中它即可）。
+          连上后手机会多出一个 <code>麦克风 (&lt;手机名&gt; A2DP SNK)</code> 采集设备 —— 到
+          <b>⑥ 频道 → 频道音源</b> 里把它选上，勾「广播我的声音」，声音就进了你的耳机。<br>
+          <span style="color:#8b97a8">蓝牙是点对点的：<b>一块适配器同时只能接一台手机</b>。要同时接多台，插多个 USB 蓝牙适配器，
+          然后把它们全部选进频道音源（程序会混成一路）。</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ⑧ Wi-Fi 音频 -->
+    <section class="card">
+      <h2><span class="n">⑧</span>Wi-Fi 音频（手机的声音）
+        <span class="right"><button class="tiny ghost" onclick="loadNetMics()">刷新</button></span>
+      </h2>
+      <div class="body">
+        <div class="qbox">
+          <svg class="qchart" id="qWifi" viewBox="0 0 200 36" preserveAspectRatio="none"></svg>
+          <div class="qmeta" id="qWifiText">等待数据…</div>
+        </div>
+        <div id="netAudioList"><span class="x">正在读取…</span></div>
+        <div class="fields" style="margin-top:12px">
+          <button class="primary" onclick="addAllMics()">把正在发送的手机加入音源 + 开本机直通</button>
+          <a class="linkbtn" href="/mic" target="_blank">浏览器版（只发麦克风）</a>
+          <a class="linkbtn" href="/app" target="_blank">装 App（能发系统声音）</a>
+        </div>
+        <div class="fields" style="margin-top:10px">
+          <label class="chk"><input type="checkbox" id="autoPlay" onchange="saveAutoPlay()"> 正在发送的手机自动播放</label>
+
+        </div>
+        <div class="mini" style="margin-top:8px">
+          手机和电脑连同一个 Wi-Fi 即可，声音从手机的浏览器或 App 直接送到这台电脑，
+          <b>不经过蓝牙</b>，所以不受蓝牙那一路的数量/带宽限制。
+        </div>
+      </div>
+    </section>
+
+    <section class="card full" id="cardSettings">
+      <h2><span class="n">⑨</span>设置</h2>
+      <div class="body">
+        <div class="fields" style="margin-top:0;padding-top:0;border:0">
+          <div class="f grow"><label>节点名称</label><input type="text" id="setName"></div>
+        </div>
+        <div class="fields">
+          <div class="f"><label>抖动缓冲 (ms)</label><input type="number" id="setJitter" min="25" max="150" step="5" style="width:92px"></div>
+          <div class="f"><label>默认编码</label><select id="setCodec" style="width:150px">
+            <option value="pcm_s16">PCM 16bit</option><option value="opus">Opus</option>
+          </select></div>
+          <button class="primary" onclick="saveSettings()">保存</button>
+          <span class="msg" id="setMsg"></span>
+        </div>
+        <div class="note" style="margin-top:12px">抖动缓冲越大越抗网络抖动、延迟也越高。有线或 5GHz 可以调到 40ms 以下。</div>
+      </div>
+    </section>
+
+    <!-- ⑨ 日志 -->
+    <section class="card full">
+      <h2><span class="n">⑩</span>日志
+        <span class="right"><button class="tiny ghost" onclick="toggleLog()" id="logToggle">展开</button></span>
+      </h2>
+      <div class="body tight" id="logWrap" style="display:none"><pre id="logBox">（暂无）</pre></div>
+    </section>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<div id="ghost"></div>
+
+      <section class="card" id="multiOutCard">
+        <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          一台电脑，多个耳机
+          <span class="sub" id="moSummary" style="font-weight:400">未开启</span>
+          <button id="moToggle" class="btn" style="margin-left:auto;padding:4px 12px;font-size:12px">设置设备</button>
+        </h2>
+        <div id="moBody" style="display:none;margin-top:10px">
+          <div class="note" style="font-size:12px;margin-bottom:8px">
+            勾上要同时出声的设备，各调各的音量。蓝牙比有线慢，用「延迟」补偿对齐。<br>
+            刚插上的设备几秒内自动出现。<b>Windows 正在用的那块不在列表里</b>
+            —— 它本来就在响，再勾一份会变成金属音。
+          </div>
+          <div id="moList" style="display:flex;flex-direction:column;gap:6px;
+               max-height:190px;overflow:auto"></div>
+          <div style="display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap">
+            <button id="moApply" class="btn" style="padding:4px 12px;font-size:12px">应用</button>
+            <button id="moStop" class="btn" style="padding:4px 12px;font-size:12px">全部停止</button>
+            <button id="moRefresh" class="btn" style="padding:4px 12px;font-size:12px">刷新设备</button>
+            <span id="moStatus" style="font-size:12px;opacity:.75"></span>
+          </div>
+        </div>
+      </section>
+      <script>
+      (function () {
+        const list = document.getElementById('moList');
+        const status = document.getElementById('moStatus');
+        const summary = document.getElementById('moSummary');
+        const body = document.getElementById('moBody');
+        const toggle = document.getElementById('moToggle');
+        const rows = new Map();
+
+        toggle.onclick = () => {
+          const open = body.style.display !== 'none';
+          body.style.display = open ? 'none' : 'block';
+          toggle.textContent = open ? '设置设备' : '收起';
+          if (!open) refresh();
+        };
+
+        function row(name, gain, delay) {
+          const wrap = document.createElement('div');
+          wrap.style.cssText = 'display:flex;gap:8px;align-items:center;font-size:12px';
+          const box = document.createElement('input');
+          box.type = 'checkbox';
+          box.dataset.device = name;
+          const label = document.createElement('span');
+          label.textContent = name;
+          label.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+          const g = document.createElement('input');
+          g.type = 'range'; g.min = '0'; g.max = '2'; g.step = '0.05';
+          g.value = gain; g.title = '音量';
+          g.style.cssText = 'width:90px';
+          const gv = document.createElement('span');
+          gv.textContent = Number(gain).toFixed(2);
+          gv.style.cssText = 'width:28px;opacity:.7';
+          g.oninput = () => { gv.textContent = Number(g.value).toFixed(2); };
+          const d = document.createElement('input');
+          d.type = 'number'; d.min = '0'; d.max = '2000'; d.step = '10';
+          d.value = delay; d.title = '延迟补偿（毫秒）';
+          d.style.cssText = 'width:56px;font-size:12px';
+          const dl = document.createElement('span');
+          dl.textContent = 'ms';
+          dl.style.cssText = 'opacity:.6';
+          wrap.append(box, label, g, gv, d, dl);
+          list.append(wrap);
+          rows.set(name, { box, g, d });
+        }
+
+        async function refresh() {
+          try {
+            const r = await fetch('/api/multiout');
+            const data = await r.json();
+            const chosen = new Map((data.devices || []).map(d => [d.name, d]));
+            const all = (data.available || []).concat([...chosen.keys()]);
+            const running = (data.devices || []).filter(d => d.running);
+            summary.textContent = running.length
+              ? '正在送往 ' + running.map(d => d.name).join('、')
+              : (data.note || '未开启');
+            list.innerHTML = '';
+            rows.clear();
+            [...new Set(all)].forEach(name => {
+              const have = chosen.get(name);
+              const box = row(name, have ? have.gain : 1.0, have ? have.delay_ms : 0);
+              if (have) box.checked = true;
+            });
+          } catch (err) {
+            summary.textContent = '读不到状态';
+          }
+        }
+
+        async function apply(stop) {
+          const devices = [];
+          if (!stop) {
+            rows.forEach((ui, name) => {
+              if (!ui.box.checked) return;
+              devices.push({ device: name, gain: parseFloat(ui.g.value) || 1.0,
+                             delay_ms: parseFloat(ui.d.value) || 0 });
+            });
+          }
+          status.textContent = '正在应用…';
+          try {
+            const r = await fetch('/api/multiout', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ devices })
+            });
+            const data = await r.json();
+            status.textContent = data.note || '已应用';
+            refresh();
+          } catch (err) {
+            status.textContent = '应用失败：' + err;
+          }
+        }
+
+        document.getElementById('moApply').onclick = () => apply(false);
+        document.getElementById('moStop').onclick = () => apply(true);
+        document.getElementById('moRefresh').onclick = () => refresh();
+        refresh();
+        setInterval(() => { if (!document.hidden) refresh(); }, 4000);
+      })();
+      </script>
+<script>
+const $ = (id) => document.getElementById(id);
+const state = {self:null, peers:[], routes:[], status:null, settingsLoaded:false, logOpen:false, detail:null};
+
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',[QQ]:'&quot;'}[c]));
+const KIND = {system:'系统声音', mic:'麦克风', output:'输出设备', generated:'测试用', file:'文件'};
+const QQ = String.fromCharCode(34);  // 双引号，避免在单引号字符串里直接写它
+
+async function api(path, body){
+  const opt = body ? {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)} : {};
+  const r = await fetch(path, opt);
+  const t = await r.text();
+  let j = {}; try { j = JSON.parse(t); } catch(e) { j = {error:t}; }
+  if(!r.ok) throw new Error(j.error || ('HTTP '+r.status));
+  return j;
+}
+
+let toastTimer = null;
+function toast(msg, kind){
+  const el = $('toast');
+  el.textContent = msg;
+  el.className = 'toast show' + (kind ? ' ' + kind : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = 'toast'; }, 3800);
+}
+
+function nodeLabel(n){
+  if(n.local || n.node_id === 'self') return n.name + '（本机）';
+  return n.name + (n.online === false ? '（离线）' : '');
+}
+
+function allNodes(){
+  const self = state.self ? [{node_id:'self', value:'self', name: state.self.name, local:true, online:true,
+                             sources: state.self.sources||[], sinks: state.self.sinks||[],
+                             host: state.self.host, age_s:0}] : [];
+  return self.concat((state.peers||[]).map(p => ({...p, value:p.node_id})));
+}
+
+// The engine stores a route's endpoints as concrete node ids - `self` is resolved
+// when the route is created so the same route means the same thing on every
+// machine. The page therefore has to recognise this machine by its real id (and
+// by its short id and name), or the local end of every route renders as a UUID.
+function isLocalId(id){
+  const me = state.self || {};
+  return id === 'self' || (!!me.id && id === me.id) ||
+         (!!me.short_id && id === me.short_id) || (!!me.name && id === me.name);
+}
+function nodeLabel(id){
+  if(id === '*') return '任意设备';
+  if(isLocalId(id)) return '本机';
+  const n = allNodes().find(x => x.value === id || x.node_id === id);
+  return n ? n.name : id;
+}
+
+/* ---------------- LAN banner ---------------- */
+function renderNetwork(net){
+  const local = ((net && net.interfaces) || []).filter(i => i.kind === 'private');
+  const other = ((net && net.interfaces) || []).filter(i => i.kind !== 'private');
+  const port = (state.self && state.self.web_port) || location.port;
+
+  if(!local.length){
+    $('lanBanner').className = 'banner show no';
+    $('lanUrl').textContent = '未检测到局域网地址';
+    $('lanHint').textContent = '请确认本机已连上 Wi-Fi 或网线。没有局域网地址时只有本机能用。';
+    $('netBox').innerHTML = '没有检测到局域网地址。';
+    return;
+  }
+  const url = `http://${local[0].address}:${port}`;
+  $('lanBanner').className = 'banner show';
+  $('lanUrl').textContent = url;
+  const fromLoop = /^(127\.|localhost$)/.test(location.hostname);
+  $('lanHint').textContent = fromLoop
+    ? '当前是本机打开。把这行网址敲进另一台设备的浏览器（同一个 Wi-Fi），就能在那边看到同一个控制台。'
+    : '你正从另一台设备访问' + (state.self ? state.self.name : '这台机器') + '，可以直接在这里配置。';
+
+  let html = `本机局域网地址：<b>${esc(local.map(i=>i.address).join('、'))}</b>`;
+  if(local.length > 1) html += `　多个地址时选与对端同网段的那个。`;
+  if(other.length) html += `<br>已忽略非局域网地址：${esc(other.map(i=>i.address).join('、'))}`;
+  $('netBox').innerHTML = html;
+
+  // The phone page: a browser cannot join the UDP audio plane, so this node streams
+  // what it plays over WebSocket instead. Same Wi-Fi, no app to install.
+  const phone = `http://${local[0].address}:${port}/listen`;
+  const link = $('phoneUrl');
+  if(link) link.innerHTML = `手机收听地址（同一 Wi-Fi 打开，无需装 App）：<a href="${phone}" target="_blank" rel="noopener">${esc(phone)}</a>`;
+}
+
+function copyLanUrl(){
+  const text = $('lanUrl').textContent;
+  const ok = () => toast('已复制：' + text, 'ok');
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(ok).catch(()=>fallbackCopy(text, ok));
+  } else fallbackCopy(text, ok);
+}
+function fallbackCopy(text, done){
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); done(); } catch(e){ prompt('手动复制：', text); }
+  document.body.removeChild(ta);
+}
+
+/* ---------------- ① devices ---------------- */
+function chip(s, kind){
+  const k = s.kind_class || kind;
+  const label = KIND[k] || '';
+  const cls = k === 'system' ? 'sys' : (k === 'output' ? 'out' : '');
+  return `<span class="chip ${cls}" title="${esc(s.detail||'')}">${label?`<span class="k">${label}</span>`:''}${esc(s.name)}</span>`;
+}
+function splitExtra(items){
+  const main = [], extra = [];
+  (items||[]).forEach(s => { ['mic','generated','file'].includes(s.kind_class) ? extra.push(s) : main.push(s); });
+  return [main, extra];
+}
+function extraBox(title, extra){
+  if(!extra.length) return '';
+  return `<details class="more"><summary>▸ ${title}（${extra.length}）</summary>
+    <div class="list">${extra.map(s=>`<span>${esc(s.name)}</span>`).join('')}</div></details>`;
+}
+
+function renderPeers(){
+  const nodes = allNodes();
+  if(!nodes.length){ $('peersBox').innerHTML = '<div class="empty">正在发现设备…</div>'; return; }
+  const rows = nodes.map(n => {
+    const [ms, es] = splitExtra(n.sources);
+    const [mk, ek] = splitExtra(n.sinks);
+    const cls = n.local ? 'self' : (n.online ? 'on' : 'off');
+    const stateTxt = n.local ? '本机' : (n.online ? Math.round(n.age_s) + ' 秒前' : '离线');
+    // The local machine cannot be removed; every other entry can.
+    const del = n.local ? ''
+      : `<button class="tiny danger" onclick="removePeer('${esc(n.value)}','${esc(n.name)}')"
+           title="从列表移除这台设备">移除</button>`;
+    return `<tr>
+      <td class="name"><span class="dot ${cls}"></span>${esc(n.name)}${n.manual?' <span class="chip"><span class="k">手动</span></span>':''}</td>
+      <td class="addr">${esc(n.host||'—')}${n.host ? `<br><button class="tiny ghost" onclick="pingPeer('${esc(n.host)}')">测连通</button>` : ''}</td>
+      <td><div class="chips">${ms.map(s=>chip(s,'system')).join('') || '<span class="x">—</span>'}</div>
+          ${extraBox('其它可采集', es)}</td>
+      <td><div class="chips">${mk.map(s=>chip(s,'output')).join('') || '<span class="x">—</span>'}</div>
+          ${extraBox('测试用输出', ek)}</td>
+      <td class="addr">${esc(stateTxt)}</td>
+      <td>${del}</td>
+    </tr>`;
+  }).join('');
+  const brief = nodes.map(n => {
+    const cls = n.local ? 'self' : (n.online ? 'on' : 'off');
+    const state = n.local ? '本机' : (n.online ? '在线' : '离线');
+    const del = n.local ? ''
+      : `<button class="tiny ghost" onclick="removePeer('${esc(n.value)}','${esc(n.name)}')" title="从列表移除">移除</button>`;
+    return `<div class="peerline">
+      <span class="dot ${cls}"></span>
+      <span class="nm">${esc(n.name)}${n.manual?' <span class="chip"><span class="k">手动</span></span>':''}</span>
+      <span class="tag ${n.local||n.online?'':'off'}">${state}</span>
+      ${n.host ? `<button class="tiny ghost" onclick="pingPeer('${esc(n.host)}')" title="测连通">测连通</button>` : ''}
+      ${del}
+    </div>`;
+  }).join('');
+  $('peersBox').innerHTML =
+    `<div class="brief">${brief}</div>`
+    + `<div class="full"><table><thead><tr>
+      <th>设备</th><th>地址</th>
+      <th>可以采到的声音<small>要分享谁的桌面音频</small></th>
+      <th>可以当音响用<small>把声音送到哪去</small></th>
+      <th>状态</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  $('peerTag').innerHTML = `设备 <b>${nodes.length}</b>`;
+}
+
+async function removePeer(nodeId, name){
+  if(!confirm(`从列表里移除「${name}」？\n\n· 手动添加的设备：会永久删除\n· 自动发现的设备：如果它还开着，几秒后会重新出现`)) return;
+  try{
+    const r = await api('/api/peers/remove', {node_id: nodeId});
+    toast(r.note || '已移除', 'ok');
+    refreshAll();
+  }catch(e){ toast('移除失败：' + e.message, 'err'); }
+}
+
+/* ---------------- ② route builder (drag & drop) ---------------- */
+const draft = {from:[], to:[]};
+
+// The draggable device cards. Every device can be dragged into either box; the
+// local machine is marked because as a *source* it is almost always a mistake.
+function renderDragList(){
+  const nodes = allNodes();
+  $('dragList').innerHTML = nodes.map(n => {
+    const self = n.node_id === 'self';
+    const [ms] = splitExtra(n.sources);
+    const [mk] = splitExtra(n.sinks);
+    const tags = [];
+    if(!self && ms.length) tags.push('可采声音');
+    if(mk.length) tags.push('可当音响');
+    if(self) tags.push('本机');
+    return `<div class="drag${self?' self':''}" data-id="${esc(n.value)}" data-name="${esc(n.name)}">
+      <span class="grip">⣿</span>
+      <span class="nm">${esc(n.name)}</span>
+      <span class="tags">${tags.map(t=>`<span>${esc(t)}</span>`).join('')}</span>
+    </div>`;
+  }).join('') || '<div class="empty">还没有发现别的设备。在另一台电脑上也启动 Audio Mixing，或在上方手动填它的 IP。</div>';
+  // Delegated once per render; the list is rebuilt on every refresh.
+  $('dragList').querySelectorAll('.drag').forEach(el => el.addEventListener('pointerdown', beginDrag));
+}
+
+function chipOf(slot, id){
+  const name = nodeLabel(id);
+  return `<span class="dchip${slot==='to'?' dst':''}" data-id="${esc(id)}">
+    ${slot==='to'?'🔊':'🎧'} ${esc(name)}
+    <span class="rm" title="移除" onclick="removeChip('${slot}','${esc(id)}')">×</span></span>`;
+}
+
+function renderDraft(){
+  for(const slot of ['from','to']){
+    const box = slot === 'from' ? $('dropFrom') : $('dropTo');
+    const ids = draft[slot];
+    const ph = slot === 'from'
+      ? '<div class="ph"><b>拖到这里</b><span class="mini"><br>例：伴侣的电脑，或本机</span></div>'
+      : '<div class="ph"><b>拖到这里</b><span class="mini"><br>例：本机，或伴侣的电脑</span></div>';
+    box.innerHTML = ids.length ? ids.map(id => chipOf(slot, id)).join('') : ph;
+    box.classList.toggle('hot', false);
+  }
+  const toHint = draft.to.length > 1
+    ? `<div class="x" style="font-size:11.5px;color:var(--acc);margin-top:4px">这路声音会同时在这 ${draft.to.length} 台设备上播放</div>`
+    : '';
+  const hint = $('multiHint');
+  if(hint) hint.innerHTML = toHint;
+}
+
+function removeChip(slot, id){
+  draft[slot] = draft[slot].filter(v => v !== id);
+  renderDraft();
+}
+function clearDraft(){
+  draft.from = []; draft.to = [];
+  renderDraft();
+  toast('已清空');
+}
+
+/* pointer-based dragging: works with mouse and touch, unlike HTML5 drag & drop */
+let drag = null;
+
+function beginDrag(ev){
+  const card = ev.target.closest('.drag');
+  if(!card || ev.button > 0) return;
+  ev.preventDefault();
+  drag = {id: card.dataset.id, name: card.dataset.name, card: card, moved: false, x: ev.clientX, y: ev.clientY};
+  card.classList.add('dragging');
+  window.addEventListener('pointermove', moveDrag);
+  window.addEventListener('pointerup', endDrag);
+  window.addEventListener('pointercancel', endDrag);
+}
+
+function moveDrag(ev){
+  if(!drag) return;
+  if(!drag.moved){
+    if(Math.hypot(ev.clientX - drag.x, ev.clientY - drag.y) < 5) return;
+    drag.moved = true;
+    document.body.classList.add('dragging');
+    const ghost = $('ghost');
+    ghost.textContent = drag.name;
+    ghost.style.display = 'block';
+  }
+  const ghost = $('ghost');
+  ghost.style.left = ev.clientX + 'px';
+  ghost.style.top = ev.clientY + 'px';
+
+  for(const box of [$('dropFrom'), $('dropTo')]){
+    box.classList.remove('hot');
+    const r = box.getBoundingClientRect();
+    const over = ev.clientX >= r.left - 26 && ev.clientX <= r.right + 26 &&
+                 ev.clientY >= r.top - 26 && ev.clientY <= r.bottom + 26;
+    if(over) box.classList.add('hot');
+  }
+}
+
+function endDrag(ev){
+  window.removeEventListener('pointermove', moveDrag);
+  window.removeEventListener('pointerup', endDrag);
+  window.removeEventListener('pointercancel', endDrag);
+  if(!drag) return;
+  const d = drag; drag = null;
+  document.body.classList.remove('dragging');
+  $('ghost').style.display = 'none';
+  d.card.classList.remove('dragging');
+  for(const box of [$('dropFrom'), $('dropTo')]) box.classList.remove('hot');
+  if(!d.moved) return;
+
+  for(const box of [$('dropFrom'), $('dropTo')]){
+    const r = box.getBoundingClientRect();
+    const over = ev.clientX >= r.left - 26 && ev.clientX <= r.right + 26 &&
+                 ev.clientY >= r.top - 26 && ev.clientY <= r.bottom + 26;
+    if(over){ addToDraft(box.dataset.slot, d.id, d.name); return; }
+  }
+}
+
+function addToDraft(slot, id, name){
+  if(!slot) return;
+  if(draft[slot].includes(id)){ toast('已经在框里了'); return; }
+  // 本机 on the "要听谁的" side is how you send *your* sound to the other machine's
+  // headphones, so it must be allowed. Only "本机 -> 本机" is pointless: that sound
+  // is already playing here and the engine deliberately ignores self-loops.
+  const next = {from: draft.from.slice(), to: draft.to.slice()};
+  next[slot].push(id);
+  if(next.from.length && next.to.length && next.from.every(isLocalId) && next.to.every(isLocalId)){
+    toast('左边右边都是本机 = 把自己的声音放给自己听，不会有任何效果。', 'err');
+    return;
+  }
+  draft[slot].push(id);
+  renderDraft();
+  toast(`已加入「${slot === 'from' ? '要听谁的' : '用谁的耳机听'}」：${name}`, 'ok');
+}
+
+function renderRoutes(){
+  const nameOf = (id) => nodeLabel(id);
+  const routes = state.routes || [];
+  if(!routes.length){
+    $('routesBox').innerHTML = '<div class="empty">还没有路由。下面选好「要听谁的」和「用谁的耳机听」，然后点添加。</div>';
+    return;
+  }
+  $('routesBox').innerHTML = routes.map(r => `
+    <div class="route${r.mute?' mute':''}">
+      <div class="flow">
+        <span class="node">${esc(r.from.map(nameOf).join(' + '))}</span>
+        <span class="arrow">→</span>
+        <span class="node dst">${esc(r.to.map(nameOf).join(' + '))}</span>
+        ${r.mute ? '<span class="meta">已静音</span>' : ''}
+      </div>
+      <div class="gainbox">
+        <span>音量</span>
+        <input type="range" min="0" max="2" step="0.05" value="${r.gain}"
+               oninput="setGain('${esc(r.id)}', this.value, this)" title="拖动调整音量">
+        <span class="mono" id="g_${esc(r.id)}">${Number(r.gain).toFixed(2)}</span>
+      </div>
+      <div class="meta">${esc(r.codec)}${r.sink_device ? ' · ' + esc(r.sink_device) : ''}</div>
+      <div class="acts">
+        <button class="tiny" onclick="toggleMute('${esc(r.id)}', ${!r.mute})">${r.mute?'取消静音':'静音'}</button>
+        <button class="tiny danger" onclick="delRoute('${esc(r.id)}')">删除</button>
+      </div>
+    </div>`).join('');
+}
+
+async function addRoute(){
+  if(!draft.from.length){ toast('请先把设备拖到左边「要听谁的」框里', 'err'); return; }
+  if(!draft.to.length){ toast('请先把设备拖到右边「用谁的耳机听」框里', 'err'); return; }
+  // `self` travels as-is; the engine resolves it to this machine's node id when it
+  // stores the route, which is what makes the route mean the same thing everywhere.
+  const from = draft.from.slice();
+  if(from.every(isLocalId) && draft.to.every(isLocalId)){
+    toast('左边右边都是本机，不会有任何效果。', 'err');
+    return;
+  }
+  try{
+    await api('/api/routes/add', {route:{from, to: draft.to,
+      gain: parseFloat($('newGain').value) || 1,
+      codec: $('newCodec').value,
+      sink_device: $('newSinkDevice').value.trim()}});
+    const n = draft.to.length;
+    toast(n > 1 ? `路由已添加：这路声音会同时在这 ${n} 台设备上播放` : '路由已添加', 'ok');
+    clearDraft();
+    refreshAll();
+  }catch(e){ toast('添加失败：' + e.message, 'err'); }
+}
+async function delRoute(id){ try{ await api('/api/routes/delete', {id}); toast('已删除', 'ok'); refreshAll(); }catch(e){ toast('删除失败：'+e.message,'err'); } }
+async function toggleMute(id, mute){ try{ await api('/api/routes/update', {id, mute}); refreshAll(); }catch(e){ toast('操作失败：'+e.message,'err'); } }
+
+let gainTimer = {};
+function setGain(id, value, el){
+  const lab = $('g_' + id); if(lab) lab.textContent = Number(value).toFixed(2);
+  clearTimeout(gainTimer[id]);
+  gainTimer[id] = setTimeout(async () => {
+    try{ await api('/api/routes/update', {id, gain: parseFloat(value)}); }catch(e){ toast('音量设置失败：'+e.message,'err'); }
+  }, 450);
+}
+
+async function addPeer(){
+  const host = $('peerHost').value.trim();
+  if(!host) return;
+  try{ await api('/api/peers/add', {host}); $('peerHost').value=''; toast('已添加 ' + host, 'ok'); refreshAll(); }
+  catch(e){ toast('添加失败：' + e.message, 'err'); }
+}
+
+async function pingPeer(host){
+  try{
+    const r = await api('/api/ping', {host});
+    toast(r.ok ? `${r.host} 连通，往返 ${r.rtt_ms} ms` : `${host} 不通：${r.error}`, r.ok ? 'ok' : 'err');
+  }catch(e){ toast('探测失败：' + e.message, 'err'); }
+}
+
+function showTemplates(){
+  const has = allNodes().length > 1;
+  alert(
+    '常用例子\n' +
+    '─────────────────────\n' +
+    '1) 在这台电脑的耳机里听伴侣电脑的声音\n' +
+    '     要听谁的 = 伴侣的电脑\n' +
+    '     用谁的耳机听 = 本机\n\n' +
+    '2) 让伴侣也听到你的声音（再补一条反向的）\n' +
+    '     要听谁的 = 本机 …… 不行！要选「本机」的话请这样做：\n' +
+    '     如果你想让别人听你，需要在【对方那台电脑】的控制台上\n' +
+    '     加一条：要听谁的 = 你的电脑，用谁的耳机听 = 对方（本机）。\n\n' +
+    '3) 办公室：把 3 台手机 + 2 台电脑都收进自己的耳机\n' +
+    '     要听谁的 = 勾选所有其它设备（多选）\n' +
+    '     用谁的耳机听 = 本机\n\n' +
+    (has ? '' : '提示：现在只发现了一台设备，先在另一台电脑上也启动 Audio Mixing。')
+  );
+}
+
+/* ---------------- ③ status ---------------- */
+/* Level history for the sparkline: one sample per refresh, so the window is a few
+   minutes of "is anything actually flowing". */
+let levelHistory = new Array(90).fill(0);
+
+function drawInputCurve(svgId, entry){
+  // One curve per input, on a metric that fits the path: an arrival interval means
+  // nothing for Bluetooth, where Windows exposes no timing, so there the curve is the
+  // link state itself - which at least shows the moment it drops.
+  const svg = $(svgId);
+  if(!svg) return;
+  const values = (entry.history || []).map(v => (typeof v === 'number' ? v : 0));
+  const ideal = entry.ideal || 20;
+  const w = 200, h = 30;
+  const top = Math.max(ideal * 2.5, 0.001);
+  const y = v => (h - 3 - Math.min(1, v / top) * (h - 8)).toFixed(1);
+  let out = '<line x1="0" y1="' + y(ideal) + '" x2="' + w + '" y2="' + y(ideal) +
+            '" stroke="#2a3648" stroke-width="1" stroke-dasharray="3 3"/>';
+  if(values.length > 1){
+    const step = w / (values.length - 1);
+    out += '<polyline fill="none" stroke="#4da3ff" stroke-width="1.5" points="' +
+           values.map((v, i) => (i * step).toFixed(1) + ',' + y(v)).join(' ') + '"/>';
+  } else if(values.length === 1){
+    out += '<line x1="0" y1="' + y(values[0]) + '" x2="' + w + '" y2="' + y(values[0]) +
+           '" stroke="#4da3ff" stroke-width="1.5"/>';
+  }
+  svg.innerHTML = out;
+}
+function renderInputs(){
+  // Every sound arriving here, with the path it came in on and its own curve. Listing
+  // only the Wi-Fi phones hid a phone feeding audio over Bluetooth, and a single big
+  // chart with no name on it was read as belonging to whichever phone was listed first.
+  const box = $('inputsBox');
+  if(!box) return;
+  const inputs = (state.status && state.status.inputs) || [];
+  if(!inputs.length){
+    box.innerHTML = '<span class="meta">现在没有任何声音在进来</span>';
+    return;
+  }
+  box.innerHTML = inputs.map((x, i) => {
+    const score = (x.score === null || x.score === undefined) ? ''
+      : '<span class="chip ' + (x.score >= 80 ? 'sys' : '') + '"><span class="k">' + x.score + ' 分</span></span>';
+    return '<div class="btrow">'
+      + '<span class="chip"><span class="k">' + esc(x.path_label || x.path) + '</span></span>'
+      + '<span class="nm">' + esc(x.name || '') + '</span>'
+      + '<span class="meta">' + esc(x.state || '') + '</span>'
+      + score
+      + '<svg class="qchart inline" id="inCh' + i + '" viewBox="0 0 200 30" preserveAspectRatio="none"></svg>'
+      + '<span class="meta">' + esc(x.metric || '') + '</span>'
+      + '<span class="meta" title="' + esc(x.detail || '') + '">' + esc(x.detail || '') + '</span>'
+      + '</div>';
+  }).join('');
+  inputs.forEach((x, i) => drawInputCurve('inCh' + i, x));
+}
+function renderStatus(){
+  // Every status refresh redraws the curves: they are the panel's answer to
+  // "which link is misbehaving", and a chart that only updates on a mode switch
+  // is worse than no chart.
+  drawQuality();
+  renderInputs();
+  const s = state.status; if(!s) return;
+  const t = s.totals || {};
+  const be = s.backends || {};
+  const usable = Object.entries(be).filter(([k,v]) => v && k !== 'null' && k !== 'file').map(([k]) => k);
+
+  $('nodeTag').innerHTML = `<b>${esc(s.node.name)}</b>`;
+  $('backendTag').textContent = '音频 ' + (usable.join('/') || '仅测试');
+  $('streamTag').innerHTML = `流 <b>${t.active_streams||0}</b>`;
+
+  const l = s.local || {};
+  const wq = (s.quality && s.quality.wifi) || {};
+  const wl = wq.latest || null;
+  const errs = (s.receiver && s.receiver.streams || []).reduce((a,b) => a + (b.lost||0), 0);
+  $('statsBox').innerHTML = `
+    <div class="stat"><div class="k">播放到</div><div class="v sm">${esc(l.sink || '—')}</div></div>
+    <div class="stat"><div class="k">到达间隔</div><div class="v sm">${wl ? wl.v.toFixed(1) + ' ms' : '—'}</div></div>
+    <div class="stat"><div class="k">链路评分</div><div class="v ${wl && wl.score >= 80 ? 'ok' : ''}">${wl ? wl.score : '—'}</div></div>
+    <div class="stat"><div class="k">播放电平</div><div class="v sm">${l.peak ? (l.peak * 100).toFixed(1) + '%' : '0.0%'}</div></div>
+    <div class="stat"><div class="k">已播放</div><div class="v sm">${Math.round((l.frames || 0) / 48000)}s</div></div>
+    <div class="stat"><div class="k">下行</div><div class="v sm">${wl && wl.kbps ? wl.kbps.toFixed(0) + ' kbps' : '—'}</div></div>
+    <div class="stat"><div class="k">点对点流</div><div class="v sm">${t.active_streams||0}</div></div>
+    <div class="stat"><div class="k">上行</div><div class="v sm">${t.sent_kbps||0} kbps</div></div>
+    <div class="stat"><div class="k">丢包</div><div class="v sm ${errs?'warn':''}">${errs}</div></div>
+    <div class="stat"><div class="k">运行</div><div class="v sm">${Math.round(s.node.uptime_s||0)}s</div></div>`;
+
+  const d = s.discovery || {};
+  $('discoveryTag').textContent = d.sent ? `发现 已广播${d.sent}次` : '发现 未启用';
+  $('discoveryTag').className = 'tag' + (d.sent ? ' live' : ' off');
+
+  $('errBox').innerHTML = s.last_error ? `<div class="warnbox">最近错误：${esc(s.last_error)}</div>` : '';
+}
+
+/* ---------------- ④ streams ---------------- */
+function renderStreams(){
+  const s = state.status; if(!s) return;
+  const send = s.senders || [];
+  const recv = (s.receiver && s.receiver.streams) || [];
+  const clocks = (s.receiver && s.receiver.clocks) || [];
+  let html = '';
+  send.forEach(x => {
+    html += `<div class="row"><span class="dot on"></span><span class="grow">发送 → ${esc(x.source||x.route_id)}
+      <span class="num">${esc(x.host)}:${x.port}</span></span>
+      <span class="num ok">${x.kbps} kbps</span><span class="num">${esc(x.codec)}</span>
+      ${x.error?`<span class="num bad" title="${esc(x.error)}">错误</span>`:''}</div>`;
+  });
+  recv.forEach(x => {
+    const depth = Math.min(100, (x.depth_ms/150)*100);
+    html += `<div class="row"><span class="dot self"></span><span class="grow">接收 ← ${esc(x.node_name || x.node_id || ('ssrc '+x.ssrc))}
+      <span class="num">缓冲 ${x.buffered_ms}ms / 目标 ${x.target_ms}ms</span></span>
+      <span class="num ${x.lost?'bad':'ok'}">${x.packets}包${x.lost?' 丢'+x.lost:''}</span>
+      <span class="num">${esc(x.codec)}</span></div>`;
+  });
+  if(clocks.length){
+    html += `<div class="row"><span class="dot"></span><span class="grow">时钟同步
+      ${clocks.map(c=>`${esc(c.peer)} 偏移 ${c.offset_ms}ms (往返 ${c.rtt_ms}ms)`).join(' · ')}</span></div>`;
+  }
+  $('streamsBox').innerHTML = html || '<div class="empty">当前没有音频在传输。添加一条路由就开始。</div>';
+}
+
+/* ---------------- ⑤ device detail ---------------- */
+function renderDeviceDetail(d){
+  state.detail = d;
+  const all = d.all || [];
+  const cls = (x) => x.kind_detail === 'loopback' ? 'system'
+      : (x.kind === 'sink' ? 'output' : (x.kind_detail === 'capture' ? 'mic' : (x.kind_detail === 'file' ? 'file' : 'generated')));
+  const order = {system:0, output:1, mic:2, generated:3, file:4};
+  const rows = all.slice().sort((a,b) => (order[cls(a)] - order[cls(b)]) || a.name.localeCompare(b.name));
+  const line = (x) => {
+    // A phone that arrived over Bluetooth A2DP shows up as an input device named
+    // "麦克风 (<phone> A2DP SNK)". It is worth labelling: it is the one source a user
+    // cannot find by name, and it is how a phone's own sound gets in without an app.
+    const bt = /a2dp\s*snk/i.test(x.name || '');
+    return `<tr>
+      <td><span class="chip ${cls(x)==='system'?'sys':(cls(x)==='output'?'out':'')}"><span class="k">${KIND[cls(x)]}</span></span></td>
+      <td>${x.channels}ch · ${x.sample_rate}Hz</td>
+      <td>${esc(x.name)}${bt?' <span class="chip"><span class="k">蓝牙手机</span></span>':''}${x.is_default?' <span class="chip"><span class="k">默认</span></span>':''}</td></tr>`;
+  };
+  const main = rows.filter(x => ['system','output'].includes(cls(x)));
+  const extra = rows.filter(x => !['system','output'].includes(cls(x)));
+  $('devicesBox').innerHTML = `
+    <table><tbody>${main.map(line).join('')}</tbody></table>
+    ${extra.length ? `<details class="more" style="padding:0 12px 12px"><summary>▸ 麦克风 / 测试用设备（${extra.length}）</summary>
+      <table style="margin-top:4px"><tbody>${extra.map(line).join('')}</tbody></table></details>` : ''}`;
+}
+
+/* ---------------- ⑦ logs ---------------- */
+function toggleLog(){
+  state.logOpen = !state.logOpen;
+  $('logWrap').style.display = state.logOpen ? 'block' : 'none';
+  $('logToggle').textContent = state.logOpen ? '收起' : '展开';
+}
+function renderLogs(d){
+  const lines = (d && d.log) || [];
+  const bc = (d && d.broadcast) || [];
+  const all = lines.concat(bc.length ? ['', '— 路由下发 —'].concat(bc) : []);
+  $('logBox').textContent = all.join('\n') || '（暂无）';
+}
+
+/* ---------------- channel (LAN radio) ---------------- */
+async function saveChannel(){
+  const broadcast = $('chBroadcast').checked, listen = $('chListen').checked, local = $('chLocal').checked;
+  try{
+    await api('/api/settings', {broadcast, listen, local});
+    toast(local ? '本机直通已开启（音源 → 本机输出）'
+        : (broadcast && listen ? '会议模式：既广播又收听'
+        : (broadcast ? '开始广播本机声音' : (listen ? '开始收听频道（本机不发送声音）' : '频道已关闭'))), 'ok');
+    refreshAll();
+  }catch(e){ toast('切换失败：' + e.message, 'err'); }
+}
+let chGainTimer = 0;
+/* The source list used to be filled once, when the settings first loaded, so a phone
+   that started sending later never appeared until the page was reloaded - which is
+   exactly "我在 ⑥ 区域看不到它". It now refreshes on a timer, without stealing a
+   dropdown the user is currently clicking in, and without dropping the selection. */
+async function loadChannelSources(force){
+  const sel = $('chSources');
+  if(!sel) return;
+  if(!force && document.activeElement === sel) return;
+  try{
+    const [d, c] = await Promise.all([api('/api/devices'), api('/api/config')]);
+    const chosen = new Set(((c.config || {}).channel_sources) || []);
+    const keep = new Set(Array.from(sel.selectedOptions).map(o => o.value));
+    if(!keep.size) keep.add('');
+    const sources = ((d.all) || []).filter(x => x.kind === 'source' && (x.backend === 'wasapi' || x.backend === 'netmic'));
+    const html = sources.map(x => {
+      const raw = x.name || '';
+      const kind = x.backend === 'netmic' ? '手机' : (x.kind_detail === 'loopback' ? '系统声音' : '麦克风');
+      const head = raw.indexOf(kind) === 0 ? '' : kind + ' · ';
+      const bt = /a2dp\s*snk/i.test(raw);
+      const on = chosen.has(raw) || keep.has(raw);
+      return `<option value="${esc(raw)}"${on ? ' selected' : ''}>${esc(head + raw)}${bt ? '（蓝牙手机）' : ''}</option>`;
+    }).join('') || '<option disabled>没有可用的采集设备</option>';
+    if(sel.innerHTML !== html) sel.innerHTML = html;
+  }catch(e){ /* the settings card is optional */ }
+}
+/* A live line so "手机到底有没有在发" is answerable without guessing. */
+async function loadNetMics(){
+  const lines = [$('netMicLine')].filter(Boolean);
+  if(!lines.length) return;
+  try{
+    const m = await api('/api/mic');
+    const mics = m.mics || [];
+    const html = !mics.length
+      ? ''
+      : '<span class="meta">' + mics.map(x =>
+          `<b>${esc(x.name)}</b> ${x.live ? '<span style="color:#3ddc84">●</span>' : '○'}`
+        ).join('　') + '</span>';
+    // The two ways this silently fails: the phone is sending but was never picked as a
+    // source (so nothing plays it), or the pass-through was refused because the source
+    // and the output are the same device (so it would howl). Both used to be invisible.
+    let hint = '';
+    try{
+      const [cfg, st] = await Promise.all([api('/api/config'), api('/api/status')]);
+      const chosen = new Set(((cfg.config || {}).channel_sources) || []);
+      window.__chosenSources = Array.from(chosen);
+      window.__autoPlay = ((cfg.config || {}).auto_play !== false);
+      const missing = mics.filter(x => !chosen.has(x.name)).map(x => x.name);
+      if(missing.length){
+        hint += `<div class="action">手机 <b>${missing.map(esc).join('、')}</b> 正在发送，但没加入「音源」，所以听不到。`
+             + ` <button class="tiny primary" onclick='addMicToSources(${JSON.stringify(JSON.stringify(missing))})'>加入并开直通</button></div>`;
+      }
+      const note = (st.local && st.local.note) || '';
+      if(note) hint += `<div class="action">本机直通：${esc(note)}</div>`;
+    }catch(e){ /* status is optional */ }
+    // ⑧ has its own list, so a phone that is sending is visible without hunting
+    // through the source dropdown.
+    const box = $('netAudioList');
+    if(box){
+      box.innerHTML = !mics.length
+        ? '<span class="meta">还没有手机在发送</span>'
+        : mics.map((x, i) => {
+            const chosen = (window.__chosenSources || []).includes(x.name);
+            return `<div class="btrow">
+              <span class="nm">${esc(x.name)}</span>
+              <span class="chip ${x.live ? 'sys' : ''}"><span class="k">${x.live ? '正在发送' : '已静音'}</span></span>
+              <span class="meta">${x.device_rate}Hz · ${(x.bytes_in / 1048576).toFixed(1)} MB</span>
+              <span class="chip"><span class="k">${chosen ? '已加入' : '未加入'}</span></span>
+              <button class="tiny ${x.muted ? 'danger' : 'ghost'}" onclick="muteMic(${i})">${x.muted ? '已静音' : '静音'}</button>
+              <input type="range" class="micgain" min="0" max="200" value="${Math.round((x.gain || 1) * 100)}"
+                     title="这台手机的音量（手机自己的音量键不一定有效，见说明）"
+                     oninput="setMicGain(${i}, this.value)" onchange="setMicGain(${i}, this.value)">
+            </div>`;
+          }).join('');
+    }
+    lines.forEach(el => { el.innerHTML = html + hint; });
+    if($('autoPlay')) $('autoPlay').checked = !!(window.__autoPlay);
+  }catch(e){ /* ignore */ }
+}
+
+async function saveAutoPlay(){
+  try{
+    await api('/api/settings', {auto_play: $('autoPlay').checked});
+    toast($('autoPlay').checked ? '新手机一开始发送就会自动播放' : '已关闭自动播放，需要手动加入音源', 'ok');
+  }catch(e){ toast('失败：' + e.message, 'err'); }
+}
+async function setMicGain(index, percent){
+  try{
+    const m = await api('/api/mic');
+    const mic = (m.mics || [])[index];
+    if(!mic) return;
+    await api('/api/mic/gain', {name: mic.name, gain: Math.max(0, Math.min(200, parseInt(percent, 10))) / 100.0});
+  }catch(e){ toast('设置音量失败：' + e.message, 'err'); }
+}
+async function muteMic(index){
+  try{
+    const m = await api('/api/mic');
+    const mic = (m.mics || [])[index];
+    if(!mic) return;
+    await api('/api/mic/mute', {name: mic.name, muted: !mic.muted});
+    toast(mic.muted ? ('已取消静音 ' + mic.name) : ('已静音 ' + mic.name), 'ok');
+    loadNetMics();
+  }catch(e){ toast('失败：' + e.message, 'err'); }
+}
+async function addAllMics(){
+  try{
+    const m = await api('/api/mic');
+    const names = (m.mics || []).map(x => x.name);
+    if(!names.length){ toast('现在没有手机在发送', 'err'); return; }
+    await addMicToSources(JSON.stringify(names));
+  }catch(e){ toast('失败：' + e.message, 'err'); }
+}
+async function addMicToSources(jsonNames){
+  const names = JSON.parse(jsonNames);
+  try{
+    const cfg = await api('/api/config');
+    const list = (((cfg.config || {}).channel_sources) || []).slice();
+    names.forEach(n => { if(!list.includes(n)) list.push(n); });
+    await api('/api/settings', {channel_sources: list, local: true});
+    toast('已把 ' + names.join('、') + ' 加入音源，并打开本机直通', 'ok');
+    refreshAll();
+    loadChannelSources(true);
+    loadNetMics();
+  }catch(e){ toast('失败：' + e.message, 'err'); }
+}
+async function loadChannelSources(){
+  const sel = $('chSources');
+  if(!sel) return;
+  try{
+    const [d, c] = await Promise.all([api('/api/devices'), api('/api/config')]);
+    const chosen = new Set(((c.config || {}).channel_sources) || []);
+    const sources = ((d.all) || []).filter(x => x.kind === 'source' && x.backend === 'wasapi');
+    sel.innerHTML = sources.map(x => {
+      // Say what each entry actually is: a playback device's loopback is "系统声音"
+      // (everything this PC plays, a phone over Bluetooth included), a real input is
+      // "麦克风". Skip the prefix when the name already carries it, or the list reads
+      // "麦克风 · 麦克风阵列 (...)".
+      const raw = x.name || '';
+      const kind = x.kind_detail === 'loopback' ? '系统声音' : '麦克风';
+      const head = raw.indexOf(kind) === 0 ? '' : kind + ' · ';
+      const bt = /a2dp\s*snk/i.test(raw);
+      return `<option value="${esc(raw)}"${chosen.has(raw) ? ' selected' : ''}>${esc(head + raw)}${bt ? '（蓝牙手机）' : ''}</option>`;
+    }).join('') || '<option disabled>没有可用的采集设备</option>';
+  }catch(e){ /* the settings card is optional */ }
+}
+async function saveChannelSources(){
+  const vals = Array.from($('chSources').selectedOptions).map(o => o.value).filter(Boolean);
+  try{
+    await api('/api/settings', {channel_sources: vals});
+    toast(vals.length ? `频道音源已设为 ${vals.length} 路（混成一路广播）` : '频道音源已恢复为「跟随采集设备」', 'ok');
+  }catch(e){ toast('保存失败：' + e.message, 'err'); }
+}
+function chGainLabel(){ const v = $('chGainVal'); if(v) v.textContent = Number($('chGain').value).toFixed(2); }
+function setChannelGain(value){
+  chGainLabel();
+  clearTimeout(chGainTimer);
+  chGainTimer = setTimeout(async () => {
+    try{ await api('/api/settings', {channel_gain: parseFloat(value)}); }catch(e){ toast('频道音量设置失败：' + e.message, 'err'); }
+  }, 250);
+}
+function renderChannel(ch){
+  if(!ch) return;
+  $('chBroadcast').checked = !!ch.broadcast;
+  $('chListen').checked = !!ch.listen;
+  if($('chLocal')) $('chLocal').checked = !!ch.local;
+  if(document.activeElement !== $('chGain')) $('chGain').value = ch.gain;
+  chGainLabel();
+  const parts = [];
+  parts.push(ch.broadcast ? '本机正在广播' : '本机未广播');
+  parts.push(ch.listen ? '正在收听频道' : '未收听');
+  if(ch.listen && !ch.broadcast) parts.push('（只听模式：本机不发送，因此不会有回声）');
+  const el = $('chState');
+  if(el) el.textContent = '当前：' + parts.join(' · ');
+}
+
+/* ---------------- bluetooth (phone -> this PC) ---------------- */
+/* The list comes from Windows' own pairing list, so it cannot be added to or deleted
+   from here - and it keeps phones that were paired once and never removed, which is how
+   an unused phone stayed on screen long after it stopped being used. Hiding is local to
+   this browser; unpairing for real is a Windows Settings action. */
+let btDevices = [];
+let btShowHidden = false;
+let btAutoList = [];
+function btAutoListGet(){ return btAutoList; }
+async function btAuto(index){
+  const d = btDevices[index];
+  if(!d) return;
+  const list = btAutoList.slice();
+  const at = list.indexOf(d.name);
+  if(at >= 0) list.splice(at, 1); else list.push(d.name);
+  try{
+    await api('/api/settings', {autoconnect: list});
+    btAutoList = list;
+    toast(at >= 0 ? ('已取消「' + d.name + '」的自启连接') : ('启动时会自动连接「' + d.name + '」'), 'ok');
+    loadBluetooth();
+  }catch(e){ toast('设置失败：' + e.message, 'err'); }
+}
+function btHidden(){
+  try { return JSON.parse(localStorage.getItem('wl-bt-hidden') || '[]'); } catch (e) { return []; }
+}
+function btSetHidden(list){
+  try { localStorage.setItem('wl-bt-hidden', JSON.stringify(list)); } catch (e) {}
+}
+function btHide(index){
+  const d = btDevices[index];
+  if(!d) return;
+  const list = btHidden();
+  if(!list.includes(d.name)) list.push(d.name);
+  btSetHidden(list);
+  toast('已隐藏「' + d.name + '」（只是不在这个页面显示，配对关系还在）', 'ok');
+  loadBluetooth();
+}
+function btUnhide(){
+  btSetHidden([]);
+  loadBluetooth();
+}
+async function loadBluetooth(){
+  const box = $('btList');
+  if(!box) return;
+  box.innerHTML = '<span class="x">正在读取…</span>';
+  try{
+    const r = await api('/api/bluetooth?refresh=1');
+    if(!r.available){ box.innerHTML = '<span class="x">这台机器不是 Windows，或找不到 powershell.exe，蓝牙功能不可用。</span>'; return; }
+    const hidden = btHidden();
+    const all = r.devices || [];
+    try{
+      const cfg = await api('/api/config');
+      btAutoList = ((cfg.config || {}).autoconnect) || [];
+    }catch(e){ btAutoList = []; }
+    btDevices = btShowHidden ? all : all.filter(d => !hidden.includes(d.name));
+    const hiddenCount = all.filter(d => hidden.includes(d.name)).length;
+    const footer = hiddenCount
+      ? `<div class="bthint">已隐藏 ${hiddenCount} 台：${esc(all.filter(d=>hidden.includes(d.name)).map(d=>d.name).join('、'))}
+         <button class="tiny ghost" onclick="btShowHidden=!btShowHidden; loadBluetooth()">${btShowHidden?'收起':'显示'}</button>
+         <button class="tiny ghost" onclick="btUnhide()">全部恢复</button></div>`
+      : '';
+    if(!btDevices.length){
+      box.innerHTML = '<span class="x">没有可用于接收音频的蓝牙设备。请先在 Windows 设置里把手机配对（手机端不用装任何 App）。</span>' + footer;
+      return;
+    }
+    // The device id ends in "...}\SNK" and contains & # { }, so it must never be
+    // inlined into an onclick string: a JS escape would eat the backslash and the
+    // panel would then try to disconnect a key that does not exist. Pass an index.
+    box.innerHTML = btDevices.map((d, i) => {
+      // Three states, because "this PC opened its sink" and "a phone is connected" are
+      // different things - State==Opened only means this machine is willing to receive.
+      const map = {
+        connected: ['正在接收手机声音', 'sys', true],
+        // "waiting" is the PC's own state, not the phone's: nothing is being received
+        // yet. Saying "已开启接收" read like an active connection and confused exactly
+        // that - the label now leads with what is NOT happening.
+        waiting:   ['手机未连接（电脑已就绪）', 'off', false],
+        hfp:       ['手机只连了通话(HFP)，没有媒体声音', '', false],
+        error:     ['手机没有响应或出错', '', false],
+        off:       ['未连接', '', false],
+      }[d.link] || ['未连接', '', false];
+      const hint = d.link === 'hfp'
+        ? '<div class="bthint">当前听到的只是<b>通话通路</b>：请在手机蓝牙设置里，把这台电脑的 <b>「媒体音频」</b> 打开（同时确认媒体没有走到别的蓝牙耳机）。改完手机蓝牙关一次再开。</div>'
+        : (d.link === 'waiting'
+            ? '<div class="bthint">状态说明：<b>电脑这边已就绪</b>，但手机还没把媒体音频发过来 —— 所以现在是<b>没有声音</b>的。请在手机蓝牙设置里连上这台电脑，并确认「媒体音频」已打开。</div>'
+            : (d.link === 'error' && d.state
+                ? `<div class="bthint">${esc(d.state)}　—　手机可能没开机、不在附近，或已经被别的设备占用。</div>`
+                : ''));
+      return `<div class="btrow">
+        <span class="nm">${esc(d.name)}</span>
+        <span class="chip ${map[1]}"><span class="k">${map[0]}</span></span>
+        <button class="tiny ${map[2] ? 'danger' : 'primary'}" onclick="btToggle(${i})">${map[2] ? '断开' : '连接'}</button>
+        <button class="tiny ${btAutoList.includes(d.name) ? 'primary' : 'ghost'}" onclick="btAuto(${i})"
+                title="启动 Audio Mixing 时自动连接这台手机">${btAutoList.includes(d.name) ? '自启 ✓' : '自启'}</button>
+        <button class="tiny ghost" onclick="btHide(${i})" title="不再显示（不影响 Windows 里的配对）">隐藏</button>
+      </div>${hint}`;
+    }).join('') + footer;
+  }catch(e){ box.innerHTML = '<span class="x">读取失败：' + esc(e.message) + '</span>'; }
+}
+async function btToggle(index){
+  const d = btDevices[index];
+  if(!d) return;
+  const live = d.link === 'connected' || d.link === 'waiting';
+  const box = $('btList');
+  if(box) box.innerHTML = '<span class="x">' + (live ? '正在断开…' : '正在连接，请在手机上确认…') + '</span>';
+  try{
+    const r = live ? await api('/api/bluetooth/disconnect', {id: d.id})
+                   : await api('/api/bluetooth/connect', {id: d.id});
+    toast(live ? '已断开' : ('连接状态：' + (r.state || '已发起')), r.ok === false ? 'err' : 'ok');
+  }catch(e){ toast((live ? '断开' : '连接') + '失败：' + e.message, 'err'); }
+  setTimeout(loadBluetooth, live ? 800 : 1500);
+}
+
+/* ---------------- settings ---------------- */
+async function saveSettings(){
+  try{
+    const r = await api('/api/settings', {
+      name: $('setName').value.trim(),
+      jitter_ms: parseFloat($('setJitter').value) || 55,
+      codec: $('setCodec').value,
+    });
+    toast('已保存：' + (r.changed||[]).join('、'), 'ok');
+    refreshAll();
+  }catch(e){ toast('保存失败：' + e.message, 'err'); }
+}
+
+/* ---------------- tone ---------------- */
+async function testTone(){
+  const btn = $('testBtn'), old = btn.textContent;
+  btn.disabled = true; btn.textContent = '播放中…';
+  try{
+    const r = await api('/api/test-tone', {seconds:2});
+    btn.textContent = '✅ 已响';
+    toast('测试音已播放到：' + (r.device || '默认输出'), 'ok');
+  }catch(e){
+    btn.textContent = '❌ 失败';
+    toast('测试音失败：' + e.message, 'err');
+  }
+  setTimeout(() => { btn.textContent = old; btn.disabled = false; }, 2200);
+}
+
+function showBootError(msg){
+  const el = document.getElementById('boot');
+  if(!el) return;
+  el.style.display = 'block';
+  el.innerHTML = `<b style="color:#f87171">页面脚本出错了</b><br>
+    <span style="font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#fca5a5">${esc(msg)}</span><br><br>
+    服务本身是好的（这个页面就是它给你的）。请在手机浏览器里打开 <code>/plain</code>：
+    如果那个页面正常，问题就在这个控制台的脚本上，把上面这行错误发我即可。`;
+}
+
+/* ---------------- refresh loop ---------------- */
+let inFlight = false;
+async function refreshAll(){
+  if(inFlight) return;
+  inFlight = true;
+  try{
+    const [peers, routes, status] = await Promise.all([api('/api/peers'), api('/api/routes'), api('/api/status')]);
+    state.self = peers.self; state.peers = peers.peers; state.routes = routes.routes; state.status = status;
+    // A tab left open keeps running the JavaScript it loaded, so a shipped fix could
+    // stay invisible with nothing on screen to explain it. The server stamps each status
+    // with a fingerprint of the current page; when it differs, this page is old, and it
+    // reloads itself once rather than waiting for someone to think of pressing Ctrl+F5.
+    if(status && status.page_rev){
+      if(!window.__pageRev){ window.__pageRev = status.page_rev; }
+      else if(window.__pageRev !== status.page_rev && !window.__reloading){
+        window.__reloading = true;
+        location.reload();
+        return;
+      }
+    }
+
+    renderNetwork(peers.network);
+    renderPeers();
+    renderDragList();
+    renderDraft();
+    renderRoutes();
+    renderStatus();
+    renderStreams();
+
+    // First successful render: the page is genuinely working, drop the boot notice.
+    const boot = document.getElementById('boot');
+    if(boot) boot.style.display = 'none';
+
+    api('/api/devices').then(renderDeviceDetail).catch(()=>{});
+    if(state.logOpen) api('/api/logs').then(renderLogs).catch(()=>{});
+
+    if(!state.settingsLoaded){
+      state.settingsLoaded = true;
+      api('/api/config').then(c => {
+        const cfg = c.config || {};
+        $('setName').value = cfg.name || '';
+        $('setJitter').value = cfg.jitter_ms || 55;
+        $('setCodec').value = cfg.codec || 'pcm_s16';
+        renderChannel({broadcast: cfg.broadcast, listen: cfg.listen, local: cfg.local, gain: cfg.channel_gain});
+        loadChannelSources();
+        loadBluetooth();
+      }).catch(()=>{});
+    }
+  }catch(e){
+    // Do not leave a blank page: say what failed and how to prove the server is fine.
+    if(!state.everRendered) showBootError(e.message);
+    toast('刷新失败：' + e.message, 'err');
+  } finally {
+    state.everRendered = true;
+    inFlight = false;
+  }
+}
+
+/* ---------------- display modes ----------------
+   简洁 (default) shows the three decisions a person actually makes - 谁在线, 听什么,
+   播到哪 - and keeps every explanation, table, counter and log behind 详细. Nothing
+   leaves the DOM, it is only hidden, so every script keeps finding its elements.
+   The choice is restored here rather than in <head>: a second script block would be a
+   separate scope, and the drag-logic checker evaluates the page's one script block.
+   Only a 详细 user can notice the switch, and it happens before the first refresh. */
+try {
+  const root = document.documentElement;
+  if (root && root.classList && localStorage.getItem('wl-mode') === 'full') root.classList.add('fullui');
+} catch (e) {}
+
+function uiRoot(){
+  const el = document.documentElement;
+  return el && el.classList ? el : null;
+}
+function uiSegButtons(){
+  return document.querySelectorAll ? document.querySelectorAll('#modeSeg button') : [];
+}
+function setUiMode(mode){
+  const full = mode === 'full';
+  const root = uiRoot();
+  if (root) root.classList.toggle('fullui', full);
+  try { localStorage.setItem('wl-mode', full ? 'full' : 'simple'); } catch (e) {}
+  // Each mode has its own saved arrangement, so re-apply it on every switch.
+  if (typeof applyCardLayout === 'function') applyCardLayout();
+  const hint = document.getElementById('outHint');
+  if (hint && state.status) {
+    // Named from the live configuration, never hardcoded: this page ships to everyone.
+    const sink = ((state.status.sinks || [])[0] || {}).device_selector
+      || ((state.config && state.config.sink_device) || '');
+    const el = document.getElementById('outDevice');
+    if (el) el.textContent = sink ? '（当前：' + sink + '）' : '';
+  }
+  initUiMode();
+  if (typeof refreshAll === 'function') refreshAll();
+}
+function drawSpark(svgId, textId, entry, ideal){
+  const svg = $(svgId);
+  if(!svg) return;
+  const text = $(textId);
+  const history = (entry && entry.history) || [];
+  const history0 = entry && entry.history ? entry.history : [];
+  const latest = entry && entry.latest;
+  if(text){
+    text.innerHTML = latest
+      ? '<b>' + latest.score + ' 分</b> · ' + esc(latest.detail) + (latest.label ? ' · ' + esc(latest.label) : '')
+      : '该通道当前未在工作';
+  }
+  if(!history.length){ svg.innerHTML = ''; return; }
+  const values = history.map(e => (e && typeof e.v === 'number') ? e.v : 0);
+  // A fixed ceiling per metric, so the curve only moves when the data moves. Rescaling
+  // to the current maximum drew steps that were not in the audio at all.
+  const top = Math.max(ideal * 2.5, 0.001);
+  const w = 200, h = 36;
+  const step = values.length > 1 ? w / (values.length - 1) : 0;
+  const y = v => (h - 3 - Math.min(1, v / top) * (h - 8)).toFixed(1);
+  const points = values.map((v, i) => (i * step).toFixed(1) + ',' + y(v)).join(' ');
+  svg.innerHTML = '<line x1="0" y1="' + y(ideal) + '" x2="' + w + '" y2="' + y(ideal) +
+    '" stroke="#2a3648" stroke-width="1" stroke-dasharray="3 3"/>' +
+    '<polyline fill="none" stroke="#4da3ff" stroke-width="1.6" points="' + points + '"/>';
+}
+function drawQuality(){
+  const q = (state.status && state.status.quality) || {};
+  drawSpark('qWifi', 'qWifiText', q.wifi, 20);
+  drawSpark('qBt', 'qBtText', q.bt, 11);
+  drawSpark('qP2p', 'qP2pText', q.p2p, 60);
+}
+
+function initUiMode(){
+  const root = uiRoot();
+  const full = !!(root && root.classList.contains('fullui'));
+  uiSegButtons().forEach(b => { b.classList.toggle('on', (b.dataset.mode === 'full') === full); });
+}
+/* ---------------- card layout: drag to move, ⤢ to widen ----------------
+   Stored per display mode, because the two modes show different cards and a sensible
+   arrangement in one is usually wrong in the other. Nothing here is required for the
+   panel to work: if the browser refuses localStorage, the default order is used. */
+function cardKey(card){
+  const n = card.querySelector('h2 .n');
+  return n ? ('c' + n.textContent.trim()) : '';
+}
+function layoutStore(){
+  // v2: the meaning of wide changed from span-a-row to own-a-column, so the old
+  // saved flags must not be reused - they would give half the cards a column each.
+  return document.documentElement.classList.contains('fullui') ? 'wl-layout-v2-full' : 'wl-layout-v2-simple';
+}
+function readLayout(){
+  try { return JSON.parse(localStorage.getItem(layoutStore()) || '{}') || {}; } catch (e) { return {}; }
+}
+function writeLayout(data){
+  try { localStorage.setItem(layoutStore(), JSON.stringify(data)); } catch (e) {}
+}
+function saveCardLayout(){
+  try{
+    const cards = Array.from(document.querySelectorAll('.wrap .card[data-card]'));
+    writeLayout({
+      order: cards.map(c => c.dataset.card),
+      wide: cards.filter(c => c.classList.contains('wide')).map(c => c.dataset.card),
+    });
+  }catch(e){}
+}
+function toggleWide(button){
+  const card = button.closest('.card');
+  if(!card) return;
+  card.classList.toggle('wide');
+  saveCardLayout();
+  packColumns();
+}
+function enableCardDrag(){
+  document.querySelectorAll('.card .grip').forEach(grip => {
+    grip.addEventListener('pointerdown', (ev) => {
+      const card = grip.closest('.card');
+      if(!card) return;
+      card.classList.add('dragging');
+      ev.preventDefault();
+      const move = (e) => {
+        const under = document.elementFromPoint(e.clientX, e.clientY);
+        const target = under && under.closest ? under.closest('.card') : null;
+        if(!target || target === card) return;
+        const box = target.getBoundingClientRect();
+        const after = (e.clientY - box.top) > box.height / 2;
+        target.parentNode.insertBefore(card, after ? target.nextSibling : target);
+      };
+      const up = () => {
+        document.removeEventListener('pointermove', move);
+        document.removeEventListener('pointerup', up);
+        card.classList.remove('dragging');
+        saveCardLayout();
+        packColumns();
+        packColumns();
+      };
+      document.addEventListener('pointermove', move);
+      document.addEventListener('pointerup', up);
+    });
+  });
+}
+function applyCardLayout(){
+  try{
+    if(!document.querySelectorAll || !document.querySelector('.wrap')) return;
+    const saved = readLayout();
+    const wide = new Set(saved.wide || []);
+    document.querySelectorAll('.wrap .card').forEach(card => {
+      const key = cardKey(card);
+      if(!key) return;
+      card.dataset.card = key;
+      card.classList.toggle('wide', wide.has(key));
+      const head = card.querySelector('h2');
+      if(head && !head.querySelector('.cardtools')){
+        const tools = document.createElement('span');
+        tools.className = 'cardtools';
+        tools.innerHTML = '<button class="tiny ghost grip" title="按住拖动，改变卡片位置">⠿</button>'
+                        + '<button class="tiny ghost" title="让这张卡独占一列 / 还原" onclick="toggleWide(this)">⤢</button>';
+        head.appendChild(tools);
+      }
+    });
+    packColumns();
+  }catch(e){ /* the layout is a convenience, never a requirement */ }
+}
+
+/* Greedy height packing: measure each card at the real column width, then drop them one
+   by one into whichever column is currently shortest. A card marked ⤢ is given a column
+   of its own, which is how a long card stops leaving a hole under a short one. */
+function packColumns(){
+  const wrap = document.querySelector('.wrap');
+  if(!wrap || !wrap.clientWidth || !wrap.querySelector) return;
+  const cards = Array.from(wrap.querySelectorAll('.card'));
+  if(!cards.length) return;
+
+  // Keep the order the user arranged; anything unknown keeps its DOM position.
+  const saved = readLayout().order || [];
+  cards.sort((a, b) => {
+    const ia = saved.indexOf(a.dataset.card), ib = saved.indexOf(b.dataset.card);
+    return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib);
+  });
+
+  const gap = 14;
+  const only = document.createElement('div');
+  only.className = 'col';
+  cards.forEach(c => only.appendChild(c));
+  while(wrap.firstChild) wrap.removeChild(wrap.firstChild);
+  wrap.appendChild(only);
+  const heights = cards.map(c => c.getBoundingClientRect().height || 120);
+
+  const narrow = document.documentElement.classList.contains('fullui') ? 430 : 360;
+  // Clamped: a zoomed-out page or a freak clientWidth must not turn six cards into
+  // six squeezed columns, which is exactly what happened once.
+  const wanted = Math.max(1, Math.min(4, Math.floor((wrap.clientWidth + gap) / (narrow + gap))));
+  const columns = [];
+  const loads = [];
+  for(let i = 0; i < wanted; i++){
+    const col = document.createElement('div');
+    col.className = 'col';
+    columns.push(col);
+    loads.push(0);
+  }
+  cards.forEach((card, i) => {
+    if(card.classList.contains('wide')){
+      // Own column: appended at the end, so the packed columns stay side by side.
+      const solo = document.createElement('div');
+      solo.className = 'col';
+      solo.appendChild(card);
+      wrap.appendChild(solo);
+      return;
+    }
+    let best = 0;
+    for(let k = 1; k < columns.length; k++){
+      if(loads[k] < loads[best] - 1) best = k;
+    }
+    columns[best].appendChild(card);
+    loads[best] += heights[i] + gap;
+  });
+  columns.forEach(col => { if(col.children.length) wrap.appendChild(col); });
+  if(only.parentNode) only.parentNode.removeChild(only);
+}
+applyCardLayout();
+enableCardDrag();
+let resizePackTimer = 0;
+window.addEventListener('resize', () => {
+  clearTimeout(resizePackTimer);
+  resizePackTimer = setTimeout(packColumns, 150);
+});
+initUiMode();
+
+refreshAll();
+loadNetMics();
+setInterval(refreshAll, 2500);
+// The device lists move: a phone can start sending at any moment, so the source picker
+// and the network-source line follow along instead of freezing at page load.
+setInterval(() => { loadChannelSources(); loadNetMics(); }, 4000);
+
+// 详细版里的「启动时自动打开面板」。状态来自 config，改了就写回去。
+// 地址里带 ?mode=full 或 ?mode=simple 时，按它决定一开始显示哪个视图。
+// 启动时自动打开面板就用这个参数把用户选的那个视图直接带出来。
+(function applyModeFromUrl(){
+  try{
+    const m = new URLSearchParams(location.search).get('mode');
+    if(m !== 'full' && m !== 'simple') return;
+    // 面板启动时会先读浏览器里保存的视图，那个值可能和用户这次选的不一样，
+    // 所以这里要压过它，并且等它初始化完再压一次。
+    const force = () => { try{ if (typeof setUiMode === 'function') setUiMode(m); }catch(e){} };
+    force();
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => setTimeout(force, 0));
+    }
+    window.addEventListener('load', () => setTimeout(force, 0));
+  }catch(e){}
+})();
+
+</script>
+</body>
+</html>

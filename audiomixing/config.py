@@ -149,7 +149,12 @@ class Config:
 
     def save(self, path: Path | None = None) -> Path:
         p = path or config_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            # 建不了目录也要能跑：安全软件（火绒 HIPS 之类）会拦"新程序往
+            # %APPDATA% 建目录"，以前这里直接抛异常 → 启动即崩。
+            return p
         data = {
             "version": CONFIG_VERSION,
             "node_id": self.node_id,
@@ -179,8 +184,13 @@ class Config:
             "netmic_jitter_ms": self.netmic_jitter_ms,
         }
         tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(p)
+        try:
+            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(p)
+        except Exception:
+            # 写不进去就跳过：这一版启动时不能因为"存不了设置"而崩掉。
+            # 设置改动会在下次能写的时候再落盘。
+            return p
         return p
 
     def to_json(self) -> dict[str, Any]:

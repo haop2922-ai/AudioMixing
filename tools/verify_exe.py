@@ -1,4 +1,4 @@
-"""Fast smoke test for dist/WaveLink.exe — finishes in well under a minute.
+"""Fast smoke test for dist/AudioMixing.exe — finishes in well under a minute.
 
     python tools/verify_exe.py          # full check (also runs `doctor`, ~40 s)
     python tools/verify_exe.py --quick  # just the critical paths, ~10 s
@@ -26,7 +26,7 @@ import time
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-EXE = ROOT / "dist" / "WaveLink.exe"
+EXE = ROOT / "dist" / "AudioMixing.exe"
 QUICK = "--quick" in sys.argv
 
 WEB_PORT = 17991
@@ -137,7 +137,7 @@ def user_config_fingerprint() -> str:
     """Snapshot of the real user config, to prove this run does not touch it."""
     import hashlib
 
-    cfg = pathlib.Path(os.environ.get("APPDATA", "")) / "WaveLink" / "config.json"
+    cfg = pathlib.Path(os.environ.get("APPDATA", "")) / "AudioMixing" / "config.json"
     if not cfg.is_file():
         return "absent"
     try:
@@ -150,7 +150,7 @@ def main() -> int:
     if not EXE.is_file():
         print("找不到 %s，先运行 python tools/build_exe.py" % EXE)
         return 1
-    real_config = pathlib.Path(os.environ.get("APPDATA", "")) / "WaveLink" / "config.json"
+    real_config = pathlib.Path(os.environ.get("APPDATA", "")) / "AudioMixing" / "config.json"
     before = user_config_fingerprint()
     print("验证对象: %s (%.1f MB)  %s" % (EXE, EXE.stat().st_size / 1024 / 1024, "快速模式" if QUICK else "完整模式"))
     print("沙箱配置目录: %s" % SANDBOX)
