@@ -169,8 +169,12 @@ class MultiOut:
         """这台机器上可以作为输出的设备名（跳过虚拟声卡）。"""
         out: list[str] = []
         try:
-            for item in audio_base.list_devices():
+            for item in audio_base.list_all_devices():
                 if getattr(item, "kind", "") != audio_base.KIND_SINK:
+                    continue
+                # 只列真实输出设备：文件后端和空后端也会报一个"设备名"，
+                # 但它们不是耳机/音箱，列出来只会让人误选。
+                if str(getattr(item, "backend", "")) in ("file", "null"):
                     continue
                 name = str(getattr(item, "name", "") or "")
                 if name and name not in out:
