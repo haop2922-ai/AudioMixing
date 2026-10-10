@@ -2098,6 +2098,63 @@ class TestTodayRegressions(unittest.TestCase):
         self.assertIn("p2p", wanted, "只听模式下点对点的发送端必须保留")
         self.assertNotIn("channel", wanted, "只听模式下不该往广播通道发送")
 
+    def test_one_capture_feeds_two_output_devices(self) -> None:
+        """一份采集要能同时喂两个输出设备。
+
+        需求是"一台电脑给两个耳机同时出声音"。结构上就是：采集中心给每个设备
+        一个独立读取器（同一份采集），每个读取器配一个播放端。
+        这里用两个 WAV 文件当播放端，跑一秒，两个文件都必须有数据。
+        """
+        import wave
+
+        from wavelink.audio.capture import CaptureHub
+        from wavelink.audio.format import CHANNELS, SAMPLE_RATE, make_tone
+        from wavelink.audio.multiout import MultiOut
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            a = os.path.join(tmp, "one.wav")
+            b = os.path.join(tmp, "two.wav")
+            hub = CaptureHub()
+            out = MultiOut(hub)
+            spec = {"backend": "file", "device": os.path.join(tmp, "src.wav"),
+                    "loopback": False}
+            # 音源文件：一秒 440Hz
+            tone = make_tone(440.0, SAMPLE_RATE, 0.25, CHANNELS)
+            with wave.open(spec["device"], "wb") as fh:
+                fh.setnchannels(CHANNELS)
+                fh.setsampwidth(2)
+                fh.setframerate(SAMPLE_RATE)
+                fh.writeframes(b"".join(__import__("struct").pack("<h", int(max(-1.0, min(1.0, s)) * 32767))
+                              for s in tone))
+            try:
+                out.configure(spec, [{"device": a, "gain": 1.0},
+                                     {"device": b, "gain": 0.5, "delay_ms": 50.0}])
+                deadline = time.time() + 6.0
+                while time.time() < deadline:
+                    done = 0
+                    for path in (a, b):
+                        try:
+                            if os.path.getsize(path) > 8000:
+                                done += 1
+                        except OSError:
+                            pass
+                    if done == 2:
+                        break
+                    time.sleep(0.1)
+                stats = out.stats()
+                self.assertEqual(len(stats["devices"]), 2, "应该有两路输出")
+                sizes = []
+                for path in (a, b):
+                    try:
+                        sizes.append(os.path.getsize(path))
+                    except OSError:
+                        sizes.append(0)
+                self.assertTrue(all(s > 8000 for s in sizes),
+                                "两个输出设备都应该收到数据，实际大小：%s" % sizes)
+            finally:
+                out.stop()
+                # 采集中心没有 close：后台线程是守护线程，跟着进程退出即可
+
     def test_the_default_sink_is_a_real_sound_card(self) -> None:
         """默认播放后端必须是真实声卡，绝不能是写文件。"""
         from wavelink.audio import base as audio_base
