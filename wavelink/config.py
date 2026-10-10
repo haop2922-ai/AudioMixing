@@ -70,6 +70,8 @@ class Config:
     # Several entries are mixed into one stream, which is how several phones - each on
     # its own Bluetooth adapter - or a phone plus this machine's sound travel as one.
     channel_sources: list[str] = field(default_factory=list)
+    # 本机多设备输出：勾选的输出设备（每项含 device/gain/delay_ms）
+    multi_out_devices: list[dict[str, Any]] = field(default_factory=list)
     # Play the channel's sources on *this* machine's output as well. This is what makes
     # "phone over Bluetooth -> this PC -> my headphones" work without any second node.
     local: bool = False

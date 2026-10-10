@@ -45,6 +45,7 @@ from .config import Config
 from .net.discovery import BeaconService, DiscoveryRegistry, PeerEndpoints, short_id
 from .net.rtpaudio import JitterBuffer, Receiver, Sender, SenderSession
 from .audio.capture import CaptureHub
+from .audio.multiout import MultiOut
 from .audio.local import LocalLoop
 from .audio.tap import AudioTap
 
@@ -212,6 +213,8 @@ class WaveLinkNode:
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._wake = threading.Event()
+        # 一台电脑送多个耳机：一份采集、多路播放（复用采集中心）
+        self.multi_out = MultiOut(self.hub)
         # 被显式删掉的路由 id。拉取回来的表里若还带着它，不要复活：
         # 否则推送删一次、拉取加一次，播放端会反复开关。
         self._dropped_ids: set[str] = set()
@@ -669,6 +672,7 @@ class WaveLinkNode:
         self.refresh_devices()
         self._apply_pushed_routes()
         self.apply_routes()
+        self._apply_multi_out()
 
         # 兜底清扫放在 tick 里：tick 每半秒跑一次，是唯一稳定被执行的地方。
         # 单独包一层，任何异常都不能影响调和本身。
@@ -1378,6 +1382,40 @@ class WaveLinkNode:
         except Exception:
             pass
         return False
+
+
+    def set_multi_out(self, devices: list[dict[str, Any]]) -> None:
+        """设置"本机多设备输出"的设备清单，并立刻生效。"""
+        clean: list[dict[str, Any]] = []
+        for item in devices or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("device") or "").strip()
+            if not name:
+                continue
+            clean.append({"device": name,
+                          "gain": float(item.get("gain", 1.0) or 1.0),
+                          "delay_ms": float(item.get("delay_ms", 0.0) or 0.0)})
+        self.config.multi_out_devices = clean
+        self._apply_multi_out()
+        try:
+            self.save_config()
+        except Exception:
+            pass
+
+
+    def _apply_multi_out(self) -> None:
+        """按配置起停"多设备输出"。配置没变时 MultiOut 内部直接返回，不会反复开关设备。"""
+        try:
+            wanted = list(getattr(self.config, "multi_out_devices", None) or [])
+            if not wanted:
+                if self.multi_out.running():
+                    self.multi_out.stop()
+                return
+            spec = self.default_source_spec()
+            self.multi_out.configure(spec, wanted)
+        except Exception as exc:
+            self.note("多设备输出出错: %s" % exc)
 
 
     def _local_loop_spec(self) -> tuple[Any, dict[str, Any], tuple]:
@@ -2105,6 +2143,7 @@ class WaveLinkNode:
             "local": self.local_state(),
             "senders": self.sender.stats(),
             "sinks": [engine.describe() for engine in self.sinks.values()],
+            "multi_out": self.multi_out.stats(),
             "receiver": recv,
             "totals": {
                 "sent_kbps": self.sender.total_kbps(),

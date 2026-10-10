@@ -14,7 +14,7 @@ import threading
 import time
 from typing import Any
 
-from .format import CHANNELS, apply_gain
+from .format import CHANNELS, SAMPLE_RATE, apply_gain, as_float_array
 
 
 # HWHHYN 用 DEEPSEEK 制作
@@ -91,6 +91,9 @@ class LocalLoop(threading.Thread):
         self.blocks = 0
         self.peak = 0.0
         self.ready = False
+        # 延迟补偿：先把这么多毫秒的静音喂给这个设备，
+        # 这一路就整体往后错开同样的时间（用来对齐蓝牙和有线）。
+        self.pre_roll_ms = 0.0
         self.error = ""
         self.started_at = time.time()
 
@@ -103,6 +106,17 @@ class LocalLoop(threading.Thread):
             return
         self.ready = True
         try:
+            if self.pre_roll_ms > 0:
+                # 先补一段静音，让这一路晚一点出声。
+                # 必须和真实数据块同一种类型（float 数组），否则播放端会直接抛异常，
+                # 而异常被这里吞掉后表现为"这一路一个字都没写"。
+                frames = int(SAMPLE_RATE * self.pre_roll_ms / 1000.0)
+                chunk = 480
+                silence = as_float_array([0.0] * (chunk * CHANNELS))
+                while frames > 0 and not self._stop.is_set():
+                    take = min(chunk, frames)
+                    self.sink.write(silence[: take * CHANNELS])
+                    frames -= take
             while not self._stop.is_set():
                 block = self.source.read()
                 if block is None:
