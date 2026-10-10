@@ -1485,6 +1485,35 @@ class _Handler(BaseHTTPRequestHandler):
                 self._mic_stream(parsed)
                 return
             body = self._read_json()
+            if path == "/api/multiout":
+                # 本机多设备输出：勾选几个输出设备就同时响几个。
+                # 这里用 body（POST 分支里请求体叫 body，只有 GET 分支叫 payload，
+                # 上次照 GET 抄成 payload 就 NameError 了）。
+                raw = body.get("devices")
+                items: list[dict] = []
+                if isinstance(raw, list):
+                    for entry in raw:
+                        if not isinstance(entry, dict):
+                            continue
+                        name = str(entry.get("device") or "").strip()
+                        if not name:
+                            continue
+                        try:
+                            gain = float(entry.get("gain", 1.0))
+                        except (TypeError, ValueError):
+                            gain = 1.0
+                        try:
+                            delay = float(entry.get("delay_ms", 0.0))
+                        except (TypeError, ValueError):
+                            delay = 0.0
+                        items.append({"device": name,
+                                      "gain": max(0.0, min(4.0, gain)),
+                                      "delay_ms": max(0.0, min(2000.0, delay))})
+                self.api.node.set_multi_out(items)
+                out = self.api.node.multi_out.stats()
+                out["available"] = self.api.node.multi_out.available_devices()
+                self._json(200, out)
+                return
             if path == "/api/firewall":
                 # 放行防火墙。这条必须放在 POST 分支里，因为页面用的是 POST；
                 # 之前只写进了 GET 分支，页面点按钮只会拿到 404。
