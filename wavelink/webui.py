@@ -1511,12 +1511,32 @@ class _Handler(BaseHTTPRequestHandler):
                                       "delay_ms": max(0.0, min(2000.0, delay))})
                 self.api.node.set_multi_out(items)
                 out = self.api.node.multi_out.stats()
+                _excl: list[str] = []
                 try:
-                    _excl = [self.api.node._default_render_name()]
+                    # 两个来源都问一遍：多设备输出是从 default_source_spec() 那块
+                    # 设备的回环采的，它一定已经在响；_default_render_name() 是
+                    # Windows 当前的默认输出，通常与前者相同。
+                    spec_now = self.api.node.default_source_spec() or {}
+                    name_now = str(spec_now.get("device") or "")
+                    if name_now:
+                        _excl.append(name_now)
                 except Exception:
-                    _excl = []
+                    pass
+                try:
+                    default_now = self.api.node._default_render_name()
+                    if default_now:
+                        _excl.append(default_now)
+                except Exception:
+                    pass
+                try:
+                    for item in self.api.node.devices or []:
+                        if getattr(item, "is_default", False):
+                            _excl.append(str(getattr(item, "name", "") or ""))
+                except Exception:
+                    pass
+                _excl = [x for x in dict.fromkeys(_excl) if x]
                 out["available"] = self.api.node.multi_out.available_devices(_excl)
-                out["playing_now"] = [x for x in _excl if x]
+                out["playing_now"] = _excl
                 self._json(200, out)
                 return
             if path == "/api/firewall":
