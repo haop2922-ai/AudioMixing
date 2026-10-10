@@ -1511,7 +1511,12 @@ class _Handler(BaseHTTPRequestHandler):
                                       "delay_ms": max(0.0, min(2000.0, delay))})
                 self.api.node.set_multi_out(items)
                 out = self.api.node.multi_out.stats()
-                out["available"] = self.api.node.multi_out.available_devices()
+                try:
+                    _excl = [self.api.node._default_render_name()]
+                except Exception:
+                    _excl = []
+                out["available"] = self.api.node.multi_out.available_devices(_excl)
+                out["playing_now"] = [x for x in _excl if x]
                 self._json(200, out)
                 return
             if path == "/api/firewall":
