@@ -165,8 +165,14 @@ class MultiOut:
                 dev.loop = None
         self._devices = {}
 
-    def available_devices(self) -> list[str]:
-        """这台机器上可以作为输出的设备名（跳过虚拟声卡）。"""
+    def available_devices(self, exclude: list[str] | None = None) -> list[str]:
+        """这台机器上可以作为输出的设备名。
+
+        exclude 里放"已经在响、不需要再勾"的设备（通常是 Windows 的默认输出，
+        以及我们自己正在采集的那块）—— 勾了它会听到原声加一份晚到的复制，
+        两路叠加互相抵消，听感就是金属音。
+        """
+        skip = [str(x) for x in (exclude or []) if str(x).strip()]
         out: list[str] = []
         try:
             for item in audio_base.list_all_devices():
@@ -177,8 +183,11 @@ class MultiOut:
                 if str(getattr(item, "backend", "")) in ("file", "null"):
                     continue
                 name = str(getattr(item, "name", "") or "")
-                if name and name not in out:
-                    out.append(name)
+                if not name or name in out:
+                    continue
+                if any(name == s or name in s or s in name for s in skip):
+                    continue
+                out.append(name)
         except Exception:
             pass
         return out

@@ -685,12 +685,16 @@ html:not(.fullui) .card .body { padding-top: 6px; }
         <div class="note" style="margin-bottom:10px">
           插两个耳机/音箱，勾上它们，两边就都有声音了 —— 双人游戏用这个。
           蓝牙比有线慢几十到几百毫秒，用「延迟」补偿把两边对齐
-          （听音乐不用管，打游戏要调）。
+          （听音乐不用管，打游戏要调）。<br>
+          刚插上的设备几秒内会自动出现；没出现就点「刷新设备」。<br>
+          <b>Windows 正在用的那块输出不在列表里</b>：它本来就在响，再勾一份会因为
+          两路叠加互相抵消而变成金属音。
         </div>
         <div id="moList" style="display:flex;flex-direction:column;gap:8px"></div>
         <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
           <button id="moApply" class="btn">应用</button>
           <button id="moStop" class="btn">全部停止</button>
+          <button id="moRefresh" class="btn">刷新设备</button>
           <span id="moStatus" style="font-size:12px;opacity:.75;align-self:center"></span>
         </div>
       </section>
@@ -774,6 +778,10 @@ html:not(.fullui) .card .body { padding-top: 6px; }
         }
 
         document.getElementById('moApply').onclick = () => apply(false);
+        const refreshBtn = document.getElementById('moRefresh');
+        if (refreshBtn) refreshBtn.onclick = () => refresh();
+        // 隔几秒自动刷新一次，插上新耳机不用重启也不用刷新页面
+        setInterval(() => { if (!document.hidden) refresh(); }, 4000);
         document.getElementById('moStop').onclick = () => apply(true);
         if (document.readyState === 'loading') {
           document.addEventListener('DOMContentLoaded', refresh);
