@@ -1529,33 +1529,6 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, self.api.add_peer(body))
             elif path == "/api/peers/remove":
                 self._json(200, self.api.remove_peer(body))
-            elif path == "/api/multiout":
-                # 本机多设备输出：勾选几个输出设备就同时响几个
-                raw = payload.get("devices")
-                items: list[dict] = []
-                if isinstance(raw, list):
-                    for entry in raw:
-                        if not isinstance(entry, dict):
-                            continue
-                        name = str(entry.get("device") or "").strip()
-                        if not name:
-                            continue
-                        try:
-                            gain = float(entry.get("gain", 1.0))
-                        except (TypeError, ValueError):
-                            gain = 1.0
-                        try:
-                            delay = float(entry.get("delay_ms", 0.0))
-                        except (TypeError, ValueError):
-                            delay = 0.0
-                        items.append({"device": name,
-                                      "gain": max(0.0, min(4.0, gain)),
-                                      "delay_ms": max(0.0, min(2000.0, delay))})
-                self.api.node.set_multi_out(items)
-                out = self.api.node.multi_out.stats()
-                out["available"] = self.api.node.multi_out.available_devices()
-                self._json(200, out)
-                return
             elif path == "/api/settings":
                 self._json(200, self.api.set_settings(body))
             elif path == "/api/bluetooth/connect":
