@@ -681,58 +681,70 @@ html:not(.fullui) .card .body { padding-top: 6px; }
 <div id="ghost"></div>
 
       <section class="card" id="multiOutCard">
-        <h2>一台电脑，多个耳机<span class="sub">同时出声，各调各的音量</span></h2>
-        <div class="note" style="margin-bottom:10px">
-          插两个耳机/音箱，勾上它们，两边就都有声音了 —— 双人游戏用这个。
-          蓝牙比有线慢几十到几百毫秒，用「延迟」补偿把两边对齐
-          （听音乐不用管，打游戏要调）。<br>
-          刚插上的设备几秒内会自动出现；没出现就点「刷新设备」。<br>
-          <b>Windows 正在用的那块输出不在列表里</b>：它本来就在响，再勾一份会因为
-          两路叠加互相抵消而变成金属音。
-        </div>
-        <div id="moList" style="display:flex;flex-direction:column;gap:8px"></div>
-        <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
-          <button id="moApply" class="btn">应用</button>
-          <button id="moStop" class="btn">全部停止</button>
-          <button id="moRefresh" class="btn">刷新设备</button>
-          <span id="moStatus" style="font-size:12px;opacity:.75;align-self:center"></span>
+        <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          一台电脑，多个耳机
+          <span class="sub" id="moSummary" style="font-weight:400">未开启</span>
+          <button id="moToggle" class="btn" style="margin-left:auto;padding:4px 12px;font-size:12px">设置设备</button>
+        </h2>
+        <div id="moBody" style="display:none;margin-top:10px">
+          <div class="note" style="font-size:12px;margin-bottom:8px">
+            勾上要同时出声的设备，各调各的音量。蓝牙比有线慢，用「延迟」补偿对齐。<br>
+            刚插上的设备几秒内自动出现。<b>Windows 正在用的那块不在列表里</b>
+            —— 它本来就在响，再勾一份会变成金属音。
+          </div>
+          <div id="moList" style="display:flex;flex-direction:column;gap:6px;
+               max-height:190px;overflow:auto"></div>
+          <div style="display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap">
+            <button id="moApply" class="btn" style="padding:4px 12px;font-size:12px">应用</button>
+            <button id="moStop" class="btn" style="padding:4px 12px;font-size:12px">全部停止</button>
+            <button id="moRefresh" class="btn" style="padding:4px 12px;font-size:12px">刷新设备</button>
+            <span id="moStatus" style="font-size:12px;opacity:.75"></span>
+          </div>
         </div>
       </section>
       <script>
       (function () {
         const list = document.getElementById('moList');
         const status = document.getElementById('moStatus');
+        const summary = document.getElementById('moSummary');
+        const body = document.getElementById('moBody');
+        const toggle = document.getElementById('moToggle');
         const rows = new Map();
+
+        toggle.onclick = () => {
+          const open = body.style.display !== 'none';
+          body.style.display = open ? 'none' : 'block';
+          toggle.textContent = open ? '设置设备' : '收起';
+          if (!open) refresh();
+        };
 
         function row(name, gain, delay) {
           const wrap = document.createElement('div');
-          wrap.style.cssText = 'display:flex;gap:10px;align-items:center;flex-wrap:wrap';
+          wrap.style.cssText = 'display:flex;gap:8px;align-items:center;font-size:12px';
           const box = document.createElement('input');
           box.type = 'checkbox';
           box.dataset.device = name;
           const label = document.createElement('span');
           label.textContent = name;
-          label.style.cssText = 'min-width:180px;font-size:13px';
+          label.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
           const g = document.createElement('input');
           g.type = 'range'; g.min = '0'; g.max = '2'; g.step = '0.05';
-          g.value = gain;
-          g.title = '音量';
+          g.value = gain; g.title = '音量';
+          g.style.cssText = 'width:90px';
           const gv = document.createElement('span');
           gv.textContent = Number(gain).toFixed(2);
-          gv.style.cssText = 'font-size:12px;opacity:.7;width:34px';
+          gv.style.cssText = 'width:28px;opacity:.7';
           g.oninput = () => { gv.textContent = Number(g.value).toFixed(2); };
           const d = document.createElement('input');
           d.type = 'number'; d.min = '0'; d.max = '2000'; d.step = '10';
-          d.value = delay;
-          d.title = '延迟补偿（毫秒）';
-          d.style.cssText = 'width:74px;font-size:12px';
+          d.value = delay; d.title = '延迟补偿（毫秒）';
+          d.style.cssText = 'width:56px;font-size:12px';
           const dl = document.createElement('span');
-          dl.textContent = '毫秒延迟';
-          dl.style.cssText = 'font-size:12px;opacity:.7';
+          dl.textContent = 'ms';
+          dl.style.cssText = 'opacity:.6';
           wrap.append(box, label, g, gv, d, dl);
           list.append(wrap);
           rows.set(name, { box, g, d });
-          return box;
         }
 
         async function refresh() {
@@ -741,6 +753,10 @@ html:not(.fullui) .card .body { padding-top: 6px; }
             const data = await r.json();
             const chosen = new Map((data.devices || []).map(d => [d.name, d]));
             const all = (data.available || []).concat([...chosen.keys()]);
+            const running = (data.devices || []).filter(d => d.running);
+            summary.textContent = running.length
+              ? '正在送往 ' + running.map(d => d.name).join('、')
+              : (data.note || '未开启');
             list.innerHTML = '';
             rows.clear();
             [...new Set(all)].forEach(name => {
@@ -748,21 +764,20 @@ html:not(.fullui) .card .body { padding-top: 6px; }
               const box = row(name, have ? have.gain : 1.0, have ? have.delay_ms : 0);
               if (have) box.checked = true;
             });
-            const running = (data.devices || []).filter(d => d.running).length;
-            status.textContent = data.note + (running ? '' : '');
           } catch (err) {
-            status.textContent = '读不到状态：' + err;
+            summary.textContent = '读不到状态';
           }
         }
 
         async function apply(stop) {
           const devices = [];
-          rows.forEach((ui, name) => {
-            if (stop) return;
-            if (!ui.box.checked) return;
-            devices.push({ device: name, gain: parseFloat(ui.g.value) || 1.0,
-                           delay_ms: parseFloat(ui.d.value) || 0 });
-          });
+          if (!stop) {
+            rows.forEach((ui, name) => {
+              if (!ui.box.checked) return;
+              devices.push({ device: name, gain: parseFloat(ui.g.value) || 1.0,
+                             delay_ms: parseFloat(ui.d.value) || 0 });
+            });
+          }
           status.textContent = '正在应用…';
           try {
             const r = await fetch('/api/multiout', {
@@ -778,16 +793,10 @@ html:not(.fullui) .card .body { padding-top: 6px; }
         }
 
         document.getElementById('moApply').onclick = () => apply(false);
-        const refreshBtn = document.getElementById('moRefresh');
-        if (refreshBtn) refreshBtn.onclick = () => refresh();
-        // 隔几秒自动刷新一次，插上新耳机不用重启也不用刷新页面
-        setInterval(() => { if (!document.hidden) refresh(); }, 4000);
         document.getElementById('moStop').onclick = () => apply(true);
-        if (document.readyState === 'loading') {
-          document.addEventListener('DOMContentLoaded', refresh);
-        } else {
-          refresh();
-        }
+        document.getElementById('moRefresh').onclick = () => refresh();
+        refresh();
+        setInterval(() => { if (!document.hidden) refresh(); }, 4000);
       })();
       </script>
 <script>
