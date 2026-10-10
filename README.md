@@ -118,3 +118,23 @@ tools/               打包、自检、回收站等工具
 MIT，见 `LICENSE`。
 
 HWHHYN 用 DEEPSEEK 制作
+
+---
+
+## 怎么自己编译
+
+`ash
+python -m pip install nuitka numpy pyogg opuslib_next qrcode pillow
+python tools/build_nuitka.py          # 产物 dist_nuitka\AudioMixing.exe（约 20 MB，单文件）
+`
+
+**为什么用 Nuitka 而不是 PyInstaller**：PyInstaller 单文件模式启动时要创建临时目录解压自己，
+这个动作会被部分安全软件（火绒 HIPS、游戏加加注入）拦截，报
+`Could not create temporary directory!`。换打包器可直接绕开。
+
+⚠️ 需要 **python.org 官方版 Python**（微软商店版没有链接用库文件，Nuitka 无法编译）。
+
+⚠️ 编译时请用 python.org 版；**交付产物不要放在反复编译的目录里** ——
+那个目录可能已被安全软件按路径拦截，详见
+[docs/构建与分发.md](docs/构建与分发.md) 与
+[docs/排查实录-改名事故.md](docs/排查实录-改名事故.md)。
