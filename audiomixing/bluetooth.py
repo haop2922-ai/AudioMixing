@@ -37,7 +37,7 @@ POWERSHELL = shutil.which("powershell.exe") or shutil.which("powershell")
 # every few seconds in the background, and without this flag Windows flashes a console
 # window each time - which looks exactly like malware and cannot be ignored.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-_STATE_DIR = pathlib.Path(tempfile.gettempdir()) / "wavelink-bt"
+_STATE_DIR = pathlib.Path(tempfile.gettempdir()) / "audiomixing-bt"
 _LOCK = threading.Lock()
 
 # Shared by both scripts: awaits a WinRT IAsyncOperation from PowerShell 5.1.
@@ -101,9 +101,9 @@ if ($out.Count -eq 0) { Write-Output "[]" } else { Write-Output ($out | ConvertT
 # NOTE: `param()` is not used on purpose - it has to be the very first statement in a
 # script file, and this script starts with the Add-Type/Await preamble.
 _HOLD_SCRIPT = _AWAIT + r"""
-$deviceId = $env:WAVELINK_BT_ID
-$sentinel = $env:WAVELINK_BT_SENTINEL
-$status   = $env:WAVELINK_BT_STATUS
+$deviceId = $env:AUDIOMIXING_BT_ID
+$sentinel = $env:AUDIOMIXING_BT_SENTINEL
+$status   = $env:AUDIOMIXING_BT_STATUS
 function Write-Status($s) {
   try {
     $tmp = $status + ".tmp"
@@ -368,9 +368,9 @@ def connect(device_id: str) -> dict[str, Any]:
             script = fh.name
         env = dict(os.environ)
         env.update({
-            "WAVELINK_BT_ID": device_id,
-            "WAVELINK_BT_SENTINEL": str(sentinel),
-            "WAVELINK_BT_STATUS": str(status_file),
+            "AUDIOMIXING_BT_ID": device_id,
+            "AUDIOMIXING_BT_SENTINEL": str(sentinel),
+            "AUDIOMIXING_BT_STATUS": str(status_file),
         })
         # A fully detached process (DETACHED_PROCESS) could not bring up WinRT and
         # silently died before writing anything; CREATE_NO_WINDOW alone is enough to

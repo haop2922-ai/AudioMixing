@@ -90,7 +90,7 @@ python tools/build_exe.py
 代码结构：
 
 ```
-wavelink/
+audiomixing/
   engine.py          核心：设备、路由、播放端、本机直通、多设备输出
   net/rtpaudio.py    RTP 收发、抖动缓冲、时钟对齐
   net/discovery.py   局域网发现（UDP 47830）
@@ -98,7 +98,7 @@ wavelink/
   webui.py           控制台、监控页、诊断报告的 HTTP 服务
   ui/                控制台与各页面的前端
   bluetooth.py       手机走蓝牙进来的那一路
-wavelink_launcher.py 启动器（托盘、开监控窗、单实例）
+audiomixing_launcher.py 启动器（托盘、开监控窗、单实例）
 tools/               打包、自检、回收站等工具
 ```
 

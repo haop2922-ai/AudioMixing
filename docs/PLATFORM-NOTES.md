@@ -24,7 +24,7 @@
   PipeWire 时代用 `pw-record --target=<monitor>` 或 `parec`。
 * 计划实现：`wavelink/audio/backends/pipewire.py`，用子进程（`parec`/`pw-record`）采集、
   `pacat`/`pw-play` 播放，统一转成本项目的 float32@48k 格式。不需要 ctypes，实现成本低。
-* 如果只想快速验证，也可以先 `arecord | python -m wavelink send <host>` 走标准输入。
+* 如果只想快速验证，也可以先 `arecord | python -m audiomixing send <host>` 走标准输入。
 
 ## macOS —— 系统限制，需虚拟声卡
 
@@ -48,7 +48,7 @@
   1. 用 Kotlin 写一个最小 App：MediaProjection → AudioRecord(48k, stereo, PCM16) →
      UDP 按 `proto.py` 的格式发包。协议是公开且已经稳定的（28 字节头）。
   2. 先用 **Termux + scrcpy 的音频转发** 做验证，把 PCM 通过管道喂给
-     `python -m wavelink send <host>`（需要 Termux 里能跑 Python）。
+     `python -m audiomixing send <host>`（需要 Termux 里能跑 Python）。
   3. 先不做手机端，用蓝牙/音频线把手机声音接进一台电脑（见 `VS-PHONELINK.md` 的混合方案）。
 
 ## iOS —— 限制最严

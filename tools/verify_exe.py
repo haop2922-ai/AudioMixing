@@ -110,7 +110,7 @@ def wait_port_free(port: int, timeout: float = 10.0) -> bool:
 def ping_audio_port(port: int, timeout: float = 3.0) -> bool:
     """Send the node a PING and wait for its PONG on the audio port."""
     sys.path.insert(0, str(ROOT))
-    from wavelink import proto  # imported lazily so this script works standalone
+    from audiomixing import proto  # imported lazily so this script works standalone
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)

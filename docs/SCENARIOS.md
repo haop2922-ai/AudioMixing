@@ -17,15 +17,15 @@
 1. **主机**（插耳机的那台，比如你的笔记本）：
 
    ```powershell
-   python -m wavelink serve --name "我的笔记本" --sink-device "WH-1000XM5"
+   python -m audiomixing serve --name "我的笔记本" --sink-device "WH-1000XM5"
    ```
 
-   `--sink-device` 里的关键字用 `python -m wavelink devices` 查到的名字片段即可。
+   `--sink-device` 里的关键字用 `python -m audiomixing devices` 查到的名字片段即可。
 
 2. **其它电脑**（同样接耳机的声音源）：
 
    ```powershell
-   python -m wavelink serve --name "台式机"
+   python -m audiomixing serve --name "台式机"
    ```
 
 3. **手机**：见 [`PLATFORM-NOTES.md`](PLATFORM-NOTES.md) 的移动端说明（需要系统授权采集）。
@@ -73,10 +73,10 @@
 
    ```powershell
    :: 我的电脑
-   python -m wavelink serve --name "我的电脑" --sink-device "我的耳机"
+   python -m audiomixing serve --name "我的电脑" --sink-device "我的耳机"
 
    :: 伴侣的电脑
-   python -m wavelink serve --name "伴侣的电脑" --sink-device "她的耳机"
+   python -m audiomixing serve --name "伴侣的电脑" --sink-device "她的耳机"
    ```
 
 2. 在任意一台打开控制台，加两条路由：
@@ -116,10 +116,10 @@
 ## 快速排查命令
 
 ```powershell
-python -m wavelink doctor          # 本机链路自检（采集→网络→播放）
-python -m wavelink devices         # 设备名清单
-python -m wavelink status          # 现在有哪些设备、哪些路由、流量多少
-python -m wavelink status --json   # 给脚本/工单用
+python -m audiomixing doctor          # 本机链路自检（采集→网络→播放）
+python -m audiomixing devices         # 设备名清单
+python -m audiomixing status          # 现在有哪些设备、哪些路由、流量多少
+python -m audiomixing status --json   # 给脚本/工单用
 ```
 
 `doctor` 第 6 项会打印「真机回路测试」的 rms：如果接近 0，说明这台机器此刻没有在播放

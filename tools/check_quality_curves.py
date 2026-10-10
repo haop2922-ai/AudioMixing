@@ -20,7 +20,7 @@ import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-HTML = ROOT / "wavelink" / "ui" / "index.html"
+HTML = ROOT / "audiomixing" / "ui" / "index.html"
 
 HARNESS = r"""
 const fs = require('fs');

@@ -33,8 +33,8 @@ if "WAVELINK_HOME" not in _os.environ:
     _os.environ["WAVELINK_HOME"] = _sandbox
     _atexit.register(lambda: _shutil.rmtree(_sandbox, ignore_errors=True))
 
-from wavelink.config import Config
-from wavelink.engine import WaveLinkNode
+from audiomixing.config import Config
+from audiomixing.engine import WaveLinkNode
 
 failures: list[str] = []
 

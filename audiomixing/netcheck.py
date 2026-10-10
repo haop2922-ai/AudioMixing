@@ -4,7 +4,7 @@ Run it, then copy the whole output. Output is ASCII-only on purpose so it surviv
 copy/paste and any console code page.
 
     dist\\WaveLink.exe netcheck          (packaged)
-    python -m wavelink netcheck          (from source)
+    python -m audiomixing netcheck          (from source)
 
 What it answers:
   1. is a WaveLink node actually running, and on which port?
@@ -123,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
             status = probe_health(web_port)
     if status is None:
         line("%s no WaveLink node answers on port %d" % (BAD, web_port))
-        line("       -> start it first: dist\\WaveLink.exe  (or python -m wavelink serve)")
+        line("       -> start it first: dist\\WaveLink.exe  (or python -m audiomixing serve)")
         problems.append("node is not running")
     else:
         node = status.get("node", {})
@@ -167,9 +167,9 @@ def main(argv: list[str] | None = None) -> int:
             for r in rules.strip().splitlines():
                 line("%s %s" % (INFO, r.rstrip()))
             # Rule names are case-insensitive in Windows, but our own string check was
-            # not: a rule literally named "wavelink" failed a "WaveLink" test.
-            check_label("wavelink" in rules_lower, "WaveLink firewall rules exist")
-            if "wavelink.exe" not in rules_lower:
+            # not: a rule literally named "audiomixing" failed a "WaveLink" test.
+            check_label("audiomixing" in rules_lower, "WaveLink firewall rules exist")
+            if "audiomixing.exe" not in rules_lower:
                 line("%s the rules are not tied to WaveLink.exe (port-only rules)" % INFO)
             elif "deep blue" not in rules_lower:
                 line("%s note: the program path in the rules may be from another machine/copy" % WARN)

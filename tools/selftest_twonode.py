@@ -37,11 +37,11 @@ _SANDBOX = tempfile.mkdtemp(prefix="wavelink-selftest-")
 os.environ["WAVELINK_HOME"] = _SANDBOX
 atexit.register(lambda: shutil.rmtree(_SANDBOX, ignore_errors=True))
 
-from wavelink.audio import base as audio_base  # noqa: E402
-from wavelink.audio.format import CHANNELS, SAMPLE_RATE, make_tone, signal_report  # noqa: E402
-from wavelink.config import Config  # noqa: E402
-from wavelink.engine import WaveLinkNode  # noqa: E402
-from wavelink.webui import WebUI  # noqa: E402
+from audiomixing.audio import base as audio_base  # noqa: E402
+from audiomixing.audio.format import CHANNELS, SAMPLE_RATE, make_tone, signal_report  # noqa: E402
+from audiomixing.config import Config  # noqa: E402
+from audiomixing.engine import WaveLinkNode  # noqa: E402
+from audiomixing.webui import WebUI  # noqa: E402
 
 PASS = "PASS"
 FAIL = "FAIL"

@@ -32,10 +32,10 @@ atexit.register(lambda: shutil.rmtree(_TEST_SANDBOX, ignore_errors=True))
 
 import numpy as np  # noqa: E402
 
-from wavelink import proto  # noqa: E402
-from wavelink.config import Config  # noqa: E402
-from wavelink.audio import base as audio_base  # noqa: E402
-from wavelink.audio.format import (  # noqa: E402
+from audiomixing import proto  # noqa: E402
+from audiomixing.config import Config  # noqa: E402
+from audiomixing.audio import base as audio_base  # noqa: E402
+from audiomixing.audio.format import (  # noqa: E402
     CHANNELS,
     SAMPLE_RATE,
     Resampler,
@@ -47,9 +47,9 @@ from wavelink.audio.format import (  # noqa: E402
     saturating_mix_into,
     signal_report,
 )
-from wavelink.engine import SinkEngine, WaveLinkNode  # noqa: E402
-from wavelink.net.discovery import BeaconService, DiscoveryRegistry, build_beacon  # noqa: E402
-from wavelink.net.rtpaudio import JitterBuffer, Receiver, SenderSession, StreamInfo, stable_ssrc  # noqa: E402
+from audiomixing.engine import SinkEngine, WaveLinkNode  # noqa: E402
+from audiomixing.net.discovery import BeaconService, DiscoveryRegistry, build_beacon  # noqa: E402
+from audiomixing.net.rtpaudio import JitterBuffer, Receiver, SenderSession, StreamInfo, stable_ssrc  # noqa: E402
 
 BLOCK = 480
 
@@ -324,7 +324,7 @@ class TestAudioFormat(unittest.TestCase):
         entire buffer at once and the backlog limit discarded almost all of it - the
         panel's "can I hear it?" test tone was nearly inaudible because of this.
         """
-        from wavelink.audio.base import write_paced
+        from audiomixing.audio.base import write_paced
 
         class _Greedy:
             def __init__(self) -> None:
@@ -352,7 +352,7 @@ class TestAudioFormat(unittest.TestCase):
         and catches a regression where the reference and the real resampler drift
         apart (which would make future debugging misleading).
         """
-        from wavelink.audio.format import resample_linear
+        from audiomixing.audio.format import resample_linear
 
         frames = 4800
         src = make_tone(500.0, frames, 0.5, 1)
@@ -375,7 +375,7 @@ class TestAudioFormat(unittest.TestCase):
         delay at all. This test therefore uses a chirp, and asserts that a sine is
         genuinely ambiguous - documenting the trap rather than tripping over it.
         """
-        from wavelink.audio.format import Chirp, best_lag
+        from audiomixing.audio.format import Chirp, best_lag
 
         shift = 37
         chirp = Chirp(300.0, 3000.0, seconds=0.4)
@@ -445,7 +445,7 @@ class TestAudioFormat(unittest.TestCase):
         import tempfile
         import wave
 
-        from wavelink.config import Config
+        from audiomixing.config import Config
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             path = os.path.join(tmp, "mix.wav")
@@ -959,7 +959,7 @@ class TestRouting(unittest.TestCase):
         """
         import array as _array
 
-        from wavelink.audio.capture import MixReader
+        from audiomixing.audio.capture import MixReader
 
         class _Tap:
             """Stands in for a TapReader, feeding one block per read."""
@@ -1085,7 +1085,7 @@ class TestRouting(unittest.TestCase):
 
 
 def _config_stub(name: str = "test", node_id: str = "node-test"):
-    from wavelink.config import Config
+    from audiomixing.config import Config
 
     cfg = Config()
     cfg.node_id = node_id
@@ -1155,7 +1155,7 @@ class TestCaptureHub(unittest.TestCase):
             return {"name": self.name}
 
     def test_a_capture_without_consumers_is_released(self):
-        from wavelink.audio.capture import CaptureHub
+        from audiomixing.audio.capture import CaptureHub
 
         hub = CaptureHub()
         hub.configure(lambda spec: self._FakeSource())
@@ -1247,7 +1247,7 @@ class TestRoutePortability(unittest.TestCase):
         The merge keeps every route whose owner is someone else, so it restored the
         route from the current table and the delete appeared to do nothing.
         """
-        from wavelink.webui import WaveLinkApi
+        from audiomixing.webui import WaveLinkApi
 
         self.a.set_routes([{"id": "theirs", "from": ["node-b"], "to": ["node-a"]}], persist=False,
                           author_id="node-b", author_name="B机")
@@ -1275,7 +1275,7 @@ class TestRoutePortability(unittest.TestCase):
 
     def test_any_panel_can_adjust_any_route(self):
         """The volume slider lives on whichever machine is doing the playing."""
-        from wavelink.webui import WaveLinkApi
+        from audiomixing.webui import WaveLinkApi
 
         self.a.set_routes([{"id": "theirs", "from": ["node-b"], "to": ["node-a"], "gain": 1.0}],
                           persist=False, author_id="node-b", author_name="B机")
@@ -1350,7 +1350,7 @@ class TestRenderLoop(unittest.TestCase):
             return 0
 
         def write(self, samples) -> int:
-            from wavelink.audio.format import as_float_array
+            from audiomixing.audio.format import as_float_array
 
             arr = as_float_array(samples)
             take = min(self.per_call, len(arr) // CHANNELS)
@@ -1396,13 +1396,13 @@ class TestPhoneTap(unittest.TestCase):
     talks to mirrors what it plays over WebSocket instead."""
 
     def test_ws_accept_matches_the_rfc_example(self):
-        from wavelink.webui import ws_accept
+        from audiomixing.webui import ws_accept
 
         # RFC 6455 section 1.3 - the one published test vector.
         self.assertEqual(ws_accept("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
 
     def test_ws_frame_encodes_all_three_length_forms(self):
-        from wavelink.webui import ws_frame
+        from audiomixing.webui import ws_frame
 
         self.assertEqual(ws_frame(b"abc")[:2], bytes([0x82, 3]))
         medium = ws_frame(b"x" * 200)
@@ -1413,7 +1413,7 @@ class TestPhoneTap(unittest.TestCase):
         self.assertEqual(ws_frame(b"", opcode=0xA)[:2], bytes([0x8A, 0]), "a pong frame")
 
     def test_tap_fans_out_to_every_listener(self):
-        from wavelink.audio.tap import AudioTap
+        from audiomixing.audio.tap import AudioTap
 
         tap = AudioTap()
         first, second = tap.subscribe(), tap.subscribe()
@@ -1426,7 +1426,7 @@ class TestPhoneTap(unittest.TestCase):
 
     def test_a_stalled_listener_cannot_grow_without_bound(self):
         """A phone paused in a background tab must not stall playback or eat memory."""
-        from wavelink.audio.tap import AudioTap
+        from audiomixing.audio.tap import AudioTap
 
         tap = AudioTap(max_blocks=4)
         sid = tap.subscribe()
@@ -1436,7 +1436,7 @@ class TestPhoneTap(unittest.TestCase):
         self.assertGreater(tap.stats()["dropped_blocks"], 0, "and the drops must be counted")
 
     def test_pcm16_clips_instead_of_wrapping(self):
-        from wavelink.audio.tap import to_pcm16
+        from audiomixing.audio.tap import to_pcm16
 
         values = struct.unpack("<5h", to_pcm16([0.0, 1.0, -1.0, 2.0, -2.0]))
         self.assertEqual(values, (0, 32767, -32767, 32767, -32767))
@@ -1457,7 +1457,7 @@ class TestPhoneTap(unittest.TestCase):
         self.assertEqual(audio_base.spec_for_selector(base, "")["device"], "@default")
 
     def test_write_paced_reports_every_block(self):
-        from wavelink.audio.base import write_paced
+        from audiomixing.audio.base import write_paced
 
         seen: list[int] = []
 
@@ -1482,7 +1482,7 @@ class TestBluetoothBridge(unittest.TestCase):
     """
 
     def test_the_parser_accepts_both_json_shapes(self):
-        from wavelink import bluetooth as bt
+        from audiomixing import bluetooth as bt
 
         original = bt._run
         try:
@@ -1508,7 +1508,7 @@ class TestBluetoothBridge(unittest.TestCase):
         """
         import json as _json
 
-        from wavelink import bluetooth as bt
+        from audiomixing import bluetooth as bt
 
         device = {"id": r"\\?\BTHENUM#x\SNK", "name": "手机A", "state": "Opened", "endpoint": True}
         original_run, original_dir = bt._run, bt._STATE_DIR
@@ -1530,12 +1530,12 @@ class TestBluetoothBridge(unittest.TestCase):
             bt._run, bt._STATE_DIR = original_run, original_dir
 
     def test_connect_without_an_id_is_refused(self):
-        from wavelink import bluetooth as bt
+        from audiomixing import bluetooth as bt
 
         self.assertFalse(bt.connect("")["ok"])
 
     def test_the_helper_key_is_stable_and_path_safe(self):
-        from wavelink import bluetooth as bt
+        from audiomixing import bluetooth as bt
 
         device_id = r"\\?\BTHENUM#{0000110a-...#abc\SNK"
         first = bt._key(device_id)
@@ -1553,8 +1553,8 @@ class TestLocalLoop(unittest.TestCase):
     """
 
     def test_the_local_loop_carries_capture_into_render(self):
-        from wavelink.audio.local import LocalLoop
-        from wavelink.audio.tap import AudioTap
+        from audiomixing.audio.local import LocalLoop
+        from audiomixing.audio.tap import AudioTap
 
         source = audio_base.open_source({"backend": "null", "device": "tone:1000"})
         sink = audio_base.open_sink({"backend": "null", "device": "null"})
@@ -1574,7 +1574,7 @@ class TestLocalLoop(unittest.TestCase):
         self.assertGreater(len(tap.drain(sid)), 0, "the phone listener page hears it too")
 
     def test_a_loop_that_cannot_open_reports_instead_of_crashing(self):
-        from wavelink.audio.local import LocalLoop
+        from audiomixing.audio.local import LocalLoop
 
         class _Broken:
             endpoint_name = "broken"
@@ -1617,7 +1617,7 @@ class TestStartupPreset(unittest.TestCase):
         self.addCleanup(self.node.stop)
 
     def test_only_the_ticked_phones_are_connected(self):
-        from wavelink import bluetooth as bt
+        from audiomixing import bluetooth as bt
 
         devices = [
             {"id": "id-A", "name": "手机A", "link": "off", "held": False},
@@ -1648,7 +1648,7 @@ class TestStartupPreset(unittest.TestCase):
         self.assertEqual(sorted(done), ["手机A", "手机C"], "an already-open phone counts as done")
 
     def test_nothing_is_connected_when_nothing_is_ticked(self):
-        from wavelink import bluetooth as bt
+        from audiomixing import bluetooth as bt
 
         opened: list[str] = []
         original = bt.connect
@@ -1688,7 +1688,7 @@ class TestNetworkMic(unittest.TestCase):
         mic.push(buf.tobytes())
 
     def test_pushed_audio_reads_back_as_a_real_capture_device(self):
-        from wavelink.audio.backends import netmic
+        from audiomixing.audio.backends import netmic
 
         mic = netmic.open_mic("测试手机", SAMPLE_RATE)
         try:
@@ -1713,7 +1713,7 @@ class TestNetworkMic(unittest.TestCase):
             while time.time() < deadline:
                 got.extend(mic.read())
             self.assertGreater(len(got), 20000, "it must run at real time")
-            from wavelink.audio.format import peak as _peak
+            from audiomixing.audio.format import peak as _peak
 
             self.assertAlmostEqual(_peak(got), 12000 / 32768.0, places=2)
             self.assertAlmostEqual(measure_frequency(got), 1000.0, delta=30.0)
@@ -1723,7 +1723,7 @@ class TestNetworkMic(unittest.TestCase):
 
     def test_a_phone_that_stops_sending_is_dropped(self):
         """Walking out of Wi-Fi range must not leave a dead device in the pickers."""
-        from wavelink.audio.backends import netmic
+        from audiomixing.audio.backends import netmic
 
         mic = netmic.open_mic("走远的手机", SAMPLE_RATE)
         try:
@@ -1736,7 +1736,7 @@ class TestNetworkMic(unittest.TestCase):
             netmic.close_mic("走远的手机", mic)
 
     def test_an_odd_byte_count_does_not_corrupt_the_stream(self):
-        from wavelink.audio.backends import netmic
+        from audiomixing.audio.backends import netmic
 
         mic = netmic.open_mic("半字节手机", SAMPLE_RATE)
         try:
@@ -1771,7 +1771,7 @@ class TestNoMachineSpecificCode(unittest.TestCase):
     }
 
     def test_the_shipped_package_names_no_particular_machine(self):
-        root = pathlib.Path(__file__).resolve().parent.parent / "wavelink"
+        root = pathlib.Path(__file__).resolve().parent.parent / "audiomixing"
         offenders: list[str] = []
         for path in sorted(root.rglob("*")):
             if not path.is_file() or path.suffix not in (".py", ".html", ".js"):
@@ -1788,7 +1788,7 @@ class TestWedgedCapture(unittest.TestCase):
     """A source whose read() never returns used to freeze the pipeline silently."""
 
     def test_a_capture_that_never_produced_a_block_is_wedged(self):
-        from wavelink.audio.capture import WEDGED_AFTER_S, _Capture
+        from audiomixing.audio.capture import WEDGED_AFTER_S, _Capture
 
         class _Blocked:
             name = "blocked"
@@ -1824,7 +1824,7 @@ class TestWedgedCapture(unittest.TestCase):
         import pathlib as _path
         import re as _re
 
-        root = _path.Path(__file__).resolve().parent.parent / "wavelink"
+        root = _path.Path(__file__).resolve().parent.parent / "audiomixing"
         # Which functions of each module take that module's lock?
         takers: dict[str, set[str]] = {}
         sources: dict[str, str] = {}
@@ -1868,9 +1868,9 @@ class TestWedgedCapture(unittest.TestCase):
         Bluetooth was missing from the machine's own status even while the Bluetooth
         card showed it playing.
         """
-        from wavelink import bluetooth as bt_mod
-        from wavelink import config as config_mod
-        from wavelink import engine as engine_mod
+        from audiomixing import bluetooth as bt_mod
+        from audiomixing import config as config_mod
+        from audiomixing import engine as engine_mod
 
         node = engine_mod.WaveLinkNode(config_mod.Config(), audio_port=free_udp_port(),
                                        discovery_port=free_udp_port(), simulate=True)
@@ -1918,8 +1918,8 @@ class TestTodayRegressions(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        from wavelink.config import Config
-        from wavelink.engine import WaveLinkNode
+        from audiomixing.config import Config
+        from audiomixing.engine import WaveLinkNode
 
         cfg = Config()
         cfg.node_id = "self-node"
@@ -2025,7 +2025,7 @@ class TestTodayRegressions(unittest.TestCase):
         但返回 numpy 数组时真值判断会抛异常，整包被丢弃 —— 现场就是
         "Opus 编码的点对点完全没声音"。这条测试直接守住那个写法。
         """
-        from wavelink.audio import opus as op
+        from audiomixing.audio import opus as op
 
         if not op.available():
             self.skipTest("这台机器没有 Opus 库")
@@ -2049,7 +2049,7 @@ class TestTodayRegressions(unittest.TestCase):
         """
         import numpy as np
 
-        from wavelink.audio import opus as op
+        from audiomixing.audio import opus as op
 
         if not op.available():
             self.skipTest("这台机器没有 Opus 库：%s" % op.load_error())
@@ -2069,7 +2069,7 @@ class TestTodayRegressions(unittest.TestCase):
         状态接口对 self.sinks 里每个对象都调 describe()。占位对象少了这个方法，
         /api/status 直接 500 —— 现场就是"一打开只听，监控页就报错"。
         """
-        from wavelink.engine import _SinkFeed
+        from audiomixing.engine import _SinkFeed
 
         class _Holder:
             route_id = "primary"
@@ -2107,9 +2107,9 @@ class TestTodayRegressions(unittest.TestCase):
         """
         import wave
 
-        from wavelink.audio.capture import CaptureHub
-        from wavelink.audio.format import CHANNELS, SAMPLE_RATE, make_tone
-        from wavelink.audio.multiout import MultiOut
+        from audiomixing.audio.capture import CaptureHub
+        from audiomixing.audio.format import CHANNELS, SAMPLE_RATE, make_tone
+        from audiomixing.audio.multiout import MultiOut
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             a = os.path.join(tmp, "one.wav")
@@ -2157,7 +2157,7 @@ class TestTodayRegressions(unittest.TestCase):
 
     def test_the_default_sink_is_a_real_sound_card(self) -> None:
         """默认播放后端必须是真实声卡，绝不能是写文件。"""
-        from wavelink.audio import base as audio_base
+        from audiomixing.audio import base as audio_base
 
         spec = self.node.default_sink_spec()
         self.assertIn(spec["backend"], ("wasapi", "null", "coreaudio", "pipewire", "pulse"),

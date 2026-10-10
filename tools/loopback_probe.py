@@ -29,8 +29,8 @@ if "WAVELINK_HOME" not in _os.environ:
     _sandbox = _tempfile.mkdtemp(prefix="wavelink-check-")
     _os.environ["WAVELINK_HOME"] = _sandbox
     _atexit.register(lambda: _shutil.rmtree(_sandbox, ignore_errors=True))
-from wavelink.audio.base import open_sink, open_source, write_paced
-from wavelink.audio.format import CHANNELS, SAMPLE_RATE, make_tone, measure_frequency, peak, rms, signal_report
+from audiomixing.audio.base import open_sink, open_source, write_paced
+from audiomixing.audio.format import CHANNELS, SAMPLE_RATE, make_tone, measure_frequency, peak, rms, signal_report
 
 SCAN = "--scan" in sys.argv
 _POSITIONAL = [a for a in sys.argv[1:] if not a.startswith("--")]
@@ -95,8 +95,8 @@ def _print_role_defaults() -> None:
     up capturing (or rendering to) a device that never carries the real sound.
     """
     try:
-        from wavelink.audio.backends import wasapi as W
-        from wavelink.audio.backends import wasapi_com as wc
+        from audiomixing.audio.backends import wasapi as W
+        from audiomixing.audio.backends import wasapi_com as wc
 
         W._ensure_com()
         enum = wc.create_device_enumerator()
@@ -121,7 +121,7 @@ def scan(seconds: float) -> int:
     """Report the live signal level of every loopback (playback) endpoint."""
     import numpy as np
 
-    from wavelink.audio import base as audio_base
+    from audiomixing.audio import base as audio_base
 
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -139,7 +139,7 @@ def scan(seconds: float) -> int:
         print("  没有找到可环回采集的播放设备")
         return 1
 
-    from wavelink.engine import WaveLinkNode
+    from audiomixing.engine import WaveLinkNode
 
     virtual_hints = WaveLinkNode._VIRTUAL_HINTS
     live = []

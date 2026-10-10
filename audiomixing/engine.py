@@ -1162,7 +1162,7 @@ class WaveLinkNode:
             if not session.supported:
                 self.note("codec %s unavailable, falling back to pcm_s16" % rule["codec"])
                 session.codec = proto.CODEC_PCM_S16
-                session._encoder = __import__("wavelink.proto", fromlist=["x"]).encode_pcm_s16
+                session._encoder = __import__("audiomixing.proto", fromlist=["x"]).encode_pcm_s16
             try:
                 self.sender.add(rid, session)
                 self.note("sending %s -> %s:%d (%s)" % (rid, target.host, target.audio_port, target.name))

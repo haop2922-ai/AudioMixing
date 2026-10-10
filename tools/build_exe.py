@@ -29,7 +29,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DIST = ROOT / "dist"
 BUILD = ROOT / "build"
-ICON = ROOT / "tools" / "wavelink.ico"
+ICON = ROOT / "tools" / "audiomixing.ico"
 NAME = "AudioMixing"
 
 
@@ -132,15 +132,15 @@ def _verify_imports() -> bool:
     """打包前先确认关键模块能导入。
 
     之前我把 import 插到 from __future__ 之前，整个 engine 模块加载失败，
-    打出来的 exe 一启动就报 No module named 'wavelink.engine'。
+    打出来的 exe 一启动就报 No module named 'audiomixing.engine'。
     在打包前跑一次导入，这类错误立刻暴露。
     """
     import importlib
 
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
-    for name in ("wavelink.engine", "wavelink.cli", "wavelink.webui", "wavelink.tray",
-                 "wavelink.bluetooth"):
+    for name in ("audiomixing.engine", "audiomixing.cli", "audiomixing.webui", "audiomixing.tray",
+                 "audiomixing.bluetooth"):
         try:
             importlib.import_module(name)
         except Exception as exc:
@@ -240,33 +240,33 @@ def main() -> int:
         # The control panel is a real file so the UI can be edited without touching
         # Python; it must travel inside the bundle.
         "--add-data",
-        "%s%s%s" % (ROOT / "wavelink" / "ui", os.pathsep, "wavelink/ui"),
-        "--hidden-import", "wavelink.tray",
-           "--hidden-import", "wavelink.audio.opus",
+        "%s%s%s" % (ROOT / "audiomixing" / "ui", os.pathsep, "audiomixing/ui"),
+        "--hidden-import", "audiomixing.tray",
+           "--hidden-import", "audiomixing.audio.opus",
            "--hidden-import", "opuslib_next",
            "--collect-all", "pyogg",
            "--hidden-import", "qrcode",
            "--collect-all", "qrcode",
            "--hidden-import",
-        "wavelink.audio.backends.wasapi",
+        "audiomixing.audio.backends.wasapi",
         "--hidden-import",
-        "wavelink.audio.backends.wasapi_com",
+        "audiomixing.audio.backends.wasapi_com",
         "--hidden-import",
-        "wavelink.audio.backends.file",
+        "audiomixing.audio.backends.file",
         "--hidden-import",
-        "wavelink.audio.backends.null",
+        "audiomixing.audio.backends.null",
         "--hidden-import",
-        "wavelink.net.discovery",
+        "audiomixing.net.discovery",
         "--hidden-import",
-        "wavelink.net.rtpaudio",
+        "audiomixing.net.rtpaudio",
         "--hidden-import",
-        "wavelink.netcheck",
+        "audiomixing.netcheck",
         "--hidden-import",
-        "wavelink.webui",
+        "audiomixing.webui",
     ]
     if icon is not None:
         cmd += ["--icon", str(icon)]
-    cmd.append(str(ROOT / "wavelink_launcher.py"))
+    cmd.append(str(ROOT / "audiomixing_launcher.py"))
 
     print("[build] 开始打包（首次会慢一些）…")
     proc = subprocess.run(cmd, cwd=str(ROOT))

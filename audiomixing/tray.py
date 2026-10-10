@@ -125,7 +125,7 @@ def add_firewall_rules() -> str:
 
     frozen = getattr(sys, "frozen", False)
     exe = sys.executable if frozen else os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "wavelink_launcher.py"))
+        os.path.join(os.path.dirname(__file__), "..", "audiomixing_launcher.py"))
 
     # 不带 chcp：批处理文件用系统编码写，控制台保持系统编码，中文路径才不会变乱码
     lines = ["@echo off"]

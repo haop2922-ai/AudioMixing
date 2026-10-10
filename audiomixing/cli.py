@@ -1,11 +1,11 @@
 """WaveLink command line interface.
 
-    wavelink devices                 list capture/playback devices
-    wavelink serve                   run the node + web control panel
-    wavelink status                  print the state of a running node
-    wavelink route add|list|rm|set   manage the route table (pushes to the LAN)
-    wavelink send / play             direct one-shot streaming without the daemon
-    wavelink peer add|list           manual peers for AP-isolated networks
+    audiomixing devices                 list capture/playback devices
+    audiomixing serve                   run the node + web control panel
+    audiomixing status                  print the state of a running node
+    audiomixing route add|list|rm|set   manage the route table (pushes to the LAN)
+    audiomixing send / play             direct one-shot streaming without the daemon
+    audiomixing peer add|list           manual peers for AP-isolated networks
     wavelink doctor                  end-to-end self test on this machine
 """
 
@@ -346,7 +346,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
         print("无法连接本机控制台 (端口 %d): %s" % (port, exc))
-        print("先运行: wavelink serve")
+        print("先运行: audiomixing serve")
         return 1
     if args.json:
         _print(data)
@@ -840,7 +840,7 @@ def _doctor_body(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="wavelink", description="把多台设备的声音投射到指定的音响设备（局域网）")
+    p = argparse.ArgumentParser(prog="audiomixing", description="把多台设备的声音投射到指定的音响设备（局域网）")
     p.add_argument("--version", action="version", version="wavelink %s" % __version__)
     sub = p.add_subparsers(dest="cmd")
 

@@ -81,7 +81,7 @@
    屏蔽组播的路由器。
 2. **mDNS/DNS-SD（兼容层）**：注册 `_wavelink._udp.local`（PTR/SRV/TXT），
    方便将来的原生客户端和 `dns-sd -B` 调试。（本仓库先实现信标；mDNS 解析器可选实现。）
-3. **手动添加**：`wavelink peer add 192.168.1.23`，用于 AP 隔离 / 跨网段场景。
+3. **手动添加**：`audiomixing peer add 192.168.1.23`，用于 AP 隔离 / 跨网段场景。
 
 ## 5. 同步与抖动
 
@@ -158,7 +158,7 @@ wavelink/
     engine.py         节点引擎：把配置变成线程与流
     config.py         ~/.wavelink/config.json
     webui.py          控制台 HTTP 服务 + 单页 UI
-    cli.py            wavelink devices|serve|send|play|route|doctor
+    cli.py            audiomixing devices|serve|send|play|route|doctor
   tools/              真机验证脚本
   tests/              单元测试 + 端到端测试
 ```

@@ -41,7 +41,7 @@ import time
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-PKG = ROOT / "wavelink"
+PKG = ROOT / "audiomixing"
 
 findings: list[tuple[str, str, str]] = []   # (severity, area, message)
 FIX = False
@@ -79,7 +79,7 @@ def audit_environment() -> None:
         except (OSError, subprocess.TimeoutExpired):
             out = ""
         if "AudioMixing.exe" in out:
-            count = out.lower().count("wavelink.exe")
+            count = out.lower().count("audiomixing.exe")
             ports: list[str] = []
             try:
                 cfg = pathlib.Path(os.environ.get("APPDATA", "")) / "WaveLink" / "config.json"
@@ -315,7 +315,7 @@ def audit_project() -> None:
     #    converters) and nothing caught it until tests failed. Pin the names that the
     #    rest of the project imports, so a silent removal becomes a loud failure.
     CRITICAL = {
-        "wavelink/audio/format.py": [
+        "audiomixing/audio/format.py": [
             "make_tone", "Chirp", "to_float32", "from_float32_f32", "from_float32_s16",
             "from_float32_fmt", "channel_map", "Resampler", "resample_linear", "peak",
             "rms", "saturating_mix_into", "apply_gain", "signal_report",
@@ -323,14 +323,14 @@ def audit_project() -> None:
             "to_mono", "as_float_array", "clamp", "ms_to_frames", "frames_to_ms",
             "bytes_per_frame", "frames_to_samples",
         ],
-        "wavelink/proto.py": [
+        "audiomixing/proto.py": [
             "Packet", "decode", "encode_payload", "decode_payload", "ClockSync",
             "ping_body", "pong_body", "clock_sample", "StreamStats",
         ],
-        "wavelink/net/rtpaudio.py": ["Receiver", "SenderSession", "Sender", "JitterBuffer"],
-        "wavelink/audio/capture.py": ["CaptureHub", "TapReader"],
-        "wavelink/engine.py": ["WaveLinkNode"],
-        "wavelink/webui.py": ["WebUI", "index_html"],
+        "audiomixing/net/rtpaudio.py": ["Receiver", "SenderSession", "Sender", "JitterBuffer"],
+        "audiomixing/audio/capture.py": ["CaptureHub", "TapReader"],
+        "audiomixing/engine.py": ["WaveLinkNode"],
+        "audiomixing/webui.py": ["WebUI", "index_html"],
     }
     missing_api: list[str] = []
     for rel, names in CRITICAL.items():

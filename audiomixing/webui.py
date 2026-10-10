@@ -1786,7 +1786,7 @@ def index_html() -> str:
     # Frozen (PyInstaller): --add-data drops files under sys._MEIPASS.
     base = getattr(sys, "_MEIPASS", None)
     if base:
-        candidates.append(Path(base) / "wavelink" / "ui" / "index.html")
+        candidates.append(Path(base) / "audiomixing" / "ui" / "index.html")
         candidates.append(Path(base) / "ui" / "index.html")
     # Source checkout / installed package.
     candidates.append(Path(__file__).resolve().parent / "ui" / "index.html")
@@ -1812,7 +1812,7 @@ def mic_html() -> str:
     candidates: list[Path] = []
     base = getattr(sys, "_MEIPASS", None)
     if base:
-        candidates.append(Path(base) / "wavelink" / "ui" / "mic.html")
+        candidates.append(Path(base) / "audiomixing" / "ui" / "mic.html")
         candidates.append(Path(base) / "ui" / "mic.html")
     candidates.append(Path(__file__).resolve().parent / "ui" / "mic.html")
 
@@ -1840,8 +1840,8 @@ def apk_path() -> Path | None:
         candidates.append(Path(env))
     base = getattr(sys, "_MEIPASS", None)
     if base:
-        candidates.append(Path(base) / "wavelink" / "ui" / "AudioMixing-mic.apk")
-    candidates.append(Path(base) / "wavelink" / "ui" / "wavelink-mic.apk")
+        candidates.append(Path(base) / "audiomixing" / "ui" / "AudioMixing-mic.apk")
+    candidates.append(Path(base) / "audiomixing" / "ui" / "wavelink-mic.apk")
     here = Path(__file__).resolve().parent
     candidates.append(here / "ui" / "AudioMixing-mic.apk")
     candidates.append(here / "ui" / "wavelink-mic.apk")
@@ -2162,7 +2162,7 @@ def app_html() -> str:
     candidates: list[Path] = []
     base = getattr(sys, "_MEIPASS", None)
     if base:
-        candidates.append(Path(base) / "wavelink" / "ui" / "app.html")
+        candidates.append(Path(base) / "audiomixing" / "ui" / "app.html")
         candidates.append(Path(base) / "ui" / "app.html")
     candidates.append(Path(__file__).resolve().parent / "ui" / "app.html")
 
@@ -2201,7 +2201,7 @@ def listen_html() -> str:
     candidates: list[Path] = []
     base = getattr(sys, "_MEIPASS", None)
     if base:
-        candidates.append(Path(base) / "wavelink" / "ui" / "listen.html")
+        candidates.append(Path(base) / "audiomixing" / "ui" / "listen.html")
         candidates.append(Path(base) / "ui" / "listen.html")
     candidates.append(Path(__file__).resolve().parent / "ui" / "listen.html")
 

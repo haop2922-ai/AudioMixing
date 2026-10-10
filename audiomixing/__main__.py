@@ -1,4 +1,4 @@
-"""Allow `python -m wavelink ...`."""
+"""Allow `python -m audiomixing ...`."""
 
 from .cli import main
 

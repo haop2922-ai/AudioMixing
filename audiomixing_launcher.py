@@ -271,10 +271,10 @@ def _existing_node_address() -> str:
 def run_service() -> int:
     """起节点并打开监控窗，自己不占窗口。"""
     try:
-        from wavelink.config import Config
-        from wavelink.engine import WaveLinkNode
-        from wavelink.net import discovery as disc
-        from wavelink.webui import WebUI
+        from audiomixing.config import Config
+        from audiomixing.engine import WaveLinkNode
+        from audiomixing.net import discovery as disc
+        from audiomixing.webui import WebUI
 
         cfg = Config.load()
         port = int(cfg.web_port)
@@ -310,7 +310,7 @@ def run_service() -> int:
             _close_panel_windows()
 
         # 托盘图标是唯一的控制入口：程序没有窗口，所以必须有个地方能停它。
-        from wavelink.tray import Tray
+        from audiomixing.tray import Tray
 
         tray = Tray(address, on_quit=stop_everything)
         _log("准备在托盘中显示图标")
@@ -344,7 +344,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
     if argv:
-        from wavelink.cli import main as cli_main
+        from audiomixing.cli import main as cli_main
 
         return cli_main(argv)
 

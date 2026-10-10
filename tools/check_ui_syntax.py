@@ -16,7 +16,7 @@ import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-HTML = ROOT / "wavelink" / "ui" / "index.html"
+HTML = ROOT / "audiomixing" / "ui" / "index.html"
 
 
 def find_node() -> str | None:
@@ -54,7 +54,7 @@ def main() -> int:
     print("[%s] 元素 id 引用完整%s" % ("PASS" if not missing else "FAIL", "" if not missing else " 缺失 " + ",".join(missing)))
 
     # 3. every API path the page calls must exist in webui.py
-    py = (ROOT / "wavelink" / "webui.py").read_text(encoding="utf-8")
+    py = (ROOT / "audiomixing" / "webui.py").read_text(encoding="utf-8")
     server_paths = set(re.findall(r'path == "(/api/[a-z\-/]+)"', py))
     ui_paths = set(re.findall(r"api\('(/api/[a-z\-/]+)'", js)) | set(re.findall(r"fetch\('(/api/[a-z\-/]+)'", js))
     unknown = sorted(p for p in ui_paths if p not in server_paths)

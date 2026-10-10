@@ -17,6 +17,24 @@ CONFIG_VERSION = 1
 
 
 # HWHHYN 用 DEEPSEEK 制作
+def _migrate_old_dir(new_dir: "Path") -> None:
+    """把旧的 %APPDATA%\\WaveLink 整棵复制到新目录（只做一次）。
+
+    用户的设备选择、路由表、蓝牙配对都在里面 —— 直接换路径会让它们凭空消失。
+    复制而不是移动：万一下次还要跑老版本，老目录仍然完整。
+    """
+    import shutil
+
+    try:
+        old = new_dir.parent / "WaveLink"
+        if new_dir.exists() or not old.is_dir():
+            return
+        shutil.copytree(old, new_dir, dirs_exist_ok=True)
+    except Exception:
+        # 迁移失败不影响启动：大不了回到默认设置
+        pass
+
+
 def config_dir() -> Path:
     override = os.environ.get("WAVELINK_HOME")
     if override:
@@ -24,11 +42,13 @@ def config_dir() -> Path:
     system = platform.system()
     if system == "Windows":
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
-        return Path(base) / "WaveLink"
+        target = Path(base) / "AudioMixing"
+        _migrate_old_dir(target)
+        return target
     if system == "Darwin":
-        return Path.home() / "Library" / "Application Support" / "WaveLink"
+        return Path.home() / "Library" / "Application Support" / "AudioMixing"
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return Path(base) / "wavelink"
+    return Path(base) / "audiomixing"
 
 
 def config_path() -> Path:
@@ -36,7 +56,7 @@ def config_path() -> Path:
 
 
 def default_node_name() -> str:
-    host = socket.gethostname() or "wavelink"
+    host = socket.gethostname() or "audiomixing"
     return host
 
 
