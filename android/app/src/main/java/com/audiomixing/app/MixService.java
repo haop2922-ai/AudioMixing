@@ -95,6 +95,14 @@ public class MixService extends Service {
         String action = (intent == null) ? null : intent.getAction();
         if (ACTION_STOP.equals(action)) {
             engine.stop();
+            // 必须先摘掉前台身份再去掉通知：只 stopSelf() 的话，
+            // 部分 ROM 上那条"正在运行"会一直挂在通知栏里，用户以为还没停。
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE);
+            } catch (Throwable t) {
+                Log.w(TAG, "停止前台状态失败", t);
+            }
+            foreground = false;
             removeNotification();
             stopSelf();
             return START_NOT_STICKY;
@@ -169,8 +177,9 @@ public class MixService extends Service {
     }
 
     private void goForeground() {
-        Notification n = build(buildText());
-        lastText = buildText();
+        String text = buildText();
+        lastText = text;
+        Notification n = build(text);
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(NOTI_ID, n, foregroundTypes());
