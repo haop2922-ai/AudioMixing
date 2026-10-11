@@ -264,6 +264,8 @@ public final class Diagnosis {
         sb.append("音频端口：").append(e.audioPort()).append("（UDP，收发都用它）\n");
         sb.append("收听名单：").append(e.listeningCount()).append(" 台 → ")
                 .append(e.listenTargetsText()).append('\n');
+        // ★ 听广播（频道）：这是"电脑在广播、手机要能听见"的唯一入口，报告里必须有。
+        sb.append("听广播  ：").append(e.isChannelListening() ? "已打开 ✓（谁来都听）" : "没开 ✗").append('\n');
         sb.append("送声目标：").append(e.sendTargetText()).append('\n');
         sb.append("运行状态：发现 ").append(onOff(e.discoveryRunning()))
                 .append(" / 接收器 ").append(onOff(e.receiverRunning()))
@@ -272,6 +274,28 @@ public final class Diagnosis {
                 .append("（1.00 = 原样）\n");
         sb.append("统计包  ：已发 ").append(e.statsPacketsSent())
                 .append(" 个（每 2 秒一次，收发双方互报）\n");
+
+        // ── ★ 声音来源（送什么）──
+        // 用户被"手机只采了麦克风"误导过一次（那是对讲机，不是他要的桌面音频），
+        // 所以这一段把"选了什么、实际采的是什么、为什么不一致、支不支持、是不是一直静音"
+        // 全部写出来 —— 采不到声音时，这几行就是定性用的证据。
+        sb.append("\n【声音来源（送什么）】\n");
+        sb.append("当前选择：").append(e.sourceNameText()).append('\n');
+        sb.append("实际采集：").append(e.activeSourceText()).append('\n');
+        sb.append("系统支持：").append(e.playbackSupportText()).append('\n');
+        sb.append("授权状态：").append(e.projectionStateText()).append('\n');
+        sb.append("采集格式：").append(e.captureFormatText()).append('\n');
+        sb.append("静音情况：").append(e.silenceText()).append('\n');
+        String srcHint = e.silenceHintText();
+        if (srcHint != null && srcHint.length() > 0) {
+            sb.append("提醒    ：").append(srcHint).append('\n');
+        }
+        String pending = e.pendingSendId();
+        if (pending != null && pending.length() > 0) {
+            sb.append("等待中  ：正在等系统的投屏授权回来（授权后就送给 ").append(pending).append("）\n");
+        }
+        sb.append("（采本机声音的限制：安卓 10 以下没有这个能力；DRM 保护的内容和\n")
+                .append("  主动禁止被采集的 App 采不到，会是静音；少数厂商 ROM 阉割了该接口。）\n");
 
         // ── 发现 ──
         sb.append("\n【发现（信标）】\n");
@@ -296,14 +320,41 @@ public final class Diagnosis {
         sb.append("\n【接收（我听别人）】\n");
         AudioRecv.Stats st = e.recvStats();
         if (st == null) {
-            sb.append("接收器没在运行（没点过任何一台的「🎧 收听」）。\n");
+            sb.append("接收器没在运行（没点过任何一台的「🎧 收听」，也没开「📻 听广播」）。\n");
         } else {
+            sb.append("听广播  ：").append(e.isChannelListening()
+                    ? "开着（接收端不按名单过滤，谁来都听）" : "没开（只收点过「收听」的那几台）").append('\n');
             sb.append("已收包  ：").append(st.received).append(" 包\n");
             sb.append("丢包    ：").append(st.lost).append("（迟到 ").append(st.late)
                     .append(" · 重复 ").append(st.duplicates).append("）\n");
             sb.append("坏包    ：").append(st.badPackets).append("（控制包 ").append(st.controls)
                     .append(" · 按名单过滤 ").append(st.filtered)
                     .append(" · 自愈 ").append(st.recoveries).append("）\n");
+            // ★ 坏包按原因分开报（2026-10-12 真机反馈）：原来只有一个"坏包 3220"的总数，
+            //   报告里只解释了其中 49 个，剩下 3171 个只能猜 —— 有数字没线索是最难受的排查状态。
+            sb.append("坏包分类：magic 不对 ").append(st.badMagic)
+                    .append(" · 版本不对 ").append(st.badVersion)
+                    .append(" · 包太短 ").append(st.badShort)
+                    .append(" · 编码不是 PCM16 ").append(st.badCodec)
+                    .append(" · 帧长不是 480 ").append(st.badFrames).append('\n');
+            if (st.lastCodecSeen != null && st.lastCodecSeen.length() > 0) {
+                sb.append("对面编码：").append(st.lastCodecSeen).append('\n');
+            }
+            if (st.badBySource != null && st.badBySource.length() > 0) {
+                sb.append("坏包来源：").append(st.badBySource)
+                        .append("（全来自同一台 = 那台在按我们不懂的方式发；"
+                                + "来自很多台 = 多半是这个端口被别的软件/扫描器盯上了）\n");
+            }
+            if (st.badByLen != null && st.badByLen.length() > 0) {
+                sb.append("坏包长度：").append(st.badByLen)
+                        .append("（1948 字节 = 28 字节包头 + 480 帧 PCM16，正是我们一条音频流的长度；"
+                                + "零碎长度多半是别人的杂流量）\n");
+            }
+            appendSample(sb, "最近坏包", st.lastMagicSample);
+            appendSample(sb, "最近编码包", st.lastCodecSample);
+            appendSample(sb, "最近帧长包", st.lastFramesSample);
+            appendSample(sb, "最近短包", st.lastShortSample);
+            appendSample(sb, "最近版本包", st.lastVersionSample);
             sb.append("缓冲    ：").append(st.bufferedMs).append("ms（目标 ")
                     .append(st.targetMs).append("ms）\n");
             sb.append("流数    ：").append(st.streamCount).append('\n');
@@ -327,9 +378,11 @@ public final class Diagnosis {
         // ── 发送 ──
         sb.append("\n【发送（别人听我）】\n");
         if (!e.senderRunning()) {
-            sb.append("发送器没在运行（没点过任何一台的「🎤 送声音」）。\n");
+            sb.append("发送器没在运行（没点过任何一台的「送声音」）。\n");
         } else {
             sb.append("目标    ：").append(e.sendTargetText()).append('\n');
+            // ★ 送出去的是本机声音还是麦克风，必须在报告里一眼看到（别再让人猜）
+            sb.append("音源    ：").append(e.activeSourceText()).append('\n');
             sb.append("已发包  ：").append(e.sentPackets()).append(" 包 / ")
                     .append(bytesText(e.sentBytes())).append('\n');
             sb.append("发送失败：").append(e.sendErrors()).append(" 次\n");
@@ -352,7 +405,7 @@ public final class Diagnosis {
                 sb.append('\n');
                 sb.append("    ").append(ps.sending
                                 ? "它说：正在送声音 ✓"
-                                : "它说：没在送声音 ✗（要它那台点「🎤 送声音」）")
+                                : "它说：没在送声音 ✗（要它那台点「送声音」）")
                         .append('\n');
                 sb.append("    它已发：").append(ps.sent).append(" 包 / ").append(bytesText(ps.bytes))
                         .append('\n');
@@ -396,15 +449,80 @@ public final class Diagnosis {
         long recvAll = st == null ? 0 : st.received;
 
         if (sending) {
-            sb.append("· 本机：正在送声音 ✓（已发 ").append(e.sentPackets()).append(" 包）\n");
+            sb.append("· 本机：正在送声音 ✓（已发 ").append(e.sentPackets()).append(" 包，音源 ")
+                    .append(AudioSend.sourceName(e.activeSourceKind())).append("）\n");
+            if (e.sourceMismatch()) {
+                // 最容易让人误判的一种状态：以为是本机声音，其实退回了麦克风（或反过来）。
+                sb.append("· ★ 本机：你想送 ").append(AudioSend.sourceName(e.sourceKind()))
+                        .append("，实际送的是 ").append(AudioSend.sourceName(e.activeSourceKind()))
+                        .append(" → 详情看上面「声音来源」那一段；对面听到的是 ")
+                        .append(AudioSend.sourceShortName(e.activeSourceKind()))
+                        .append("，不是你以为的那个。\n");
+            }
         } else {
-            sb.append("· 本机：没在送声音 ✗ → 想让对方听见，在本机任意一台设备上点「🎤 送声音」\n");
+            sb.append("· 本机：没在送声音 ✗ → 想让对方听见，在本机任意一台设备上点「送声音」\n");
         }
         if (e.receiverRunning()) {
             sb.append("· 本机：接收器在跑，已收到 ").append(recvAll).append(" 个音频包")
                     .append(recvAll > 0 ? " ✓\n" : "（一个都没有）\n");
+            if (e.isChannelListening() && recvAll == 0) {
+                // ★ 用户现在最常见的现场：电脑在广播、手机开着听广播却没声。这里把两种可能
+                //   按"先查哪个"的顺序写清楚，而不是丢一句"没收到包"。
+                sb.append("· ★ 本机：开着「听广播」却一个包都没收到 → 按顺序查两件事：")
+                        .append("① 对面那台到底在不在广播（电脑上「广播我的声音」要开着，")
+                        .append("而且它的采集设备得真的在出声音）；")
+                        .append("② 对面的发现列表里有没有本机 —— 电脑端的广播**只发给\"它看得见的在线节点\"**，")
+                        .append("看不见就等于发给 0 个人。看上面【发现（信标）】的自检那几行：")
+                        .append("如果写着\"从没收到过自己的信标\"，那是本机/AP 的组播问题，跟对面无关。\n");
+            } else if (e.isChannelListening()) {
+                sb.append("· 本机：听广播已经收到声音 ✓（谁在广播就听谁，不用点设备）\n");
+            }
         } else {
-            sb.append("· 本机：接收器没在跑 → 想听对方，点它的「🎧 收听」\n");
+            sb.append("· 本机：接收器没在跑 → 想听某台就点它的「🎧 收听」；")
+                    .append("想听电脑正在广播的声音就开「📻 听广播」\n");
+        }
+        try {
+            if (e.peers().isEmpty()) {
+                sb.append("· 本机：设备列表是空的（0 台）。上面【发现（信标）】的自检会说明卡在哪一步：")
+                        .append("「自己绕回来 0」= 本机收不到组播/广播；「不是我们的」很大 = 收到的都是别人的流量；")
+                        .append("「最近收到：一个都没有」= 对面根本没发到你这台。\n");
+            }
+        } catch (Throwable ignored) {
+            // 设备列表读不到不影响其余判断
+        }
+
+        // ★ 坏包的说人话版本：一个"坏包 3220"的数字没用，这里直接给结论和下一步动作。
+        //   （必须放在下面"对端没回话就 return"之前，否则最需要这段的时候反而看不到。）
+        if (st != null && st.badPackets > 0) {
+            if (st.badCodec > 0) {
+                sb.append("· 本机：有 ").append(st.badCodec)
+                        .append(" 个音频包的编码不是 PCM16（").append(nz(st.lastCodecSeen))
+                        .append("）→ 手机只有 PCM16 解码器，去对面那台把编码改成 pcm_s16 就能听见。\n");
+            }
+            if (st.badFrames > 0) {
+                sb.append("· 本机：有 ").append(st.badFrames)
+                        .append(" 个包不是 480 帧/10ms 一包 → 手机只认这一档（不做重采样），")
+                        .append("要对面把每包帧数改回 480。\n");
+            }
+            if (st.badMagic > 0) {
+                sb.append("· 本机：有 ").append(st.badMagic)
+                        .append(" 个包的 magic 不对（根本不是我们这套协议）→ 通常不是对方发的，")
+                        .append("而是网络里别人的广播/扫描流量，或者是另一套协议（网页端/别的 App）。")
+                        .append("看上面「最近坏包」那一行开头的十六进制就能定性。\n");
+            }
+            if (st.badShort > 0) {
+                sb.append("· 本机：有 ").append(st.badShort)
+                        .append(" 个包太短（连 28 字节包头都不够）→ 是别的流量或者被截断的包，不影响收听。\n");
+            }
+            if (st.badVersion > 0) {
+                sb.append("· 本机：有 ").append(st.badVersion)
+                        .append(" 个包版本号不是 1 → 对面那台的协议版本和本机不一致（一边升级了一边没升）。\n");
+            }
+            long classified = st.badMagic + st.badVersion + st.badShort + st.badCodec + st.badFrames;
+            if (st.badPackets > classified) {
+                sb.append("· 本机：另有 ").append(st.badPackets - classified)
+                        .append(" 个坏包没归到已知类别里（多半是更早版本记下的旧数字）。\n");
+            }
         }
 
         if (psList.isEmpty()) {
@@ -421,7 +539,7 @@ public final class Diagnosis {
             }
             if (!ps.sending) {
                 sb.append("· 对端 ").append(ps.host)
-                        .append("：它自己说没在发 ✗ → 去它那台点「🎤 送声音」，本机这边没问题。\n");
+                        .append("：它自己说没在发 ✗ → 去它那台点「送声音」，本机这边没问题。\n");
                 continue;
             }
             // 对方说它在发：那就只看"我到底收到没有"——这才是真正的分界线。
@@ -494,6 +612,13 @@ public final class Diagnosis {
 
     private static String orNone(String s) {
         return (s == null || s.length() == 0) ? "（无）" : s;
+    }
+
+    /** 坏包现场样本：有才写一行（缩进），没有就不占篇幅。 */
+    private static void appendSample(StringBuilder sb, String label, String sample) {
+        if (sample != null && sample.length() > 0) {
+            sb.append("  ").append(label).append("：").append(sample).append('\n');
+        }
     }
 
     private static String indent(String s) {

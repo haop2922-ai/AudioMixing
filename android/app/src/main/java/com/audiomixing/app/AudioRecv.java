@@ -107,6 +107,44 @@ public final class AudioRecv {
         public float peak;
         public List<StreamStats> streams = Collections.emptyList();
 
+        // ── ★ 坏包按原因分类（2026-10-12 真机反馈）──
+        // 原来只有一个"坏包 3220"的总数、报告里只解释了其中 49 个，剩下 3171 个只能猜。
+        // "有数字没线索"是排查里最难受的状态，所以每一类都单独计数 + 留一个现场样本。
+        /** magic 不对：根本不是我们的协议（别人的广播、扫描器、别的 App 的流量）。 */
+        public long badMagic;
+        /** 版本号不是 1（将来协议升级时能一眼看出来）。 */
+        public long badVersion;
+        /** 连 28 字节包头都不够（被截断）。 */
+        public long badShort;
+        /** 是我们的包，但编码不是 PCM16（手机只有 PCM16，Opus/浮点都解不了）。 */
+        public long badCodec;
+        /** 是我们的 PCM16 包，但帧长不是 480 帧这一档。 */
+        public long badFrames;
+        /** 各类最近一个坏包的现场（人话，直接抄进诊断报告）。 */
+        public String lastMagicSample = "";
+        public String lastVersionSample = "";
+        public String lastShortSample = "";
+        public String lastCodecSample = "";
+        public String lastFramesSample = "";
+        /** 最近见过的编码值（"codec=3(Opus)"）：判断"对面到底用什么编码发的"最直接的证据。 */
+        public String lastCodecSeen = "";
+        /**
+         * ★ 坏包来源前几名（"192.168.0.109 3171 个"）。
+         *
+         * <p>这一条把"是某一台设备在按我们不懂的方式发"和"整个网段的噪声都在往这个端口灌"
+         * 彻底分开 —— 后者通常说明这个端口号被别的软件占了/被扫了。
+         */
+        public String badBySource = "";
+        /**
+         * ★ 坏包长度分布前几名（"1948 字节 3171 个"）。
+         *
+         * <p>长度是最便宜也最有效的"指纹"：<b>1948 字节</b>正好是"28 字节包头 + 480 帧 PCM16"
+         * 的长度 —— 如果坏包全是这个长度，那它几乎肯定是一条<b>音频流</b>（只是头不对/编码不对）；
+         * 如果长度是 60/200/1200 这种零碎的，那就是网络里别人的杂流量。
+         * 有了这一条，"3171 个坏包到底是什么"就不必再猜。
+         */
+        public String badByLen = "";
+
         @Override
         public String toString() {
             return "收 " + received + " 丢 " + lost + " 迟到 " + late + " 坏包 " + badPackets
@@ -148,9 +186,34 @@ public final class AudioRecv {
     private volatile float peak;
     private volatile String lastError = "";
 
-    private final long[] counters = new long[8];   // received,lost,late,dup,bad,filtered,controls,recoveries
+    // received,lost,late,dup,bad,filtered,controls,recoveries,
+    // 8..12 = ★ 坏包分类：magic / version / 太短 / 编码不是 PCM16 / 帧长不对
+    private final long[] counters = new long[16];
     private volatile long trackErrors;
     private int ssrcSeen;
+    /**
+     * ★ 坏包现场样本的节流表：<b>每一类各自节流</b>。
+     *
+     * <p>为什么不能用一个全局节流：真机上往往是好几种坏包混在一起（这次就是）。
+     * 全局节流会让"先到的那一类"把后面每一类的样本都吞掉 —— 结果报告里只有一类的现场，
+     * 剩下的还是只能猜。分开之后每一类都能立刻留下自己的第一条现场。
+     */
+    private final long[] lastSampleMs = new long[6];
+    // ★ 坏包现场样本（收包线程写、界面线程读，所以是 volatile）
+    private volatile String lastMagicSample = "";
+    private volatile String lastVersionSample = "";
+    private volatile String lastShortSample = "";
+    private volatile String lastCodecSample = "";
+    private volatile String lastFramesSample = "";
+    /** 最近见过的编码（"codec=3（Opus…）"）：判断对面用什么编码发的最直接的证据。 */
+    private volatile String lastCodecSeen = "";
+    /**
+     * ★ 坏包按来源 IP 计数（只由收包线程写，读的时候拿 counters 锁）。
+     * 上限 8 个来源：局域网里不会有更多，防的是被人乱刷撑爆内存。
+     */
+    private final Map<String, Long> badBySource = new java.util.LinkedHashMap<>();
+    /** ★ 坏包按"整包长度"计数（同一个上限策略：只留最近 8 种长度）。 */
+    private final Map<Integer, Long> badByLen = new java.util.LinkedHashMap<>();
 
     /** 用默认端口 47831。 */
     public AudioRecv() {
@@ -340,7 +403,45 @@ public final class AudioRecv {
             st.filtered = counters[5];
             st.controls = counters[6];
             st.recoveries = counters[7];
+            st.badShort = counters[8];
+            st.badMagic = counters[9];
+            st.badVersion = counters[10];
+            st.badCodec = counters[11];
+            st.badFrames = counters[12];
+            // ★ 坏包来源前 3 名：把"某一台在乱发"和"整个网段的噪声"分开。
+            if (!badBySource.isEmpty()) {
+                java.util.List<Map.Entry<String, Long>> list = new ArrayList<>(badBySource.entrySet());
+                list.sort((a, b) -> Long.compare(b.getValue(), a.getValue()));
+                StringBuilder bs = new StringBuilder(64);
+                for (int i = 0; i < list.size() && i < 3; i++) {
+                    if (bs.length() > 0) {
+                        bs.append(" · ");
+                    }
+                    bs.append(list.get(i).getKey()).append(' ').append(list.get(i).getValue()).append(" 个");
+                }
+                st.badBySource = bs.toString();
+            }
+            // ★ 长度分布：1948 字节（28 头 + 480 帧 PCM16）= 一条音频流的形状；
+            //   零碎长度 = 网络里别人的杂流量。
+            if (!badByLen.isEmpty()) {
+                java.util.List<Map.Entry<Integer, Long>> list = new ArrayList<>(badByLen.entrySet());
+                list.sort((a, b) -> Long.compare(b.getValue(), a.getValue()));
+                StringBuilder bs = new StringBuilder(64);
+                for (int i = 0; i < list.size() && i < 3; i++) {
+                    if (bs.length() > 0) {
+                        bs.append(" · ");
+                    }
+                    bs.append(list.get(i).getKey()).append(" 字节 ").append(list.get(i).getValue()).append(" 个");
+                }
+                st.badByLen = bs.toString();
+            }
         }
+        st.lastMagicSample = lastMagicSample;
+        st.lastVersionSample = lastVersionSample;
+        st.lastShortSample = lastShortSample;
+        st.lastCodecSample = lastCodecSample;
+        st.lastFramesSample = lastFramesSample;
+        st.lastCodecSeen = lastCodecSeen;
         st.trackErrors = trackErrors;
         st.targetMs = targetMs;
         st.peak = peak;
@@ -452,13 +553,36 @@ public final class AudioRecv {
     }
 
     private void onPacket(byte[] buf, int len, InetAddress from) {
-        Proto.Pkt pkt = Proto.decode(buf, 0, len);
-        if (pkt == null) {
-            bump(4);   // badPackets：magic/版本不对，不是我们的包
+        // 来源地址先解析出来：下面每个分支（包括坏包分类）都要用它，只算一次。
+        String host = normalizeHost(from);
+        // ★ 坏包原因分类（2026-10-12 真机反馈）：只有一个"坏包 3220"的总数查不出任何东西，
+        //   所以在丢掉之前先分清"为什么丢"，每一类各留一个现场样本。
+        //   注意：这里只是只读地看一眼包头，不改动 Proto（那个类和电脑端逐字节对过）。
+        if (len < Proto.HEADER_SIZE) {
+            bumpBad(8, host, len);
+            sampleBad(1, buf, len, from, "长度 " + len + " 字节，连 28 字节包头都不够");
             return;
         }
-        // 来源地址先解析出来：下面的控制包分支和音频分支都要用，只算一次。
-        String host = normalizeHost(from);
+        int magic = (buf[0] & 0xFF) | ((buf[1] & 0xFF) << 8);
+        if (magic != Proto.MAGIC) {
+            bumpBad(9, host, len);
+            sampleBad(2, buf, len, from, "magic=0x" + Integer.toHexString(magic)
+                    + "（我们的是 0x" + Integer.toHexString(Proto.MAGIC) + "）");
+            return;
+        }
+        int ver = buf[2] & 0xFF;
+        if (ver != Proto.VERSION) {
+            bumpBad(10, host, len);
+            sampleBad(3, buf, len, from, "version=" + ver + "（我们的是 " + Proto.VERSION + "）");
+            return;
+        }
+        Proto.Pkt pkt = Proto.decode(buf, 0, len);
+        if (pkt == null) {
+            // magic 和版本都对、长度也够，decode 不该返回 null；真出现了也不能掩盖。
+            bumpBad(0, host, len);
+            sampleBad(0, buf, len, from, "包头能认出来但解码失败");
+            return;
+        }
         if (pkt.type != Proto.T_AUDIO) {
             bump(6);   // PING/PONG/BYE 之类的控制包，先计数
             // ★ 对端统计（T_STATS=7）：两台设备"自己交流"的唯一入口。对方每 2 秒说一次
@@ -472,23 +596,97 @@ public final class AudioRecv {
             }
             return;
         }
+        int plen0 = pkt.payload == null ? 0 : pkt.payload.length;
+        // 记下"对面到底用什么编码发的"：这一条比任何猜测都直接（电脑端广播/路由用的是
+        // config.codec，默认 pcm_s16，但用户可能改成 opus 或 pcm_f32）。
         if (pkt.codec != Proto.CODEC_PCM_S16) {
-            bump(4);   // 手机没有 Opus 解码器（见类注释），直接丢
+            bumpBad(11, host, len);
+            lastCodecSeen = "codec=" + pkt.codec + "（" + codecName(pkt.codec) + "）";
+            sampleBad(4, buf, len, from, "编码 " + lastCodecSeen + "，负载 " + plen0
+                    + " 字节，samples=" + pkt.samples);
             return;
         }
+        lastCodecSeen = "codec=2（PCM 16位）";
         if (!isAllowed(host)) {
-            bump(5);   // 用户没勾「收听」它
+            bump(5);   // 用户没勾「收听」它（也没开「听广播」）
             return;
         }
-        int plen = pkt.payload == null ? 0 : pkt.payload.length;
+        int plen = plen0;
         if (plen > FRAME_BYTES || pkt.samples > Proto.FRAME_SAMPLES) {
             // 只认 480 帧一包（10ms）。别的帧长我们不做重采样 —— 宁可不要，也不要变速变调。
-            bump(4);
+            bumpBad(12, host, len);
+            sampleBad(5, buf, len, from, "samples=" + pkt.samples + "、负载 " + plen
+                    + " 字节（我们要 " + Proto.FRAME_SAMPLES + " 帧/" + FRAME_BYTES + " 字节）");
             return;
         }
         bump(0);   // received
         Stream stream = streamFor(host, pkt.ssrc);
         stream.store(pkt.seq, pkt.payload, plen, (pkt.flags & Proto.FLAG_SILENCE) != 0);
+    }
+
+    /** 编码的人话名字（和电脑端 proto.CODEC_NAMES 一致，报告里两边对得上）。 */
+    private static String codecName(int c) {
+        switch (c) {
+            case Proto.CODEC_PCM_F32:
+                return "PCM 浮点32，手机解不了";
+            case Proto.CODEC_PCM_S16:
+                return "PCM 16位";
+            case Proto.CODEC_OPUS:
+                return "Opus，手机解不了";
+            default:
+                return "未知编码";
+        }
+    }
+
+    /**
+     * 记一个坏包现场。{@code kind}：0=其它 1=太短 2=magic 3=版本 4=编码 5=帧长。
+     *
+     * <p>为什么要带"开头 16 个字节的十六进制"：3220 个坏包到底是"别人的流量"还是
+     * "我们自己的包但参数不对"，看一眼开头就能定性 —— 这是从一个数字变成一条线索的关键。
+     * （我们的包头开头一定是 {@code 4c 57 01}；是纯文本的话还能直接认出协议名，比如
+     * SSDP 的 "M-SEARCH"、DNS、mDNS 之类。）
+     * 另外带来源 IP 和总长度：如果都来自同一个地址，那基本就是某台设备在按我们不懂的方式发。
+     */
+    private void sampleBad(int kind, byte[] buf, int len, InetAddress from, String why) {
+        long now = SystemClock.elapsedRealtime();
+        int slot = (kind >= 0 && kind < lastSampleMs.length) ? kind : 0;
+        if (now - lastSampleMs[slot] < 500) {
+            return;                 // 节流：同一类坏包成灾时不必每个都拼字符串
+        }
+        lastSampleMs[slot] = now;
+        StringBuilder sb = new StringBuilder(128);
+        sb.append(why).append("；共 ").append(len).append(" 字节，来自 ")
+                .append(normalizeHost(from)).append("，开头 ");
+        int n = Math.min(16, len);
+        for (int i = 0; i < n; i++) {
+            int v = buf[i] & 0xFF;
+            if (v < 16) {
+                sb.append('0');
+            }
+            sb.append(Integer.toHexString(v)).append(' ');
+        }
+        String s = sb.toString();
+        switch (kind) {
+            case 1:
+                lastShortSample = s;
+                break;
+            case 2:
+                lastMagicSample = s;
+                break;
+            case 3:
+                lastVersionSample = s;
+                break;
+            case 4:
+                lastCodecSample = s;
+                break;
+            case 5:
+                lastFramesSample = s;
+                break;
+            default:
+                if (lastMagicSample.length() == 0) {
+                    lastMagicSample = s;
+                }
+        }
     }
 
     /**
@@ -890,6 +1088,48 @@ public final class AudioRecv {
     private void bump(int idx) {
         synchronized (counters) {
             counters[idx]++;
+        }
+    }
+
+    /**
+     * ★ 记一个坏包：总数 + 分类 + 来源 IP + 整包长度。
+     *
+     * @param idx 分类下标（0 = 其它/解码失败，8..12 见 counters 的注释）
+     * @param host 来源地址（记不住就算了，不影响计数）
+     * @param len 整包字节数（长度是最有效的"指纹"，见 {@link Stats#badByLen}）
+     */
+    private void bumpBad(int idx, String host, int len) {
+        synchronized (counters) {
+            counters[4]++;
+            if (idx > 0) {
+                counters[idx]++;
+            }
+            if (host != null && !host.isEmpty()) {
+                Long c = badBySource.get(host);
+                badBySource.put(host, (c == null ? 0L : c) + 1L);
+                // 只有收包线程写；上限 8 个来源，超了就丢最老的那个。
+                while (badBySource.size() > 8) {
+                    java.util.Iterator<String> it = badBySource.keySet().iterator();
+                    if (!it.hasNext()) {
+                        break;
+                    }
+                    it.next();
+                    it.remove();
+                }
+            }
+            if (len > 0) {
+                Integer key = len;
+                Long c = badByLen.get(key);
+                badByLen.put(key, (c == null ? 0L : c) + 1L);
+                while (badByLen.size() > 8) {
+                    java.util.Iterator<Integer> it = badByLen.keySet().iterator();
+                    if (!it.hasNext()) {
+                        break;
+                    }
+                    it.next();
+                    it.remove();
+                }
+            }
         }
     }
 

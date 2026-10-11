@@ -16,6 +16,14 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+    <!--
+      MEDIA_PROJECTION：用来采集【本机正在播放的声音】（音乐/视频/游戏），
+      也就是这个 App 真正的用途 —— 早期版本只采了麦克风，那是"对讲机"不是音频投射，
+      用户明确指出过这个方向性错误。
+      为此需要前台服务带上 mediaProjection 类型：targetSdk 34 下，
+      没在已启动的 mediaProjection 类型前台服务里调用 getMediaProjection() 会直接抛异常。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <application android:label="Audio Mixing" android:theme="@android:style/Theme.Material.NoActionBar">
         <activity android:name=".MainActivity" android:exported="true"
@@ -27,12 +35,12 @@
         </activity>
         <!--
           前台服务：手机当节点时，App 切到后台也要继续收发声音。
-          type 用 mediaPlayback|microphone —— 我们做的是"播别人的声音"和"采自己的麦克风"，
-          不是录屏，所以不用 mediaProjection（那个反而要求先拿到录屏授权，是多余的坑）。
-          targetSdk 34 起权限与 service 的 type 必须对得上，缺一个就会在 startForeground
-          时抛 SecurityException，所以权限和节点一起声明。
+          type = mediaPlayback（播别人的声音）+ microphone（对讲用的麦克风）
+                 + mediaProjection（采本机正在播放的声音，见上面的权限说明）。
+          三个都要声明：targetSdk 34 起，startForeground 带的类型必须与清单一致，
+          缺一个就在那一条路上抛 SecurityException。
         -->
         <service android:name=".MixService" android:exported="false"
-                 android:foregroundServiceType="mediaPlayback|microphone"/>
+                 android:foregroundServiceType="mediaPlayback|microphone|mediaProjection"/>
     </application>
 </manifest>

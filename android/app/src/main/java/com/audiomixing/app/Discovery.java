@@ -163,6 +163,38 @@ public final class Discovery {
     private volatile String lastError = "";
     private volatile long beaconsSent;
     private volatile long beaconsReceived;
+
+    // ── ★ 发现层自检（2026-10-12 真机反馈：74 秒只收到 8 个信标、列表里 0 台设备，
+    //    而"到底是我们没发出去、还是对方的帧被 Wi-Fi 丢了"完全看不出来）。
+    //    下面这些计数就是为了把这个问题一刀切开。──
+    /** 组播/广播/单播各发出去多少份（哪条通道是通的，一眼可见）。 */
+    private volatile long beaconsSentMc;
+    private volatile long beaconsSentBc;
+    private volatile long beaconsSentUni;
+    /**
+     * 自己发的信标绕回来收到几份。
+     *
+     * <p><b>这是最省事也最有用的一个自检</b>：socket 允许回环（setLoopbackMode(false)），
+     * 所以只要"收组播"这条链路在本机是通的，我们就会收到自己的信标。
+     * 如果这个数一直是 0，那说明本机根本收不到组播 —— 那就别再怀疑对方了，
+     * 先解决网卡/AP 的组播问题（或者换广播/单播通道）。
+     */
+    private volatile long beaconsSelf;
+    /** 收到但解析不出信标的帧（不是我们的协议 / 乱码），和 wl 版本不对的分开记。 */
+    private volatile long beaconsBad;
+    private volatile long beaconsWrongVersion;
+    private volatile String lastBadFrameSample = "";
+    /** 最近一次收到"自己"的信标是什么时候（elapsedRealtime）。 */
+    private volatile long lastSelfBeaconMs;
+    /** 最近一次收到别人信标的现场：谁、从哪个 IP、什么时候。 */
+    private volatile String lastBeaconFrom = "";
+    private volatile long lastBeaconAtMs;
+    private volatile String lastBeaconNote = "";
+    /** 最近一轮单播信标发给了几台已知设备（0 = 还没见过任何人，只能靠组播/广播）。 */
+    private volatile int unicastTargets;
+    /** 成功加入组播组的网卡名（空 = 一个都没加进去，只能靠广播）。 */
+    private volatile String mcastIfaces = "";
+
     private WifiManager.MulticastLock mcastLock;
     private Thread txThread;
     private Thread rxThread;
@@ -308,6 +340,206 @@ public final class Discovery {
         return beaconsReceived;
     }
 
+    /** 组播/广播/单播各发出去多少份（哪条通道是通的，一眼可见）。 */
+    public long beaconsSentMulticast() {
+        return beaconsSentMc;
+    }
+
+    public long beaconsSentBroadcast() {
+        return beaconsSentBc;
+    }
+
+    public long beaconsSentUnicast() {
+        return beaconsSentUni;
+    }
+
+    /** 自己发的信标绕回来收到几份（>0 就证明本机收组播这条路是通的）。 */
+    public long beaconsSelfReceived() {
+        return beaconsSelf;
+    }
+
+    /** 收到但解析不出信标的帧数 / 版本不对的帧数。 */
+    public long badFrames() {
+        return beaconsBad;
+    }
+
+    public long wrongVersionFrames() {
+        return beaconsWrongVersion;
+    }
+
+    public String lastBadFrameSample() {
+        return lastBadFrameSample;
+    }
+
+    /** 最近一轮单播信标发给了几台已知设备。 */
+    public int unicastTargets() {
+        return unicastTargets;
+    }
+
+    /** 成功加入组播组的网卡（空 = 一张都没加进去，只能靠广播）。 */
+    public String multicastIfaces() {
+        return mcastIfaces;
+    }
+
+    public boolean multicastLockHeld() {
+        WifiManager.MulticastLock l = mcastLock;
+        try {
+            return l != null && l.isHeld();
+        } catch (Throwable t) {
+            return l != null;
+        }
+    }
+
+    /** 最近一次收到"自己的"信标距今多久（毫秒）；-1 = 从来没收到过。 */
+    public long lastSelfBeaconAgeMs() {
+        long t = lastSelfBeaconMs;
+        return t <= 0 ? -1 : Math.max(0, SystemClock.elapsedRealtime() - t);
+    }
+
+    /** 最近一次收到别人的信标是谁、什么时候（人话）。 */
+    public String lastBeaconText() {
+        if (lastBeaconFrom.isEmpty()) {
+            return "一个别人的信标都没收到";
+        }
+        return lastBeaconFrom + " " + lastBeaconNote + "，"
+                + ageText(lastBeaconAtMs, SystemClock.elapsedRealtime());
+    }
+
+    /**
+     * 发现层自检（多行，人话）—— 给诊断报告和界面"详情"直接用。
+     *
+     * <p>为什么值得占报告篇幅：真机上"列表里 0 台设备"可能是好几种完全不同的问题 ——
+     * 本机没发出去 / 发出去了对端没收到 / 对端发了我没收到 / 收到了但不是我们的协议 /
+     * 收到了但地址走错网卡。以前这些从报告里一个都看不出来，只能猜。
+     */
+    public String selfCheckText() {
+        long now = SystemClock.elapsedRealtime();
+        StringBuilder sb = new StringBuilder(640);
+        sb.append("信标发  ：组播 ").append(beaconsSentMc)
+                .append(" / 广播 ").append(beaconsSentBc)
+                .append(" / 单播给已知设备 ").append(beaconsSentUni)
+                .append("（本轮 ").append(unicastTargets).append(" 台）\n");
+        sb.append("信标收  ：别人的 ").append(beaconsReceived)
+                .append(" · 自己绕回来 ").append(beaconsSelf)
+                .append(" · 不是我们的 ").append(beaconsBad)
+                .append(" · 版本不对 ").append(beaconsWrongVersion).append('\n');
+        sb.append("组播锁  ：").append(multicastLockHeld()
+                ? "已持有 ✓" : "没有 ✗（安卓会把组播/广播帧丢掉）").append('\n');
+        sb.append("加入组播：").append(mcastIfaces.isEmpty()
+                ? "没有网卡加进去 ✗（只能靠广播这一路）" : mcastIfaces).append('\n');
+        if (beaconsSelf > 0) {
+            sb.append("自检    ：收到过自己的信标 ✓ → 本机收组播这条路是通的（最近 ")
+                    .append(ageText(lastSelfBeaconMs, now)).append("）\n");
+        } else {
+            sb.append("自检    ：从没收到过自己的信标 ✗ → 本机收不到组播/广播。")
+                    .append("问题在本机或 AP（Wi-Fi 省电、AP 的 IGMP/客户端隔离），")
+                    .append("对方发得再好也没用\n");
+        }
+        sb.append("最近收到：").append(lastBeaconText()).append('\n');
+        sb.append("本机网卡：").append(ifaceText()).append('\n');
+        if (lastBadFrameSample.length() > 0) {
+            sb.append("非信标帧：").append(lastBadFrameSample).append('\n');
+        }
+        return sb.toString();
+    }
+
+    /** 每张网卡一行：名字、IPv4、支不支持组播。判断"是不是走错网卡"用。 */
+    private String ifaceText() {
+        StringBuilder sb = new StringBuilder(192);
+        try {
+            Enumeration<NetworkInterface> all = NetworkInterface.getNetworkInterfaces();
+            while (all != null && all.hasMoreElements()) {
+                NetworkInterface nif = all.nextElement();
+                if (!nif.isUp() || nif.isLoopback() || !hasIpv4(nif)) {
+                    continue;
+                }
+                if (sb.length() > 0) {
+                    sb.append("；");
+                }
+                sb.append(nif.getName()).append('(');
+                StringBuilder ips = new StringBuilder(24);
+                Enumeration<InetAddress> as = nif.getInetAddresses();
+                while (as != null && as.hasMoreElements()) {
+                    InetAddress a = as.nextElement();
+                    if (a instanceof java.net.Inet4Address && !a.isLoopbackAddress()) {
+                        if (ips.length() > 0) {
+                            ips.append('/');
+                        }
+                        ips.append(a.getHostAddress());
+                    }
+                }
+                sb.append(ips);
+                sb.append(nif.supportsMulticast() ? " 支持组播" : " 不支持组播");
+                try {
+                    if (nif.isVirtual()) {
+                        sb.append(" 虚拟");
+                    }
+                } catch (Throwable ignored) {
+                    // 个别 ROM 不支持这个查询
+                }
+                sb.append(')');
+            }
+        } catch (Throwable t) {
+            return "读取网卡失败：" + t;
+        }
+        return sb.length() == 0 ? "没有可用的非回环 IPv4 网卡" : sb.toString();
+    }
+
+    /** "3.2 秒前" 这种人话。 */
+    private static String ageText(long atMs, long nowMs) {
+        if (atMs <= 0) {
+            return "从没收到过";
+        }
+        long d = Math.max(0, nowMs - atMs);
+        if (d < 1000) {
+            return d + " 毫秒前";
+        }
+        return String.format(java.util.Locale.US, "%.1f 秒前", d / 1000.0);
+    }
+
+    /** 对端地址和本机哪个地址同网段（/24）：判断"是不是走错网卡"最直接的线索。 */
+    private String subnetNote(String host) {
+        int dot = host.lastIndexOf('.');
+        if (dot <= 0) {
+            return "（地址格式看不懂）";
+        }
+        String prefix = host.substring(0, dot + 1);
+        for (String ip : localIps) {
+            if (ip.startsWith(prefix)) {
+                return "（与本机 " + ip + " 同网段 ✓）";
+            }
+        }
+        StringBuilder mine = new StringBuilder(48);
+        for (String ip : localIps) {
+            if (mine.length() > 0) {
+                mine.append('/');
+            }
+            mine.append(ip);
+        }
+        return "（不在本机任何网段 ✗ 本机地址："
+                + (mine.length() == 0 ? "没有非回环地址" : mine.toString()) + "）";
+    }
+
+    /** 一个"不是我们信标"的帧样本：来源 + 长度 + 开头 8 字节 hex + 能打印出来的字符。 */
+    private static String sampleFrame(byte[] buf, int len, InetAddress from) {
+        int n = Math.min(8, len);
+        StringBuilder hex = new StringBuilder(32);
+        for (int i = 0; i < n; i++) {
+            int v = buf[i] & 0xFF;
+            if (v < 16) {
+                hex.append('0');
+            }
+            hex.append(Integer.toHexString(v)).append(' ');
+        }
+        StringBuilder txt = new StringBuilder(24);
+        for (int i = 0; i < Math.min(24, len); i++) {
+            int c = buf[i] & 0xFF;
+            txt.append((c >= 0x20 && c < 0x7F) ? (char) c : '.');
+        }
+        return "来自 " + normalizeHost(from) + "，共 " + len + " 字节，开头 " + hex
+                + "（可打印：" + txt + "）";
+    }
+
     /** 最近一次错误，空串表示一切正常。 */
     public String lastError() {
         return lastError;
@@ -351,16 +583,58 @@ public final class Discovery {
             try {
                 s.send(new DatagramPacket(data, data.length, target.getAddress(), target.getPort()));
                 sent++;
+                if (target.getAddress() != null && target.getAddress().isMulticastAddress()) {
+                    beaconsSentMc++;
+                } else {
+                    beaconsSentBc++;
+                }
             } catch (IOException | RuntimeException e) {
                 // 某一个地址发不出去很正常（比如 /24 广播地址在当前网段不存在），
                 // 只要还有一份发出去就算数，不能因为一个地址失败就放弃整轮。
             }
         }
-        if (sent > 0) {
+        // ★ 单播给"已经见过面的设备"。
+        //
+        // 为什么必须加这一条：安卓 Wi-Fi 在省电模式下会大量丢组播/广播帧（真机实测：
+        // 74 秒里对方发了 ~37 轮信标，我们只收到 8 个）。而发现列表 15 秒没信标就把设备
+        // 摘掉，于是表现成"设备时有时无、列表里经常是 0 台"。更糟的是对面那台也一样：
+        // 它把我们标成"不在线"之后，它的**广播音频就不会发给我们**（电脑端广播路由只发给
+        // 在线节点），于是变成"电脑明明在广播，手机一个包都收不到"。
+        // 单播帧不会被 AP 的组播过滤丢掉，只要互相见过一次面，这条路就一直通。
+        int uni = 0;
+        for (String host : knownPeerHosts()) {
+            try {
+                s.send(new DatagramPacket(data, data.length,
+                        InetAddress.getByName(host), Proto.DEFAULT_DISCOVERY_PORT));
+                uni++;
+                beaconsSentUni++;
+            } catch (IOException | RuntimeException e) {
+                // 对端刚走、IP 已经不可达：很正常，忽略。
+            }
+        }
+        unicastTargets = uni;
+        if (sent > 0 || uni > 0) {
             beaconsSent++;
         } else {
             note("信标一个都没发出去（Wi-Fi 可能断了）");
         }
+    }
+
+    /** 已经见过面的设备 IP（单播信标用）。有上限：局域网里不会有这么多，防的是被人乱刷撑爆。 */
+    private List<String> knownPeerHosts() {
+        List<String> out = new ArrayList<>(8);
+        synchronized (lock) {
+            for (Peer p : peers.values()) {
+                String h = p.host;
+                if (h != null && !h.isEmpty() && !out.contains(h)) {
+                    out.add(h);
+                    if (out.size() >= 16) {
+                        break;
+                    }
+                }
+            }
+        }
+        return out;
     }
 
     /** 组播一份 + 受限广播一份 + 每个本机 /24 的定向广播一份。 */
@@ -485,20 +759,43 @@ public final class Discovery {
         try {
             o = new JSONObject(new String(buf, 0, len, StandardCharsets.UTF_8));
         } catch (Exception e) {
-            return;   // 不是我们的信标（或者是别人家的 UDP 包），安静丢掉
+            // ★ 不是我们的信标（或者是别人家的 UDP 包）。计数 + 留一个样本：
+            //   "一个都没收到"和"收到了但都不是我们的"是完全不同的两个问题。
+            if (len > 0) {
+                beaconsBad++;
+                if (lastBadFrameSample.length() == 0) {
+                    lastBadFrameSample = sampleFrame(buf, len, from);
+                }
+            }
+            return;
         }
         if (o.optInt("wl", 0) != 1) {
+            beaconsWrongVersion++;
+            if (lastBadFrameSample.length() == 0) {
+                lastBadFrameSample = "wl=" + o.optInt("wl", 0) + "（我们的是 1），" + sampleFrame(buf, len, from);
+            }
             return;
         }
         String id = o.optString("id", "");
-        if (id.isEmpty() || nodeId.equals(id)) {
-            return;   // 自己的信标（组播回环）要忽略，否则列表里会多出一台"自己"
+        if (id.isEmpty()) {
+            return;
+        }
+        if (nodeId.equals(id)) {
+            // ★ 自己的信标绕回来了 —— 说明"收组播/广播"这条链路在本机是通的。
+            //   这个数一直是 0 就意味着本机根本收不到组播，问题在本机/AP，不在对方。
+            beaconsSelf++;
+            lastSelfBeaconMs = SystemClock.elapsedRealtime();
+            return;   // 自己的信标不能进列表（否则会多出一台"自己"）
         }
         String host = normalizeHost(from);
         if (host.isEmpty()) {
             return;
         }
         beaconsReceived++;
+        lastBeaconFrom = o.optString("name", "") + "@" + host
+                + (o.optInt("audio_port", 0) > 0 ? (":" + o.optInt("audio_port", 0)) : "");
+        lastBeaconAtMs = SystemClock.elapsedRealtime();
+        lastBeaconNote = subnetNote(host);
 
         synchronized (lock) {
             Peer peer = peers.get(id);
@@ -661,6 +958,7 @@ public final class Discovery {
         NetworkInterface preferred = null;
         int preferredScore = -1;
         int joined = 0;
+        StringBuilder joinedNames = new StringBuilder(32);
         Enumeration<NetworkInterface> all = NetworkInterface.getNetworkInterfaces();
         while (all != null && all.hasMoreElements()) {
             NetworkInterface nif = all.nextElement();
@@ -670,6 +968,10 @@ public final class Discovery {
                 }
                 s.joinGroup(sa, nif);
                 joined++;
+                if (joinedNames.length() > 0) {
+                    joinedNames.append('/');
+                }
+                joinedNames.append(nif.getName());
                 int score = ifaceScore(nif.getName());
                 if (score > preferredScore) {
                     preferredScore = score;
@@ -677,11 +979,18 @@ public final class Discovery {
                 }
             } catch (IOException | RuntimeException e) {
                 // 某张网卡加不进去（蜂窝网卡常见）不影响其它网卡。
+                // ★ 但要记下来："一张都没加进去"和"加进去了但收不到"是两种不同的问题。
+                if (joinedNames.length() > 0) {
+                    joinedNames.append('/');
+                }
+                joinedNames.append(nif.getName()).append("失败");
             }
         }
+        mcastIfaces = joinedNames.toString();
         if (joined == 0) {
             // 兜底：让系统自己挑默认网卡，总比一条都收不到强。
             s.joinGroup(group);
+            mcastIfaces = "（没有网卡能加组播，已回退到默认网卡）" + mcastIfaces;
             note("没有网卡支持组播，已回退到默认网卡（可能只能靠广播发现）");
         }
         if (preferred != null) {

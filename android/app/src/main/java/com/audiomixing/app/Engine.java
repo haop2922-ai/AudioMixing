@@ -1,7 +1,10 @@
 package com.audiomixing.app;
 
 import android.content.Context;
+import android.media.projection.MediaProjection;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
 
@@ -71,10 +74,41 @@ public final class Engine {
     private final Object lock = new Object();
 
     private volatile Discovery discovery;
-    /** 同一时刻只送一路（麦克风只有一支），换目标时先停旧的。 */
+    /** 同一时刻只送一路，换目标时先停旧的。 */
     private volatile AudioSend sender;
     /** 一个 UDP 端口收，收到几台就混几台 —— 这本来就是个"混音"工具。 */
     private volatile AudioRecv receiver;
+
+    // ── ★ 送什么声音（用户指出过方向性缺陷：手机端不能只当对讲机）──
+
+    /**
+     * 用户选的音源。<b>默认"本机声音"</b>—— 这才是这个 App 的定位（把设备正在放的声音送出去），
+     * 麦克风只是给对讲场景留的备选。
+     *
+     * <p>低于 Android 10 的机器没有 {@code AudioPlaybackCapture} 这个能力，
+     * 构造时就直接定死麦克风 —— <b>不是"选了再说"，是根本不给选</b>，
+     * 界面上会写明"你的安卓版本不支持"。
+     */
+    private volatile int sourceKind = AudioSend.playbackSupported()
+            ? AudioSend.SRC_PLAYBACK : AudioSend.SRC_MIC;
+
+    /**
+     * 采本机声音要用的授权（MediaProjection）。<b>刻意在拿到之后一直留着</b>：
+     * targetSdk 34 / Android 14 起，每次授权只能换一个 MediaProjection 对象，
+     * 用完就丢的话用户每切一次音源都要再看一次系统弹窗。
+     */
+    private volatile MediaProjection projection;
+    /** 授权失败的原因。界面和诊断报告必须把它写出来，不能让用户以为"选了就已经在送本机声音"。 */
+    private volatile String projectionError = "";
+    /** 授权弹窗已经弹出去、还没回来的那台设备 id（授权回来之后自动开始送）。 */
+    private volatile String pendingSendId = "";
+    /** 主线程 Handler：MediaProjection 的回调要用它。 */
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    /**
+     * 授权被系统收回的回调。<b>刻意懒创建</b>：MediaProjection.Callback 是 API 29 才有的类，
+     * 在构造器里 new 出来会让 Android 9 及以下的机器一开 App 就 NoClassDefFoundError。
+     */
+    private MediaProjection.Callback projectionCallback;
 
     /** 用户点了「收听」的设备 id（可以多台）。 */
     private final Set<String> listenIds = new LinkedHashSet<String>();
@@ -90,6 +124,21 @@ public final class Engine {
     private final Map<String, String> listenHosts = new LinkedHashMap<String, String>();
     /** 用户点了「送声音」的设备 id（只会有 0 或 1 台）。 */
     private final Set<String> sendIds = new LinkedHashSet<String>();
+
+    /**
+     * ★ 「听广播」（频道模式）：不挑发送方，谁往本机音频端口发声音就播谁。
+     *
+     * <p><b>为什么必须单独有这么一个开关</b>：我们的设计里广播和点对点是两条通道 ——
+     * 电脑开着「广播我的声音」时，声音是发给<b>所有在线节点</b>的；而手机原来只会播
+     * "用户点过🎧收听的那几台"（白名单），所以电脑广播过来的包会被按名单过滤掉。
+     * 真机现场就是这样：电脑在广播，手机一个包都没播（"按名单过滤"那一条能看出来）。
+     *
+     * <p><b>为什么是"谁来都听"而不是"只听广播"</b>：音频包里没有路由标记（电脑端协议注释
+     * 里写得很清楚：{@code An audio packet carries no route id}），接收端从包本身分不出
+     * "这是广播给我的"还是"这是点对点给我的"。所以这里如实按"谁的都听"实现，
+     * 界面上也照实这么写，不假装能分辨。
+     */
+    private volatile boolean channelListen;
 
     /** Discovery 回调线程推过来的快照；peers() 优先问 Discovery，失败时退回这份。 */
     private volatile List<Discovery.Peer> cache = Collections.emptyList();
@@ -183,8 +232,11 @@ public final class Engine {
             listenHosts.clear();
             listenPorts.clear();
             sendIds.clear();
+            channelListen = false;      // 「停止」= 一切都停，重启后不要留着一个用户看不见的开关
             stopReceiver();
             stopSender();
+            // 采集停了就把投屏授权也放掉：一直攥着它，系统状态栏会一直挂着"正在投放"的提示。
+            releaseProjection();
             stopStatsThread();
             synchronized (peerLock) {
                 peerStats.clear();
@@ -266,12 +318,47 @@ public final class Engine {
             if (listenIds.isEmpty()) {
                 // 用户明确取消了全部收听：这时候才停接收器。
                 // （注意顺序：上面已经把 id 移除，所以这里判断的是"用户真的都取消了"。）
-                stopReceiver();
+                // ★ 但"听广播"还开着、或者还在送声音时不能停：前者靠它收频道音频，
+                //   后者靠它收对端的统计回话。
+                stopReceiverIfIdle();
             } else {
                 ensureReceiver();
                 applyAllowedHosts();
             }
         }
+    }
+
+    /** ★ 「听广播」开关。打开之后接收端不再按名单过滤（谁来都听），并且保持接收器活着。 */
+    public boolean isChannelListening() {
+        return channelListen;
+    }
+
+    public void setChannelListen(boolean on) {
+        synchronized (lock) {
+            if (channelListen == on) {
+                return;
+            }
+            channelListen = on;
+            if (on) {
+                ensureReceiver();       // 没有它一个包都收不到
+                applyAllowedHosts();    // 名单留空 = 谁的都听
+            } else {
+                applyAllowedHosts();
+                stopReceiverIfIdle();
+            }
+        }
+    }
+
+    /**
+     * 没有任何理由再收包时才停接收器。
+     *
+     * <p>三个理由：还开着「听广播」、还在送声音（要收对端的统计回话）、还有收听目标。
+     */
+    private void stopReceiverIfIdle() {
+        if (channelListen || sender != null || !listenIds.isEmpty()) {
+            return;
+        }
+        stopReceiver();
     }
 
     /** 点「送声音」：把我的麦克风送给这台。换目标会自动切换，不需要先关。 */
@@ -291,9 +378,8 @@ public final class Engine {
             if (sendIds.isEmpty()) {
                 // 送声停了、又没有别的收听目标：接收器只是刚才为了收对端统计才开着的，
                 // 一起收掉（否则它会一直占着 UDP 端口和一个 WifiLock）。
-                if (listenIds.isEmpty()) {
-                    stopReceiver();
-                }
+                // ★ 但「听广播」开着就不能收 —— 那正是它存在的理由。
+                stopReceiverIfIdle();
                 return;
             }
             Discovery.Peer target = findById(id);
@@ -305,6 +391,11 @@ public final class Engine {
                 // 用带 Context 的构造：它会顺手拿一个 WifiLock，息屏后不至于一顿一顿的。
                 AudioSend s = new AudioSend(app, target.host, port);
                 s.setGain(volume);
+                // ★ 把"送什么声音"接上：音源 + 本机声音的授权。
+                //   拿不到授权、或低于 Android 10 时，AudioSend 自己会退回麦克风并记下原因，
+                //   界面拿 activeSourceKind() 如实显示"现在实际送的是哪一个"。
+                s.setProjection(projection);
+                s.setSourceKind(sourceKind);
                 s.start();
                 sender = s;
                 lastSendError = "";
@@ -313,7 +404,7 @@ public final class Engine {
                 //   两边互报状态，用户才能一眼看出"是哪一端没在发/没收"。
                 ensureReceiver();
             } catch (Throwable t) {
-                // 拿不到麦克风（被别的 App 占用 / 没权限）时不要把界面搞崩。
+                // 拿不到采集（被别的 App 占用 / 没权限）时不要把界面搞崩。
                 Log.w(TAG, "启动送声音失败 -> " + target.host + ":" + port, t);
                 lastSendError = String.valueOf(t);
                 sendIds.clear();
@@ -366,7 +457,9 @@ public final class Engine {
      */
     public void pruneGoneTargets() {
         synchronized (lock) {
-            if (!sawPeer || (sendIds.isEmpty() && listenIds.isEmpty())) {
+            // ★ 「听广播」开着时不能提前返回：那时候用户很可能一台设备都没看见
+            //   （这正是要用它的场景），而接收器的自愈就靠下面那几行。
+            if (!channelListen && (!sawPeer || (sendIds.isEmpty() && listenIds.isEmpty()))) {
                 return;
             }
             Discovery d = discovery;
@@ -394,15 +487,358 @@ public final class Engine {
             } else if (changed) {
                 // 送声音的目标没了就真的没得送了（麦克风不该一直开着）。
                 stopSender();
-            }            // 自愈：只要还有收听目标，接收器就必须活着（可能被别处停掉过）。
-            if (!listenIds.isEmpty() && receiver == null) {
+            }            // 自愈：只要还有收听目标（或开着听广播），接收器就必须活着（可能被别处停掉过）。
+            if ((!listenIds.isEmpty() || channelListen) && receiver == null) {
                 ensureReceiver();
-            } else if (listenIds.isEmpty() && sender == null && receiver != null) {
-                // 既不听也不送：接收器只是刚才为了收对端统计才开着的，可以收掉了（省电、放端口）。
+            } else if (listenIds.isEmpty() && sender == null && receiver != null && !channelListen) {
+                // 既不听也不送、也没开听广播：接收器只是刚才为了收对端统计才开着的，
+                // 可以收掉了（省电、放端口）。
                 stopReceiver();
             }
             applyAllowedHosts();
         }
+    }
+
+    // ────────────────────────── ★ 送什么声音（音源 + 授权） ──────────────────────────
+
+    /** 用户选的音源。注意这可能和实际采的不一样，看 {@link #activeSourceKind()}。 */
+    public int sourceKind() {
+        return sourceKind;
+    }
+
+    /**
+     * 换音源。正在送声音时是<b>热切换</b>：AudioSend 会在采集线程里重建 AudioRecord，
+     * 既不中断发送，也不会出现两路采集叠在一起发（那会让对端听到重音）。
+     */
+    public void setSourceKind(int kind) {
+        if (kind == AudioSend.SRC_PLAYBACK && !AudioSend.playbackSupported()) {
+            kind = AudioSend.SRC_MIC;      // 低版本没有这个能力，不给选
+        }
+        sourceKind = kind;
+        AudioSend s = sender;
+        if (s != null) {
+            try {
+                s.setProjection(projection);
+                s.setSourceKind(kind);
+            } catch (Throwable t) {
+                Log.w(TAG, "切换音源失败", t);
+            }
+        }
+    }
+
+    /** <b>实际</b>在采的音源：没在送声音时就是用户选的那个。界面显示"现在送的是什么"必须用它。 */
+    public int activeSourceKind() {
+        AudioSend s = sender;
+        if (s != null && s.isRunning() && s.activeSourceKind() >= 0) {
+            return s.activeSourceKind();
+        }
+        return sourceKind;
+    }
+
+    /** 用户选的音源和实际在采的不一样吗（= 界面上要显眼地写清楚原因）。 */
+    public boolean sourceMismatch() {
+        AudioSend s = sender;
+        return s != null && s.isRunning() && s.activeSourceKind() >= 0
+                && s.activeSourceKind() != sourceKind;
+    }
+
+    /** 这台机器支不支持采本机声音（Android 10+）。 */
+    public boolean playbackSupported() {
+        return AudioSend.playbackSupported();
+    }
+
+    public boolean hasProjection() {
+        return projection != null;
+    }
+
+    public String projectionError() {
+        return projectionError == null ? "" : projectionError;
+    }
+
+    /** 授权弹窗之前先记下"授权回来要送给哪一台"，拿不到授权就清掉。 */
+    public void requestSendWithPlayback(Discovery.Peer p) {
+        pendingSendId = (p == null) ? "" : idOf(p);
+    }
+
+    /** 用户放弃了授权（关掉了系统窗口/点了拒绝）：把待办清掉，别让界面一直转圈。 */
+    public void cancelPendingSend(String why) {
+        String id = pendingSendId;
+        pendingSendId = "";
+        if (id != null && id.length() > 0) {
+            lastSendError = (why == null || why.length() == 0) ? "没有拿到送本机声音的授权" : why;
+        }
+    }
+
+    /** 待办的那台设备 id（诊断报告里用：不是空的就是"卡在等授权"）。 */
+    public String pendingSendId() {
+        return pendingSendId == null ? "" : pendingSendId;
+    }
+
+    /**
+     * 授权成功。由 {@link MixService} 调用 —— 而且必须在<b>已经启动的、
+     * 类型含 mediaProjection 的前台服务里</b>调：targetSdk 34 下顺序反了系统直接抛
+     * SecurityException（这是 Android 14 的硬性要求）。
+     */
+    public void onProjectionGranted(MediaProjection p) {
+        if (p == null) {
+            onProjectionFailed("系统没有返回授权对象");
+            return;
+        }
+        String target;
+        synchronized (lock) {
+            projection = p;
+            projectionError = "";
+            try {
+                // 必须注册回调：授权被系统收回时要立刻知道，否则界面会一直显示"送声中"
+                // 而实际上一片静音 —— 那是最难查的一种假象。
+                p.registerCallback(projectionCallback(), mainHandler);
+            } catch (Throwable t) {
+                Log.w(TAG, "注册投屏回调失败（继续用，只是收不到系统收回的通知）", t);
+            }
+            target = (pendingSendId == null) ? "" : pendingSendId;
+            pendingSendId = "";
+            // 正在送麦克风的话就热切到本机声音：用户点授权的意图很明确。
+            AudioSend s = sender;
+            if (s != null && sourceKind == AudioSend.SRC_PLAYBACK) {
+                try {
+                    s.setProjection(p);
+                    s.setSourceKind(AudioSend.SRC_PLAYBACK);
+                } catch (Throwable t) {
+                    Log.w(TAG, "授权到手后切换到本机声音失败", t);
+                }
+            }
+        }
+        if (target.length() > 0) {
+            Discovery.Peer t = findById(target);
+            if (t != null && t.host != null && !t.host.isEmpty()) {
+                setSending(t, true);       // 授权前用户点的那一台：现在真的开始送
+            } else {
+                lastSendError = "授权拿到了，但设备列表里已经找不到那台设备了";
+                Log.w(TAG, lastSendError);
+            }
+        }
+    }
+
+    /** 授权失败（用户在系统窗口点了拒绝，或系统不给）。必须如实记下来。 */
+    public void onProjectionFailed(String err) {
+        String msg = (err == null || err.length() == 0) ? "授权失败（原因未知）" : err;
+        synchronized (lock) {
+            projectionError = msg;
+            pendingSendId = "";
+            // 正在用旧授权送本机声音的话，先退回麦克风：授权没了还继续采只会是静音。
+            if (sourceKind == AudioSend.SRC_PLAYBACK && sender != null) {
+                try {
+                    sender.setProjection(null);
+                    sender.setSourceKind(AudioSend.SRC_MIC);
+                } catch (Throwable ignored) {
+                    // 切不过去也不影响"如实报告"，界面看 activeSourceKind() 就知道
+                }
+            }
+        }
+        Log.w(TAG, "采本机声音的授权没拿到：" + msg);
+    }
+
+    /**
+     * 系统把授权收回了（用户在状态栏点"停止投放"、或者被别的 App / 系统抢走）。
+     *
+     * <p>处理原则：<b>立刻退回麦克风 + 写明原因</b>。继续拿旧授权采集只会得到一片静音，
+     * 而用户看到的却是"送声中"，那种假象比直接报错难查得多。
+     */
+    public void onProjectionStopped() {
+        synchronized (lock) {
+            boolean wasGranted = projection != null;
+            projection = null;
+            if (wasGranted) {
+                projectionError = "系统收回了「录制/投射」授权（在状态栏点了停止，或被别的 App 抢走）";
+            }
+            AudioSend s = sender;
+            if (s != null && s.activeSourceKind() == AudioSend.SRC_PLAYBACK) {
+                try {
+                    s.setProjection(null);
+                    s.setSourceKind(AudioSend.SRC_MIC);
+                } catch (Throwable t) {
+                    Log.w(TAG, "授权被收回后切回麦克风失败", t);
+                }
+            }
+        }
+        Log.w(TAG, "采本机声音的授权被系统收回了");
+    }
+
+    /** 释放授权（停引擎时调用）。释放之后要再送本机声音就得重新授权一次。 */
+    private void releaseProjection() {
+        MediaProjection p;
+        synchronized (lock) {
+            p = projection;
+            projection = null;
+            pendingSendId = "";
+        }
+        if (p == null) {
+            return;
+        }
+        try {
+            MediaProjection.Callback cb = projectionCallback;
+            if (cb != null) {
+                p.unregisterCallback(cb);
+            }
+        } catch (Throwable ignored) {
+            // 没注册成功过就会抛，忽略
+        }
+        try {
+            p.stop();
+        } catch (Throwable t) {
+            Log.w(TAG, "停止投屏授权失败", t);
+        }
+    }
+
+    private MediaProjection.Callback projectionCallback() {
+        if (projectionCallback == null) {
+            projectionCallback = new MediaProjection.Callback() {
+                @Override
+                public void onStop() {
+                    onProjectionStopped();
+                }
+            };
+        }
+        return projectionCallback;
+    }
+
+    // ── 这些是给界面和诊断报告用的人话（只在这一处定义，免得两种说法把用户绕晕）──
+
+    /** 「当前选择」那一行。 */
+    public String sourceNameText() {
+        return AudioSend.sourceName(sourceKind)
+                + (sourceKind == AudioSend.SRC_PLAYBACK ? "（手机上正在放的音乐/视频/游戏）" : "（对讲用）");
+    }
+
+    /** 「实际采集」那一行：和用户选的不一样时，把原因一起写出来。 */
+    public String activeSourceText() {
+        AudioSend s = sender;
+        if (s == null || !s.isRunning() || s.activeSourceKind() < 0) {
+            return "没在采集（没点过任何一台的「送声音」）";
+        }
+        int act = s.activeSourceKind();
+        StringBuilder sb = new StringBuilder(AudioSend.sourceName(act));
+        if (act == sourceKind) {
+            sb.append(" ✓");
+        } else {
+            sb.append(" ⚠（你要的是 ").append(AudioSend.sourceName(sourceKind))
+                    .append("，采不到：").append(mismatchReason(s)).append("）");
+        }
+        return sb.toString();
+    }
+
+    /** 采集不到时给用户看的原因（优先用采集线程记下的那条）。 */
+    public String mismatchReason(AudioSend s) {
+        String e = (s == null) ? "" : s.lastError();
+        if (e != null && e.length() > 0) {
+            return e;
+        }
+        String p = projectionError();
+        return p.length() > 0 ? p : "原因未知（看诊断报告）";
+    }
+
+    /** 「系统支持」那一行。 */
+    public String playbackSupportText() {
+        String ver = "Android " + Build.VERSION.RELEASE + "（API " + Build.VERSION.SDK_INT + "）";
+        if (AudioSend.playbackSupported()) {
+            return "支持 ✓ —— " + ver + "，可以用系统声音采集（AudioPlaybackCapture）";
+        }
+        return "不支持 ✗ —— " + ver + " 低于 Android 10，系统没有采集本机声音这个能力，只能用麦克风";
+    }
+
+    /** 「授权状态」那一行。 */
+    public String projectionStateText() {
+        if (!AudioSend.playbackSupported()) {
+            return "不需要（低版本没有这个能力）";
+        }
+        if (projection != null) {
+            return "已授权 ✓（授权一次之后一直用；App 重启后要再授权一次）";
+        }
+        String e = projectionError();
+        if (e.length() > 0) {
+            return "没有授权 ✗ —— " + e;
+        }
+        return "还没授权 —— 点任意一台的「送声音」会弹一次系统授权框，允许后就能送本机声音";
+    }
+
+    /** 「采集格式」那一行。 */
+    public String captureFormatText() {
+        AudioSend s = sender;
+        if (s == null || !s.isRunning()) {
+            return "（没在采集）";
+        }
+        return s.captureFormatText();
+    }
+
+    /**
+     * 「静音情况」那一行 —— 采本机声音时最值钱的一条：
+     * 包在发、但一直是零，几乎就是 DRM 保护内容或"禁止被采集的 App"。
+     */
+    public String silenceText() {
+        AudioSend s = sender;
+        if (s == null || !s.isRunning()) {
+            return "（没在采集）";
+        }
+        long ms = s.silentMs();
+        if (ms < 1500) {
+            return "有声音 ✓（最近 " + (ms / 100) / 10f + " 秒内采到过内容）";
+        }
+        String sec = String.format(java.util.Locale.US, "%.1f", ms / 1000.0);
+        if (!s.everLoud()) {
+            return "一直是静音 ✗（已连续 " + sec + " 秒没有任何声音）"
+                    + (s.activeSourceKind() == AudioSend.SRC_PLAYBACK
+                    ? "—— 采本机声音时这通常意味着：这段内容是 DRM 保护的（部分音乐/影视 App）、"
+                    + "或者那个 App 主动禁止了被采集；先在手机上放点声音试试。"
+                    : "—— 麦克风没收到声音（手机静音了？离得远？）");
+        }
+        return "最近 " + sec + " 秒没有声音（之前在正常采）";
+    }
+
+    /** 界面主卡片里那句「现在送的是什么」。 */
+    public String sourceStateText() {
+        if (!AudioSend.playbackSupported()) {
+            return "你的安卓版本（Android " + Build.VERSION.RELEASE + "）不支持采集本机声音，只能用麦克风。"
+                    + "要送手机上正在放的声音，需要 Android 10 及以上。";
+        }
+        AudioSend s = sender;
+        boolean sending = s != null && s.isRunning();
+        if (!sending) {
+            StringBuilder sb = new StringBuilder("现在没在送声音。");
+            sb.append("选中「").append(AudioSend.sourceName(sourceKind))
+                    .append("」之后，点任意一台设备的「送声音」开始。");
+            if (sourceKind == AudioSend.SRC_PLAYBACK && projection == null) {
+                sb.append("第一次会让你在系统窗口里点一次允许（授权一次，之后一直用）。");
+            }
+            return sb.toString();
+        }
+        int act = s.activeSourceKind();
+        if (act == AudioSend.SRC_PLAYBACK) {
+            return "正在送：🔊 本机声音（手机上正在放的音乐/视频/游戏）";
+        }
+        if (sourceKind == AudioSend.SRC_PLAYBACK) {
+            return "⚠ 你要的是 🔊 本机声音，但采不到，现在实际送的是 🎤 麦克风 —— "
+                    + mismatchReason(s);
+        }
+        return "正在送：🎤 麦克风（对讲用的）";
+    }
+
+    /** 采本机声音却一直是静音时的提醒；不需要提醒就返回空串。 */
+    public String silenceHintText() {
+        AudioSend s = sender;
+        if (s == null || !s.isRunning() || s.activeSourceKind() != AudioSend.SRC_PLAYBACK) {
+            return "";
+        }
+        long ms = s.silentMs();
+        if (ms < 4000) {
+            return "";
+        }
+        String sec = String.format(java.util.Locale.US, "%.0f", ms / 1000.0);
+        if (!s.everLoud()) {
+            return "⚠ 本机声音已经送了 " + sec + " 秒，但一直是静音："
+                    + "DRM 保护的内容（部分音乐/影视 App）和主动禁止被采集的 App 采不到，属正常现象；"
+                    + "先在手机上放点声音验证一下。";
+        }
+        return "本机声音最近 " + sec + " 秒是静的（之前采到过）。";
     }
 
     private Discovery.Peer findById(String id) {
@@ -455,6 +891,16 @@ public final class Engine {
         }
         try {
             r.clearAllowed();
+            if (channelListen) {
+                // ★ 听广播：名单留空 = 谁的都听（AudioRecv 的语义就是"空 = 全收"）。
+                //   这一行就是"手机能听电脑广播"的关键：原来这里一定会写进至少一个地址
+                //   （没有收听目标时写一个不可能命中的占位地址），于是广播包全被过滤掉。
+                //
+                //   为什么不能做得更"精确"：音频包里没有路由标记，接收端分不出
+                //   "广播给我的"和"点对点给我的"，所以只能如实按"谁来都听"实现。
+                Log.i(TAG, "听广播已打开：接收端不再按名单过滤（谁来都听）");
+                return;
+            }
             int n = 0;
             for (String id : listenIds) {
                 String host = listenHosts.get(id);
@@ -645,7 +1091,20 @@ public final class Engine {
                 targets.put(snd.host(), snd.port() > 0 ? snd.port() : Proto.DEFAULT_AUDIO_PORT);
             }
         }
-        if (targets.isEmpty()) {
+        // ★ 听广播时，把"我正在收的每一路"也告诉对方：对面才知道它广播的东西到没到我这儿。
+        //   （否则用户只能看到"手机没声音"，而电脑那边毫无反馈。）
+        if (channelListen) {
+            AudioRecv.Stats st0 = recvStats();
+            if (st0 != null && st0.streams != null) {
+                for (AudioRecv.StreamStats ss : st0.streams) {
+                    if (ss.host == null || ss.host.isEmpty() || targets.containsKey(ss.host)) {
+                        continue;
+                    }
+                    targets.put(ss.host, portForHost(ss.host));
+                }
+            }
+        }
+        if (targets.isEmpty() && !channelListen) {
             expirePeerStats();
             return;
         }
@@ -901,6 +1360,19 @@ public final class Engine {
         StringBuilder sb = new StringBuilder();
         sb.append("收 ").append(st.received).append(" 包 · 丢 ").append(st.lost)
                 .append(" · 迟到 ").append(st.late).append(" · 坏包 ").append(st.badPackets);
+        // ★ 坏包分类：详情面板也要能一眼看出"坏在哪"（真机排查就卡在一个总数上）
+        if (st.badPackets > 0) {
+            sb.append("\n坏包明细 magic ").append(st.badMagic)
+                    .append(" · 版本 ").append(st.badVersion)
+                    .append(" · 太短 ").append(st.badShort)
+                    .append(" · 编码 ").append(st.badCodec)
+                    .append(" · 帧长 ").append(st.badFrames);
+            String sample = (st.lastCodecSample != null && st.lastCodecSample.length() > 0)
+                    ? st.lastCodecSample : st.lastMagicSample;
+            if (sample != null && sample.length() > 0) {
+                sb.append("\n").append(sample);
+            }
+        }
         sb.append("\n缓冲 ").append(st.bufferedMs).append("ms（目标 ").append(st.targetMs)
                 .append("ms）· 流 ").append(st.streamCount);
         if (st.duplicates > 0 || st.filtered > 0) {
@@ -943,6 +1415,17 @@ public final class Engine {
             if (s.sendErrors() > 0) {
                 sb.append(" · 失败 ").append(s.sendErrors()).append(" 次");
             }
+            // ★ 音源写在详情里：用户看"送声音"到底送的是什么，这里是最直接的答案。
+            int act = s.activeSourceKind();
+            sb.append("\n音源 ").append(act < 0 ? "（还没打开）" : AudioSend.sourceName(act));
+            if (act >= 0 && act != sourceKind) {
+                sb.append("（你要的是 ").append(AudioSend.sourceName(sourceKind)).append("）");
+            }
+            sb.append(" · ").append(s.captureFormatText());
+            String hint = silenceHintText();
+            if (hint.length() > 0) {
+                sb.append('\n').append(hint);
+            }
             String last = s.lastError();
             if (last != null && last.length() > 0) {
                 sb.append("\n最近：").append(last);
@@ -953,16 +1436,40 @@ public final class Engine {
         }
     }
 
-    /** 详情面板里的「发现统计」。 */
+    /** 界面「听广播」那一行的人话（带"收到几个包"这种能直接定性的数字）。 */
+    public String channelStateText() {
+        if (!channelListen) {
+            return "没开：只有你点过「🎧 收听」的设备才会出声。";
+        }
+        AudioRecv.Stats st = recvStats();
+        long recv = st == null ? 0 : st.received;
+        int streams = st == null ? 0 : st.streamCount;
+        StringBuilder sb = new StringBuilder(200);
+        sb.append("正在听广播：谁往本机音频端口发声音就播谁（不用先点某台设备）。");
+        if (!receiverRunning()) {
+            sb.append("⚠ 接收器没起来（音频端口可能被别的 App 占了）。");
+        } else if (recv == 0) {
+            sb.append("已经收到 0 个音频包 —— 对面要开着「广播我的声音」，")
+                    .append("而且它得先能看见本机（点「详情」看发现自检那几行）。");
+        } else if (streams == 0) {
+            sb.append("累计收到 ").append(recv).append(" 包，但当前没有活跃的流（对面可能刚停）。");
+        } else {
+            sb.append("正在收 ").append(streams).append(" 路 · 累计 ").append(recv).append(" 包。");
+        }
+        return sb.toString();
+    }
+
+    /** 详情面板里的「发现统计」（含 ★ 发现层自检：列表空着时到底卡在哪一步）。 */
     public String discoveryStatsText() {
         Discovery d = discovery;
         if (d == null) {
             return "发现未启动";
         }
         try {
-            StringBuilder sb = new StringBuilder();
-            sb.append("信标 收 ").append(d.beaconsReceived()).append(" / 发 ").append(d.beaconsSent());
-            sb.append("\n发现端口 ").append(d.boundPort()).append(" · 组播 ").append(Proto.DISCOVERY_GROUP);
+            StringBuilder sb = new StringBuilder(768);
+            sb.append("发现端口 ").append(d.boundPort())
+                    .append(" · 组播 ").append(Proto.DISCOVERY_GROUP).append(" · TTL 2\n");
+            sb.append(d.selfCheckText().trim());
             String err = d.lastError();
             if (err != null && err.length() > 0) {
                 sb.append("\n最近：").append(err);
@@ -971,6 +1478,23 @@ public final class Engine {
         } catch (Throwable t) {
             return "发现统计不可用";
         }
+    }
+
+    /** 某台设备的音频端口（从发现列表里查；查不到就用默认端口）。 */
+    private int portForHost(String host) {
+        if (host == null || host.isEmpty()) {
+            return Proto.DEFAULT_AUDIO_PORT;
+        }
+        try {
+            for (Discovery.Peer p : peers()) {
+                if (host.equals(p.host) && p.audioPort > 0) {
+                    return p.audioPort;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 查不到就用默认端口
+        }
+        return Proto.DEFAULT_AUDIO_PORT;
     }
 
     /** 本机 IP：和电脑端 netcheck 同一套判定 —— 只要私有地址，避开 VPN 叠加网段。 */

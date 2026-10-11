@@ -6,6 +6,7 @@ import android.app.Dialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Canvas;
@@ -21,6 +22,7 @@ import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.media.AudioManager;
+import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -55,8 +57,15 @@ import java.util.Map;
  * <p>每一行两个开关：
  * <ul>
  *   <li><b>🎧 收听</b>：收这台发来的声音（可以同时收听多台，声音会混在一起）。</li>
- *   <li><b>🎤 送声音</b>：把我的麦克风送给这台（同一时刻只送一台）。</li>
+ *   <li><b>🔊 送声音</b>：把<b>本机正在播放的声音</b>送给这台（音乐/视频/游戏）——
+ *       这是这个 App 本来的用法；切成 🎤 麦克风就是对讲。</li>
  * </ul>
+ *
+ * <p><b>★ 为什么"送什么声音"要做成显式可选的</b>：早期版本只采麦克风，用户的原话是
+ * 「你这手机都是采集的麦克风的声音，那不成对讲机了吗？我的需求一直都是桌面音频啊」。
+ * 所以这个页面上：①音源选择放在最显眼的位置；②下面那行<b>永远写"实际在送的是哪一个"</b>，
+ * 采不到本机声音就如实写原因并说明已退回麦克风；③限制（安卓 10 以下没有这个能力、
+ * DRM/主动禁止采集的内容采不到、部分 ROM 阉割）都写在界面上，不让用户再被误导一次。
  *
  * <p>视觉对齐 {@code audiomixing/ui/phone.html}：深色底 + 圆角卡片 + 大状态 + 电平条。
  * 工程零依赖（没有 appcompat），所以界面全部用代码搭、圆角用 {@link GradientDrawable} 画。
@@ -81,6 +90,8 @@ public class MainActivity extends Activity {
 
     private static final int REQ_MIC = 1001;
     private static final int REQ_NOTIF = 1002;
+    /** ★ 「采本机声音」的系统授权窗口（MediaProjection 的一次性许可）。 */
+    private static final int REQ_PROJ = 1003;
     /** 界面刷新间隔：150ms 足够跟手，又不会一直在重画。 */
     private static final long TICK_MS = 150L;
 
@@ -95,6 +106,16 @@ public class MainActivity extends Activity {
     private LinearLayout detailWrap;
     private TextView volumeVal;
     private SeekBar volumeBar;
+    // ★ 「送什么声音」那一块
+    private TextView playChip;
+    private TextView micChip;
+    private TextView sourceNow;
+    private TextView sourceWarn;
+    private String lastSrcSig;
+    // ★ 「听广播」（频道模式）
+    private TextView channelChip;
+    private TextView channelNow;
+    private boolean lastChannelOn;
 
     private final Map<String, PeerRow> rows = new LinkedHashMap<String, PeerRow>();
     private final Map<String, TextView> kvValues = new LinkedHashMap<String, TextView>();
@@ -104,7 +125,8 @@ public class MainActivity extends Activity {
     private boolean detailsOpen;
     private boolean ticking;
     private int tickCount;
-    private Discovery.Peer pendingSend;   // 等麦克风权限回来之后再开始送的那台
+    /** 等权限 / 等投屏授权回来之后再开始送的那台设备。 */
+    private Discovery.Peer pendingSend;
 
     private final Runnable tick = new Runnable() {
         @Override
@@ -172,15 +194,45 @@ public class MainActivity extends Activity {
             return;
         }
         boolean ok = granted.length > 0 && granted[0] == PackageManager.PERMISSION_GRANTED;
-        if (ok && pendingSend != null) {
-            engine.setSending(pendingSend, true);
-            // 权限到手了，再叫一次服务把 microphone 这个前台类型补上（安卓 14 要求）。
-            // 注意是"再叫一次"而不是 stop+start —— 后者会把刚开起来的送声一起掐掉。
-            MixService.safeStart(this);
-        } else if (!ok) {
-            toast("没有麦克风权限，送不了声音");
-        }
+        Discovery.Peer p = pendingSend;
         pendingSend = null;
+        if (!ok) {
+            // 采本机声音也要这个权限（系统对 AudioRecord 一律要求），所以这句话必须说准，
+            // 否则用户会以为"我不给麦克风权限就送不了本机声音"是 Bug。
+            toast("没有录音权限，送不了声音（采本机声音也需要它，但不会采你说话的声音）");
+            engine.cancelPendingSend("没有录音权限");
+            refreshNow();
+            return;
+        }
+        // 权限到手了，再叫一次服务把 microphone 这个前台类型补上（安卓 14 要求）。
+        // 注意是"再叫一次"而不是 stop+start —— 后者会把刚开起来的送声一起掐掉。
+        MixService.safeStart(this);
+        if (p != null) {
+            startSendFlow(p);     // 接着走：如果选的是本机声音，下一步就是投屏授权
+        }
+        refreshNow();
+    }
+
+    /**
+     * ★ 投屏授权的返回。这里<b>不</b>自己换 MediaProjection，而是交给前台服务去做：
+     * targetSdk 34 起必须先有带 mediaProjection 类型的前台服务，再调 getMediaProjection，
+     * 顺序反了系统直接抛异常。服务那边会把这两步按顺序做完（见 MixService.armProjection）。
+     */
+    @Override
+    protected void onActivityResult(int req, int resultCode, Intent data) {
+        super.onActivityResult(req, resultCode, data);
+        if (req != REQ_PROJ) {
+            return;
+        }
+        if (resultCode != RESULT_OK || data == null) {
+            pendingSend = null;
+            engine.cancelPendingSend("你在系统窗口里拒绝了授权");
+            toast("没有授权采不到本机声音；也可以改用麦克风");
+            refreshNow();
+            return;
+        }
+        MixService.armProjection(this, resultCode, data);
+        toast("已授权，正在开始送本机声音…");
         refreshNow();
     }
 
@@ -208,7 +260,59 @@ public class MainActivity extends Activity {
         for (PeerRow r : rows.values()) {
             r.sync();
         }
+        refreshSourceRow();
+        refreshChannelRow();
         updateHeader(peers.size());
+    }
+
+    /** 刷新「听广播」那一块（状态会随"收到了几个包"变，所以每 150ms 一起刷）。 */
+    private void refreshChannelRow() {
+        if (channelNow == null) {
+            return;
+        }
+        boolean on = engine.isChannelListening();
+        if (channelChip != null && on != lastChannelOn) {
+            lastChannelOn = on;
+            styleChip(channelChip, on, "📻 听广播");
+        }
+        setTextIfChanged(channelNow, engine.channelStateText());
+        int color = on ? OK : DIM;
+        if (channelNow.getCurrentTextColor() != color) {
+            channelNow.setTextColor(color);
+        }
+    }
+
+    /**
+     * 刷新「送什么声音」那一块。
+     *
+     * <p>为什么每 150ms 都刷：音源会因为"授权被系统收回""设备采不到本机声音"而<b>自己变</b>，
+     * 用户看到的必须是当下真实的那一个，而不是他上次点的那个。
+     */
+    private void refreshSourceRow() {
+        if (sourceNow == null) {
+            return;
+        }
+        int want = engine.sourceKind();
+        boolean supported = engine.playbackSupported();
+        boolean sending = engine.senderRunning();
+        int act = engine.activeSourceKind();
+        // 只在状态真的变了才重建按钮背景（150ms 一次，别一直产生垃圾对象）
+        String sig = want + "|" + supported + "|" + sending + "|" + act + "|" + engine.hasProjection();
+        if (!sig.equals(lastSrcSig)) {
+            lastSrcSig = sig;
+            // 低版本把「本机声音」画成没选中的样子：点了会明确告诉你"不支持"，
+            // 而不是选中了却什么也采不到（那正是会误导人的地方）。
+            styleChip(playChip, supported && want == AudioSend.SRC_PLAYBACK, "🔊 本机声音");
+            styleChip(micChip, want == AudioSend.SRC_MIC, "🎤 麦克风");
+        }
+        setTextIfChanged(sourceNow, engine.sourceStateText());
+        int color = engine.sourceMismatch() ? WARN : (sending ? OK : DIM);
+        if (sourceNow.getCurrentTextColor() != color) {
+            sourceNow.setTextColor(color);
+        }
+        String hint = engine.silenceHintText();
+        setTextIfChanged(sourceWarn, hint);
+        sourceWarn.setVisibility(hint.length() == 0 ? View.GONE : View.VISIBLE);
     }
 
     private void refreshNow() {
@@ -291,15 +395,84 @@ public class MainActivity extends Activity {
             refreshNow();
             return;
         }
-        // 麦克风权限：点「送声音」时才要，别一打开 App 就弹窗（用户会反感）。
+        startSendFlow(p);
+    }
+
+    /**
+     * 「送声音」的完整流程。顺序是有原因的：
+     * <ol>
+     *   <li>低于安卓 10 → 本机声音这个能力根本不存在，直接改成麦克风并说清楚；</li>
+     *   <li>要录音权限 —— <b>采本机声音同样需要它</b>（系统对 AudioRecord 一律要求 RECORD_AUDIO），
+     *       界面上会写明"不会采你说话的声音"，免得用户又以为这是对讲机；</li>
+     *   <li>选的是本机声音且还没授权 → 弹一次系统授权窗口，授权回来之后由前台服务接着开始送。</li>
+     * </ol>
+     */
+    private void startSendFlow(Discovery.Peer p) {
+        if (p == null) {
+            return;
+        }
+        int want = engine.sourceKind();
+        if (want == AudioSend.SRC_PLAYBACK && !engine.playbackSupported()) {
+            toast("你的安卓版本不支持采本机声音（要 Android 10 及以上），只能用麦克风");
+            engine.setSourceKind(AudioSend.SRC_MIC);
+            want = AudioSend.SRC_MIC;
+        }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
             pendingSend = p;
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
             return;
         }
+        if (want == AudioSend.SRC_PLAYBACK && !engine.hasProjection()) {
+            pendingSend = p;
+            engine.requestSendWithPlayback(p);      // 授权回来之后还知道要送给谁
+            if (!requestProjection()) {
+                pendingSend = null;
+                engine.cancelPendingSend("这台设备没有投屏服务，送不了本机声音");
+                toast("这台设备没有投屏服务，送不了本机声音；可以改用麦克风");
+            }
+            return;
+        }
         engine.setSending(p, true);
-        toast("正在把本机麦克风送给 " + p.label());
+        // 提示里说的是"打算送什么"；真实采到的是什么，下面那行状态 150ms 内就会如实刷新
+        // （采不到本机声音时会写"已退回麦克风 + 原因"）。
+        toast("开始送声音：" + AudioSend.sourceShortName(want) + " → " + p.label());
+        MixService.safeStart(this);
+        refreshNow();
+    }
+
+    /** 弹系统授权窗口（「是否允许 Audio Mixing 录制或投放？」）。返回 false = 连窗口都拉不起来。 */
+    private boolean requestProjection() {
+        try {
+            MediaProjectionManager mgr =
+                    (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+            if (mgr == null) {
+                return false;
+            }
+            startActivityForResult(mgr.createScreenCaptureIntent(), REQ_PROJ);
+            return true;
+        } catch (Throwable t) {
+            toast("拉不起授权窗口：" + t);
+            return false;
+        }
+    }
+
+    /** 用户点了音源按钮。正在送声音时是热切换（不中断发送、不会两路声音叠着发）。 */
+    private void onSourceClick(int kind) {
+        if (kind == AudioSend.SRC_PLAYBACK && !engine.playbackSupported()) {
+            toast("你的安卓版本不支持采集本机声音（要 Android 10 及以上），只能用麦克风");
+            return;
+        }
+        engine.setSourceKind(kind);
+        if (kind == AudioSend.SRC_PLAYBACK && !engine.hasProjection()) {
+            if (requestProjection()) {
+                toast("请在系统窗口里点「立即开始」/「允许」（授权一次，之后一直用）");
+            }
+        } else {
+            toast(kind == AudioSend.SRC_PLAYBACK
+                    ? "已切到本机声音（正在送的话会立刻换过来）"
+                    : "已切到麦克风");
+        }
         refreshNow();
     }
 
@@ -478,6 +651,10 @@ public class MainActivity extends Activity {
         scroll.addView(root, new ViewGroup.LayoutParams(MATCH, WRAP));
 
         root.addView(buildHeader());
+        // ★ 「听广播」放在设备列表【上面】：用户现在最常见的情况就是列表里 0 台设备
+        //   （电脑在广播、手机看不见它），那时候列表里没有任何东西可点，
+        //   而这个开关恰恰是"电脑在广播，我要能听见"的唯一入口 —— 放进列表里等于藏起来。
+        root.addView(buildChannelCard());
 
         listBox = new LinearLayout(this);
         listBox.setOrientation(LinearLayout.VERTICAL);
@@ -486,6 +663,42 @@ public class MainActivity extends Activity {
         root.addView(buildControlCard());
         root.addView(buildHintCard());
         return scroll;
+    }
+
+    /**
+     * ★ 「听广播」卡片（频道模式）。
+     *
+     * <p>为什么必须是独立开关：我们设计里广播和点对点是两条通道。电脑开「广播我的声音」时，
+     * 声音发给<b>所有在线节点</b>；而手机原来只播"用户点过🎧收听的那几台"，
+     * 于是电脑广播过来的包全被按名单过滤掉 —— 真机现场就是这样，一个包都没播。
+     */
+    private View buildChannelCard() {
+        LinearLayout card = card();
+
+        channelChip = chip("📻 听广播");
+        channelChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                boolean on = !engine.isChannelListening();
+                engine.setChannelListen(on);
+                toast(on ? "已打开听广播：谁在广播就听谁" : "已关闭听广播");
+                refreshNow();
+            }
+        });
+        card.addView(channelChip, margins(MATCH, dpi(44), 0, 0, 0, 0));
+
+        channelNow = text("", 12f, DIM, false);
+        channelNow.setLineSpacing(dp(3), 1f);
+        card.addView(channelNow, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
+
+        TextView hint = text("📻 听广播 = 「谁在广播就听谁」：电脑上开着「广播我的声音」时选这个就能听见，"
+                + "不用先在这里点某台设备。\n"
+                + "🎧 收听 = 点对点，只收你点名的那一台（列表里有设备时用）。\n"
+                + "（音频包里没有\"路由\"标记，所以听广播实际是\"谁发过来都听\"——局域网里只有主动发给你的声音才到得了你这台。）",
+                11.5f, DIM, false);
+        hint.setLineSpacing(dp(3), 1f);
+        card.addView(hint, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
+        return card;
     }
 
     private View buildHeader() {
@@ -515,6 +728,62 @@ public class MainActivity extends Activity {
 
     private View buildControlCard() {
         LinearLayout card = card();
+
+        // ★ 『送什么声音』—— 这一块必须放在最显眼的地方。
+        //   用户的原话：「你这手机都是采集的麦克风的声音，那不成对讲机了吗？
+        //   我的需求一直都是桌面音频啊」—— 音源选错是这个 App 最大的方向性缺陷，
+        //   所以选择、当前实际音源、限制说明三样都摆在第一屏。
+        card.addView(text("送什么声音", 12.5f, DIM, false));
+
+        LinearLayout srcRow = new LinearLayout(this);
+        srcRow.setOrientation(LinearLayout.HORIZONTAL);
+
+        playChip = chip("🔊 本机声音");
+        playChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                onSourceClick(AudioSend.SRC_PLAYBACK);
+            }
+        });
+        LinearLayout.LayoutParams plp = margins(0, dpi(44), 0, 0, 0, 0);
+        plp.weight = 1f;
+        srcRow.addView(playChip, plp);
+
+        micChip = chip("🎤 麦克风");
+        micChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                onSourceClick(AudioSend.SRC_MIC);
+            }
+        });
+        LinearLayout.LayoutParams mlp = margins(0, dpi(44), dpi(8), 0, 0, 0);
+        mlp.weight = 1f;
+        srcRow.addView(micChip, mlp);
+        card.addView(srcRow, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+
+        // 这一行是"现在到底送的是什么"的唯一权威说法（绿=正常，黄=和你要的不一样）
+        sourceNow = text("", 12f, FG, false);
+        sourceNow.setLineSpacing(dp(3), 1f);
+        card.addView(sourceNow, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
+
+        // 采本机声音却一直是静音时的提醒（DRM / 禁止被采集的 App 就是这样）
+        sourceWarn = text("", 11.5f, WARN, false);
+        sourceWarn.setLineSpacing(dp(3), 1f);
+        sourceWarn.setVisibility(View.GONE);
+        card.addView(sourceWarn, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+
+        // 限制一次写清：别让用户以为"选上了就一定能采到"
+        TextView limit = text("🔊 本机声音 = 手机上正在放的音乐/视频/游戏（第一次要授权一次，之后一直用；"
+                + "安卓 10 以下没有这个能力，只能用麦克风）。\n"
+                + "注意：DRM 保护的内容（部分音乐/影视 App）和主动禁止被采集的 App 采不到，会是静音；"
+                + "少数厂商 ROM 也阉割了这个接口。\n"
+                + "🎤 麦克风 = 对讲：说给对面听。两种都走同一条音频链路，音质一样。", 11.5f, DIM, false);
+        limit.setLineSpacing(dp(3), 1f);
+        card.addView(limit, margins(MATCH, WRAP, 0, dpi(10), 0, dpi(4)));
+
+        View hr = new View(this);
+        hr.setBackgroundColor(LINE);
+        card.addView(hr, margins(MATCH, Math.max(1, dpi(1)), 0, dpi(4), 0, dpi(12)));
 
         LinearLayout volRow = new LinearLayout(this);
         volRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -610,11 +879,19 @@ public class MainActivity extends Activity {
     private View buildHintCard() {
         LinearLayout card = card();
         TextView t = text("同一 Wi-Fi 下打开这个 App，设备会自己出现 —— 不用配对、不用房间号、不用扫码。\n"
-                + "🎧 收听 = 收它发来的声音（可多台混音）；🎤 送声音 = 把本机麦克风送给它。\n"
+                + "📻 听广播 = 谁在广播就听谁（电脑上开着「广播我的声音」时用这个）；\n"
+                + "🎧 收听 = 点对点，只收你点名的那一台（可多台混音）。\n"
+                + "🔊 送声音 = 把【本机正在放的声音】送给它（音乐/视频/游戏）—— 这才是这个 App 的用法；\n"
+                + "🎤 换成麦克风就是对讲（说给对面听）。\n"
                 + "手机之间直连，关掉电脑照常工作。", 12f, DIM, false);
         t.setLineSpacing(dp(4), 1f);
         card.addView(t);
         return card;
+    }
+
+    /** 「送声音」按钮上的字：图标直接表达当前音源（🔊 本机声音 / 🎤 麦克风）。 */
+    private static String sendChipLabel(int kind) {
+        return kind == AudioSend.SRC_PLAYBACK ? "🔊 送声音" : "🎤 送声音";
     }
 
     private View buildEmptyCard() {
@@ -628,15 +905,29 @@ public class MainActivity extends Activity {
         pb.setIndeterminateTintList(ColorStateList.valueOf(ACC));
         card.addView(pb, margins(MATCH, dpi(4), 0, dpi(14), 0, 0));
 
-        TextView h = text("让另一台手机 / 电脑打开 Audio Mixing，它就会自动出现在这里。",
-                12f, DIM, false);
+        TextView h = text("让另一台手机 / 电脑打开 Audio Mixing，它就会自动出现在这里。", 12f, DIM, false);
         h.setGravity(Gravity.CENTER);
         card.addView(h, margins(MATCH, WRAP, 0, dpi(12), 0, 0));
+
+        // ★ 列表空着不等于没得听：电脑在广播时「听广播」照样能出声。
+        //   真机现场最常见的就是"列表 0 台设备"，这时候必须给用户一条能走的路。
+        TextView h2 = text("电脑上开着「广播我的声音」？直接点上面的「📻 听广播」就能听见 —— "
+                + "不用等它出现在这个列表里。", 12f, ACC, false);
+        h2.setGravity(Gravity.CENTER);
+        card.addView(h2, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
 
         TextView e = text("本机 " + engine.nodeName() + " · " + engine.localIpsText(),
                 11.5f, DIM, false);
         e.setGravity(Gravity.CENTER);
         card.addView(e, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
+
+        // 一张小抄：列表空着时按这个顺序查（和诊断报告里的【发现自检】对得上）
+        TextView tip = text("一直搜不到设备？点「详情」看「发现统计」里的自检："
+                + "如果写着\"从没收到过自己的信标\"，那是本机/路由器的组播问题（换 Wi-Fi、关掉 AP 隔离）。",
+                11.5f, DIM, false);
+        tip.setGravity(Gravity.CENTER);
+        tip.setLineSpacing(dp(3), 1f);
+        card.addView(tip, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
         return card;
     }
 
@@ -754,6 +1045,7 @@ public class MainActivity extends Activity {
         private boolean styledOnce;
         private boolean styledListen;
         private boolean styledSend;
+        private int styledSrc = -1;
 
         PeerRow(Discovery.Peer p) {
             this.peer = p;
@@ -805,7 +1097,7 @@ public class MainActivity extends Activity {
             llp.weight = 1f;
             btns.addView(listenChip, llp);
 
-            sendChip = chip("🎤 送声音");
+            sendChip = chip(sendChipLabel(engine.sourceKind()));
             sendChip.setOnClickListener(new View.OnClickListener() {
                 @Override
                 public void onClick(View v) {
@@ -823,21 +1115,25 @@ public class MainActivity extends Activity {
         void sync() {
             boolean listen = engine.isListening(peer);
             boolean send = engine.isSending(peer);
+            // 按钮上的图标直接表达"送的是什么"：🔊 本机声音 / 🎤 麦克风。
+            int src = engine.sourceKind();
             // 只在状态真的变了才重建背景（每 150ms 重来一次会一直产生垃圾对象）
             if (!styledOnce) {
                 styledOnce = true;
                 styledListen = listen;
                 styledSend = send;
+                styledSrc = src;
                 styleChip(listenChip, listen, "🎧 收听");
-                styleChip(sendChip, send, "🎤 送声音");
+                styleChip(sendChip, send, sendChipLabel(src));
             } else {
                 if (listen != styledListen) {
                     styledListen = listen;
                     styleChip(listenChip, listen, "🎧 收听");
                 }
-                if (send != styledSend) {
+                if (send != styledSend || src != styledSrc) {
                     styledSend = send;
-                    styleChip(sendChip, send, "🎤 送声音");
+                    styledSrc = src;
+                    styleChip(sendChip, send, sendChipLabel(src));
                 }
             }
 
@@ -862,7 +1158,8 @@ public class MainActivity extends Activity {
                 st = "收听中";
                 color = OK;
             } else if (send) {
-                st = "送声中";
+                // 送声时把音源也写在状态里：用户一眼就知道送出去的是本机声音还是他说话
+                st = "送声·" + AudioSend.sourceShortName(engine.activeSourceKind());
                 color = WARN;
             } else if (peer.busy) {
                 st = "对端忙";
