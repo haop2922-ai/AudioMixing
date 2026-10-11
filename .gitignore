@@ -35,3 +35,9 @@ dist_nuitka/
 
 # 版本备份（本机存档，不进仓库）
 版本备份/
+# Android 构建产物
+android/app/build/
+android/build/
+android/.gradle/
+android/out/
+android/local.properties

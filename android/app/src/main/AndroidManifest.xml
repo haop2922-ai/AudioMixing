@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <application android:label="Audio Mixing" android:theme="@android:style/Theme.Material.NoActionBar">
+        <activity android:name=".MainActivity" android:exported="true"
+                  android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+        <!--
+          前台服务：手机当节点时，App 切到后台也要继续收发声音。
+          type 用 mediaPlayback|microphone —— 我们做的是"播别人的声音"和"采自己的麦克风"，
+          不是录屏，所以不用 mediaProjection（那个反而要求先拿到录屏授权，是多余的坑）。
+          targetSdk 34 起权限与 service 的 type 必须对得上，缺一个就会在 startForeground
+          时抛 SecurityException，所以权限和节点一起声明。
+        -->
+        <service android:name=".MixService" android:exported="false"
+                 android:foregroundServiceType="mediaPlayback|microphone"/>
+    </application>
+</manifest>

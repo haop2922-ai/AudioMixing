@@ -1,0 +1,27 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.audiomixing.app'
+    compileSdk 34
+    defaultConfig {
+        applicationId "com.audiomixing.app"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    buildTypes { release { minifyEnabled false } }
+}
+
+// 源码是 UTF-8，但这台机器（以及很多中文 Windows）javac 默认按 GBK 读源码，
+// 字符串里的中文会变成乱码 —— 而这个 App 界面上全是中文，这一条不设就白写了。
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = "UTF-8"
+}
+
+// 刻意不引入 appcompat：它会把旧版 kotlin-stdlib 拖进来，和 AGP 自带的版本
+// 撞出一堆 Duplicate class。这个 App 只用系统 API，零依赖就够，构建还更快更稳。
