@@ -228,6 +228,43 @@ def main() -> int:
         got_ice = host.recv_json()
         check(got_ice == ice, "ice 反向原样到达 host")
 
+        print("== 4b. 完整协商序列（照页面真实顺序再走一遍）==")
+        # 页面实际会做的事：host 发 offer → guest 回 answer → 双向各若干条 ICE。
+        # 这里按同样顺序、同样 JSON 形状跑一遍，验证服务端不挑食、不截断长 SDP、
+        # 也不打乱 ICE 的顺序 —— 这些是"信令通了但 WebRTC 连不上"的常见原因。
+        long_sdp = (
+            "v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\ns=-\r\n"
+            + "".join("a=candidate:842163049 %d 1 udp 1677729535 192.168.0.%d 50000 typ host\r\n"
+                      % (i, i % 250 + 1) for i in range(60))
+            + "a=ice-ufrag:Xk29\r\na=ice-pwd:Zq8vLm3nP0oR5sT7uW1yA4bC\r\n"
+        )
+        host.send(json.dumps({"t": "offer", "sdp": long_sdp}, ensure_ascii=False))
+        got_offer = guest.recv_json(timeout=6.0)
+        check(bool(got_offer and got_offer.get("sdp") == long_sdp),
+              "长 SDP（含 60 条候选）原样到达，没有被截断",
+              "%d 字符 → %d 字符" % (len(long_sdp), len((got_offer or {}).get("sdp") or "")))
+
+        answer = {"t": "answer", "sdp": long_sdp.replace("a=ice-ufrag:Xk29", "a=ice-ufrag:Guest")}
+        guest.send(json.dumps(answer, ensure_ascii=False))
+        got_answer = host.recv_json(timeout=6.0)
+        check(bool(got_answer and got_answer.get("sdp") == answer["sdp"]),
+              "answer 原样回到 host")
+
+        ok_ice = True
+        for i in range(5):
+            host.send(json.dumps({"t": "ice", "candidate": "host-%d" % i, "mid": "0", "mlin": 0}))
+            guest.send(json.dumps({"t": "ice", "candidate": "guest-%d" % i, "mid": "0", "mlin": 0}))
+        for i in range(5):
+            a1 = host.recv_json(timeout=4.0)
+            b1 = guest.recv_json(timeout=4.0)
+            if (not a1 or not b1
+                    or a1.get("candidate") != "guest-%d" % i
+                    or b1.get("candidate") != "host-%d" % i):
+                ok_ice = False
+                break
+        check(ok_ice, "双向各 5 条 ICE 全部按顺序到达，没有丢也没有串",
+              "host 收到 guest-0..4 ／ guest 收到 host-0..4")
+
         print("== 5. 第三个人进不来 ==")
         third = WsClient(_url("/ws/p2p", role="guest", room=room, name="丙"), timeout=4.0)
         err = third.recv_json(timeout=4.0)
