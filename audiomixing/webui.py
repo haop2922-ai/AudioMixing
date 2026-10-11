@@ -501,7 +501,7 @@ class WaveLinkApi:
             current_prev[name] = (total, now)
             flows.append({
                 "from": name,
-                "to": "本机耳机",
+                "to": "本机",
                 "channel": "Wi-Fi",
                 "state": str(item.get("state") or ""),
                 "bytes": total,
@@ -520,7 +520,7 @@ class WaveLinkApi:
                     continue
                 flows.append({
                     "from": str(device.get("name") or ""),
-                    "to": "本机耳机",
+                    "to": "本机",
                     "channel": "蓝牙",
                     "state": "正在接收手机声音",
                     "bytes": None,
@@ -655,7 +655,7 @@ class WaveLinkApi:
                     bits.append("%s %s" % (label, value))
             flows.append({
                 "from": str(stream.get("node_name") or stream.get("source") or "其它电脑"),
-                "to": "本机耳机",
+                "to": "本机",
                 # 收到的流可能来自广播通道，也可能来自点对点路由；协议里不带这个信息，
                 # 所以不猜：写清楚两种都可能，要看本机是否开着「只听」（只听只影响广播）。
                 "channel": "点对点/广播",
@@ -685,6 +685,50 @@ class WaveLinkApi:
                 "detail": "墙钟差 %s 毫秒（已在对齐里扣除）　往返 %s 毫秒　样本 %s" % (
                     item.get("offset_ms"), item.get("rtt_ms"), item.get("samples")),
             })
+
+        # 已配置、但当前没有数据在流的路由，也要显示出来。
+        # 不然"对端没在发"的时候监控页一片空白，用户会以为路由丢了 ——
+        # 实际上路由还在，只是没有数据（2026-10-11 用户反馈）。
+        try:
+            shown = {str(f.get("route_id") or "") for f in flows if f.get("route_id")}
+
+            def _name_of(node_id: str) -> str:
+                text = str(node_id or "")
+                if not text:
+                    return "?"
+                try:
+                    peer = node.registry.get(text)
+                    if peer is not None and peer.name:
+                        return str(peer.name)
+                except Exception:
+                    pass
+                if text == str(getattr(node, "node_id", "")):
+                    return str(getattr(node, "name", "") or "本机")
+                return text[:8]
+
+            for rule in (node.routes or []):
+                rid = str(rule.get("id") or "")
+                if not rid or rid in shown:
+                    continue
+                src_ids = rule.get("from") or rule.get("source") or []
+                dst_ids = rule.get("to") or rule.get("target") or []
+                if isinstance(src_ids, str):
+                    src_ids = [src_ids]
+                if isinstance(dst_ids, str):
+                    dst_ids = [dst_ids]
+                flows.append({
+                    "route_id": rid,
+                    "from": "、".join(_name_of(x) for x in src_ids) or "?",
+                    "to": "、".join(_name_of(x) for x in dst_ids) or "?",
+                    "channel": "点对点",
+                    "state": "已配置 · 当前没有数据",
+                    "bytes": 0,
+                    "rate_kbps": 0.0,
+                    "latency_ms": None,
+                    "detail": "这条路由已经建好了，但现在没有数据在流（对端没在发，或还没开始）",
+                })
+        except Exception:
+            pass
 
         local = status.get("local") or {}
         return {
