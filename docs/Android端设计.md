@@ -132,7 +132,6 @@ E:\Android\gradle\gradle-8.7\bin\gradle.bat --no-daemon --console=plain assemble
 ```
 
 ### 协议一致性怎么验（最重要的一步）
-
 手机和电脑各写一遍二进制格式，差一个字节就永远连不上。所以不靠读代码，靠对字节：
 
 ```bash
@@ -154,3 +153,25 @@ python tools/check_android_proto.py <把Java那边的hex粘进来>   # 也可以
 ---
 
 HWHHYN 用 DEEPSEEK 制作
+
+### ★ 验收要看内容，不要看哈希（2026-10-12 踩到）
+
+**APK 的 SHA256 不可复现**：同一份源码连续两次 `clean assembleDebug`，
+产物大小完全一样（67265 字节）但哈希不同（`03f455e2…` → `2ecbaf75…`），
+第三次构建又是第三个值。原因是 debug 包的**签名块**和 **zip 内文件时间戳**每次都变。
+
+所以：
+
+- 哈希的作用只有"**标识这一次构建的这一个文件**"（比如"我给你的就是这个"），
+  **不能**用来判断"构建是否可复现"或"交付是否合格"；
+- 判断交付合格必须看**内容**：类是否都在 dex 里、中文有没有乱码、清单里的
+  service/权限对不对 —— 也就是 `tools/check_apk.py` 干的事；
+- 想真正可复现，需要固定签名密钥 + 关闭 zip 时间戳（`--no-timestamp` 之类），
+  这个项目没做，也不打算为 debug 包做。
+
+同类教训还有一条：**验证工具本身也会骗人**。
+`tools/check_apk.py` 原来在纯 PowerShell（GBK 控制台）下会因 `✓` 字符抛
+`UnicodeEncodeError` 直接崩掉，而验收条件写的是"原样跑 → PASS" ——
+如果没人质疑验收条件本身，后面所有"验证通过"都不可信。
+现在脚本自己把 stdout 转成 UTF-8，并且 `CLASSES` 必须包含每个交付的类
+（漏掉一个，那个类整个丢了也照样 PASS）。
