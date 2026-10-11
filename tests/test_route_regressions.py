@@ -30,6 +30,15 @@ atexit.register(lambda: shutil.rmtree(_TEST_SANDBOX, ignore_errors=True))
 from audiomixing.config import Config          # noqa: E402
 from audiomixing.engine import WaveLinkNode    # noqa: E402
 
+# 显式注册后端：default_source_spec() 会先问 available_backends()，
+# 如果没人导入过 wasapi 后端，它会返回空表 → 直接返回 silence，
+# 于是这两个用例就变成"依赖别的测试先跑过"的顺序依赖（很脆）。
+# 这里自己保证前置条件，单独跑也稳定。
+try:  # pragma: no cover - 平台相关
+    from audiomixing.audio.backends import wasapi as _wasapi  # noqa: F401
+except Exception:
+    pass
+
 
 def free_udp_port() -> int:
     import socket
