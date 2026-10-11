@@ -48,8 +48,28 @@ ARGS = [
     "--include-data-dir=audiomixing/ui=audiomixing/ui",
     "--output-dir=dist_nuitka",
     "--output-filename=" + NAME,
+    # 完整的版本信息 + 图标。不只是好看：
+    # 未签名、又完全没有版本信息的单文件 exe，最容易被杀软的机器学习启发式
+    # 判成 Trojan:Win32/Bearfoos.B!ml 之类的误报（2026-10-11 实测遇到）。
+    # 正规软件都会带这些字段，补上能明显降低误报率。
+    # 注意：Nuitka 要求这几个版本字段【成套出现】，只给其中一个会直接报错。
+    "--company-name=Audio Mixing Project",
+    "--product-name=Audio Mixing",
+    "--file-description=Audio Mixing - LAN audio casting",
+    "--file-version=1.1.0.0",
+    "--product-version=1.1.0.0",
+    "--copyright=MIT License",
     ENTRY,
 ]
+
+
+def icon_args() -> list[str]:
+    """带上图标（有则用，没有就跳过）。"""
+    ico = ROOT / "tools" / "audiomixing.ico"
+    if ico.is_file():
+        return ["--windows-icon-from-ico=%s" % ico]
+    print("[build] 提示：没找到 tools/audiomixing.ico，本次不带图标")
+    return []
 
 
 def opus_dll_args() -> list[str]:
@@ -89,9 +109,9 @@ def main() -> int:
         return 2
 
     # 2. 编译
-    extra = opus_dll_args()
+    extra = opus_dll_args() + icon_args()
     if extra:
-        print("[build] 已附带 opus.dll (ok)")
+        print("[build] 已附带 opus.dll 和图标")
     print("[build] Nuitka 编译中（首次会下载 MinGW，约 100 MB，10-30 分钟）…")
     rc = subprocess.call([sys.executable, *ARGS[:-1], *extra, ARGS[-1]], cwd=ROOT)
     if rc != 0:
