@@ -754,9 +754,19 @@ html:not(.fullui) .card .body { padding-top: 6px; }
             const chosen = new Map((data.devices || []).map(d => [d.name, d]));
             const all = (data.available || []).concat([...chosen.keys()]);
             const running = (data.devices || []).filter(d => d.running);
-            summary.textContent = running.length
+            // 起不来的那几路必须说出来。以前这里只说"正在送往 N 个设备"，
+            // 某一路静默失败时界面上什么都看不到 —— 现场就变成"勾了、点了、
+            // 没反应、也没报错"，只能靠人去猜（2026-10-11 踩过）。
+            const dead = (data.devices || []).filter(d => !d.running);
+            let txt = running.length
               ? '正在送往 ' + running.map(d => d.name).join('、')
               : (data.note || '未开启');
+            if (dead.length) {
+              txt += '　｜　没起来：' + dead
+                .map(d => d.name + '（' + (d.error || '设备没打开，检查它是否已连接 / 是否被别的程序独占') + '）')
+                .join('、');
+            }
+            summary.textContent = txt;
             list.innerHTML = '';
             rows.clear();
             [...new Set(all)].forEach(name => {

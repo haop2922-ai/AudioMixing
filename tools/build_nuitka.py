@@ -52,6 +52,28 @@ ARGS = [
 ]
 
 
+def opus_dll_args() -> list[str]:
+    """把 opus.dll 明确放进包里 + 放到 exe 旁边（双保险）。
+
+    实测（2026-10-11）：Nuitka 打包版界面报
+        RuntimeError: Opus 不可用: Could not find Opus library.
+    原因：打包后模块的 __file__ 指向源码路径，而且 Nuitka 不设
+    sys.frozen / sys._MEIPASS，原来那几个搜索分支全部落空。
+    这里除了带上包数据，还把 dll 复制到 exe 同级（onefile 解压根目录），
+    配合 audiomixing/audio/opus.py 的多路径查找一定能命中。
+    """
+    try:
+        import pyogg
+
+        dll = pathlib.Path(pyogg.__file__).resolve().parent / "opus.dll"
+        if dll.is_file():
+            return ["--include-data-files=%s=opus.dll" % dll]
+        print("[build] 警告：没找到 pyogg/opus.dll，打包后可能没有 Opus 压缩")
+    except Exception as exc:
+        print("[build] 警告：定位 pyogg 失败（%s），继续打包" % exc)
+    return []
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--test", action="store_true", help="编译后启动一次，检查端口 17800")
@@ -67,8 +89,11 @@ def main() -> int:
         return 2
 
     # 2. 编译
+    extra = opus_dll_args()
+    if extra:
+        print("[build] 已附带 opus.dll ✓")
     print("[build] Nuitka 编译中（首次会下载 MinGW，约 100 MB，10-30 分钟）…")
-    rc = subprocess.call([sys.executable, *ARGS], cwd=ROOT)
+    rc = subprocess.call([sys.executable, *ARGS[:-1], *extra, ARGS[-1]], cwd=ROOT)
     if rc != 0:
         print("[build] 失败，退出码 %d" % rc)
         return rc

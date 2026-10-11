@@ -35,26 +35,77 @@ _load_error = ""
 
 # HWHHYN 用 DEEPSEEK 制作
 def _candidate_dirs() -> list[str]:
-    dirs: list[str] = []
-    here = os.path.dirname(os.path.abspath(__file__))
-    dirs.append(here)
-    meipass = getattr(sys, "_MEIPASS", "")
-    if meipass:
-        dirs.append(meipass)
-    if getattr(sys, "frozen", False):
-        dirs.append(os.path.dirname(os.path.abspath(sys.executable)))
-    # pyogg 自带 opus.dll，构建时会被一起打进来
-    try:
-        import pyogg
+    """所有可能藏着 opus.dll 的目录。
 
-        dirs.append(os.path.dirname(os.path.abspath(pyogg.__file__)))
+    三种运行方式都要能找得到，缺一个就会出现"源码好好的、打包版报
+    Could not find Opus library"：
+
+        源码运行      __file__ 就是磁盘上的真实路径 ✓
+        PyInstaller   _MEIPASS 指向解压目录 ✓
+        Nuitka        __file__ 指向【源码路径】（磁盘上可能已经不存在），
+                      真实位置在 __compiled__.containing_dir；
+                      而且它不设 sys.frozen / sys._MEIPASS，
+                      所以老代码里那几个分支全都命中不了 —— 2026-10-11 踩过。
+    """
+    dirs: list[str] = []
+
+    def push(path: Any) -> None:
+        if not path:
+            return
+        p = os.path.abspath(str(path))
+        if os.path.isdir(p) and p not in dirs:
+            dirs.append(p)
+
+    # 1) 本文件所在目录（源码 / onedir 布局）
+    push(os.path.dirname(os.path.abspath(__file__)))
+
+    # 2) Nuitka：编译后的模块位置
+    comp = globals().get("__compiled__")
+    if comp is not None:
+        for attr in ("containing_dir_absolute", "containing_dir", "main_dir"):
+            try:
+                push(getattr(comp, attr, None))
+            except Exception:
+                pass
+
+    # 3) PyInstaller：解压目录
+    push(getattr(sys, "_MEIPASS", ""))
+
+    # 4) 可执行文件所在目录（onedir / 手动把 dll 放旁边的情况）
+    push(os.path.dirname(os.path.abspath(sys.executable)))
+    try:
+        push(os.path.dirname(os.path.abspath(sys.argv[0])))
     except Exception:
         pass
-    # 源码运行时，顺便找一下 site-packages 下的副本
-    for base in sys.path:
-        if base and base not in dirs:
-            dirs.append(base)
-    return [d for d in dirs if d and os.path.isdir(d)]
+
+    # 5) 依赖包自己的目录：pyogg 自带 opus.dll，opuslib_next 自己不带
+    for mod in ("pyogg", "opuslib_next"):
+        try:
+            m = __import__(mod)
+            d = os.path.dirname(os.path.abspath(getattr(m, "__file__", "") or ""))
+            push(d)
+            push(os.path.join(d, mod))      # .../site-packages/pyogg
+        except Exception:
+            pass
+
+    # 6) 兜底：在已知根目录的【下一层】里找带 opus*.dll 的子目录
+    #    （打包器常把包数据放在 <root>/pyogg/ 这种位置）
+    for root in list(dirs):
+        try:
+            for name in os.listdir(root):
+                sub = os.path.join(root, name)
+                if not os.path.isdir(sub):
+                    continue
+                try:
+                    if any(f.lower().startswith("opus") and f.lower().endswith(".dll")
+                           for f in os.listdir(sub)):
+                        push(sub)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return dirs
 
 
 def _load() -> Any:
