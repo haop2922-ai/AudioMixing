@@ -1696,7 +1696,8 @@ class _Handler(BaseHTTPRequestHandler):
                 # 一律用局域网地址：在电脑上用 127.0.0.1 打开监控页时，
                 # 如果用请求里的地址生成二维码，手机扫了会连到自己，永远打不开。
                 host = _lan_host(self.api, self.headers.get("Host") or "")
-                tail = "/app" if what == "app" else "/listen"
+                # listen=手机当喇叭 app=装手机端 p2p=手机之间直连（WebRTC）
+                tail = {"app": "/app", "p2p": "/p2p"}.get(what, "/listen")
                 target = "http://%s%s" % (host or "127.0.0.1:17800", tail)
                 png = _qr_png(target)
                 if png is None:
