@@ -91,7 +91,7 @@ def main() -> int:
     # 2. 编译
     extra = opus_dll_args()
     if extra:
-        print("[build] 已附带 opus.dll ✓")
+        print("[build] 已附带 opus.dll (ok)")
     print("[build] Nuitka 编译中（首次会下载 MinGW，约 100 MB，10-30 分钟）…")
     rc = subprocess.call([sys.executable, *ARGS[:-1], *extra, ARGS[-1]], cwd=ROOT)
     if rc != 0:
@@ -120,7 +120,7 @@ def main() -> int:
                 try:
                     with urllib.request.urlopen("http://127.0.0.1:17800/healthz", timeout=3) as r:
                         if r.status == 200:
-                            print("[build] 面板已响应 ✓  http://127.0.0.1:17800")
+                            print("[build] 面板已响应 (ok)  http://127.0.0.1:17800")
                             break
                 except Exception:
                     continue
