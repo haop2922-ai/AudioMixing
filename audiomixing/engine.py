@@ -767,6 +767,15 @@ class WaveLinkNode:
             author_name = peer.name if peer is not None else ""
         incoming = [self._normalize_route(r, author, author_name) for r in routes if isinstance(r, dict)]
         dropped = {str(x) for x in drop}
+        # 刚被显式删掉的路由，短时间内在【所有入口】都不许复活。
+        # 以前只在"从对端拉取"那条路上挡，结果面板（浏览器里那份旧表）下一次
+        # 自动保存就把删掉的路由又 PUT 回来了 —— 两边来回删/加，界面显示"残留"，
+        # 音频链路反复重建，现场表现就是"一直不响"（2026-10-11 定位）。
+        self._purge_dropped()
+        if self._dropped_ids:
+            blocked = set(self._dropped_ids)
+            dropped = dropped | blocked
+            incoming = [r for r in incoming if str(r.get("id") or "") not in blocked]
 
         with self._routes_lock:
             incoming_ids = {r["id"] for r in incoming}
