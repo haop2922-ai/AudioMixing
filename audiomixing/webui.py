@@ -581,7 +581,12 @@ class WaveLinkApi:
             node_name = str(getattr(node, "name", "") or "本机")
             source_label = node_name
             where = ("采自 " + device) if device else ""
-            stale = bool(live_ids) and not is_channel and str(rid) not in live_ids
+            # ★ 会话键是 "<路由id>|<目标节点id>"，判断"残留"必须只取前半段。
+            # 以前拿整个键去和路由表里的 id 比，永远匹配不上 —— 于是【正在正常发送】
+            # 的行也被标成"残留"，用户看到的就是"明明在响却写着残留"（2026-10-12 定位）。
+            # _sweep_dead_senders 里取 id 用的就是 split("|")[0]，这里保持一致。
+            route_key = str(rid).split("|", 1)[0]
+            stale = bool(live_ids) and not is_channel and route_key not in live_ids
             if is_channel:
                 flows.append({
                     "disconnect": "broadcast",
@@ -656,6 +661,9 @@ class WaveLinkApi:
             flows.append({
                 "from": str(stream.get("node_name") or stream.get("source") or "其它电脑"),
                 "to": "本机",
+                # 带上 route_id：这样"已配置但当前没有数据"那一行才能认出这条路由
+                # 其实正在收数据，不会再多显示一行（2026-10-12 修）。
+                "route_id": str(stream.get("route_id") or ""),
                 # 收到的流可能来自广播通道，也可能来自点对点路由；协议里不带这个信息，
                 # 所以不猜：写清楚两种都可能，要看本机是否开着「只听」（只听只影响广播）。
                 "channel": "点对点/广播",
