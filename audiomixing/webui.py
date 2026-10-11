@@ -412,6 +412,28 @@ class WaveLinkApi:
             mark = "?" if c.get("ok") is None else ("通过" if c.get("ok") else "不通过")
             lines.append("[%s] %s：%s" % (mark, c.get("name"), c.get("detail")))
 
+        head("音源状态（每块采集源有没有数据）")
+        # 只报事实：这块源收到过多少、最后一次收到是多久以前。
+        # 空的那块会显示"没有音频数据"，用户自己就能看出该换成正在用的那一块。
+        # 判断依据与设备类型无关（蓝牙/有线/USB/虚拟声卡一视同仁）。
+        sources = st.get("sources") or []
+        if not sources:
+            lines.append("当前没有任何采集源（程序没在采集）")
+        for item in sources:
+            spec = item.get("spec") or {}
+            age = item.get("last_data_age_s")
+            if item.get("blocks_read"):
+                state = "有数据 ✓　最后一块 %.1f 秒前" % (age or 0.0)
+            else:
+                state = "没有音频数据 ✗　这块设备当前没有在出声（或没在推流、被独占、已断开）"
+            lines.append("%s　[%s]　%s" % (
+                item.get("name") or "?",
+                str(spec.get("backend") or "") + ("/loopback" if spec.get("loopback") else ""),
+                state))
+            lines.append("    已收到 %s 块 / %s 帧　运行 %.0f 秒　错误=%s" % (
+                item.get("blocks_read"), item.get("frames_read"),
+                float(item.get("alive_for_s") or 0), item.get("error") or "无"))
+
         head("发送端判定依据（引擎自报）")
         debug = st.get("debug") or {}
         if not debug:

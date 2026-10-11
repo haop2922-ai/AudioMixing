@@ -92,6 +92,9 @@ class _Capture:
                 self.next_index += 1
                 self.blocks_read += 1
                 self.frames_read += len(block) // CHANNELS
+                # 记下"最后一次真的收到音频"的时间。这是判断一块音源是不是空的最直接
+                # 依据，而且与设备类型无关（蓝牙/有线/USB/虚拟声卡一视同仁）。
+                self.last_block_at = time.monotonic()
                 self.lock.notify_all()
         with self.lock:
             self.closed = True
@@ -110,6 +113,12 @@ class _Capture:
             self.thread = None
 
     def stats(self) -> dict[str, Any]:
+        """这块采集源的实时状态。字段刻意保持"事实"：收到过多少、最后什么时候收到。
+
+        面板和诊断报告据此显示"这块音源是空的还是有数据"，不做任何设备类型的假设。
+        """
+        last = float(getattr(self, "last_block_at", 0.0) or 0.0)
+        now = time.monotonic()
         return {
             "name": self.endpoint_name(),
             "spec": dict(self.spec),
@@ -118,6 +127,9 @@ class _Capture:
             "frames_read": self.frames_read,
             "error": self.error,
             "closed": self.closed,
+            # 一直没有数据时是 None，界面据此显示"没有音频数据"
+            "last_data_age_s": round(max(0.0, now - last), 1) if last > 0 else None,
+            "alive_for_s": round(max(0.0, now - float(getattr(self, "created_at", now) or now)), 1),
         }
 
 

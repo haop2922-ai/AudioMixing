@@ -1274,7 +1274,17 @@ class WaveLinkNode:
         self._auto_play_sources()
         self.hub.reap()
         for name in self.hub.health():
-            self._note_once("采集端卡死，已重建：%s" % name)
+            # 这里不能对设备类型做任何假设（蓝牙/有线/USB/虚拟声卡一视同仁）。
+            # 通用事实只有一条：这块采集源在一段时间内没有产出任何音频数据。
+            # 可能的原因对所有设备都成立，所以按"通用原因清单"报给用户，
+            # 由用户自己判断是哪一种，而不是由程序去猜设备类型。
+            self._note_once(
+                "音源「%s」一直没有产出音频数据（已自动重建采集）。"
+                "常见原因：这块设备当前没有在播放声音、被其它程序独占、"
+                "已经被拔出或断开、或者它是虚拟设备而没有在推流。"
+                "如果持续如此，请在控制台的音源清单里确认选中的就是你正在使用的那一块。"
+                % name
+            )
         self._apply_local_loop()
         self._sample_quality()
         # The real Bluetooth listing takes seconds, so it happens here, in the background
@@ -2168,6 +2178,10 @@ class WaveLinkNode:
             "senders": self.sender.stats(),
             "sinks": [engine.describe() for engine in self.sinks.values()],
             "multi_out": self.multi_out.stats(),
+            # 每块采集源的实时状态（收到过多少、最后一次什么时候收到）。
+            # 面板和诊断报告用它显示"这块音源是不是空的"，判断依据全是事实，
+            # 与设备类型无关（蓝牙/有线/USB/虚拟声卡一视同仁）。
+            "sources": self.hub.stats(),
             "receiver": recv,
             "totals": {
                 "sent_kbps": self.sender.total_kbps(),

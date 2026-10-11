@@ -1295,7 +1295,19 @@ function renderStatus(){
     <div class="stat"><div class="k">点对点流</div><div class="v sm">${t.active_streams||0}</div></div>
     <div class="stat"><div class="k">上行</div><div class="v sm">${t.sent_kbps||0} kbps</div></div>
     <div class="stat"><div class="k">丢包</div><div class="v sm ${errs?'warn':''}">${errs}</div></div>
-    <div class="stat"><div class="k">运行</div><div class="v sm">${Math.round(s.node.uptime_s||0)}s</div></div>`;
+    <div class="stat"><div class="k">运行</div><div class="v sm">${Math.round(s.node.uptime_s||0)}s</div></div>` +
+    // 音源状态：只报事实 —— 每块采集源收到过多少、最后一次收到是多久以前。
+    // 没有数据的那块直接标红，用户自己就能看出"我在采集的这块是空的"，
+    // 从而换成自己正在用的那一块。判断与设备类型无关（蓝牙/有线/USB/虚拟声卡一视同仁）。
+    (s.sources || []).map(x => {
+      const ok = (x.blocks_read || 0) > 0;
+      const age = x.last_data_age_s;
+      const detail = ok
+        ? ('有数据 · ' + (age != null ? age.toFixed(1) + 's 前' : '刚刚'))
+        : '没有音频数据 ✗';
+      return `<div class="stat"><div class="k">音源</div><div class="v sm ${ok ? '' : 'warn'}">`
+        + `${esc(x.name || '?')}<br><span style="font-size:11px">${detail}</span></div></div>`;
+    }).join('');
 
   const d = s.discovery || {};
   $('discoveryTag').textContent = d.sent ? `发现 已广播${d.sent}次` : '发现 未启用';
