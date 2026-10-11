@@ -11,8 +11,10 @@ import java.net.NetworkInterface;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Enumeration;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -66,6 +68,16 @@ public final class Engine {
 
     /** 用户点了「收听」的设备 id（可以多台）。 */
     private final Set<String> listenIds = new LinkedHashSet<String>();
+    /**
+     * 收听目标的地址（按 id 记）。
+     *
+     * <p>为什么要单独记：白名单原本是在 applyAllowedHosts() 里现查 peers() 得到的，
+     * 而 Wi-Fi 上偶尔丢一两个信标是常态。设备只要在列表里闪一下，白名单就会退化成
+     * "只允许 255.255.255.255"，于是一个包都收不进来 —— 真机现场表现就是
+     * "界面还显示收听中，但缓冲 0ms、流 0"，而且自己永远好不了。
+     * 把地址记在用户点选的那一刻，就不受设备列表抖动影响了。
+     */
+    private final Map<String, String> listenHosts = new LinkedHashMap<String, String>();
     /** 用户点了「送声音」的设备 id（只会有 0 或 1 台）。 */
     private final Set<String> sendIds = new LinkedHashSet<String>();
 
@@ -123,6 +135,7 @@ public final class Engine {
         synchronized (lock) {
             started = false;
             listenIds.clear();
+            listenHosts.clear();
             sendIds.clear();
             stopReceiver();
             stopSender();
@@ -189,10 +202,17 @@ public final class Engine {
         synchronized (lock) {
             if (on) {
                 listenIds.add(id);
+                if (p.host != null && !p.host.isEmpty()) {
+                    // 记下地址：设备列表以后怎么抖，这条收听都不受影响。
+                    listenHosts.put(id, p.host);
+                }
             } else {
                 listenIds.remove(id);
+                listenHosts.remove(id);
             }
             if (listenIds.isEmpty()) {
+                // 用户明确取消了全部收听：这时候才停接收器。
+                // （注意顺序：上面已经把 id 移除，所以这里判断的是"用户真的都取消了"。）
                 stopReceiver();
             } else {
                 ensureReceiver();
@@ -302,23 +322,21 @@ public final class Engine {
                     changed = true;
                 }
             }
-            for (String id : new ArrayList<String>(listenIds)) {
-                if (!alive.contains(id)) {
-                    listenIds.remove(id);
-                    changed = true;
-                }
-            }
-            if (!changed) {
-                return;
-            }
+            // ★ 关键修复（2026-10-12 真机反馈）：不再因为"设备列表里暂时没有"就取消
+            // 用户的「收听」选择。Wi-Fi 上偶尔丢一两个信标是常态（15 秒没收到就当设备走了），
+            // 设备只要在列表里闪一下，下面这段就会把 listenIds 清空 → 接收器被停 →
+            // 而且再也不会自己起来。现场表现正是"界面显示收听中，但缓冲 0ms、流 0"。
+            // 用户的勾选只有用户自己能取消；对方真的关机了，收不到包自然就没声音，不需要停。
             if (sendIds.isEmpty()) {
                 stopSender();
+            } else if (changed) {
+                // 送声音的目标没了就真的没得送了（麦克风不该一直开着）。
+                stopSender();
+            }            // 自愈：只要还有收听目标，接收器就必须活着（可能被别处停掉过）。
+            if (!listenIds.isEmpty() && receiver == null) {
+                ensureReceiver();
             }
-            if (listenIds.isEmpty()) {
-                stopReceiver();
-            } else {
-                applyAllowedHosts();
-            }
+            applyAllowedHosts();
         }
     }
 
@@ -349,8 +367,12 @@ public final class Engine {
     /**
      * 把「要听哪几台」同步给接收端。
      *
-     * <p>AudioRecv 的语义是"名单空 = 全收"，所以这里必须把名单显式写满；
-     * 一台都没解析出来时留一个不可能命中的占位地址，避免退化成全收。
+     * <p>地址取自 listenHosts（用户点选那一刻记下来的），**不**在这里现查设备列表 ——
+     * 现查的话，设备只要在列表里闪一下，白名单就会退化成"只允许 255.255.255.255"，
+     * 一个包都收不进来，而且不会自己恢复（这是真机上遇到的头号问题）。
+     *
+     * <p>AudioRecv 的语义是"名单空 = 全收"，所以这里必须把名单显式写满 ——
+     * 一台都没有时留一个不可能命中的占位地址，避免退化成全收。
      */
     private void applyAllowedHosts() {
         AudioRecv r = receiver;
@@ -360,9 +382,10 @@ public final class Engine {
         try {
             r.clearAllowed();
             int n = 0;
-            for (Discovery.Peer p : peers()) {
-                if (listenIds.contains(idOf(p)) && p.host != null && !p.host.isEmpty()) {
-                    r.allow(p.host, true);
+            for (String id : listenIds) {
+                String host = listenHosts.get(id);
+                if (host != null && !host.isEmpty()) {
+                    r.allow(host, true);
                     n++;
                 }
             }

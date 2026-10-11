@@ -6,6 +6,13 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
+    <!--
+      WAKE_LOCK 是必须的：AudioRecv/AudioSend 会各拿一个 WifiLock，
+      让 Wi-Fi 在息屏后别进省电模式（省电模式会把抖动缓冲冲垮，听感就是一顿一顿）。
+      忘了声明它时，真机上会看到 "Neither user ... has android.permission.WAKE_LOCK"
+      —— 这是 2026-10-12 真机反馈里抓到的第二个 bug。
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
