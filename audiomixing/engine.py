@@ -311,10 +311,40 @@ class WaveLinkNode:
             picked = self._default_render_name()
             if picked:
                 selector = picked
+        elif not self._selector_still_exists(selector):
+            # 配置里记着的那块设备现在可能已经不在了（拔掉、断开、改名、驱动重装），
+            # 这与设备类型无关 —— 蓝牙、USB、板载、虚拟声卡都会发生。
+            # 以前这里会拿着这个不存在的名字反复去开：采集端每次都 start failed，
+            # 一个字节都产不出来，对端永远收不到声音，而界面上只看到"没有音频数据"。
+            # 现在退回"当前真实可用的输出"，并在日志里说清发生了什么、怎么固定回去。
+            picked = self._default_render_name() or self._best_loopback_selector()
+            if picked and not self._same_endpoint(picked, selector):
+                self._note_once(
+                    "音源「%s」现在在这台电脑上找不到了，已临时改用「%s」。"
+                    "要让程序固定用它，请把该设备接回来；否则请在控制台的音源清单里"
+                    "改成你现在正在使用的那一块。" % (selector, picked))
+                selector = picked
         # 返回单个规格字典（调用方要的是 dict，不是 list）。
         # 选的是麦克风就按输入打开，选的是输出设备才采它的回环。
         return {"backend": "wasapi", "device": selector,
                 "loopback": self._selector_is_loopback(selector)}
+
+    def _selector_still_exists(self, selector: str) -> bool:
+        """这个名字现在还能在这台电脑上找到吗（输入或输出都算）。
+
+        只做"存不存在"的事实判断，不看设备类型。
+        """
+        name = str(selector or "").strip()
+        if not name:
+            return True
+        try:
+            for item in self.devices:
+                if self._same_endpoint(str(getattr(item, "name", "") or ""), name):
+                    return True
+        except Exception:
+            # 设备枚举失败时不要因此把用户的设置换掉
+            return True
+        return False
 
     def _looks_virtual(self, name: str) -> bool:
         """是不是一块虚拟声卡。
