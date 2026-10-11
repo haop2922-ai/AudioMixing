@@ -29,3 +29,6 @@ venv/
 # 编辑器
 .vscode/
 .idea/
+
+# Nuitka 编译产物（不要进仓库）
+dist_nuitka/
