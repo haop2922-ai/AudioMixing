@@ -766,6 +766,23 @@ class WaveLinkNode:
             peer = self.registry.get(author)
             author_name = peer.name if peer is not None else ""
         incoming = [self._normalize_route(r, author, author_name) for r in routes if isinstance(r, dict)]
+        # ★ 保留已存在路由的"归属"。
+        # 集合里的归属决定"谁的推送有资格替换它"：下面 kept 会把 origin == 推送者
+        # 的记录全部丢掉、用推送内容替代。而面板（update_route / set_routes）
+        # 提交的是【整张表】，_normalize_route 会把表里每一条的归属都写成提交者 ——
+        # 结果：2025BJB 建的路由，被 2024TSJ 的某次保存改成"归属 2024TSJ"，
+        # 而 2024TSJ 推送自己表时并不包含它 → 这条路被当成"作者撤回了"而删除 ✗
+        # → 发送会话还在、字节 0、界面显示"残留"（2026-10-11 定位）。
+        # 所以：id 已经在表里的路由，归属一律沿用旧值，不因为谁提交而改变。
+        try:
+            origin_by_id = {str(r.get("id") or ""): r.get("origin") for r in (self.routes or [])}
+        except Exception:
+            origin_by_id = {}
+        if origin_by_id:
+            for r in incoming:
+                old = origin_by_id.get(str(r.get("id") or ""))
+                if old:
+                    r["origin"] = old
         dropped = {str(x) for x in drop}
         # 刚被显式删掉的路由，短时间内在【所有入口】都不许复活。
         # 以前只在"从对端拉取"那条路上挡，结果面板（浏览器里那份旧表）下一次
