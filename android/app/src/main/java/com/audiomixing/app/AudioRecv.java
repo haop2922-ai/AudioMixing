@@ -70,6 +70,24 @@ public final class AudioRecv {
     private static final int RECV_BUF = 4096;
     private static final float PEAK_DECAY = 0.82f;
 
+    /**
+     * 对端发来的统计包（{@code ptype=7 T_STATS}）回调：两台设备"自己交流"的入口。
+     *
+     * <p><b>回调跑在收包线程上</b>：实现里只许做"解析 + 存起来"这种微秒级的事
+     * （见 {@link Engine} 的实现），绝不能在这里发网络请求或者碰界面。
+     * 就算实现里抛了异常也影响不到收包 —— 调用处套了 try/catch。
+     */
+    public interface StatsListener {
+        void onStats(String host, byte[] payload);
+    }
+
+    /** 谁想知道对端统计就设进来；为 null 表示不需要（默认）。 */
+    private volatile StatsListener statsListener;
+
+    public void setStatsListener(StatsListener l) {
+        statsListener = l;
+    }
+
     /** 收包统计，给界面"详情"用。 */
     public static final class Stats {
         public long received;
@@ -439,15 +457,25 @@ public final class AudioRecv {
             bump(4);   // badPackets：magic/版本不对，不是我们的包
             return;
         }
+        // 来源地址先解析出来：下面的控制包分支和音频分支都要用，只算一次。
+        String host = normalizeHost(from);
         if (pkt.type != Proto.T_AUDIO) {
-            bump(6);   // PING/PONG/BYE 之类的控制包，现在只计数
+            bump(6);   // PING/PONG/BYE 之类的控制包，先计数
+            // ★ 对端统计（T_STATS=7）：两台设备"自己交流"的唯一入口。对方每 2 秒说一次
+            //   "我发了多少、是不是正在发、我收了你多少"，界面据此直接显示是哪一端的问题。
+            //
+            //   必须放在下面 isAllowed(host) 白名单检查【之前】：统计是双向的 ——
+            //   我可能在给它送声音、但并没有勾「收听」它，这种时候同样要收得到它的回话。
+            //   （音频包仍然严格走白名单，这里只是控制包的分发。）
+            if (pkt.type == Proto.T_STATS) {
+                dispatchStats(host, pkt.payload);
+            }
             return;
         }
         if (pkt.codec != Proto.CODEC_PCM_S16) {
             bump(4);   // 手机没有 Opus 解码器（见类注释），直接丢
             return;
         }
-        String host = normalizeHost(from);
         if (!isAllowed(host)) {
             bump(5);   // 用户没勾「收听」它
             return;
@@ -461,6 +489,26 @@ public final class AudioRecv {
         bump(0);   // received
         Stream stream = streamFor(host, pkt.ssrc);
         stream.store(pkt.seq, pkt.payload, plen, (pkt.flags & Proto.FLAG_SILENCE) != 0);
+    }
+
+    /**
+     * 把统计包交给监听器。
+     *
+     * <p><b>为什么整段都套 try/catch</b>：这段跑在收包线程上，而监听器是 {@link Engine} 的代码
+     * （里面要解析 JSON）。真机上 Wi-Fi 里什么怪包都有，解析失败一次就可能让"收听"整条链路停摆 ——
+     * 外层 rxLoop 虽然也有兜底，但那里 catch 之后会 sleep 50ms，抖动缓冲会被冲垮。
+     * 所以宁可在这里丢掉一份统计，也绝不让收包线程受一点影响。
+     */
+    private void dispatchStats(String host, byte[] payload) {
+        StatsListener l = statsListener;
+        if (l == null || payload == null || payload.length == 0) {
+            return;
+        }
+        try {
+            l.onStats(host, payload);
+        } catch (Throwable t) {
+            note("对端统计回调异常（已忽略）：" + t);
+        }
     }
 
     /** 只由收包线程调用：找不到就新建一条流。 */
@@ -806,9 +854,19 @@ public final class AudioRecv {
                     // 回到预缓冲状态，等它恢复时重新攒一段再播；继续傻等会让序号错位到最后全变"迟到"。
                     playing = false;
                     nextSeq = -1;
+                    prebufStartMs = now;
                     Arrays.fill(filled, false);
                     bump(7);   // recoveries
+                    // ★ 这里必须直接返回。原来会一路走到函数末尾那句无条件的
+                    //   nextSeq = (nextSeq + 1) & 0xFFFF，把刚设好的 -1 推成 0：
+                    //   播放头于是在一个空缓冲上空转计数，等对端恢复时新包全被判成"太超前"丢掉，
+                    //   流再也回不来（离线抖动缓冲测试抓到："断流 2.5s 后恢复：重新出声 0 帧"）。
+                    return 0;
                 }
+            }
+            // 双保险：恢复分支把 nextSeq 置成 -1 之后，绝不能再自增（-1 是"等第一包"的哨兵值）。
+            if (nextSeq < 0) {
+                return 0;
             }
             nextSeq = (nextSeq + 1) & 0xFFFF;
             return 1;

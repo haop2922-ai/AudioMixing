@@ -2,6 +2,9 @@ package com.audiomixing.app;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.Dialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
@@ -13,6 +16,7 @@ import android.graphics.PixelFormat;
 import android.graphics.RadialGradient;
 import android.graphics.Shader;
 import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
@@ -21,11 +25,13 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
+import android.view.WindowManager;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
@@ -257,6 +263,8 @@ public class MainActivity extends Activity {
         put("conn", "收听 " + engine.listeningCount() + " 台 / 送声 " + engine.sendingCount() + " 台");
         put("recv", engine.statsText());
         put("send", engine.sendStatsText());
+        // 对端回话：这是"哪一端没在发"最直接的证据（对方自己说的）。
+        put("peers", Diagnosis.peersSummary(engine.peerStatsList(), SystemClock.elapsedRealtime()));
         put("disc", engine.discoveryStatsText());
     }
 
@@ -301,6 +309,128 @@ public class MainActivity extends Activity {
         setTextIfChanged(detailToggle, detailsOpen ? "▾ 详情" : "▸ 详情");
         if (detailsOpen) {
             refreshDetails();
+        }
+    }
+
+    // ────────────────────────────── 诊断 ──────────────────────────────
+
+    /**
+     * 「🩺 诊断」对话框：上半部分是可滚动、可长按选中的报告全文，下面是「复制」。
+     *
+     * <p><b>为什么不用 AlertDialog</b>：这个工程零依赖、主题是深色的，
+     * 系统 AlertDialog 的亮色底板和整套视觉不搭，还得为它单独调主题；自己搭一个
+     * {@link Dialog} 反而代码更少、圆角和配色都能直接复用页面那套 tools。
+     *
+     * <p><b>为什么自动刷新</b>：这报告是给"现场盯着数字变化"用的（对方还在不在发、
+     * 丢包涨不涨），一打开就定格的快照没什么用。所以每 1.5 秒重算一次；
+     * 用户点一下正文（想手动选中一段）就停掉自动刷新，免得把选区刷没。
+     */
+    private void showDiagnosisDialog() {
+        final Dialog d = new Dialog(this);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackground(roundRect(0xF5070B12, dp(18), LINE, Math.max(1, dpi(1))));
+        int pad = dpi(16);
+        box.setPadding(pad, pad, pad, pad);
+
+        box.addView(text("🩺 诊断报告", 16f, FG, true));
+
+        TextView hint = text("整段可以长按选中；点「复制」一键拷走。"
+                + "数字每 1.5 秒自动刷新，点一下正文可暂停刷新再慢慢选。", 11.5f, DIM, false);
+        hint.setLineSpacing(dp(3), 1f);
+        box.addView(hint, margins(MATCH, WRAP, 0, dpi(6), 0, dpi(10)));
+
+        final TextView body = text("", 11f, FG, false);
+        body.setTypeface(Typeface.MONOSPACE);
+        body.setTextIsSelectable(true);      // 用户要的是"能复制"，这里连手动选也一并给上
+        body.setLineSpacing(dp(3), 1f);
+
+        ScrollView sv = new ScrollView(this);
+        sv.setVerticalScrollBarEnabled(true);
+        sv.addView(body, new ViewGroup.LayoutParams(MATCH, WRAP));
+        // 固定占屏幕一半多一点：报告很长必须能滚，又不能把对话框撑出屏幕。
+        int bodyH = Math.max(dpi(220),
+                (int) (getResources().getDisplayMetrics().heightPixels * 0.52f));
+        box.addView(sv, new LinearLayout.LayoutParams(MATCH, bodyH));
+
+        final boolean[] auto = {true};
+        body.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (auto[0]) {
+                    auto[0] = false;
+                    toast("已暂停自动刷新，可以慢慢选了");
+                }
+            }
+        });
+
+        final Runnable refreshBody = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    setTextIfChanged(body, Diagnosis.build(MainActivity.this));
+                } catch (Throwable t) {
+                    setTextIfChanged(body, "生成诊断报告失败：" + t);
+                }
+                // 对话框关了（isShowing 为假）就自然停掉，不会一直挂着刷。
+                if (auto[0] && d.isShowing()) {
+                    ui.postDelayed(this, 1500L);
+                }
+            }
+        };
+
+        LinearLayout btns = new LinearLayout(this);
+        btns.setOrientation(LinearLayout.HORIZONTAL);
+
+        TextView copy = chip("📋 复制");
+        copy.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                copyToClipboard("Audio Mixing 诊断报告", body.getText().toString());
+            }
+        });
+        LinearLayout.LayoutParams clp = margins(0, dpi(46), 0, dpi(12), dpi(8), 0);
+        clp.weight = 1f;
+        btns.addView(copy, clp);
+
+        TextView close = chip("关闭");
+        close.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                d.dismiss();
+            }
+        });
+        LinearLayout.LayoutParams xlp = margins(0, dpi(46), 0, dpi(12), 0, 0);
+        xlp.weight = 1f;
+        btns.addView(close, xlp);
+        box.addView(btns);
+
+        d.setContentView(box);
+        Window dw = d.getWindow();
+        if (dw != null) {
+            dw.setBackgroundDrawable(new ColorDrawable(0));   // 背景透明，圆角才看得出来
+            dw.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            dw.setDimAmount(0.62f);
+            dw.setLayout(MATCH, WRAP);
+        }
+        d.show();
+        refreshBody.run();      // 立刻出一版，别让用户对着空白等 1.5 秒
+    }
+
+    /** 复制到剪贴板并提示。任何异常都只提示、不崩（某些 ROM 在受限状态下会抛）。 */
+    private void copyToClipboard(String label, String value) {
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (cm == null) {
+                toast("这台设备没有剪贴板服务");
+                return;
+            }
+            cm.setPrimaryClip(ClipData.newPlainText(label, value == null ? "" : value));
+            toast("已复制");
+        } catch (Throwable t) {
+            toast("复制失败：" + t);
         }
     }
 
@@ -429,15 +559,35 @@ public class MainActivity extends Activity {
         });
         card.addView(volRow);
 
+        // 「详情」和「诊断」并排：详情是常驻的实时统计（看一眼），
+        // 诊断是一次性的完整快照（能整段复制发出去）—— 真机排查要的正是后者。
+        LinearLayout tools = new LinearLayout(this);
+        tools.setOrientation(LinearLayout.HORIZONTAL);
+        tools.setGravity(Gravity.CENTER_VERTICAL);
+
         detailToggle = text("▸ 详情", 12.5f, DIM, false);
-        detailToggle.setPadding(0, dpi(14), 0, dpi(2));
+        detailToggle.setGravity(Gravity.CENTER_VERTICAL);
         detailToggle.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
                 toggleDetails();
             }
         });
-        card.addView(detailToggle);
+        LinearLayout.LayoutParams tlp = margins(0, dpi(40), 0, 0, 0, 0);
+        tlp.weight = 1f;
+        tools.addView(detailToggle, tlp);
+
+        // ★ 「诊断」入口：用户原话"要不加个诊断吧"——点开就是一段可复制的完整报告，
+        //   不用再靠截图里的几个数字猜是哪一端的问题。
+        TextView diagChip = chip("🩺 诊断");
+        diagChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showDiagnosisDialog();
+            }
+        });
+        tools.addView(diagChip, margins(dpi(100), dpi(40), 0, dpi(12), 0, 0));
+        card.addView(tools);
 
         detailWrap = new LinearLayout(this);
         detailWrap.setOrientation(LinearLayout.VERTICAL);
@@ -451,6 +601,8 @@ public class MainActivity extends Activity {
         kv("已连接", "conn");
         kv("收端统计", "recv");
         kv("发端统计", "send");
+        // ★ 对端自己报的统计（两台设备互报的"我发了多少/我收了你多少"）
+        kv("对端回话", "peers");
         kv("发现统计", "disc");
         return card;
     }
@@ -597,6 +749,8 @@ public class MainActivity extends Activity {
         final TextView listenChip;
         final TextView sendChip;
         final LevelBar level;
+        /** ★ 「对方：…」那一行（两台设备互报的统计）。 */
+        final TextView peerLine;
         private boolean styledOnce;
         private boolean styledListen;
         private boolean styledSend;
@@ -628,6 +782,14 @@ public class MainActivity extends Activity {
 
             level = new LevelBar(MainActivity.this, Math.max(2, dpi(3)));
             card.addView(level, margins(MATCH, dpi(10), 0, dpi(11), 0, 0));
+
+            // ★ 「对方」那一行：两台设备互报的结果。用户原话是"不知道是哪一端没在发"，
+            //   这一行就是答案 —— 对方自己说它有没有在发、它收了我多少。
+            //   放宽在电平条下面（而不是塞进右上角），因为这句话有时候要换行。
+            peerLine = text("", 11.5f, DIM, false);
+            peerLine.setLineSpacing(dp(3), 1f);
+            peerLine.setVisibility(View.GONE);
+            card.addView(peerLine, margins(MATCH, WRAP, 0, dpi(9), 0, 0));
 
             LinearLayout btns = new LinearLayout(MainActivity.this);
             btns.setOrientation(LinearLayout.HORIZONTAL);
@@ -714,6 +876,26 @@ public class MainActivity extends Activity {
 
             setTextIfChanged(name, peer.label());
             setTextIfChanged(meta, metaText(peer));
+
+            // ★ 「对方：已发 5938 包 / 11.0 MB · 正在发 ✓」/「没在发 ✗」那一行。
+            //   只在有「收听/送声音」关系时显示：没关系时对方本来就不会回话，
+            //   显示了反而让人以为"对方坏了"。
+            if (listen || send) {
+                long nowMs = SystemClock.elapsedRealtime();
+                Diagnosis.PeerStats ps = engine.peerStats(peer.host);
+                setTextIfChanged(peerLine, Diagnosis.cardLine(ps, nowMs));
+                // 颜色也表达结论：绿=对面在发、黄=对面没在发、灰=还没回话/已过期。
+                int pc = DIM;
+                if (ps != null && ps.fresh(nowMs)) {
+                    pc = ps.sending ? OK : WARN;
+                }
+                if (peerLine.getCurrentTextColor() != pc) {
+                    peerLine.setTextColor(pc);
+                }
+                peerLine.setVisibility(View.VISIBLE);
+            } else {
+                peerLine.setVisibility(View.GONE);
+            }
         }
     }
 

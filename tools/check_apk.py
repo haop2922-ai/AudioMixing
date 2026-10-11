@@ -13,9 +13,22 @@ import re
 import sys
 import zipfile
 
+# 这台机器（以及很多中文 Windows）控制台是 GBK：报告里用了 ✓/✗ 这类字符，
+# 不显式转 UTF-8 的话 print 会直接抛 UnicodeEncodeError，脚本 exit 1 ——
+# 而验收条件写的是"跑 check_apk.py → RESULT: PASS"，那样根本跑不到结论。
+# 这是个真实缺陷（由 android-ui 独立验收时发现），所以在这里堵死。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:  # pragma: no cover - Python < 3.7 或非常规 stdout
+    pass
+
 DEFAULT = pathlib.Path(__file__).resolve().parent.parent / "android/app/build/outputs/apk/debug/app-debug.apk"
 
-CLASSES = ["Proto", "Discovery", "AudioSend", "AudioRecv", "Engine", "MixService", "MainActivity"]
+# 每个交付的类都要在这里 —— 漏掉一个，那个类整个丢了脚本也照样报 PASS
+# （Diagnosis.java 是 task-6 的主要交付物，之前就漏在清单外）。
+CLASSES = ["Proto", "Discovery", "AudioSend", "AudioRecv", "Engine", "MixService",
+           "MainActivity", "Diagnosis"]
 WORDS = ["麦克风", "收听", "送声音", "详情", "设备", "正在", "局域网", "配对", "同一", "音量"]
 
 
@@ -36,7 +49,7 @@ def main() -> int:
     blob = b"".join(z.read(n) for n in dex_files)
     text = blob.decode("utf-8", "replace")
 
-    print("\n== 七个类都在吗 ==")
+    print("\n== 每个交付的类都在吗（清单见 CLASSES）==")
     missing = 0
     for cls in CLASSES:
         ok = ("Lcom/audiomixing/app/%s;" % cls) in text

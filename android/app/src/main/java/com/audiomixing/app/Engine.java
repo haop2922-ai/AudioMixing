@@ -2,8 +2,11 @@ package com.audiomixing.app;
 
 import android.content.Context;
 import android.os.Build;
+import android.os.SystemClock;
 import android.util.Log;
 
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.InterfaceAddress;
@@ -39,6 +42,13 @@ public final class Engine {
 
     /** 统计快照的复用窗口：界面每 150ms 刷一次，没必要每次都新建一个 Stats。 */
     private static final long STATS_TTL_MS = 120L;
+
+    /** ★ 对端统计的交换周期：每 2 秒互报一次（用户说的"让俩设备自己交流"）。 */
+    private static final long STATS_INTERVAL_MS = 2000L;
+    /** 收到的对端统计保留多久：过期的留在内存里没意义（界面会显示"没在回话"）。 */
+    private static final long PEER_STATS_KEEP_MS = 60000L;
+    /** 最多记多少台的对端统计：局域网里不会有这么多，防的是被人乱刷撑爆内存。 */
+    private static final int PEER_STATS_MAX = 32;
 
     private static volatile Engine sInstance;
 
@@ -93,6 +103,36 @@ public final class Engine {
     private volatile AudioRecv.Stats statsCache;
     private volatile long statsCacheAt;
 
+    // ── ★ 对端统计交换（用户要的"让俩设备自己交流"）──
+
+    /** 对端自己报的统计，按来源 IP 存。key = host，value 每次收到都换成新对象（不再修改）。 */
+    private final Map<String, Diagnosis.PeerStats> peerStats =
+            new LinkedHashMap<String, Diagnosis.PeerStats>();
+    /**
+     * 专门保护 {@link #peerStats} 的锁，<b>刻意不复用 {@link #lock}</b>。
+     *
+     * <p>为什么：写这份统计的是<b>收包线程</b>（AudioRecv 的回调），而 {@link #lock} 会被
+     * 界面线程拿着去停接收器（{@code stopReceiver()} 里有 join 等待收包线程退出）。
+     * 如果两边抢同一把锁，就变成"界面线程等收包线程、收包线程等界面线程"——
+     * 靠 join 的超时能解开，但界面会白卡一下。分开锁就完全没有这个交集。
+     */
+    private final Object peerLock = new Object();
+    /**
+     * 收听目标的端口（和 listenHosts 一起、在用户点选那一刻记下来）。
+     *
+     * <p>为什么要单独记端口：统计包要单播到对方的 audio_port（信标里公布的那个）。
+     * 跟地址同样的道理 —— 设备列表抖一下不至于让统计发不出去。
+     */
+    private final Map<String, Integer> listenPorts = new LinkedHashMap<String, Integer>();
+
+    /** 统计包发送线程：每 2 秒给"和我有关系的每一台"各发一个。 */
+    private volatile Thread statsThread;
+    private volatile boolean statsRunning;
+    private volatile long statsSent;
+    private volatile String statsLastError = "";
+    /** 统计包的固定 ssrc：不是音频流，只为了在对端日志里能认出是同一个人发的。 */
+    private final int statsSsrc = ((int) System.nanoTime()) | 1;
+
     private Engine(Context ctx) {
         this.app = ctx;
     }
@@ -127,6 +167,11 @@ public final class Engine {
                 // Wi-Fi 没开、组播锁拿不到等等：记下来但不让界面挂掉。
                 Log.w(TAG, "启动自主发现失败", t);
             }
+            // 对端统计的发送线程：和发现一起起来，它自己会在"没有任何关系"时静默空转。
+            synchronized (peerLock) {
+                peerStats.clear();
+            }
+            ensureStatsThread();
         }
     }
 
@@ -136,9 +181,14 @@ public final class Engine {
             started = false;
             listenIds.clear();
             listenHosts.clear();
+            listenPorts.clear();
             sendIds.clear();
             stopReceiver();
             stopSender();
+            stopStatsThread();
+            synchronized (peerLock) {
+                peerStats.clear();
+            }
             Discovery d = discovery;
             discovery = null;
             if (d != null) {
@@ -205,10 +255,13 @@ public final class Engine {
                 if (p.host != null && !p.host.isEmpty()) {
                     // 记下地址：设备列表以后怎么抖，这条收听都不受影响。
                     listenHosts.put(id, p.host);
+                    // 端口一起记住：对端统计要单播到它的 audio_port（信标里公布的那个）。
+                    listenPorts.put(id, p.audioPort > 0 ? p.audioPort : Proto.DEFAULT_AUDIO_PORT);
                 }
             } else {
                 listenIds.remove(id);
                 listenHosts.remove(id);
+                listenPorts.remove(id);
             }
             if (listenIds.isEmpty()) {
                 // 用户明确取消了全部收听：这时候才停接收器。
@@ -236,6 +289,11 @@ public final class Engine {
             }
             stopSender();
             if (sendIds.isEmpty()) {
+                // 送声停了、又没有别的收听目标：接收器只是刚才为了收对端统计才开着的，
+                // 一起收掉（否则它会一直占着 UDP 端口和一个 WifiLock）。
+                if (listenIds.isEmpty()) {
+                    stopReceiver();
+                }
                 return;
             }
             Discovery.Peer target = findById(id);
@@ -250,6 +308,10 @@ public final class Engine {
                 s.start();
                 sender = s;
                 lastSendError = "";
+                // ★ 送声音的同时把接收器也开起来：对方会把"我收到了多少"用统计包发回来，
+                //   没有接收器就收不到这句回话（白名单里没有收听目标，所以不会出声）。
+                //   两边互报状态，用户才能一眼看出"是哪一端没在发/没收"。
+                ensureReceiver();
             } catch (Throwable t) {
                 // 拿不到麦克风（被别的 App 占用 / 没权限）时不要把界面搞崩。
                 Log.w(TAG, "启动送声音失败 -> " + target.host + ":" + port, t);
@@ -335,6 +397,9 @@ public final class Engine {
             }            // 自愈：只要还有收听目标，接收器就必须活着（可能被别处停掉过）。
             if (!listenIds.isEmpty() && receiver == null) {
                 ensureReceiver();
+            } else if (listenIds.isEmpty() && sender == null && receiver != null) {
+                // 既不听也不送：接收器只是刚才为了收对端统计才开着的，可以收掉了（省电、放端口）。
+                stopReceiver();
             }
             applyAllowedHosts();
         }
@@ -356,6 +421,15 @@ public final class Engine {
         try {
             // 带 Context 的构造会拿 WifiLock：不收包时 Wi-Fi 进省电模式会把抖动缓冲冲垮。
             AudioRecv r = new AudioRecv(app, audioPort);
+            // ★ 对端统计的回话入口：对方每 2 秒会说一次"我发了多少、是不是正在发"。
+            //   回调在收包线程上，所以只做"解析 + 存起来"；解析失败就当没收到，
+            //   绝不能让一份坏包把"收听"整条链路带走。
+            r.setStatsListener(new AudioRecv.StatsListener() {
+                @Override
+                public void onStats(String host, byte[] payload) {
+                    onPeerStats(host, payload);
+                }
+            });
             r.start();
             receiver = r;
             applyAllowedHosts();
@@ -419,6 +493,233 @@ public final class Engine {
             } catch (Throwable t) {
                 Log.w(TAG, "停止送声音失败", t);
             }
+        }
+    }
+
+    // ────────────────────────── ★ 对端统计交换（两机互报） ──────────────────────────
+
+    /**
+     * 收到一份对端统计（<b>跑在收包线程上</b>）。
+     *
+     * <p>为什么这里还要再兜一层 try/catch：{@link AudioRecv} 的收包线程虽然也兜了，
+     * 但真机 Wi-Fi 上什么怪包都有，解析失败顶多是这一份统计丢掉，
+     * <b>绝不能让"收听"整条链路陪葬</b>（那条链路刚刚才修好）。
+     */
+    private void onPeerStats(String host, byte[] payload) {
+        try {
+            if (host == null || host.isEmpty() || payload == null) {
+                return;
+            }
+            Diagnosis.PeerStats ps = Diagnosis.parse(payload, payload.length);
+            if (ps == null) {
+                return;                 // 不是统计包/被截断了，静默丢掉
+            }
+            ps.host = host;
+            ps.receivedAtMs = SystemClock.elapsedRealtime();
+            synchronized (peerLock) {
+                peerStats.remove(host);
+                peerStats.put(host, ps);   // 重新插入 = 最新的排在最后，下面按顺序淘汰最老的
+                while (peerStats.size() > PEER_STATS_MAX) {
+                    java.util.Iterator<String> it = peerStats.keySet().iterator();
+                    if (!it.hasNext()) {
+                        break;
+                    }
+                    it.next();
+                    it.remove();
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "对端统计解析失败（已忽略这一份）", t);
+        }
+    }
+
+    /** 某一台自己报告的状态；没有就是 null（界面据此显示"等它回话…"）。 */
+    public Diagnosis.PeerStats peerStats(String host) {
+        if (host == null) {
+            return null;
+        }
+        synchronized (peerLock) {
+            return peerStats.get(host);
+        }
+    }
+
+    /** 所有对端报告的统计（按最近回话排序）。返回拷贝，界面线程随便遍历。 */
+    public List<Diagnosis.PeerStats> peerStatsList() {
+        synchronized (peerLock) {
+            return new ArrayList<Diagnosis.PeerStats>(peerStats.values());
+        }
+    }
+
+    /** 本机已经发出去了多少个统计包（诊断报告里用：为 0 说明统计交换根本没跑起来）。 */
+    public long statsPacketsSent() {
+        return statsSent;
+    }
+
+    private void ensureStatsThread() {
+        if (statsRunning) {
+            return;
+        }
+        statsRunning = true;
+        Thread t = new Thread(this::statsLoop, "am-stats-tx");
+        t.setDaemon(true);
+        statsThread = t;
+        t.start();
+    }
+
+    private void stopStatsThread() {
+        statsRunning = false;
+        Thread t = statsThread;
+        statsThread = null;
+        if (t != null && t != Thread.currentThread()) {
+            try {
+                // 循环里每 100ms 看一眼开关，所以这里很快就能等到它退出，不用干等一轮 2 秒。
+                t.join(600);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * 统计包发送循环：每 2 秒给"和我有关系的每一台"单播一个 {@code T_STATS}。
+     *
+     * <p><b>为什么放在引擎这一层、而不是 AudioSend 里</b>：用户完全可能"只收听、不送声音"，
+     * 那时候 AudioSend 根本不存在 —— 可恰恰是这种时候最需要告诉对方"我没在发"。
+     * 否则对面看到的就是"连上了、数字在动、就是没声音"，还是只能靠猜。
+     * 放在这里，统计和具体的音频收发解耦：只要和某台有收听/送声关系，就互报。
+     *
+     * <p>socket 用临时端口（和 AudioSend 一样），统计包一律发到<b>对方的音频端口</b>
+     * （信标里公布的 {@code audio_port}，由对方的 AudioRecv 收）。
+     */
+    private void statsLoop() {
+        DatagramSocket s;
+        try {
+            s = new DatagramSocket();
+            s.setSendBufferSize(16 * 1024);
+        } catch (Throwable t) {
+            // 统计发不出去不影响音频，只是用户少了"对方视角"这一半信息。
+            statsLastError = "统计 socket 打不开：" + t;
+            Log.w(TAG, statsLastError, t);
+            statsRunning = false;
+            return;
+        }
+        try {
+            while (statsRunning) {
+                try {
+                    sendStatsRound(s);
+                } catch (Throwable t) {
+                    // 对端还没起来/刚走，send 报错很正常，绝不能因此退出循环。
+                    statsLastError = "发统计失败：" + t;
+                    Log.w(TAG, statsLastError);
+                }
+                // 拆成 100ms 小步睡：stop() 时能立刻醒来，不用等满 2 秒。
+                for (int i = 0; i < STATS_INTERVAL_MS / 100 && statsRunning; i++) {
+                    sleepQuiet(100);
+                }
+            }
+        } finally {
+            try {
+                s.close();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /** 发一轮统计：给每台"有关系的设备"各发一个（内容按方向区分）。 */
+    private void sendStatsRound(DatagramSocket s) {
+        AudioSend snd;
+        Map<String, Integer> targets = new LinkedHashMap<String, Integer>();
+        synchronized (lock) {
+            // 我收听的那些：告诉它们"我收了你多少、我有没有在发"。
+            for (Map.Entry<String, String> e : listenHosts.entrySet()) {
+                String host = e.getValue();
+                if (host == null || host.isEmpty()) {
+                    continue;
+                }
+                Integer port = listenPorts.get(e.getKey());
+                targets.put(host, (port != null && port > 0) ? port : Proto.DEFAULT_AUDIO_PORT);
+            }
+            // 我正在送声音的那台：告诉它"我发了多少、我又收了你多少"。
+            snd = sender;
+            if (snd != null && snd.host() != null && !snd.host().isEmpty()) {
+                targets.put(snd.host(), snd.port() > 0 ? snd.port() : Proto.DEFAULT_AUDIO_PORT);
+            }
+        }
+        if (targets.isEmpty()) {
+            expirePeerStats();
+            return;
+        }
+
+        String sendHost = (snd == null) ? null : snd.host();
+        boolean sendingNow = snd != null && snd.isRunning();
+        long sent = (snd == null) ? 0 : snd.packetsSent();
+        long bytes = (snd == null) ? 0 : snd.bytesSent();
+        AudioRecv.Stats st = recvStats();
+        int streams = (st == null) ? 0 : st.streamCount;
+
+        for (Map.Entry<String, Integer> t : targets.entrySet()) {
+            String host = t.getKey();
+            if (host == null || host.isEmpty()) {
+                continue;
+            }
+            int port = (t.getValue() == null || t.getValue() <= 0)
+                    ? Proto.DEFAULT_AUDIO_PORT : t.getValue();
+            // 只对"我正在送的那台"报已发包数；对别的设备要如实说"我没在发给你"，
+            // 否则对面会以为那些包是发给它的（负载里的 target 字段就是干这个的）。
+            boolean iSendToIt = sendingNow && host.equals(sendHost);
+            // 这条链路的收包数单独取：对方最想知道的就是"我发出去的它到底收到多少"。
+            long recv = 0;
+            long lost = 0;
+            int buf = 0;
+            if (st != null && st.streams != null) {
+                for (AudioRecv.StreamStats ss : st.streams) {
+                    if (host.equals(ss.host)) {
+                        recv = ss.received;
+                        lost = ss.lost;
+                        buf = ss.bufferedMs;
+                        break;
+                    }
+                }
+            }
+            byte[] payload = Diagnosis.json(nodeName(),
+                    iSendToIt ? sent : 0, iSendToIt ? bytes : 0, iSendToIt,
+                    recv, lost, buf, streams, host);
+            Proto.Pkt pkt = new Proto.Pkt(Proto.T_STATS);
+            pkt.ssrc = statsSsrc;                                  // 固定一个，对端日志里好认
+            pkt.tsNs = System.currentTimeMillis() * 1_000_000L;
+            pkt.payload = payload;
+            byte[] raw = Proto.encode(pkt);
+            try {
+                s.send(new DatagramPacket(raw, raw.length, InetAddress.getByName(host), port));
+                statsSent++;
+            } catch (Throwable e) {
+                statsLastError = "统计包发不到 " + host + ":" + port + "：" + e;
+                Log.w(TAG, statsLastError);
+            }
+        }
+        expirePeerStats();
+    }
+
+    /** 过期的对端统计定期清掉：界面会显示"没在回话"，没必要一直占着内存。 */
+    private void expirePeerStats() {
+        long now = SystemClock.elapsedRealtime();
+        synchronized (peerLock) {
+            java.util.Iterator<Map.Entry<String, Diagnosis.PeerStats>> it =
+                    peerStats.entrySet().iterator();
+            while (it.hasNext()) {
+                Diagnosis.PeerStats ps = it.next().getValue();
+                if (ps == null || now - ps.receivedAtMs > PEER_STATS_KEEP_MS) {
+                    it.remove();
+                }
+            }
+        }
+    }
+
+    private static void sleepQuiet(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -499,6 +800,94 @@ public final class Engine {
     }
 
     // ────────────────────────────── 统计 / 本机信息 ──────────────────────────────
+
+    /**
+     * 只看一眼当前实例，<b>不创建</b>。
+     *
+     * <p>给 {@link Diagnosis#build(android.content.Context)} 用：生成一份诊断报告
+     * 不该顺手把引擎建起来（那会真的去开组播端口、拿 WifiLock）。没有实例就返回 null，
+     * 报告里照实写"引擎没在运行"。
+     */
+    public static Engine peek() {
+        return sInstance;
+    }
+
+    /** 接收器在跑吗（诊断报告和界面都要用）。 */
+    public boolean receiverRunning() {
+        AudioRecv r = receiver;
+        return r != null && r.isRunning();
+    }
+
+    /** 发送器在跑吗。注意 start() 之后麦克风还有可能打开失败，所以这里问的是它自己的状态。 */
+    public boolean senderRunning() {
+        AudioSend s = sender;
+        return s != null && s.isRunning();
+    }
+
+    public boolean discoveryRunning() {
+        Discovery d = discovery;
+        return d != null && d.isRunning();
+    }
+
+    /** 正在收听哪几台的地址（给诊断报告用的人话）。 */
+    public String listenTargetsText() {
+        synchronized (lock) {
+            StringBuilder sb = new StringBuilder();
+            for (String h : listenHosts.values()) {
+                if (h == null || h.isEmpty()) {
+                    continue;
+                }
+                if (sb.length() > 0) {
+                    sb.append(" / ");
+                }
+                sb.append(h);
+            }
+            return sb.length() == 0 ? "（无）" : sb.toString();
+        }
+    }
+
+    /** 正在送声音给谁（"host:port"，没在送就是"（无）"）。 */
+    public String sendTargetText() {
+        AudioSend s = sender;
+        if (s == null || s.host() == null || s.host().isEmpty()) {
+            return "（无）";
+        }
+        return s.host() + ":" + s.port() + (s.isRunning() ? "" : "（已停止）");
+    }
+
+    public long sentPackets() {
+        AudioSend s = sender;
+        return s == null ? 0 : s.packetsSent();
+    }
+
+    public long sentBytes() {
+        AudioSend s = sender;
+        return s == null ? 0 : s.bytesSent();
+    }
+
+    public int sendErrors() {
+        AudioSend s = sender;
+        return s == null ? 0 : s.sendErrors();
+    }
+
+    /** 发送侧最近一次错误（没有发送器时退回"启动失败"的那条）。 */
+    public String sendLastError() {
+        AudioSend s = sender;
+        String e = (s == null) ? lastSendError : s.lastError();
+        return e == null ? "" : e;
+    }
+
+    public String recvLastError() {
+        AudioRecv r = receiver;
+        String e = (r == null) ? "" : r.lastError();
+        return e == null ? "" : e;
+    }
+
+    public String discLastError() {
+        Discovery d = discovery;
+        String e = (d == null) ? "" : d.lastError();
+        return e == null ? "" : e;
+    }
 
     /** 详情面板里的「丢包统计」。 */
     public String statsText() {
