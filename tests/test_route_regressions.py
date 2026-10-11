@@ -17,6 +17,7 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -29,15 +30,7 @@ atexit.register(lambda: shutil.rmtree(_TEST_SANDBOX, ignore_errors=True))
 
 from audiomixing.config import Config          # noqa: E402
 from audiomixing.engine import WaveLinkNode    # noqa: E402
-
-# 显式注册后端：default_source_spec() 会先问 available_backends()，
-# 如果没人导入过 wasapi 后端，它会返回空表 → 直接返回 silence，
-# 于是这两个用例就变成"依赖别的测试先跑过"的顺序依赖（很脆）。
-# 这里自己保证前置条件，单独跑也稳定。
-try:  # pragma: no cover - 平台相关
-    from audiomixing.audio.backends import wasapi as _wasapi  # noqa: F401
-except Exception:
-    pass
+from audiomixing.audio import base as audio_base  # noqa: E402
 
 
 def free_udp_port() -> int:
@@ -171,8 +164,14 @@ class StaleSourceDeviceTests(unittest.TestCase):
         self.addCleanup(self.node.stop)
 
     def _fake_devices(self, names: list[str]) -> None:
-        # simulate=True 时 default_source_spec() 会返回测试音，这里要测的是真实选择逻辑
+        # simulate=True 时 default_source_spec() 会返回测试音，这里要测的是真实选择逻辑。
+        # 同时把"后端可用性"打桩掉：不这样做就要真的导入 wasapi 后端，而那个导入是
+        # 全局副作用，会打乱其它测试（曾经一次搞坏 9 个用例）。打桩只影响本用例。
         self.node.simulate = False
+        patcher = unittest.mock.patch.object(
+            audio_base, "available_backends", lambda: {"wasapi": True, "file": True, "null": True})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         items = []
         for i, name in enumerate(names):
             items.append(types.SimpleNamespace(
