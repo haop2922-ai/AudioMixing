@@ -217,7 +217,11 @@ class WaveLinkNode:
         self.multi_out = MultiOut(self.hub)
         # 被显式删掉的路由 id。拉取回来的表里若还带着它，不要复活：
         # 否则推送删一次、拉取加一次，播放端会反复开关。
-        self._dropped_ids: set[str] = set()
+        # 被显式删掉的路由 id → 记录时间。注意【必须有有效期】：
+        # 以前这里是永久 set，结果是同一条路由一旦在本机被删过一次，
+        # 对端再建、再推、本机再拉，全都会被这条规则过滤掉，永远回不来 ——
+        # 现象就是"对端显示残留、一直在发，本机收不到也不响"（2026-10-11 实测）。
+        self._dropped_ids: dict[str, float] = {}
         self._shared_sinks: dict[str, Any] = {}
         self.beacon: BeaconService | None = None
         self.devices: list[audio_base.AudioDevice] = []
@@ -718,6 +722,20 @@ class WaveLinkNode:
         self.set_routes(routes, author_id=origin, drop=removed)
 
     # -- route handling ----------------------------------------------------
+    # 显式删除的路由压制多久。够长，能压住"推送删除"和"拉取合并"来回打架；
+    # 又够短，用户在对端重建同一条路由后不用重启程序就能恢复。
+    DROPPED_TTL = 120.0
+
+    def _purge_dropped(self) -> None:
+        """把过期的"已删除路由"记录清掉，让同名路由有机会重新进来。"""
+        try:
+            now = time.time()
+            for key, stamp in list(self._dropped_ids.items()):
+                if now - float(stamp or 0.0) > self.DROPPED_TTL:
+                    self._dropped_ids.pop(key, None)
+        except Exception:
+            pass
+
     def set_routes(
         self,
         routes: list[dict[str, Any]],
@@ -726,7 +744,10 @@ class WaveLinkNode:
         author_name: str = "",
         drop: Iterable[str] = (),
     ) -> list[dict[str, Any]]:
-        self._dropped_ids.update(str(x) for x in drop)
+        _drop_now = time.time()
+        for _x in drop:
+            self._dropped_ids[str(_x)] = _drop_now
+        self._purge_dropped()
         """Replace `author`'s share of the route table and reconcile.
 
         The route table is shared by every node on the LAN, but each node owns the
@@ -818,7 +839,10 @@ class WaveLinkNode:
             routes = data.get("routes") if isinstance(data, dict) else data
             if not isinstance(routes, list) or not routes:
                 continue
-            # 已经被显式删掉的路由不要再拉回来，否则会和推送的删除来回打架
+            # 已经被显式删掉的路由短时间内不要再拉回来（压住来回打架的推送），
+            # 但【不能永久】：过了有效期就允许重新拉取，否则对端重建同名路由
+            # 也永远回不来，现场表现就是"对端一直在发、本机永远不响"。
+            self._purge_dropped()
             kept = [r for r in routes
                     if str(r.get("id") or "") not in self._dropped_ids]
             if not kept:
