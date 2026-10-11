@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#070b12">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Audio Mixing · 手机直传</title>
+<style>
+  /* 配色变量、圆角卡片、大圆环、电平条都来自 phone.html —— 两个页面要像一个 App */
+  :root{
+    --bg:#070b12; --card:rgba(255,255,255,.045); --line:rgba(255,255,255,.09);
+    --fg:#eaf1fb; --dim:#8ea0b8; --acc:#38bdf8; --acc2:#6366f1;
+    --ok:#34d399; --warn:#fbbf24; --err:#f87171;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%}
+  [hidden]{display:none !important}
+  body{
+    margin:0;background:
+      radial-gradient(120% 70% at 50% -10%, #14324d 0%, transparent 60%),
+      radial-gradient(90% 60% at 110% 110%, #2a1b52 0%, transparent 55%),
+      var(--bg);
+    color:var(--fg); font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",system-ui,sans-serif;
+    padding:calc(env(safe-area-inset-top) + 14px) 18px calc(env(safe-area-inset-bottom) + 18px);
+    display:flex; flex-direction:column; gap:14px; min-height:100%;
+    overscroll-behavior:none;
+  }
+  header{display:flex;align-items:center;gap:10px}
+  .logo{
+    width:34px;height:34px;border-radius:11px;flex:0 0 auto;
+    background:linear-gradient(140deg,var(--acc),var(--acc2));
+    display:grid;place-items:center;box-shadow:0 6px 18px rgba(56,189,248,.28)
+  }
+  .logo svg{width:19px;height:19px}
+  .titles{min-width:0;flex:1}
+  .titles b{display:block;font-size:15.5px;letter-spacing:.2px}
+  .titles span{display:block;font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pill{
+    font-size:11.5px;color:var(--dim);border:1px solid var(--line);border-radius:999px;
+    padding:5px 10px;white-space:nowrap;background:rgba(255,255,255,.03)
+  }
+  .pill.on{color:var(--ok);border-color:rgba(52,211,153,.35)}
+  .pill.err{color:var(--err);border-color:rgba(248,113,113,.35)}
+  .back{
+    align-self:flex-start;font-size:12px;color:var(--dim);text-decoration:none;
+    border:1px solid var(--line);border-radius:999px;padding:5px 11px;background:rgba(255,255,255,.03)
+  }
+  .back:active{color:var(--fg)}
+
+  /* 角色切换 */
+  .seg{display:flex;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:4px;gap:4px}
+  .seg button{
+    flex:1;border:0;background:transparent;color:var(--dim);font:inherit;font-weight:600;
+    padding:11px 6px;border-radius:11px;cursor:pointer;transition:.18s;font-size:14px
+  }
+  .seg button.sel{background:linear-gradient(140deg,var(--acc),var(--acc2));color:#04121f}
+  .seg button:disabled{opacity:.4}
+
+  /* 房间号：给另一台手机看的，越大越好 */
+  .room{text-align:center;padding:4px 0 2px}
+  .room-label{font-size:12.5px;color:var(--dim);margin-bottom:4px}
+  .room-num{
+    font:700 clamp(46px,15vw,62px)/1.1 ui-monospace,Menlo,Consolas,monospace;
+    letter-spacing:.18em;text-indent:.18em;font-variant-numeric:tabular-nums;
+    color:var(--acc);text-shadow:0 6px 26px rgba(56,189,248,.35);
+    -webkit-user-select:all;user-select:all;word-break:break-all
+  }
+  .room-act{margin-top:8px}
+  .link{
+    border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--dim);
+    font:inherit;font-size:12px;border-radius:999px;padding:5px 11px;cursor:pointer
+  }
+  .link:disabled{opacity:.4}
+
+  /* 大圆环 */
+  .stage{flex:1;display:grid;place-items:center;position:relative;min-height:210px}
+  .ring{position:relative;width:min(62vw,230px);height:min(62vw,230px);display:grid;place-items:center}
+  .ring svg{position:absolute;inset:0;transform:rotate(-90deg)}
+  .ring .track{fill:none;stroke:rgba(255,255,255,.07);stroke-width:8}
+  .ring .prog{fill:none;stroke:url(#g);stroke-width:8;stroke-linecap:round;
+              transition:stroke-dashoffset .12s linear}
+  /* 等待/协商时圆环转起来，一眼看出"在忙" */
+  .ring.busy .prog{transform-box:fill-box;transform-origin:center;animation:spin 1.8s linear infinite}
+  .ring.bad .prog{stroke:var(--err);animation:none}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .core{text-align:center;z-index:1}
+  .core .big{font-size:34px;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
+  .core .unit{font-size:13px;color:var(--dim);margin-top:2px}
+  .core .st{font-size:13px;color:var(--dim);margin-top:8px;padding:0 10px}
+  .ring.live .core .big{color:var(--ok)}
+  .ring.busy .core .big{color:var(--warn)}
+  .ring.bad .core .big{color:var(--err)}
+
+  /* 电平条 */
+  .bars{display:flex;gap:3px;height:34px;align-items:flex-end;justify-content:center;margin-top:4px}
+  .bars i{width:5px;border-radius:3px;background:rgba(255,255,255,.10);transition:height .1s linear}
+  .bars i.hot{background:linear-gradient(180deg,var(--acc),var(--ok))}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px 15px}
+  .row{display:flex;align-items:center;gap:12px}
+  .row+.row{margin-top:12px}
+  .row label{color:var(--dim);font-size:12.5px;min-width:52px}
+  input[type=text]{
+    flex:1;min-width:0;background:rgba(255,255,255,.05);border:1px solid var(--line);
+    border-radius:12px;color:var(--fg);font:inherit;padding:11px 13px;outline:none
+  }
+  input[type=text]:focus{border-color:rgba(56,189,248,.5);box-shadow:0 0 0 3px rgba(56,189,248,.12)}
+  input[type=text]:disabled{opacity:.5}
+  #roomInput{
+    width:100%;text-align:center;font:700 34px/1.2 ui-monospace,Menlo,Consolas,monospace;
+    letter-spacing:.26em;text-indent:.26em;padding:12px;font-variant-numeric:tabular-nums
+  }
+  #roomInput::placeholder{color:rgba(142,160,184,.45)}
+
+  .main{
+    border:0;border-radius:16px;padding:17px;font:inherit;font-size:17px;font-weight:700;
+    background:linear-gradient(140deg,var(--acc),var(--acc2));color:#04121f;cursor:pointer;
+    box-shadow:0 10px 26px rgba(56,189,248,.22);width:100%
+  }
+  .main.stop{background:linear-gradient(140deg,#f87171,#fb923c);color:#220a0a}
+  .main:disabled{opacity:.55;box-shadow:none}
+  /* 自动播放被挡时的兜底按钮：要显眼到不可能看不见 */
+  .main.play{
+    background:linear-gradient(140deg,#fbbf24,#34d399);color:#20160a;
+    animation:pulse 1.6s ease-in-out infinite
+  }
+  @keyframes pulse{50%{transform:scale(1.015);box-shadow:0 10px 30px rgba(251,191,36,.30)}}
+
+  details{border-top:1px solid var(--line);margin-top:12px;padding-top:10px}
+  details summary{color:var(--dim);font-size:12.5px;cursor:pointer;list-style:none}
+  details summary::-webkit-details-marker{display:none}
+  details summary::before{content:"▸ ";color:var(--dim)}
+  details[open] summary::before{content:"▾ "}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin-top:10px;
+      font:12.5px ui-monospace,Menlo,Consolas,monospace;color:var(--dim)}
+  .kv b{color:var(--fg);font-weight:600;word-break:break-all}
+  .note{color:var(--dim);font-size:12px;line-height:1.75}
+  .note b{color:#cbd8ea;font-weight:600}
+</style>
+</head>
+<body>
+
+<!-- 接收方的声音出口。playsinline 是 iOS 的硬要求，否则会弹全屏播放器 -->
+<audio id="sink" autoplay playsinline></audio>
+
+<header>
+  <div class="logo">
+    <svg viewBox="0 0 24 24" fill="none" stroke="#04121f" stroke-width="2.4" stroke-linecap="round">
+      <path d="M4 12h2M9 7v10M14 4v16M19 9v6"/>
+    </svg>
+  </div>
+  <div class="titles">
+    <b>Audio Mixing</b>
+    <span>手机 ↔ 手机 · 电脑只转发协商信息</span>
+  </div>
+  <div class="pill" id="pill">未连接</div>
+</header>
+
+<a class="back" href="/">← 返回电脑控制台</a>
+
+<div class="seg" id="seg">
+  <button id="mSend" class="sel">📤 我要发送</button>
+  <button id="mRecv">📥 我要接收</button>
+</div>
+
+<!-- 发送方：4 位房间号，大字给另一台手机看 -->
+<div class="card" id="cardSend">
+  <div class="room">
+    <div class="room-label">房间号 · 让另一台手机输入这 4 位数字</div>
+    <div class="room-num" id="roomNum">----</div>
+    <div class="room-act"><button class="link" id="roomNew">换一个号码</button></div>
+  </div>
+</div>
+
+<!-- 接收方：输入房间号 -->
+<div class="card" id="cardRecv" hidden>
+  <div class="room-label" style="text-align:center">输入另一台手机上显示的房间号</div>
+  <div style="margin-top:8px">
+    <input type="text" id="roomInput" inputmode="numeric" pattern="[0-9]*"
+           autocomplete="off" autocorrect="off" spellcheck="false" maxlength="4" placeholder="0000">
+  </div>
+</div>
+
+<div class="stage">
+  <div class="ring" id="ring">
+    <svg viewBox="0 0 120 120">
+      <defs>
+        <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#38bdf8"/><stop offset="100%" stop-color="#34d399"/>
+        </linearGradient>
+      </defs>
+      <circle class="track" cx="60" cy="60" r="52"></circle>
+      <circle class="prog" id="prog" cx="60" cy="60" r="52"
+              stroke-dasharray="326.7" stroke-dashoffset="326.7"></circle>
+    </svg>
+    <div class="core">
+      <div class="big" id="metric">—</div>
+      <div class="unit" id="unit">电平 %</div>
+      <div class="st" id="state">选好角色后点下面的按钮</div>
+    </div>
+  </div>
+</div>
+
+<div class="bars" id="bars"></div>
+
+<!-- iOS 上自动播放会被挡掉，这个按钮就是那道门 -->
+<button class="main play" id="play" hidden>🔊 点这里开始播放</button>
+
+<div class="card">
+  <div class="row" style="margin-bottom:12px">
+    <label>我的名字</label>
+    <input type="text" id="nameInput" maxlength="8" autocomplete="off"
+           autocorrect="off" spellcheck="false" placeholder="手机">
+  </div>
+  <button class="main" id="btn">开始发送</button>
+  <details>
+    <summary>详情与排查</summary>
+    <div class="kv" id="kv"></div>
+  </details>
+</div>
+
+<div class="card">
+  <div class="note">
+    <b>安卓 Chrome / Edge</b>：用 http 的局域网地址打开就能直接用。<br>
+    <b>iPhone 的 Safari 必须用 https 打开</b>才能拿到麦克风（只当接收方时 http 一般也能听）。<br>
+    <b>传不了「手机正在播放的音乐」</b>：浏览器拿不到系统正在放的声音（系统限制），这里传的只能是<b>麦克风</b>里的声音。<br>
+    <b>电脑只转发协商信息</b>，音频是两台手机<b>直连</b> —— 协商完成后，关掉电脑声音照样在传。<br>
+    两台手机要在<b>同一个 Wi-Fi</b>；连不上就先查这一条。
+  </div>
+</div>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const qs = new URLSearchParams(location.search);
+
+/* 信令消息类型（协议第三、四节）
+   本页发出：offer / answer / ice / bye
+   本页处理：peer / offer / answer / ice / bye / error（hello 兼容保留）
+   服务端自己产生：peer / bye / error；其余原样转发 */
+
+const NAME_DEFAULT = '手机';
+const ROOM_MAX = 4;
+
+let role = qs.get('role') === 'guest' ? 'guest' : 'host';
+let room = /^\d{4}$/.test(qs.get('room') || '') ? qs.get('room') : newRoom();
+
+let ws = null;              // 信令 WebSocket
+let pc = null;              // RTCPeerConnection
+let micStream = null;       // 发送方的麦克风
+let sink = $('sink');       // 接收方的播放出口
+
+let pendingIce = [];        // 远端描述还没到时先攒着的候选
+let running = false, busy = false;
+let peerName = '';          // 对端手机的名字
+let hostName = '';          // 这台电脑（信令服务器）的名字
+let gotMedia = false;       // 真收到音频了吗
+let lastBytes = 0, kbps = 0;
+let recvSec = 0;            // 已接收/已发送秒数（只在直连期间累加）
+let level = 0;
+
+/* ---------- 电平表 ---------- */
+let actx = null;            // AudioContext：只在用户手势里创建/恢复（iOS 要求）
+let analyser = null, meterSrc = null, meterBuf = null;
+
+const BARS = 22;
+const barEls = [];
+(function buildBars(){
+  const box = $('bars');
+  for(let i = 0; i < BARS; i++){
+    const el = document.createElement('i');
+    el.style.height = '4px';
+    box.appendChild(el);
+    barEls.push(el);
+  }
+})();
+
+function unlockAudio(){                 // 必须在点击回调里调用，否则 iOS 一直是 suspended
+  try{
+    if(!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    if(actx.state === 'suspended') actx.resume().catch(() => {});
+  }catch(e){ actx = null; }
+}
+function detachMeter(){
+  try{ meterSrc && meterSrc.disconnect(); }catch(e){}
+  try{ analyser && analyser.disconnect(); }catch(e){}
+  meterSrc = null; analyser = null; meterBuf = null;
+}
+function attachMeter(stream){
+  if(!actx || !stream) return;
+  try{
+    detachMeter();
+    meterSrc = actx.createMediaStreamSource(stream);
+    analyser = actx.createAnalyser();
+    analyser.fftSize = 1024;
+    // 只接到分析器，不接 destination：否则会和 <audio> 一起出声，变成两份声音
+    meterSrc.connect(analyser);
+  }catch(e){ analyser = null; }
+}
+function readPeak(){
+  if(!analyser) return 0;
+  if(!meterBuf || meterBuf.length !== analyser.fftSize) meterBuf = new Float32Array(analyser.fftSize);
+  analyser.getFloatTimeDomainData(meterBuf);
+  let peak = 0;
+  for(let i = 0; i < meterBuf.length; i++){
+    const a = meterBuf[i] < 0 ? -meterBuf[i] : meterBuf[i];
+    if(a > peak) peak = a;
+  }
+  return Math.min(1, peak * 2.5);       // 人声峰值偏小，放大一点才看得见
+}
+function isLive(){ return !!pc && pc.connectionState === 'connected'; }
+function paintLevel(){
+  const pct = Math.round(Math.min(1, level) * 100);
+  barEls.forEach((el, i) => {
+    const t = i / (BARS - 1);
+    const on = level > t * 0.95;
+    el.style.height = (on ? 10 + t * 22 : 4) + 'px';
+    el.classList.toggle('hot', on);
+  });
+  if(isLive()){
+    $('prog').setAttribute('stroke-dashoffset', String(326.7 * (1 - Math.min(1, level) * 0.92)));
+    $('metric').textContent = String(pct);
+    $('unit').textContent = role === 'host' ? '麦克风电平 %' : '播放电平 %';
+  }
+}
+let lastTickAt = 0;
+setInterval(() => {
+  const now = performance.now();
+  const dt = lastTickAt ? (now - lastTickAt) / 1000 : 0;
+  lastTickAt = now;
+  if(isLive()) recvSec += dt;
+  level = Math.max(analyser ? readPeak() : 0, level * 0.86);
+  paintLevel();
+}, 90);
+
+/* ---------- 状态显示 ---------- */
+function setState(text, cls, big, unit, pillText){
+  $('state').textContent = text;
+  $('pill').textContent = pillText || (cls === 'on' ? '已连接' : cls === 'err' ? '出错'
+                                      : cls === 'busy' ? '连接中' : '未连接');
+  $('pill').className = 'pill' + (cls ? ' ' + cls : '');
+  $('ring').className = 'ring' + (cls === 'on' ? ' live' : cls === 'busy' ? ' busy'
+                                : cls === 'err' ? ' bad' : '');
+  if(big !== undefined) $('metric').textContent = big;
+  if(unit !== undefined) $('unit').textContent = unit;
+  if(cls === 'busy') $('prog').setAttribute('stroke-dashoffset', String(326.7 * 0.72));
+  else if(cls === 'err') $('prog').setAttribute('stroke-dashoffset', String(326.7 * 0.30));
+  else if(!cls) $('prog').setAttribute('stroke-dashoffset', '326.7');
+  renderDetails();
+}
+const CONN_CN = {new:'新建', connecting:'连接中', connected:'已连接', disconnected:'已断开',
+                 failed:'失败', closed:'已关闭'};
+const ICE_CN = {new:'新建', checking:'检查中', connected:'已连通', completed:'已完成',
+                disconnected:'已断开', failed:'失败', closed:'已关闭'};
+function esc(s){
+  return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function kv(pairs){
+  $('kv').innerHTML = pairs.map(([k, v]) => `<span>${esc(k)}</span><b>${esc(v)}</b>`).join('');
+}
+function renderDetails(){
+  const cs = pc ? pc.connectionState : '—';
+  const ics = pc ? pc.iceConnectionState : '—';
+  kv([
+    ['角色', role === 'host' ? '发送方（传麦克风）' : '接收方（放声音）'],
+    ['房间号', room],
+    ['对端', peerName || '—'],
+    ['连接状态', CONN_CN[cs] || cs],
+    ['ICE 状态', ICE_CN[ics] || ics],
+    [role === 'host' ? '已发送' : '已接收', (isLive() ? recvSec : 0).toFixed(1) + ' 秒'],
+    ['码率', kbps > 0 ? Math.round(kbps) + ' kbps' : '—'],
+    ['信令', ws ? '已连上电脑' : '未连接'],
+    ['电脑', hostName || location.host],
+  ]);
+}
+
+/* ---------- 房间号 / URL ---------- */
+function newRoom(){
+  // 4 位数字，不生成 0 开头：念给对方听、隔着桌子看都不会错
+  return String(1000 + Math.floor(Math.random() * 9000));
+}
+function myName(){
+  const v = ($('nameInput').value || '').trim();
+  return v || NAME_DEFAULT;
+}
+function syncUrl(){
+  try{
+    const u = new URL(location.href);
+    u.searchParams.set('role', role);
+    u.searchParams.set('room', room);
+    history.replaceState(null, '', u.toString());
+  }catch(e){}
+}
+
+/* ---------- 信令通道 ---------- */
+function wsUrl(){
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return proto + '//' + location.host + '/ws/p2p'
+       + '?role=' + encodeURIComponent(role)
+       + '&room=' + encodeURIComponent(room)
+       + '&name=' + encodeURIComponent(myName());
+}
+function send(obj){
+  if(ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+function closeSignal(){
+  const sock = ws;
+  ws = null;                       // 先摘掉引用：onclose 里靠它认出"是我自己关的"
+  if(sock){ try{ sock.close(); }catch(e){} }
+}
+function openSignal(){
+  closeSignal();
+  let sock;
+  try{ sock = new WebSocket(wsUrl()); }
+  catch(e){
+    running = false; runningUI();
+    setState('信令通道打不开：' + e.message, 'err', '出错', 'WebSocket 失败', '出错');
+    return;
+  }
+  ws = sock;
+  sock.onopen = () => {
+    if(ws !== sock) return;
+    renderDetails();
+    if(role === 'host') setState('等待对方加入…', 'busy', '等待', '把房间号给它');
+    else setState('已进入房间，等待对方…', 'busy', '连接', '房间号 ' + room);
+  };
+  sock.onmessage = (ev) => {
+    if(ws !== sock) return;
+    if(typeof ev.data === 'string') handle(ev.data);
+    // 二进制帧不在这份协议里（服务端也不会转），直接忽略
+  };
+  sock.onerror = () => {
+    if(ws === sock) setState('信令出错：手机和电脑要在同一个 Wi-Fi', 'err', '出错', '连接出错', '出错');
+  };
+  sock.onclose = () => {
+    if(ws !== sock) return;
+    ws = null;
+    if(!running) return;
+    running = false; runningUI(); teardownPeer();
+    setState('和电脑的连接断了，点按钮重来', 'err', '断开', '信令断开', '已断开');
+  };
+}
+
+/* ---------- 收消息 ---------- */
+function handle(text){
+  let m;
+  try{ m = JSON.parse(text); }
+  catch(e){ return; }                      // 不是 JSON 就当没看见
+  if(!m || typeof m.t !== 'string') return;
+  switch(m.t){
+    case 'hello':                          // 服务端回执，目前只在有的实现里出现
+      renderDetails();
+      break;
+    case 'peer':                           // 服务端：对端已就位
+      onPeer(m.name);
+      break;
+    case 'offer':
+      onOffer(m.sdp);
+      break;
+    case 'answer':
+      onAnswer(m.sdp);
+      break;
+    case 'ice':
+      onIce(m.candidate);
+      break;
+    case 'bye':                            // 对端断开（服务端也会转发主动挂断）
+      onBye();
+      break;
+    case 'error':                          // 服务端：房间号已满之类
+      onServerError(m.msg);
+      break;
+    default:                               // 协议将来加的类型：忽略，不炸
+      break;
+  }
+}
+function onPeer(name){
+  peerName = String(name || '').trim() || '对方';
+  renderDetails();
+  if(role === 'host'){
+    setState('对方已加入，正在建立直连…', 'busy', '协商', '正在建立直连');
+    negotiate();
+  }else{
+    setState('对方已就位，等待协商…', 'busy', '协商', '等待对方发来 offer');
+  }
+}
+function onServerError(msg){
+  const text = String(msg || '服务端拒绝了这个连接');
+  running = false; closeSignal(); teardownPeer(); runningUI();
+  setState('电脑说：' + text, 'err', '出错', text, '被拒绝');
+}
+function onBye(){
+  const was = running;
+  stopAll(false);                          // 对方已经走了，不用再回一条 bye
+  setState(was ? '对方已挂断，点按钮重新开始' : '和对方的连接断开了', 'err', '断开', '对方已挂断', '已断开');
+}
+
+/* ---------- WebRTC ---------- */
+function newPC(){
+  // 局域网直连：没有 STUN/TURN，host 候选就够，配了反而拖慢协商
+  const p = new RTCPeerConnection({iceServers: [], iceCandidatePoolSize: 0});
+  p.onicecandidate = (ev) => {
+    if(!ev.candidate) return;              // null = 候选收集结束
+    const c = ev.candidate;
+    send({
+      t: 'ice',
+      candidate: JSON.stringify(c),        // 协议里 candidate 是一个 JSON 字符串
+      mid: c.sdpMid != null ? c.sdpMid : '0',
+      mlin: c.sdpMLineIndex != null ? c.sdpMLineIndex : 0,
+    });
+  };
+  p.ontrack = (ev) => {
+    const stream = (ev.streams && ev.streams[0]) || new MediaStream([ev.track]);
+    attachRemote(stream);
+  };
+  p.onconnectionstatechange = refreshConn;
+  p.oniceconnectionstatechange = refreshConn;
+  return p;
+}
+function attachRemote(stream){
+  gotMedia = true;
+  sink.srcObject = stream;
+  // 先靠 autoplay 自己出声；被自动播放策略挡住就露出「开始播放」
+  const p = sink.play();
+  if(p && p.catch) p.catch(() => { $('play').hidden = false; });
+  attachMeter(stream);
+  setState('已连接，正在播放…', 'on');
+  renderDetails();
+}
+function refreshConn(){
+  if(!pc) return;
+  const cs = pc.connectionState;
+  if(cs === 'connected'){
+    setState(gotMedia ? '正在传输' : '已连接，等待声音…', 'on');
+  }else if(cs === 'failed'){
+    setState('直连失败：确认两台手机在同一个 Wi-Fi', 'err', '出错', '连接失败', '出错');
+  }else if(cs === 'disconnected'){
+    setState('直连中断，正在尝试恢复…', 'err', '断开', '连接中断', '已断开');
+  }
+  renderDetails();
+}
+function onIce(raw){
+  if(raw === undefined || raw === null || raw === '') return;
+  let cand = raw;
+  if(typeof cand === 'string'){
+    try{ cand = JSON.parse(cand); }catch(e){ return; }
+  }
+  if(!cand || !cand.candidate) return;
+  if(pc && pc.remoteDescription){ pc.addIceCandidate(cand).catch(() => {}); }
+  else pendingIce.push(cand);              // 候选先到、描述后到，是常态，先攒着
+}
+async function flushIce(){
+  if(!pc || !pc.remoteDescription) return;
+  const list = pendingIce; pendingIce = [];
+  for(const c of list){ try{ await pc.addIceCandidate(c); }catch(e){} }
+}
+async function negotiate(){                 // host：发 offer
+  if(pc || !running || role !== 'host') return;
+  if(!micStream){ setState('还没拿到麦克风', 'err', '出错', '麦克风没开', '出错'); return; }
+  try{
+    pc = newPC();
+    micStream.getTracks().forEach((t) => pc.addTrack(t, micStream));
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    send({t: 'offer', sdp: pc.localDescription.sdp});
+  }catch(e){
+    setState('协商失败：' + e.message, 'err', '出错', 'offer 失败', '出错');
+  }
+}
+async function onOffer(sdp){                // guest：回 answer
+  if(!sdp) return;
+  try{
+    if(!pc) pc = newPC();
+    await pc.setRemoteDescription({type: 'offer', sdp: sdp});
+    await flushIce();
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    send({t: 'answer', sdp: pc.localDescription.sdp});
+    setState('已应答，正在建立直连…', 'busy', '协商', '等待直连建立');
+  }catch(e){
+    setState('协商失败：' + e.message, 'err', '出错', 'answer 失败', '出错');
+  }
+}
+async function onAnswer(sdp){               // host：收 answer
+  if(!pc || !sdp) return;
+  try{
+    await pc.setRemoteDescription({type: 'answer', sdp: sdp});
+    await flushIce();
+    setState('已应答，正在建立直连…', 'busy', '协商', '等待直连建立');
+  }catch(e){
+    setState('应答处理失败：' + e.message, 'err', '出错', 'answer 处理失败', '出错');
+  }
+}
+
+/* ---------- 麦克风 ---------- */
+function micError(e){
+  const n = (e && e.name) || '';
+  if(n === 'NotAllowedError' || n === 'SecurityError')
+    return '权限被拒（iPhone 要用 https 打开才有麦克风）';
+  if(n === 'NotFoundError') return '这台设备上没有麦克风';
+  return (e && e.message) || String(e);
+}
+async function openMic(){
+  if(micStream) return micStream;
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+    throw new Error('这个浏览器不支持麦克风采集（请用 Chrome / Edge / Safari）');
+  // 和 phone.html 的"送声音"不同：这里是两台手机面对面，回声消除要开着
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true},
+  });
+  return micStream;
+}
+
+/* ---------- 开始 / 停止 ---------- */
+async function startHost(){
+  setState('正在请求麦克风…', 'busy', '麦克风', '点「允许」才能发声音');
+  try{
+    unlockAudio();                         // 正好在点击回调里，iOS 的音频在这里解锁
+    await openMic();
+  }catch(e){
+    setState('拿不到麦克风：' + micError(e), 'err', '出错', '麦克风没拿到', '出错');
+    return;
+  }
+  attachMeter(micStream);
+  running = true; runningUI();
+  openSignal();
+}
+function startGuest(){
+  const v = ($('roomInput').value || '').replace(/\D/g, '');
+  if(v.length !== ROOM_MAX){
+    setState('房间号是 4 位数字', 'err', '出错', '检查房间号', '出错');
+    $('roomInput').focus();
+    return;
+  }
+  room = v; syncUrl();
+  unlockAudio();                           // 接收方也解锁一次，播放不容易被挡
+  running = true; runningUI();
+  openSignal();
+}
+async function start(){
+  if(busy || running) return;
+  busy = true;
+  $('btn').disabled = true;
+  try{
+    if(role === 'host') await startHost(); else startGuest();
+  }finally{
+    busy = false;
+    $('btn').disabled = false;
+  }
+}
+function teardownPeer(){
+  pendingIce = [];
+  lastBytes = 0; kbps = 0; recvSec = 0; gotMedia = false;
+  detachMeter();
+  try{ pc && pc.close(); }catch(e){}
+  pc = null;
+  try{ sink.pause(); }catch(e){}
+  try{ sink.srcObject = null; }catch(e){}
+  $('play').hidden = true;
+  try{ micStream && micStream.getTracks().forEach((t) => t.stop()); }catch(e){}
+  micStream = null;
+  peerName = '';
+}
+function stopAll(notify){
+  if(notify) send({t: 'bye'});              // 先打招呼再关，close 会排在它后面
+  running = false;
+  closeSignal();
+  teardownPeer();
+  runningUI();
+  level = 0; paintLevel();
+  $('prog').setAttribute('stroke-dashoffset', '326.7');
+  setState('已停止，点按钮重新开始', '', '—', '电平 %', '未连接');
+}
+function runningUI(){
+  $('mSend').disabled = running;
+  $('mRecv').disabled = running;
+  $('roomInput').disabled = running;
+  $('nameInput').disabled = running;
+  $('roomNew').disabled = running;
+  $('btn').textContent = running ? '停止' : (role === 'host' ? '开始发送' : '连接');
+  $('btn').classList.toggle('stop', running);
+}
+
+/* ---------- 角色切换 ---------- */
+function renderRole(){
+  const host = role === 'host';
+  $('mSend').classList.toggle('sel', host);
+  $('mRecv').classList.toggle('sel', !host);
+  $('cardSend').hidden = !host;
+  $('cardRecv').hidden = host;
+  $('roomNum').textContent = room;
+  runningUI();
+  if(host){
+    setState('把房间号给另一台手机，点下面的按钮开始', '', '—', '电平 %', '未连接');
+  }else{
+    setState('输入另一台手机上的房间号，点「连接」', '', '—', '电平 %', '未连接');
+  }
+}
+function setRole(next){
+  if(running || role === next) return;
+  role = next; syncUrl(); renderRole();
+}
+$('mSend').onclick = () => setRole('host');
+$('mRecv').onclick = () => setRole('guest');
+$('roomNew').onclick = () => {
+  if(running) return;
+  room = newRoom(); $('roomNum').textContent = room; syncUrl();
+};
+$('roomInput').addEventListener('input', () => {
+  const el = $('roomInput');
+  const v = el.value.replace(/\D/g, '').slice(0, ROOM_MAX);
+  if(v !== el.value) el.value = v;
+});
+$('roomInput').addEventListener('keydown', (ev) => { if(ev.key === 'Enter') start(); });
+$('nameInput').addEventListener('change', () => {
+  $('nameInput').value = ($('nameInput').value || '').trim().slice(0, 8);
+});
+
+/* ---------- 主按钮 ---------- */
+$('btn').onclick = () => { if(running) stopAll(true); else start(); };
+$('play').onclick = async () => {          // 自动播放被挡时的兜底，点一下就好
+  unlockAudio();
+  if(sink.srcObject) attachMeter(sink.srcObject);
+  try{
+    await sink.play();
+    $('play').hidden = true;
+    setState('正在播放', 'on');
+  }catch(e){
+    setState('还是放不出来：检查手机是不是静音了', 'err', '出错', '播放被挡住', '出错');
+  }
+};
+// 锁屏 / 切后台不打断通话（这点和 phone.html 不一样：那里是推流，这里是一通电话）
+window.addEventListener('pagehide', () => { if(running) stopAll(true); });
+document.addEventListener('click', () => { if(actx && actx.state === 'suspended') actx.resume().catch(() => {}); });
+
+/* ---------- 详情里的参数 / 电脑名字 ---------- */
+setInterval(async () => {
+  renderDetails();
+  if(!isLive()) return;
+  try{
+    const report = await pc.getStats();
+    let bytes = 0;
+    report.forEach((r) => {
+      const kind = r.kind || r.mediaType;
+      if(kind !== 'audio') return;
+      if(r.type === 'inbound-rtp' && typeof r.bytesReceived === 'number') bytes += r.bytesReceived;
+      if(r.type === 'outbound-rtp' && typeof r.bytesSent === 'number') bytes += r.bytesSent;
+    });
+    if(lastBytes && bytes >= lastBytes) kbps = (bytes - lastBytes) * 8 / 1000;  // 每秒一次 → 就是 kbps
+    else kbps = 0;
+    lastBytes = bytes;
+    if(bytes > 0 && !gotMedia){ gotMedia = true; refreshConn(); }
+  }catch(e){ /* 有的浏览器不给统计，详情显示 — 就行 */ }
+}, 1000);
+
+(async function who(){
+  try{
+    const r = await fetch('/api/status', {cache: 'no-store'});
+    const s = await r.json();
+    const node = s.node || {};
+    hostName = (node.name || location.host) + (node.lan_ip ? ' · ' + node.lan_ip : '');
+  }catch(e){
+    hostName = location.host;
+  }
+  renderDetails();
+})();
+
+/* ---------- 初始化 ---------- */
+$('nameInput').value = (qs.get('name') || '').trim().slice(0, 8);
+renderRole();
+</script>
+</body>
+</html>

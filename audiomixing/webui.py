@@ -1047,6 +1047,93 @@ def ws_accept(key: str) -> str:
     return base64.b64encode(digest).decode("ascii")
 
 
+def _ws_read_frame(conn: Any, max_len: int = 1 << 20) -> tuple[int, bytes] | None:
+    """读一个**客户端发来**的 WebSocket 帧，返回 (opcode, payload)；连接断了返回 None。
+
+    项目里原来只有"服务端往浏览器发"这一条路（/ws/audio 是单向的），所以一直没有
+    读帧的代码。手机直连这条通道是双向的，必须真的解析：客户端帧一定带掩码，
+    长度有三种编码，SDP 还可能被分片（continuation 0x0）—— 这里都按 RFC 6455 处理。
+    """
+    def read_exact(n: int) -> bytes | None:
+        buf = b""
+        while len(buf) < n:
+            try:
+                chunk = conn.recv(n - len(buf))
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+    head = read_exact(2)
+    if head is None:
+        return None
+    b0, b1 = head[0], head[1]
+    opcode = b0 & 0x0F
+    fin = bool(b0 & 0x80)
+    masked = bool(b1 & 0x80)
+    length = b1 & 0x7F
+    if length == 126:
+        ext = read_exact(2)
+        if ext is None:
+            return None
+        length = struct.unpack(">H", ext)[0]
+    elif length == 127:
+        ext = read_exact(8)
+        if ext is None:
+            return None
+        length = struct.unpack(">Q", ext)[0]
+    if length > max_len:
+        return None
+    mask = b""
+    if masked:
+        got = read_exact(4)
+        if got is None:
+            return None
+        mask = got
+    payload = b""
+    if length:
+        payload = read_exact(length)
+        if payload is None:
+            return None
+        if mask:
+            payload = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+
+    # 分片：把后续的 continuation 帧拼起来（控制帧不参与拼接）
+    if not fin and opcode in (0x1, 0x2):
+        chunks = [payload]
+        total = len(payload)
+        first = opcode
+        while True:
+            nxt = _ws_read_frame(conn, max_len=max_len)
+            if nxt is None:
+                return None
+            op2, pay2 = nxt
+            total += len(pay2)
+            if total > max_len:
+                return None
+            chunks.append(pay2)
+            if op2 != 0x0:          # 控制帧：丢掉，继续等续帧
+                continue
+            break
+        return first, b"".join(chunks)
+    return opcode, payload
+
+
+_P2P_ROOMS: Any = None
+
+
+def _p2p_rooms() -> Any:
+    """整个进程共用一张手机直连房间表（所有连接共用同一实例）。"""
+    global _P2P_ROOMS
+    if _P2P_ROOMS is None:
+        from .net.p2p import P2PRooms
+
+        _P2P_ROOMS = P2PRooms()
+    return _P2P_ROOMS
+
+
 def ws_frame(payload: bytes, opcode: int = 0x2) -> bytes:
     """One server->client frame. Server frames are never masked."""
     header = bytearray([0x80 | opcode])
@@ -1258,6 +1345,100 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             tap.unsubscribe(sid)
 
+    def _websocket_p2p(self, parsed) -> None:
+        """手机↔手机直连（WebRTC）的**信令**通道。
+
+        这个接口只转发几十字节的协商信息（offer/answer/ICE）。音频是两台手机
+        WebRTC 直连的，**完全不经过这台电脑** —— 这是功能的设计前提，
+        所以这里绝不接收、缓存或转发任何二进制音频（p2p 层会拒收二进制并计数）。
+
+        线程模型：`ThreadingHTTPServer` 下，每条连接一个线程，而对端线程会替我写
+        我的 socket（转发、bye、error）。所以每个连接都要一把写锁，否则两个线程
+        同时 sendall 会写出交错的帧，浏览器直接报协议错。
+        """
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if not key or "websocket" not in (self.headers.get("Upgrade") or "").lower():
+            self._json(400, {"error": "this endpoint speaks websocket"})
+            return
+
+        qs = parse_qs(parsed.query)
+        room = str((qs.get("room") or [""])[0]).strip()
+        role = str((qs.get("role") or ["host"])[0]).strip().lower() or "host"
+        name = str((qs.get("name") or ["手机"])[0]).strip() or "手机"
+        if not (len(room) == 4 and room.isdigit()):
+            # 4 位数字房间号：够局域网内用，也便于另一台手机手输。
+            self._json(400, {"error": "房间号要 4 位数字"})
+            return
+
+        conn = self.connection
+        try:
+            conn.sendall(
+                (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Sec-WebSocket-Accept: %s\r\n\r\n" % ws_accept(key)
+                ).encode("ascii")
+            )
+        except OSError:
+            return
+        self.close_connection = True
+
+        from .net.p2p import P2PRooms
+
+        send_lock = threading.Lock()
+        closed = threading.Event()
+
+        def send_text(text: str) -> None:
+            """线程安全地把一条消息发回去（对端线程也会调它）。"""
+            with send_lock:
+                if closed.is_set():
+                    return
+                try:
+                    conn.sendall(ws_frame(str(text).encode("utf-8"), opcode=0x1))
+                except OSError:
+                    closed.set()
+
+        def close_conn() -> None:
+            closed.set()
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        rooms = _p2p_rooms()
+        member = rooms.join(room, role, name, send_text, close_conn)
+        if member is None:
+            # 房间已满：error 已经回给对方，连接也已经关了，这里直接收工。
+            return
+        try:
+            while not closed.is_set():
+                frame = _ws_read_frame(conn)
+                if frame is None:
+                    break
+                opcode, payload = frame
+                if opcode == 0x8:            # close
+                    break
+                if opcode == 0x9:            # ping -> pong
+                    with send_lock:
+                        if not closed.is_set():
+                            try:
+                                conn.sendall(ws_frame(payload[:125], opcode=0xA))
+                            except OSError:
+                                closed.set()
+                    continue
+                if opcode == 0xA:            # pong：忽略
+                    continue
+                if opcode in (0x1, 0x2):
+                    # 文本原样转发；二进制交给 p2p 层拒收（那是"绝不转发音频"的红线，
+                    # 所以这里【不要】先 decode 成 str，否则等于放行了二进制）。
+                    text: Any = payload.decode("utf-8", "replace") if opcode == 0x1 else payload
+                    rooms.relay(room, member, text)
+        except (OSError, ValueError):
+            pass
+        finally:
+            rooms.leave(room, member)
+
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
@@ -1301,6 +1482,13 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if path in ("/listen", "/listen.html", "/radio"):
                 self._send(200, listen_html().encode("utf-8"), "text/html; charset=utf-8")
+                return
+            if path in ("/p2p", "/p2p.html", "/direct"):
+                # 手机之间直连（WebRTC）。页面自己发起协商，电脑只转发信令。
+                self._send(200, p2p_html().encode("utf-8"), "text/html; charset=utf-8")
+                return
+            if path == "/ws/p2p":
+                self._websocket_p2p(parsed)
                 return
             if path == "/ws/audio":
                 self._websocket_audio()
@@ -2268,6 +2456,43 @@ _LISTEN_CACHE: str | None = None
 _MIC_CACHE: str | None = None
 # 手机页只有一个文件（phone.html），/listen 和 /mic 各自缓存一份读到的内容
 _PHONE_CACHE: dict[str, str] = {}
+_P2P_CACHE: str | None = None
+
+FALLBACK_P2P_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Audio Mixing 手机直连</title></head>
+<body style="background:#070b12;color:#eaf1fb;font:15px system-ui;padding:24px">
+<h1>手机直连</h1>
+<p>这个页面没能加载出来（<code>audiomixing/ui/p2p.html</code> 不在）。</p>
+<p>手机之间直连需要一个支持 WebRTC 的浏览器：安卓 Chrome / Edge，或 iPhone 上的 Safari。
+也可以用控制台上的「手机当喇叭」二维码收听电脑的声音。</p>
+</body></html>"""
+
+
+def p2p_html() -> str:
+    """手机之间直连的页面（WebRTC）。电脑只转发协商信息，音频不经过电脑。"""
+    global _P2P_CACHE
+    if _P2P_CACHE is not None:
+        return _P2P_CACHE
+
+    candidates: list[Path] = []
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        candidates.append(Path(base) / "audiomixing" / "ui" / "p2p.html")
+        candidates.append(Path(base) / "ui" / "p2p.html")
+    candidates.append(Path(__file__).resolve().parent / "ui" / "p2p.html")
+
+    for path in candidates:
+        try:
+            if path.is_file():
+                _P2P_CACHE = path.read_text(encoding="utf-8")
+                return _P2P_CACHE
+        except OSError:
+            continue
+
+    _P2P_CACHE = FALLBACK_P2P_HTML
+    return _P2P_CACHE
 
 FALLBACK_LISTEN_HTML = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
