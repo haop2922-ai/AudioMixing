@@ -1877,29 +1877,41 @@ def index_html() -> str:
     return _INDEX_CACHE
 
 
-def mic_html() -> str:
-    """The phone-facing page that pushes its microphone in as a capture device."""
-    global _MIC_CACHE
-    if _MIC_CACHE is not None:
-        return _MIC_CACHE
+def _phone_html(kind: str) -> str:
+    """手机端页面：收听和送声音合成同一个界面（用页面内切换，不用两套 UI）。
+
+    两个入口都发同一个 phone.html：
+        /listen  → 默认「收听」模式
+        /mic     → 默认「送声音」模式
+    页面自己按路径判断默认模式（所以这里不需要注入任何东西）。
+    """
+    cache = _PHONE_CACHE.get(kind)
+    if cache is not None:
+        return cache
 
     candidates: list[Path] = []
     base = getattr(sys, "_MEIPASS", None)
     if base:
-        candidates.append(Path(base) / "audiomixing" / "ui" / "mic.html")
-        candidates.append(Path(base) / "ui" / "mic.html")
-    candidates.append(Path(__file__).resolve().parent / "ui" / "mic.html")
+        candidates.append(Path(base) / "audiomixing" / "ui" / "phone.html")
+        candidates.append(Path(base) / "ui" / "phone.html")
+    candidates.append(Path(__file__).resolve().parent / "ui" / "phone.html")
 
     for path in candidates:
         try:
             if path.is_file():
-                _MIC_CACHE = path.read_text(encoding="utf-8")
-                return _MIC_CACHE
+                text = path.read_text(encoding="utf-8")
+                _PHONE_CACHE[kind] = text
+                return text
         except OSError:
             continue
 
-    _MIC_CACHE = FALLBACK_LISTEN_HTML
-    return _MIC_CACHE
+    _PHONE_CACHE[kind] = FALLBACK_LISTEN_HTML
+    return _PHONE_CACHE[kind]
+
+
+def mic_html() -> str:
+    """The phone-facing page that pushes its microphone in as a capture device."""
+    return _phone_html("mic")
 
 
 def apk_path() -> Path | None:
@@ -2254,6 +2266,8 @@ def app_html() -> str:
 
 _LISTEN_CACHE: str | None = None
 _MIC_CACHE: str | None = None
+# 手机页只有一个文件（phone.html），/listen 和 /mic 各自缓存一份读到的内容
+_PHONE_CACHE: dict[str, str] = {}
 
 FALLBACK_LISTEN_HTML = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -2268,27 +2282,7 @@ FALLBACK_LISTEN_HTML = """<!DOCTYPE html>
 
 def listen_html() -> str:
     """The phone-facing page: a one-tap "tune in" player for this node's output."""
-    global _LISTEN_CACHE
-    if _LISTEN_CACHE is not None:
-        return _LISTEN_CACHE
-
-    candidates: list[Path] = []
-    base = getattr(sys, "_MEIPASS", None)
-    if base:
-        candidates.append(Path(base) / "audiomixing" / "ui" / "listen.html")
-        candidates.append(Path(base) / "ui" / "listen.html")
-    candidates.append(Path(__file__).resolve().parent / "ui" / "listen.html")
-
-    for path in candidates:
-        try:
-            if path.is_file():
-                _LISTEN_CACHE = path.read_text(encoding="utf-8")
-                return _LISTEN_CACHE
-        except OSError:
-            continue
-
-    _LISTEN_CACHE = FALLBACK_LISTEN_HTML
-    return _LISTEN_CACHE
+    return _phone_html("listen")
 
 
 # Kept as a module attribute for backwards compatibility with anything importing it.

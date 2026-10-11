@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#070b12">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Audio Mixing</title>
+<style>
+  :root{
+    --bg:#070b12; --card:rgba(255,255,255,.045); --line:rgba(255,255,255,.09);
+    --fg:#eaf1fb; --dim:#8ea0b8; --acc:#38bdf8; --acc2:#6366f1;
+    --ok:#34d399; --warn:#fbbf24; --err:#f87171;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%}
+  body{
+    margin:0;background:
+      radial-gradient(120% 70% at 50% -10%, #14324d 0%, transparent 60%),
+      radial-gradient(90% 60% at 110% 110%, #2a1b52 0%, transparent 55%),
+      var(--bg);
+    color:var(--fg); font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",system-ui,sans-serif;
+    padding:calc(env(safe-area-inset-top) + 14px) 18px calc(env(safe-area-inset-bottom) + 18px);
+    display:flex; flex-direction:column; gap:14px; min-height:100%;
+    overscroll-behavior:none;
+  }
+  header{display:flex;align-items:center;gap:10px}
+  .logo{
+    width:34px;height:34px;border-radius:11px;flex:0 0 auto;
+    background:linear-gradient(140deg,var(--acc),var(--acc2));
+    display:grid;place-items:center;box-shadow:0 6px 18px rgba(56,189,248,.28)
+  }
+  .logo svg{width:19px;height:19px}
+  .titles{min-width:0;flex:1}
+  .titles b{display:block;font-size:15.5px;letter-spacing:.2px}
+  .titles span{display:block;font-size:12px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pill{
+    font-size:11.5px;color:var(--dim);border:1px solid var(--line);border-radius:999px;
+    padding:5px 10px;white-space:nowrap;background:rgba(255,255,255,.03)
+  }
+  .pill.on{color:var(--ok);border-color:rgba(52,211,153,.35)}
+  .pill.err{color:var(--err);border-color:rgba(248,113,113,.35)}
+
+  /* 模式切换 */
+  .seg{display:flex;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:4px;gap:4px}
+  .seg button{
+    flex:1;border:0;background:transparent;color:var(--dim);font:inherit;font-weight:600;
+    padding:11px 6px;border-radius:11px;cursor:pointer;transition:.18s;font-size:14px
+  }
+  .seg button.sel{background:linear-gradient(140deg,var(--acc),var(--acc2));color:#04121f}
+  .seg button:disabled{opacity:.4}
+
+  /* 大圆环 */
+  .stage{flex:1;display:grid;place-items:center;position:relative;min-height:230px}
+  .ring{position:relative;width:min(62vw,230px);height:min(62vw,230px);display:grid;place-items:center}
+  .ring svg{position:absolute;inset:0;transform:rotate(-90deg)}
+  .ring .track{fill:none;stroke:rgba(255,255,255,.07);stroke-width:8}
+  .ring .prog{fill:none;stroke:url(#g);stroke-width:8;stroke-linecap:round;
+              transition:stroke-dashoffset .12s linear}
+  .core{text-align:center;z-index:1}
+  .core .big{font-size:34px;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
+  .core .unit{font-size:13px;color:var(--dim);margin-top:2px}
+  .core .st{font-size:13px;color:var(--dim);margin-top:8px}
+  .ring.live .core .big{color:var(--ok)}
+  .ring.busy .core .big{color:var(--warn)}
+  .ring.bad .core .big{color:var(--err)}
+
+  /* 电平条 */
+  .bars{display:flex;gap:3px;height:34px;align-items:flex-end;justify-content:center;margin-top:4px}
+  .bars i{width:5px;border-radius:3px;background:rgba(255,255,255,.10);transition:height .1s linear}
+  .bars i.hot{background:linear-gradient(180deg,var(--acc),var(--ok))}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:14px 15px}
+  .row{display:flex;align-items:center;gap:12px}
+  .row+.row{margin-top:12px}
+  .row label{color:var(--dim);font-size:12.5px;min-width:52px}
+  input[type=range]{flex:1;accent-color:var(--acc);height:26px}
+  .val{font:12.5px ui-monospace,Menlo,Consolas,monospace;color:var(--dim);min-width:52px;text-align:right}
+
+  .main{
+    border:0;border-radius:16px;padding:17px;font:inherit;font-size:17px;font-weight:700;
+    background:linear-gradient(140deg,var(--acc),var(--acc2));color:#04121f;cursor:pointer;
+    box-shadow:0 10px 26px rgba(56,189,248,.22);width:100%
+  }
+  .main.stop{background:linear-gradient(140deg,#f87171,#fb923c);color:#220a0a}
+  .main:disabled{opacity:.55;box-shadow:none}
+
+  details{border-top:1px solid var(--line);margin-top:2px;padding-top:10px}
+  details summary{color:var(--dim);font-size:12.5px;cursor:pointer;list-style:none}
+  details summary::-webkit-details-marker{display:none}
+  details summary::before{content:"▸ ";color:var(--dim)}
+  details[open] summary::before{content:"▾ "}
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin-top:10px;
+      font:12.5px ui-monospace,Menlo,Consolas,monospace;color:var(--dim)}
+  .kv b{color:var(--fg);font-weight:600}
+  .note{color:var(--dim);font-size:12px;line-height:1.7}
+  .note b{color:#cbd8ea;font-weight:600}
+  .flash{animation:fl .5s ease}
+  @keyframes fl{from{opacity:.35}to{opacity:1}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <svg viewBox="0 0 24 24" fill="none" stroke="#04121f" stroke-width="2.4" stroke-linecap="round">
+      <path d="M4 12h2M9 7v10M14 4v16M19 9v6"/>
+    </svg>
+  </div>
+  <div class="titles">
+    <b>Audio Mixing</b>
+    <span id="peer">正在读取电脑信息…</span>
+  </div>
+  <div class="pill" id="pill">未连接</div>
+</header>
+
+<div class="seg" id="seg">
+  <button id="mListen" class="sel">🎧 收听</button>
+  <button id="mSend">🎤 送声音</button>
+</div>
+
+<div class="stage">
+  <div class="ring" id="ring">
+    <svg viewBox="0 0 120 120">
+      <defs>
+        <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#38bdf8"/><stop offset="100%" stop-color="#34d399"/>
+        </linearGradient>
+      </defs>
+      <circle class="track" cx="60" cy="60" r="52"></circle>
+      <circle class="prog" id="prog" cx="60" cy="60" r="52"
+              stroke-dasharray="326.7" stroke-dashoffset="326.7"></circle>
+    </svg>
+    <div class="core">
+      <div class="big" id="metric">—</div>
+      <div class="unit" id="unit">dB</div>
+      <div class="st" id="state">点下面的按钮开始</div>
+    </div>
+  </div>
+</div>
+
+<div class="bars" id="bars"></div>
+
+<div class="card">
+  <button class="main" id="btn">开始收听</button>
+  <div class="row" style="margin-top:14px">
+    <label id="gainLabel">音量</label>
+    <input type="range" id="gain" min="0" max="1.5" step="0.05" value="1">
+    <span class="val" id="gainVal">1.00</span>
+  </div>
+  <details>
+    <summary>详情与排查</summary>
+    <div class="kv" id="kv"></div>
+  </details>
+</div>
+
+<div class="card">
+  <div class="note" id="help">
+    <b>收听</b>：把<b>这台电脑正在播放的声音</b>放到手机上。<br>
+    手机和电脑要在同一个 Wi-Fi。iPhone 需要点一下按钮才会出声（系统限制）。
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const qs = new URLSearchParams(location.search);
+// 默认模式看入口路径：/mic 打开就是"送声音"，/listen（或其它）就是"收听"。
+// 也允许用 ?mode= 显式指定，方便做二维码时不依赖路径。
+const pathMode = /(^|\/)(mic|microphone)(\.html)?$/.test(location.pathname) ? 'mic' : 'listen';
+const qMode = qs.get('mode');
+let mode = (qMode === 'mic' || qMode === 'listen') ? qMode : pathMode;
+const PHONE_NAME = qs.get('name') || '手机';
+
+let ws = null, ctx = null, gainNode = null, playAt = 0, running = false, busy = false;
+let lost = 0, recv = 0, rate = 24000, ch = 1, backlog = 0;
+let micStream = null, micNode = null, micSource = null, micQueue = [], micSending = false, micSent = 0, micPeak = 0;
+let lastMsgAt = 0, level = 0;
+
+/* ---------- 电平条 ---------- */
+const BARS = 22;
+const barEls = [];
+(function buildBars(){
+  const box = $('bars');
+  for(let i = 0; i < BARS; i++){
+    const el = document.createElement('i');
+    el.style.height = '4px';
+    box.appendChild(el);
+    barEls.push(el);
+  }
+})();
+
+function pushLevel(v){                 // v: 0..1 瞬时电平
+  level = Math.max(v, level * 0.86);
+  barEls.forEach((el, i) => {
+    const t = i / (BARS - 1);
+    const on = level > t * 0.95;
+    el.style.height = (on ? 10 + t * 22 : 4) + 'px';
+    el.classList.toggle('hot', on);
+  });
+  const pct = Math.round(Math.min(1, level) * 100);
+  const dash = 326.7 * (1 - Math.min(1, level) * 0.92);
+  $('prog').setAttribute('stroke-dashoffset', String(dash));
+  return pct;
+}
+let meterTimer = setInterval(() => {
+  const pct = pushLevel(0);
+  if(running){
+    if(mode === 'listen' && Date.now() - lastMsgAt < 1500){
+      $('metric').textContent = String(pct);
+      $('unit').textContent = '电平 %';
+    } else if(mode === 'mic'){
+      $('metric').textContent = String(pct);
+      $('unit').textContent = '麦克风电平 %';
+    }
+  }
+}, 90);
+
+/* ---------- 状态显示 ---------- */
+function setState(text, cls){
+  $('state').textContent = text;
+  $('pill').textContent = {on:'已连接', err:'出错', busy:'连接中', '':'未连接'}[cls || ''] || text;
+  $('pill').className = 'pill' + (cls ? ' ' + cls : '');
+  $('ring').className = 'ring' + (cls === 'on' ? ' live' : cls === 'busy' ? ' busy' : cls === 'err' ? ' bad' : '');
+}
+function kv(pairs){
+  $('kv').innerHTML = pairs.map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join('');
+}
+
+function modeUI(){
+  const listen = mode === 'listen';
+  $('mListen').classList.toggle('sel', listen);
+  $('mSend').classList.toggle('sel', !listen);
+  $('gainLabel').textContent = listen ? '音量' : '灵敏度';
+  $('gain').min = listen ? '0' : '0.2';
+  $('gain').max = listen ? '1.5' : '3';
+  $('gain').step = listen ? '0.05' : '0.1';
+  $('gain').value = '1';
+  $('gainVal').textContent = listen ? '1.00' : '1.0×';
+  $('btn').textContent = listen ? '开始收听' : '开始发送';
+  $('btn').classList.remove('stop');
+  $('help').innerHTML = listen
+    ? '<b>收听</b>：把这台电脑正在播放的声音放到手机上。<br>手机和电脑要在同一个 Wi-Fi。iPhone 需要点一下按钮才会出声（系统限制）。'
+    : '<b>送声音</b>：把这台手机<b>麦克风</b>的声音送到电脑（说话、环境音）。<br>'
+      + '浏览器拿不到手机正在播放的音乐 —— 那需要安卓 App 用系统接口采集。<br>'
+      + '电脑上打开「频道 → 本机直通」或建一条路由就能听到。';
+  $('metric').textContent = '—';
+  $('unit').textContent = listen ? 'dB' : '%';
+  $('state').textContent = '点下面的按钮开始';
+  $('ring').className = 'ring';
+  kv([['—', '—']]);
+}
+
+$('mListen').onclick = () => { if(running) return; mode = 'listen'; modeUI(); syncUrl(); };
+$('mSend').onclick = () => { if(running) return; mode = 'mic'; modeUI(); syncUrl(); };
+function syncUrl(){
+  const u = new URL(location.href);
+  u.searchParams.set('mode', mode);
+  history.replaceState(null, '', u.toString());
+}
+
+/* ---------- 收听（WebSocket PCM16） ---------- */
+function wsUrl(){
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return proto + '//' + location.host + '/ws/audio';
+}
+function stopListen(){
+  if(ws){ try{ ws.close(); }catch(e){} ws = null; }
+  if(ctx){ try{ ctx.close(); }catch(e){} ctx = null; }
+  gainNode = null; playAt = 0; backlog = 0;
+}
+async function startListen(){
+  try{
+    // iOS 必须由用户手势触发音频上下文 —— 这里正好在点击回调里
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    await ctx.resume().catch(()=>{});
+    rate = 24000; ch = 1;
+    gainNode = ctx.createGain();
+    gainNode.gain.value = Number($('gain').value);
+    gainNode.connect(ctx.destination);
+  }catch(e){
+    setState('无法启动音频：' + e.message, 'err');
+    return false;
+  }
+  playAt = ctx.currentTime + 0.15;
+  lost = 0; recv = 0; lastMsgAt = 0;
+  return true;
+}
+function openSocket(){
+  ws = new WebSocket(wsUrl());
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    setState('已连接，等待声音…', 'on');
+    kv([['地址', location.host], ['格式', 'PCM 24kHz 单声道'], ['状态', '等待数据']]);
+  };
+  ws.onmessage = (ev) => {
+    if(!ctx || !gainNode) return;
+    const bytes = new Uint8Array(ev.data);
+    const frames = bytes.length / 2 / ch;
+    if(!frames) return;
+    recv++; lastMsgAt = Date.now();
+    const buf = ctx.createBuffer(ch, frames, 24000);
+    const out = buf.getChannelData(0);
+    let peak = 0;
+    for(let i = 0, p = 0; i < frames; i++, p += 2){
+      const v = (bytes[p] | (bytes[p+1] << 8)) << 16 >> 16;
+      const f = v / 32768;
+      out[i] = f;
+      const a = f < 0 ? -f : f;
+      if(a > peak) peak = a;
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = buf; src.connect(gainNode);
+    const now = ctx.currentTime;
+    if(playAt < now + 0.05) playAt = now + 0.05;
+    src.start(playAt);
+    playAt += buf.duration;
+    backlog = playAt - now;
+    if(backlog > 1.2){ playAt = now + 0.15; lost++; }
+    pushLevel(peak);
+    if(mode === 'listen'){
+      $('metric').textContent = String(Math.round(Math.min(1, peak) * 100));
+      $('unit').textContent = '电平 %';
+    }
+    setState('正在播放', 'on');
+    if(recv % 8 === 0){
+      kv([
+        ['地址', location.host],
+        ['缓冲', Math.round(backlog * 1000) + ' ms'],
+        ['已收块', String(recv)],
+        ['丢弃块', String(lost)],
+        ['格式', 'PCM 24kHz 单声道'],
+      ]);
+    }
+  };
+  ws.onclose = () => { if(running) setState('连接断开，点按钮重连', 'err'); };
+  ws.onerror = () => { setState('连接出错：检查手机和电脑是否同一 Wi-Fi', 'err'); };
+}
+
+/* ---------- 送声音（POST 100ms 块） ---------- */
+function post(block){
+  return fetch('/api/mic/stream?name=' + encodeURIComponent(PHONE_NAME) + '&rate=' + ctx.sampleRate, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/octet-stream'},
+    body: block,
+    keepalive: true,
+  });
+}
+async function startSend(){
+  try{
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {echoCancellation: false, noiseSuppression: false, autoGainControl: false},
+    });
+  }catch(e){
+    setState('拿不到麦克风权限：' + e.message, 'err');
+    return false;
+  }
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  await ctx.resume().catch(()=>{});
+  micSource = ctx.createMediaStreamSource(micStream);
+  micNode = ctx.createScriptProcessor ? ctx.createScriptProcessor(2048, 1, 1) : null;
+  if(!micNode){ setState('这个浏览器不支持采集（请用 Chrome / Safari）', 'err'); return false; }
+  micNode.onaudioprocess = (ev) => {
+    const input = ev.inputBuffer.getChannelData(0);
+    const g = Number($('gain').value);
+    const out = new Int16Array(input.length);
+    let peak = 0;
+    for(let i = 0; i < input.length; i++){
+      let v = input[i] * g;
+      if(v > 1) v = 1; else if(v < -1) v = -1;
+      const a = v < 0 ? -v : v;
+      if(a > peak) peak = a;
+      out[i] = v * 32767;
+    }
+    micPeak = Math.max(peak, micPeak * 0.8);
+    micQueue.push(out.buffer);
+  };
+  micSource.connect(micNode);
+  micNode.connect(ctx.destination);      // ScriptProcessor 必须连着才会跑
+  return true;
+}
+function stopSend(){
+  try{ micNode && micNode.disconnect(); }catch(e){}
+  try{ micSource && micSource.disconnect(); }catch(e){}
+  try{ micStream && micStream.getTracks().forEach(t => t.stop()); }catch(e){}
+  try{ ctx && ctx.close(); }catch(e){}
+  micNode = micSource = ctx = micStream = null;
+  micQueue = [];
+}
+(async function pump(){
+  for(;;){
+    await new Promise(r => setTimeout(r, 20));
+    if(!running || mode !== 'mic' || !micQueue.length || micSending) continue;
+    const block = micQueue.shift();
+    micSending = true;
+    try{
+      const r = await post(block);
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      micSent++;
+      pushLevel(micPeak);
+      $('metric').textContent = String(Math.round(Math.min(1, micPeak) * 100));
+      $('unit').textContent = '麦克风电平 %';
+      if(micSent % 10 === 0){
+        kv([
+          ['目标', location.host],
+          ['已发送', (micSent / 10).toFixed(1) + ' 秒'],
+          ['块大小', '100 ms 单声道'],
+          ['采样率', ctx ? ctx.sampleRate + ' Hz' : '—'],
+        ]);
+      }
+    }catch(e){
+      setState('发送失败：' + e.message + '（检查是否同一 Wi-Fi）', 'err');
+      stopAll();
+      return;
+    }finally{ micSending = false; }
+  }
+})();
+
+/* ---------- 主按钮 ---------- */
+async function start(){
+  if(busy) return;
+  busy = true;
+  $('btn').disabled = true;
+  setState(mode === 'listen' ? '正在连接…' : '正在请求麦克风…', 'busy');
+  const ok = mode === 'listen' ? await startListen() : await startSend();
+  $('btn').disabled = false;
+  busy = false;
+  if(!ok) return;
+  running = true;
+  $('btn').textContent = mode === 'listen' ? '停止收听' : '停止发送';
+  $('btn').classList.add('stop');
+  if(mode === 'listen'){
+    openSocket();
+  }else{
+    setState('正在发送（电脑面板的音源里会出现这台手机）', 'on');
+    kv([['目标', location.host], ['状态', '已开始'], ['设备名', PHONE_NAME]]);
+  }
+}
+function stopAll(){
+  running = false;
+  stopListen();
+  stopSend();
+  $('btn').textContent = mode === 'listen' ? '开始收听' : '开始发送';
+  $('btn').classList.remove('stop');
+  $('btn').disabled = false;
+  setState('已停止');
+  $('ring').className = 'ring';
+  $('prog').setAttribute('stroke-dashoffset', '326.7');
+  $('metric').textContent = '—';
+  level = 0;
+  barEls.forEach(el => { el.style.height = '4px'; el.classList.remove('hot'); });
+}
+$('btn').onclick = () => { if(running) stopAll(); else start(); };
+window.addEventListener('pagehide', stopAll);
+document.addEventListener('visibilitychange', () => { if(document.hidden && running) stopAll(); });
+
+/* ---------- 顶部信息 ---------- */
+(async function who(){
+  try{
+    const r = await fetch('/api/status', {cache:'no-store'});
+    const s = await r.json();
+    const name = (s.node && s.node.name) || '这台电脑';
+    $('peer').textContent = '电脑：' + name + '　·　' + (s.node && s.node.lan_ip ? s.node.lan_ip : location.host);
+  }catch(e){
+    $('peer').textContent = location.host;
+  }
+})();
+
+modeUI();
+</script>
+</body>
+</html>
