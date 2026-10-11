@@ -329,6 +329,7 @@ public final class AudioRecv {
         long now = SystemClock.elapsedRealtime();
         List<StreamStats> list = new ArrayList<>(streams.size());
         int maxBuf = 0;
+        long streamLost = 0;
         for (Stream s : streams) {
             StreamStats ss = new StreamStats();
             ss.ssrc = s.ssrc;
@@ -341,11 +342,18 @@ public final class AudioRecv {
             if (ss.bufferedMs > maxBuf) {
                 maxBuf = ss.bufferedMs;
             }
+            streamLost += s.lost;
             list.add(ss);
         }
         st.streamCount = list.size();
         st.bufferedMs = maxBuf;
         st.streams = list;
+        // 顶部这行原来只报 counters[1]，而真正的"播放时跳过了多少帧"记在每条流里
+        // （丢包/补静音/压延迟都算），于是出现过"上面写丢 0、下面写丢 5908"的怪相。
+        // 真机排查时这个数字是最关键的线索，必须报真实值。
+        if (streamLost > st.lost) {
+            st.lost = streamLost;
+        }
         return st;
     }
 
@@ -747,14 +755,23 @@ public final class AudioRecv {
                 }
                 playing = true;
             }
-            // 缓冲积太多说明我们播得比对方发得慢（两端音频时钟有 ppm 级漂移）。
-            // 主动丢一帧把延迟压回去，否则延迟会越攒越大，最后积满一缓冲只能整段跳。
+            // 缓冲积太多说明我们播得比对方发得慢（两端音频时钟有 ppm 级漂移），
+            // 或者刚开始播时手里已经攒了一大段。要主动丢掉多余的，把延迟压回去。
+            //
+            // ★ 2026-10-12 真机反馈的头号问题（"连上了、数字都在动、就是没声音"）：
+            //   这里原来是"每 tick 只丢一帧，然后 return"。对端每 10ms 也正好来一帧，
+            //   于是变成收一帧丢一帧，缓冲深度永远降不下来 —— 结果每个 tick 都在丢，
+            //   实测 5946 个包里 5908 个被这样丢掉，等于全程静音。
+            //   修法：一次把多出来的全丢到目标深度，然后【继续往下正常播放】，不要 return。
             if (depthMs() > dropAboveMs) {
-                filled[nextSeq & MASK] = false;
-                nextSeq = (nextSeq + 1) & 0xFFFF;
-                lost++;
-                peak *= PEAK_DECAY;
-                return 1;
+                int guard = 0;
+                while (depthMs() > targetMs && guard++ < SLOTS) {
+                    filled[nextSeq & MASK] = false;
+                    nextSeq = (nextSeq + 1) & 0xFFFF;
+                    lost++;
+                    peak *= PEAK_DECAY;
+                }
+                // 注意：这里不 return，让这一 tick 照常出声，否则永远播不出第一帧。
             }
             int idx = nextSeq & MASK;
             if (filled[idx]) {
