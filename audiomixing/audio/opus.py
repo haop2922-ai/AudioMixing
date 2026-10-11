@@ -118,12 +118,39 @@ def _load() -> Any:
         return None
 
     # 先让 Windows 的 DLL 搜索能看见这些目录（3.8 之后不再搜 PATH）
-    for folder in _candidate_dirs():
+    dirs = _candidate_dirs()
+    for folder in dirs:
         try:
             if hasattr(os, "add_dll_directory"):
                 os.add_dll_directory(folder)
         except Exception:
             pass
+
+    # ★ 关键：opuslib_next 内部用 ctypes.util.find_library("opus") 找库，
+    #   而 find_library 在 Windows 上【只沿 PATH 找】，add_dll_directory 对它
+    #   完全无效（2026-10-11 实测：加完 add_dll_directory 仍然返回 None，
+    #   把目录塞进 PATH 立刻就能返回完整路径）。
+    #   所以这里必须动 PATH，否则打包版永远报
+    #       Could not find Opus library. Make sure it is installed.
+    try:
+        path_now = os.environ.get("PATH", "")
+        extra = [d for d in dirs if d and d not in path_now.split(os.pathsep)]
+        if extra:
+            os.environ["PATH"] = os.pathsep.join(extra + [path_now]) if path_now else os.pathsep.join(extra)
+    except Exception:
+        pass
+
+    # 再把 dll 直接预加载进进程（双保险：某些环境下 find_library 会直接
+    # 尝试 CDLL("opus.dll")，名字已在进程里就一定能中）
+    for folder in dirs:
+        for name in ("opus.dll", "libopus-0.dll", "libopus.dll"):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                try:
+                    ctypes.WinDLL(path)          # noqa: S606 - 明确的本地库路径
+                except Exception:
+                    pass
+                break
 
     try:
         import opuslib_next as opus
@@ -133,19 +160,7 @@ def _load() -> Any:
     except Exception as exc:
         _load_error = "%s: %s" % (type(exc).__name__, exc)
 
-    # 退路：直接把 opus.dll 塞进进程，再用 ctypes 找符号（给没有 opuslib 的环境）
-    for folder in _candidate_dirs():
-        for name in ("opus.dll", "libopus-0.dll", "libopus.dll"):
-            path = os.path.join(folder, name)
-            if os.path.isfile(path):
-                try:
-                    ctypes.WinDLL(path)          # noqa: S606 - 明确的本地库路径
-                    import opuslib_next as opus
-
-                    _opus = opus
-                    return _opus
-                except Exception as exc:
-                    _load_error = "%s: %s" % (type(exc).__name__, exc)
+    # 退路：给没有 opuslib 的环境（用 ctypes 直接找符号的场景）
     return None
 
 
