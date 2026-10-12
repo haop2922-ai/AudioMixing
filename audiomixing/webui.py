@@ -38,9 +38,12 @@ _LAST_FORCED_BT = 0.0
 
 class ApiError(Exception):
     # HWHHYN 用 DEEPSEEK 制作
-    def __init__(self, message: str, status: int = 400) -> None:
+    def __init__(self, message: str, status: int = 400, data: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.status = status
+        # 附带的机器可读信息（比如"哪些名字被拒了"）。页面据此能给出"一键移除"，
+        # 而不是只把一句话丢给用户。旧调用方不传，等于空字典。
+        self.data: dict[str, Any] = dict(data or {})
 
 
 class RawAudioServer(threading.Thread):
@@ -384,6 +387,31 @@ class WaveLinkApi:
             if is_channel:
                 lines.append("      广播通道不依赖路由：它由「广播我的声音」开关和音源清单决定。"
                              "对端只有在打开「只听」时才会播放它。")
+
+        head("频道广播音源判定（发不发得出去，为什么）")
+        # "广播开着、上行 0 kbps"以前在报告里看不出原因：音源可能是另一台设备的名字、
+        # 可能被排除、也可能采着但一直没有数据。这里直接把结论写出来。
+        try:
+            report = node.channel_sources_report()
+        except Exception as exc:
+            report = {}
+            lines.append("判定失败：%s: %s" % (type(exc).__name__, exc))
+        if report:
+            lines.append("音源清单：%s" % ("、".join(report.get("configured") or []) or "（空）"))
+            lines.append("广播实际采的设备：%s" % ("、".join(report.get("effective") or []) or "（没有）"))
+            lines.append("其中现在真的在出音频的：%s" % ("、".join(report.get("live") or []) or "（没有）"))
+            lines.append("能收到这条广播的在线设备：%s 台" % report.get("receivers"))
+            lines.append("结论：%s" % ("会发出音频" if report.get("will_send")
+                                      else "不会发出音频（0 字节）"))
+            for item in report.get("sources") or []:
+                lines.append("· %s　状态=%s%s　%s" % (
+                    item.get("name"), item.get("state"),
+                    "　[已排除]" if item.get("excluded") else "",
+                    item.get("reason") or "正常"))
+            for warn in report.get("warnings") or []:
+                lines.append("[%s] %s" % (warn.get("level"), warn.get("text")))
+                if warn.get("advice"):
+                    lines.append("      建议：%s" % warn.get("advice"))
 
         head("接收端（本机收进来的流）")
         recv = (self.streams().get("receiver") or {}).get("streams") or []
@@ -939,7 +967,25 @@ class WaveLinkApi:
                 raw = [raw]
             if not isinstance(raw, list):
                 raise ApiError("channel_sources must be a list of device names")
-            node.config.channel_sources = [str(x).strip() for x in raw if str(x).strip()][:8]
+            wanted = [str(x).strip() for x in raw if str(x).strip()][:8]
+            # ★ 这里收下的名字必须是【这台电脑现在真的能采到的设备】。
+            # 网络上的另一台设备（手机/电脑）不是本机的音源 —— 用户很自然地把
+            # "要广播给谁"理解成了"音源是谁"，把手机名选了进来，于是广播永远没有音源、
+            # 一个字节都不发，而界面上没有任何地方告诉他。所以这里不再"静默存入"。
+            try:
+                local = node._local_capture_names()
+            except Exception:
+                local = set()
+            bad = [name for name in wanted if name.lower() not in local]
+            if bad:
+                reasons = node._explain_selectors(bad)
+                raise ApiError(
+                    "这些名字不是这台电脑上的采集设备，不能当「广播我的声音」的音源：%s"
+                    % reasons,
+                    400,
+                    {"rejected": bad, "reasons": reasons},
+                )
+            node.config.channel_sources = wanted
             changed.append("channel_sources")
         if "autoconnect" in payload:
             raw = payload["autoconnect"]
@@ -1735,7 +1781,11 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._json(404, {"error": "not found", "path": path})
         except ApiError as exc:
-            self._json(exc.status, {"error": str(exc)})
+            # 附带的机器可读字段一起发出去（例如 rejected: 哪些音源名被拒了），
+            # 页面才能给出"一键移除"，而不是只把一句话丢给用户。
+            body: dict[str, Any] = {"error": str(exc)}
+            body.update(getattr(exc, "data", None) or {})
+            self._json(exc.status, body)
         except Exception as exc:  # pragma: no cover - defensive
             self._json(500, {"error": "%s: %s" % (type(exc).__name__, exc)})
 
@@ -1872,6 +1922,19 @@ class _Handler(BaseHTTPRequestHandler):
                 current = [str(s).strip() for s in node.config.channel_sources if str(s).strip()]
                 excluded = [str(s).strip() for s in getattr(node.config, "broadcast_excluded", [])]
                 stop_transport = not turn_on and not name
+                warning = ""
+                if name and turn_on:
+                    # 这台手机必须"确实在送声音"才配当音源：它现在要么已经是本机的采集设备，
+                    # 要么至少往这台电脑推过音频。否则收下它 = 广播永远没有音源、一个字节都
+                    # 不发，而手机那边只看到按钮亮了 —— 缺陷 1 的另一扇门就是这个。
+                    try:
+                        known = name.lower() in node._local_capture_names() or name.lower() in node._phone_names()
+                    except Exception:
+                        known = True
+                    if not known:
+                        warning = ("这台手机现在没有在送声音，没有把它设成音源："
+                                   "请先在手机上打开「送声音」，再点「广播我的声音」。")
+                        turn_on = False
                 if name:
                     if turn_on:
                         # Back in the broadcast, and out of the opt-out list.
@@ -1902,6 +1965,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, "broadcast": node.config.broadcast,
                                  "mine": bool(name) and name in sources and name not in excluded_now,
                                  "sources": sources,
+                                 "warning": warning,
                                  "local": node.config.local})
             elif path == "/api/mic/mute":
                 from .audio.backends import netmic as netmic_backend
@@ -1918,7 +1982,11 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self._json(404, {"error": "not found", "path": path})
         except ApiError as exc:
-            self._json(exc.status, {"error": str(exc)})
+            # 附带的机器可读字段一起发出去（例如 rejected: 哪些音源名被拒了），
+            # 页面才能给出"一键移除"，而不是只把一句话丢给用户。
+            body: dict[str, Any] = {"error": str(exc)}
+            body.update(getattr(exc, "data", None) or {})
+            self._json(exc.status, body)
         except Exception as exc:  # pragma: no cover - defensive
             self._json(500, {"error": "%s: %s" % (type(exc).__name__, exc)})
 

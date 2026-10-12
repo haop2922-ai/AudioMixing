@@ -2162,3 +2162,218 @@ class TestTodayRegressions(unittest.TestCase):
         spec = self.node.default_sink_spec()
         self.assertIn(spec["backend"], ("wasapi", "null", "coreaudio", "pipewire", "pulse"),
                       "默认播放不能落到 file 后端，否则声音会被写进文件")
+
+
+class TestChannelSourceSafety(unittest.TestCase):
+    """电脑端两个设计缺陷的回归测试（2026-10-12 用户实测）。
+
+    现场一（★核心★）：`channel_sources=["M332BF"]`（那是他的【手机】）、
+    `broadcast_excluded=["M332BF"]`、`broadcast=true` —— 唯一的音源被排除，
+    广播永远没有音源、一个字节都不发；而界面上没有任何地方告诉他这件事。
+    用户把"要广播给谁"理解成"音源是谁"，这是设计缺陷，不是用户的错。
+
+    现场二：采集源是「扬声器 (UU远程虚拟音频设备)」，`blocks_read` 9512、
+    `last_data_age_s` 145.5 —— 采了 95 秒之后就不再有数据，面板却写着"有数据"。
+
+    这里钉住三件事：
+      ① 网络上的另一台设备不能静默存成音源；
+      ② 用不了的音源必须说清原因（网络节点 / 手机没在送 / 设备已拔出）；
+      ③ 采集源空转、广播没有音源时，面板能拿到"一个字节都不会发"这句话。
+    """
+
+    UU = "扬声器 (UU远程虚拟音频设备)"
+
+    def setUp(self) -> None:
+        from audiomixing.config import Config
+        from audiomixing.engine import WaveLinkNode
+        from audiomixing.webui import WaveLinkApi
+
+        cfg = Config()
+        cfg.node_id = "self-node"
+        cfg.name = "本机"
+        cfg.routes = []
+        cfg.broadcast = True
+        cfg.listen = False
+        cfg.channel_sources = []
+        cfg.broadcast_excluded = []
+        self.node = WaveLinkNode(cfg, audio_port=47899, discovery_port=47898, simulate=False)
+        self.node.devices = []
+        self.api = WaveLinkApi(self.node)
+        # 测试不能依赖"跑测试的这台机器上插了什么声卡/装了哪些虚拟声卡"：
+        # 把本机设备清单固定成用例自己给的那一份。
+        self._real_list_all = audio_base.list_all_devices
+        audio_base.list_all_devices = lambda: list(self.node.devices)
+
+    def tearDown(self) -> None:
+        audio_base.list_all_devices = self._real_list_all
+        try:
+            self.node.stop()
+        except Exception:
+            pass
+
+    # -- 小工具 -----------------------------------------------------------
+    def _set_devices(self, *devices) -> None:
+        self.node.devices = list(devices)
+        self.node.devices_refreshed_at = time.time()
+
+    @staticmethod
+    def _source_device(name: str) -> audio_base.AudioDevice:
+        return audio_base.AudioDevice("src-1", name, audio_base.KIND_SOURCE, "wasapi",
+                                      "loopback", is_default=True)
+
+    @staticmethod
+    def _sink_device(name: str) -> audio_base.AudioDevice:
+        return audio_base.AudioDevice("snk-1", name, audio_base.KIND_SINK, "wasapi",
+                                      "render", is_default=True)
+
+    def _add_peer(self, name: str) -> None:
+        """让局域网里出现一台叫 name 的其它设备（真实场景：他的手机 M332BF）。"""
+        self.node.registry.update(
+            {"wl": 1, "id": "peer-" + name, "name": name, "audio_port": 47831,
+             "web_port": 8080}, "192.168.0.101")
+
+    def _fake_capture(self, name: str, blocks: int = 9512, age: float | None = 145.5,
+                      alive: float = 253.8) -> None:
+        """伪造采集端的实时计数，不真的去开声卡。"""
+        self.node.hub.stats = lambda: [{          # type: ignore[method-assign]
+            "name": name,
+            "spec": {"backend": "wasapi", "device": name},
+            "blocks_read": blocks,
+            "frames_read": blocks * 480,
+            "last_data_age_s": age,
+            "alive_for_s": alive,
+            "error": "",
+        }]
+
+    # -- 缺陷 1：音源不能是"网络上的另一台设备" -----------------------------
+    def test_a_network_node_cannot_be_saved_as_a_channel_source(self) -> None:
+        """PUT channel_sources 收下网络设备名 = 广播静默失效。必须拒绝并说人话。"""
+        from audiomixing.webui import ApiError
+
+        self._add_peer("M332BF")
+        with self.assertRaises(ApiError) as ctx:
+            self.api.set_settings({"channel_sources": ["M332BF"]})
+        message = str(ctx.exception)
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertIn("M332BF", message)
+        self.assertIn("是网络上的另一台设备，不是本机的音源", message)
+        self.assertIn("送声音", message, "必须告诉用户正确的做法")
+        self.assertEqual(ctx.exception.data.get("rejected"), ["M332BF"])
+        self.assertEqual(self.node.config.channel_sources, [],
+                         "不能静默存进配置 —— 存了就是一个字节都不发")
+
+    def test_a_local_capture_device_is_still_accepted(self) -> None:
+        """本机真实存在的采集设备必须照常能存（别把正常路径一起堵死）。"""
+        speaker = "扬声器 (Senary Audio)"
+        self._set_devices(self._sink_device(speaker), self._source_device(speaker))
+        self.api.set_settings({"channel_sources": [speaker]})
+        self.assertEqual(self.node.config.channel_sources, [speaker])
+
+    def test_the_users_own_config_now_explains_itself(self) -> None:
+        """用户那条真实配置：手机名当音源 + 被排除 —— 必须出现"用不了"的说明。"""
+        self._add_peer("M332BF")
+        self.node.config.channel_sources = ["M332BF"]
+        self.node.config.broadcast_excluded = ["M332BF"]
+        report = self.node.channel_sources_report()
+        entry = report["sources"][0]
+        self.assertEqual(entry["state"], "remote_node")
+        self.assertTrue(entry["excluded"])
+        self.assertIn("M332BF 是网络上的另一台设备，不是本机的音源", entry["reason"])
+        self.assertFalse(report["will_send"])
+        texts = [w["text"] for w in report["warnings"]]
+        self.assertTrue(any("现在用不了" in t and "M332BF" in t for t in texts),
+                        "面板必须有一条说清这条音源用不了：%s" % texts)
+
+    def test_a_phone_that_stopped_sending_is_named_as_such(self) -> None:
+        """手机之前送过声音、现在没在送 —— 要和"设备已拔出"分开报。"""
+        from audiomixing.audio.backends import netmic as netmic_backend
+
+        mic = netmic_backend.open_mic("M332BF")
+        try:
+            self.node.config.channel_sources = ["M332BF"]
+            report = self.node.channel_sources_report()
+            entry = report["sources"][0]
+            self.assertEqual(entry["state"], "phone_offline")
+            self.assertIn("没有在送", entry["reason"])
+        finally:
+            netmic_backend.close_mic("M332BF", mic)
+
+    def test_an_unplugged_device_says_it_is_gone(self) -> None:
+        """真正拔掉的设备：说"现在不是这台电脑上的采集设备"，不要猜成网络节点。"""
+        self.node.config.channel_sources = ["麦克风 (USB 声卡)"]
+        entry = self.node.channel_sources_report()["sources"][0]
+        self.assertEqual(entry["state"], "gone")
+        self.assertIn("不是这台电脑上的采集设备", entry["reason"])
+
+    # -- 缺陷 2：采集到了但一直没有数据 -------------------------------------
+    def test_a_stalled_capture_is_flagged_with_a_suggestion(self) -> None:
+        """用户的真实数字：blocks_read 9512、145 秒没有新音频 —— 必须醒目报出来。"""
+        self._set_devices(self._sink_device(self.UU), self._source_device(self.UU))
+        self.node.config.channel_sources = [self.UU]
+        self.node.config.source_device = self.UU
+        self._fake_capture(self.UU)
+        channel = self.node.channel_state()
+        entry = channel["sources"][0]
+        self.assertEqual(entry["state"], "stalled")
+        self.assertIn("没有数据", entry["reason"])
+        self.assertGreaterEqual(entry["last_data_age_s"], 10.0)
+        self.assertFalse(channel["will_send"])
+        capture_warn = [w for w in channel["warnings"] if w["scope"] == "capture"]
+        self.assertTrue(capture_warn, "音源状态区域必须有一条醒目警告")
+        advice = " ".join(w.get("advice", "") for w in capture_warn)
+        self.assertIn("虚拟声卡空转", advice)
+        # 广播真的没有音源时，要直说"一个字节都不会发"，而不是只给一个 0 B。
+        bad = [w for w in channel["warnings"] if w["level"] == "bad"]
+        self.assertTrue(any("广播没有音源，一个字节都不会发" in w["text"] for w in bad),
+                        "面板必须说清一个字节都不会发：%s" % [w["text"] for w in bad])
+
+    def test_the_loopback_suffix_does_not_hide_a_stalled_capture(self) -> None:
+        """采集对象的名字会多一个「 [loopback]」（用户机器上就是这样）。
+
+        面板不能因此找不到它的计数 —— 否则"空转"永远报不出来，这正是缺陷 2。
+        """
+        self._set_devices(self._sink_device(self.UU), self._source_device(self.UU))
+        self.node.config.channel_sources = [self.UU]
+        self.node.config.source_device = self.UU
+        self._fake_capture(self.UU + " [loopback]")
+        channel = self.node.channel_state()
+        self.assertEqual(channel["sources"][0]["state"], "stalled")
+        self.assertFalse(channel["will_send"])
+
+    def test_a_capture_with_fresh_data_is_not_flagged(self) -> None:
+        """有数据时不能乱报警 —— 否则用户学会忽略这条警告。"""
+        self._add_peer("手机")   # 局域网上有人能收到，排除"没有可发对象"那条警告
+        self._set_devices(self._sink_device(self.UU), self._source_device(self.UU))
+        self.node.config.channel_sources = [self.UU]
+        self.node.config.source_device = self.UU
+        self._fake_capture(self.UU, age=0.4)
+        channel = self.node.channel_state()
+        self.assertEqual(channel["sources"][0]["state"], "ok")
+        self.assertTrue(channel["will_send"])
+        self.assertEqual(channel["warnings"], [])
+
+    def test_every_source_excluded_is_visible(self) -> None:
+        """全部音源都被排除时，面板要看得见，而不是静悄悄退回"跟随采集设备"。"""
+        speaker = "扬声器 (Senary Audio)"
+        self._set_devices(self._sink_device(speaker), self._source_device(speaker))
+        self.node.config.channel_sources = [speaker]
+        self.node.config.broadcast_excluded = [speaker]
+        self._fake_capture(speaker, age=0.4)   # 回落到"跟随采集设备"时采的就是它
+        report = self.node.channel_sources_report()
+        self.assertTrue(report["sources"][0]["excluded"])
+        self.assertIn("已被排除", report["sources"][0]["reason"])
+        self.assertTrue(any("现在用不了" in w["text"] for w in report["warnings"]),
+                        "被排除的音源必须在面板上说清楚")
+        self.assertTrue(report["effective"], "面板要能看到广播实际在采哪一块设备")
+
+    # -- 面板脚本：同名函数不能再来一份（正是它让定时刷新失效的） -----------
+    def test_the_page_defines_the_source_picker_once(self) -> None:
+        """index.html 里 `loadChannelSources` 只能有一份定义。
+
+        以前有两份（后一份覆盖前一份），于是"每 4 秒刷新一次、手机一开始送声音
+        就会出现在列表里"的那份变成死代码 —— 页面上看不出任何异常。
+        """
+        html = (ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8")
+        self.assertEqual(html.count("async function loadChannelSources("), 1)
+        # 候选清单必须按"现在真的能采到"过滤（netmic 只在正在送声音时才算设备）
+        self.assertIn("x.extra && x.extra.live", html)

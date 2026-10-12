@@ -255,6 +255,11 @@ pre{
 }
 .msg{font-size:12.5px;color:var(--dim);min-height:1.2em}
 .warnbox{padding:10px 13px;border-radius:8px;font-size:12.5px;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.25);color:#fca5a5;margin-top:10px}
+/* 黄字版：用来报"能用但要当心"，红字版报"现在就是坏的"。
+   两个都不带 .warn 类 —— 简洁视图会隐藏 .warn，而这两条正是用户必须看见的东西。 */
+.warnbox.amber{background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.28);color:#fcd34d}
+.warnbox .act{margin-top:7px}
+.warnbox .act button{margin-right:6px}
 
 .toast{
   position:fixed;left:50%;bottom:28px;transform:translate(-50%,18px);opacity:0;pointer-events:none;
@@ -522,6 +527,9 @@ html:not(.fullui) .card .body { padding-top: 6px; }
           <div class="qmeta" id="qBtText">等待数据…</div>
         </div>
         <div class="stats" id="statsBox"></div>
+        <!-- 音源状态告警：某块采集源超过 10 秒没有新音频时必须显眼（缺陷 2）。
+             由 renderSourceHealth() 填充。 -->
+        <div id="srcWarn"></div>
         <div class="rows" id="statusRows"></div>
         <div id="errBox"></div>
       </div>
@@ -586,6 +594,9 @@ html:not(.fullui) .card .body { padding-top: 6px; }
                     onchange="saveChannelSources()"></select></div>
           <button class="ghost" onclick="saveChannelSources()">保存音源</button>
         </div>
+        <!-- 音源体检：选了网络上的另一台设备、音源被排除、广播没有音源 ——
+             这些以前都不显示，用户只看到"没声音"。由 renderChannelHealth() 填充。 -->
+        <div id="chWarn"></div>
         <div class="note" style="margin-top:10px">
           像收音机一样：一台机器「广播」，其它机器「收听」即可听到它，<b>不需要配路由</b>。<br>
           <b>收听时不发送本机声音</b>（电台不会反过来播音），所以<b>不会产生回声</b>——这正是它和"双向路由"的区别。<br>
@@ -830,7 +841,13 @@ async function api(path, body){
   const r = await fetch(path, opt);
   const t = await r.text();
   let j = {}; try { j = JSON.parse(t); } catch(e) { j = {error:t}; }
-  if(!r.ok) throw new Error(j.error || ('HTTP '+r.status));
+  if(!r.ok){
+    // 服务端的错误里可能带着机器可读的字段（例如 rejected：哪些音源名被拒了），
+    // 挂在 error 上带给调用方，页面才能给出"移除这些名字"这种具体动作。
+    const err = new Error(j.error || ('HTTP '+r.status));
+    err.body = j;
+    throw err;
+  }
   return j;
 }
 
@@ -1307,12 +1324,17 @@ function renderStatus(){
     // 音源状态：只报事实 —— 每块采集源收到过多少、最后一次收到是多久以前。
     // 没有数据的那块直接标红，用户自己就能看出"我在采集的这块是空的"，
     // 从而换成自己正在用的那一块。判断与设备类型无关（蓝牙/有线/USB/虚拟声卡一视同仁）。
+    // ★ 缺陷 2：光有 blocks_read 是不够的 —— 虚拟声卡空转时帧数停在一个很大的值上，
+    //   但已经一百多秒没有新音频。所以"多久没有新数据"也是标红的依据（与引擎同一个阈值）。
     (s.sources || []).map(x => {
-      const ok = (x.blocks_read || 0) > 0;
+      const blocks = (x.blocks_read || 0);
       const age = x.last_data_age_s;
-      const detail = ok
-        ? ('有数据 · ' + (age != null ? age.toFixed(1) + 's 前' : '刚刚'))
-        : '没有音频数据 ✗';
+      const stale = blocks > 0 && age != null && age > NO_DATA_WARN_S;
+      const ok = blocks > 0 && !stale;
+      const detail = !blocks
+        ? '没有音频数据 ✗'
+        : (stale ? ('⚠ ' + age.toFixed(0) + ' 秒没有新数据')
+                 : ('有数据 · ' + (age != null ? age.toFixed(1) + 's 前' : '刚刚')));
       return `<div class="stat"><div class="k">音源</div><div class="v sm ${ok ? '' : 'warn'}">`
         + `${esc(x.name || '?')}<br><span style="font-size:11px">${detail}</span></div></div>`;
     }).join('');
@@ -1322,6 +1344,109 @@ function renderStatus(){
   $('discoveryTag').className = 'tag' + (d.sent ? ' live' : ' off');
 
   $('errBox').innerHTML = s.last_error ? `<div class="warnbox">最近错误：${esc(s.last_error)}</div>` : '';
+  // 两个新区域：音源空转（③）和频道音源体检（⑥）。每次刷新都重画，
+  // 因为它们要回答的是"为什么没声音"，晚 2.5 秒才出现就等于没出现。
+  renderSourceHealth();
+  renderChannelHealth();
+}
+
+/* 音源空转告警的阈值：与引擎 engine.NO_DATA_WARN_S 保持一致。
+   写成常量而不是散在几处，是为了让"面板说没问题"和"引擎判定没数据"永远同一口径。 */
+const NO_DATA_WARN_S = 10;
+const SRC_ADVICE = '这块设备当前没有声音在播（虚拟声卡空转时就是采不到）；换成你真正的输出设备试试 —— ⑥的「音源」里改，或 ⑧ 设置 → 采集设备。';
+
+function alertBox(w){
+  const cls = w.level === 'bad' ? 'warnbox' : 'warnbox amber';
+  const act = w.action ? `<div class="act">${w.action}</div>` : '';
+  return `<div class="${cls}">⚠ ${esc(w.text)}`
+    + (w.advice ? `<div style="margin-top:6px;font-size:12px;opacity:.92">${esc(w.advice)}</div>` : '')
+    + act + `</div>`;
+}
+
+/* ③ 音源状态：某块采集源超过 10 秒没有数据就显著标出并给处置建议。
+   用户的真实情况：采集源是「扬声器 (UU远程虚拟音频设备)」，blocks_read 9512、
+   145 秒没有新数据，而面板原来只写"有数据 · 145.5s 前" —— 看上去一切正常，
+   人却什么都听不到。所以这里不猜设备类型，只报"多久没有新数据"这个事实。 */
+function renderSourceHealth(){
+  const box = $('srcWarn');
+  if(!box) return;
+  const s = state.status;
+  if(!s){ box.innerHTML = ''; return; }
+  const srcs = s.sources || [];
+  // 引擎报的采集源名字可能带「 [loopback]」后缀（采集对象自己的叫法），
+  // 去重时必须先把后缀去掉，否则同一块设备会被报两遍。
+  const key = (n) => String(n || '').toLowerCase().replace(/\s*\[(loopback|capture)\]\s*$/, '');
+  const warned = new Set();
+  let html = '';
+  for(const w of ((s.channel && s.channel.warnings) || [])){
+    if(w.scope !== 'capture') continue;               // 引擎给的那份带着更具体的建议
+    warned.add(key(w.source));
+    html += alertBox(w);
+  }
+  // 引擎没提到的采集源（不属于频道的那几块）也要报，判据只有"多久没有新数据"。
+  for(const x of srcs){
+    if(warned.has(key(x.name))) continue;
+    const blocks = x.blocks_read || 0;
+    const age = x.last_data_age_s;
+    if(blocks > 0 && age != null && age > NO_DATA_WARN_S){
+      html += alertBox({level:'warn',
+        text: `音源「${x.name}」已经 ${age.toFixed(0)} 秒没有新音频（设备在，但采不到东西）。`,
+        advice: SRC_ADVICE});
+    }else if(blocks <= 0){
+      html += alertBox({level:'warn',
+        text: `音源「${x.name}」打开后一直没有收到音频数据。`,
+        advice: SRC_ADVICE});
+    }
+  }
+  box.innerHTML = html;
+}
+
+/* ⑥ 频道音源体检：把"广播到底发不发得出去、为什么"直接写在卡片上。
+   缺陷 1 的核心就是这里什么都不说 —— 用户把局域网上另一台设备（他的手机）
+   选成了音源，唯一的反馈是"没有声音"。结论由引擎的 channel_sources_report() 给出，
+   和引擎实际采的东西同一套口径。 */
+function renderChannelHealth(){
+  const box = $('chWarn');
+  if(!box) return;
+  const ch = (state.status && state.status.channel) || null;
+  if(!ch){ box.innerHTML = ''; return; }
+  const missing = ch.missing || [];
+  const btn = missing.length
+    ? `<button class="tiny danger" onclick="dropUnusableChannelSources()">移除用不了的音源（${missing.length}）</button>`
+    : '';
+  let html = '';
+  let btnUsed = false;                                // 按钮只挂一次，别每条警告都来一个
+  for(const w of (ch.warnings || [])){
+    if(w.scope === 'capture') continue;               // 那些进 ③
+    const action = (w.level === 'bad' && btn && !btnUsed) ? (btnUsed = true, btn) : '';
+    html += alertBox(Object.assign({}, w, {action}));
+  }
+  // 广播现在采的是哪几块：用户选的是 A、程序采的却是 B 时，只有写出来才对得上。
+  const eff = ch.effective || [];
+  if(ch.broadcast && eff.length){
+    const live = new Set((ch.live || []).map(x => String(x).toLowerCase()));
+    const bad = new Set(missing.map(x => String(x).toLowerCase()));
+    html += `<div style="margin-top:8px;font-size:12px;color:#8b97a8">广播现在采的是：`
+      + eff.map(n => `${esc(n)}${live.has(String(n).toLowerCase()) ? '（有音频 ✓）'
+          : (bad.has(String(n).toLowerCase()) ? '（不是本机设备 ✗）' : '（没有音频 ✗）')}`).join('　')
+      + `　· 能收到的在线设备 ${ch.receivers || 0} 台</div>`;
+  }
+  box.innerHTML = html;
+}
+
+/* 一键把"用不了的音源"从配置里去掉（例如那台被当成音源的手机）。
+   只是从音源清单里移除，不改别的设置；对方自己打开「广播我的声音」时会被重新收编。 */
+async function dropUnusableChannelSources(){
+  const ch = (state.status && state.status.channel) || {};
+  const bad = new Set((ch.missing || []).map(x => String(x).toLowerCase()));
+  const kept = (ch.configured || []).filter(n => !bad.has(String(n).toLowerCase()));
+  try{
+    await api('/api/settings', {channel_sources: kept});
+    toast(kept.length ? ('已移除用不了的音源，剩下：' + kept.join('、'))
+                      : '音源已清空（广播改为跟随本机采集设备）', 'ok');
+    refreshAll();
+    loadChannelSources(true);
+  }catch(e){ toast('移除失败：' + e.message, 'err'); }
 }
 
 /* ---------------- ④ streams ---------------- */
@@ -1405,20 +1530,34 @@ let chGainTimer = 0;
 /* The source list used to be filled once, when the settings first loaded, so a phone
    that started sending later never appeared until the page was reloaded - which is
    exactly "我在 ⑥ 区域看不到它". It now refreshes on a timer, without stealing a
-   dropdown the user is currently clicking in, and without dropping the selection. */
+   dropdown the user is currently clicking in, and without dropping the selection.
+
+   ★ 候选清单只列【这台电脑现在真的能采到的】设备（缺陷 1）：
+     · wasapi = 本机声卡 / 麦克风（输出设备的 loopback 就是"系统声音"）；
+     · netmic = 手机此刻正在送声音 —— 它现在确实就是本机的一块采集设备。
+   网络上的另一台设备（只是在线、并没有在送声音）永远不进这个清单：
+   把"要广播给谁"选成"音源"是很自然的误会，而收下它只会静默失败、一个字节都不发。
+   配置里已经存着的这种名字，由 renderChannelHealth() 用红字显著提示。 */
 async function loadChannelSources(force){
   const sel = $('chSources');
   if(!sel) return;
-  if(!force && document.activeElement === sel) return;
+  if(!force && document.activeElement === sel) return;   // 不抢用户正在点的下拉
   try{
     const [d, c] = await Promise.all([api('/api/devices'), api('/api/config')]);
     const chosen = new Set(((c.config || {}).channel_sources) || []);
     const keep = new Set(Array.from(sel.selectedOptions).map(o => o.value));
     if(!keep.size) keep.add('');
-    const sources = ((d.all) || []).filter(x => x.kind === 'source' && (x.backend === 'wasapi' || x.backend === 'netmic'));
+    const sources = ((d.all) || []).filter(x => x.kind === 'source'
+      && (x.backend === 'wasapi' || (x.backend === 'netmic' && x.extra && x.extra.live)));
     const html = sources.map(x => {
+      // Say what each entry actually is: a playback device's loopback is "系统声音"
+      // (everything this PC plays, a phone over Bluetooth included), a real input is
+      // "麦克风", and a phone that is sending right now is spelled out as such.
+      // Skip the prefix when the name already carries it, or the list reads
+      // "麦克风 · 麦克风阵列 (...)".
       const raw = x.name || '';
-      const kind = x.backend === 'netmic' ? '手机' : (x.kind_detail === 'loopback' ? '系统声音' : '麦克风');
+      const kind = x.backend === 'netmic' ? '手机（正在送声音）'
+        : (x.kind_detail === 'loopback' ? '系统声音' : '麦克风');
       const head = raw.indexOf(kind) === 0 ? '' : kind + ' · ';
       const bt = /a2dp\s*snk/i.test(raw);
       const on = chosen.has(raw) || keep.has(raw);
@@ -1526,32 +1665,18 @@ async function addMicToSources(jsonNames){
     loadNetMics();
   }catch(e){ toast('失败：' + e.message, 'err'); }
 }
-async function loadChannelSources(){
-  const sel = $('chSources');
-  if(!sel) return;
-  try{
-    const [d, c] = await Promise.all([api('/api/devices'), api('/api/config')]);
-    const chosen = new Set(((c.config || {}).channel_sources) || []);
-    const sources = ((d.all) || []).filter(x => x.kind === 'source' && x.backend === 'wasapi');
-    sel.innerHTML = sources.map(x => {
-      // Say what each entry actually is: a playback device's loopback is "系统声音"
-      // (everything this PC plays, a phone over Bluetooth included), a real input is
-      // "麦克风". Skip the prefix when the name already carries it, or the list reads
-      // "麦克风 · 麦克风阵列 (...)".
-      const raw = x.name || '';
-      const kind = x.kind_detail === 'loopback' ? '系统声音' : '麦克风';
-      const head = raw.indexOf(kind) === 0 ? '' : kind + ' · ';
-      const bt = /a2dp\s*snk/i.test(raw);
-      return `<option value="${esc(raw)}"${chosen.has(raw) ? ' selected' : ''}>${esc(head + raw)}${bt ? '（蓝牙手机）' : ''}</option>`;
-    }).join('') || '<option disabled>没有可用的采集设备</option>';
-  }catch(e){ /* the settings card is optional */ }
-}
 async function saveChannelSources(){
   const vals = Array.from($('chSources').selectedOptions).map(o => o.value).filter(Boolean);
   try{
     await api('/api/settings', {channel_sources: vals});
     toast(vals.length ? `频道音源已设为 ${vals.length} 路（混成一路广播）` : '频道音源已恢复为「跟随采集设备」', 'ok');
-  }catch(e){ toast('保存失败：' + e.message, 'err'); }
+    refreshAll();
+  }catch(e){
+    // 服务端会拒绝"不是本机采集设备"的名字（例如网络上的另一台手机），
+    // 并把原因写成人话。这里原样显示它 —— 含糊的"保存失败"等于没说。
+    toast('没有保存：' + e.message, 'err');
+    if(e.body && e.body.rejected) refreshAll();
+  }
 }
 function chGainLabel(){ const v = $('chGainVal'); if(v) v.textContent = Number($('chGain').value).toFixed(2); }
 function setChannelGain(value){

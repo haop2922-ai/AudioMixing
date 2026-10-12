@@ -52,6 +52,12 @@ from .audio.tap import AudioTap
 # How long a phone must be gone before its name leaves the source list.
 PRUNE_AFTER_S = 60.0
 
+# 采集源多久没有新音频就算"空转"。用户的网易 UU 远程虚拟声卡就是这样：采集一直开着、
+# 帧数停在一个很大的数上（blocks_read 9512），但已经 145 秒没有新数据 —— 面板原来只显示
+# "有数据 · 145.5s 前"，用户完全看不出"没声音"出在哪一块设备上。
+# 判定只看"最后一次真的收到音频是什么时候"，与设备类型无关（虚拟声卡/蓝牙/USB/有线一视同仁）。
+NO_DATA_WARN_S = 10.0
+
 SELF_KEYWORDS = ("self", "*self*", "@self", "me", "本机", "自己")
 
 # One fixed route id for the whole LAN channel, so every station's audio lands in the
@@ -1168,11 +1174,30 @@ class WaveLinkNode:
         return self.channel_routes() + table
 
     def channel_state(self) -> dict[str, Any]:
+        """频道的实时状态，含"每个音源现在到底能不能用、广播会不会真的发出声音"。
+
+        以前这里只有四个布尔值/数字，面板上"广播开着、上行 0 kbps"是看不出原因的；
+        用户把手机上那台设备选成音源时，唯一的反馈就是"没有声音"。判定结论由
+        `channel_sources_report()` 统一给出，面板和引擎日志用的是同一套口径。
+        """
+        report = self.channel_sources_report()
         return {
             "broadcast": bool(self.config.broadcast),
             "listen": bool(self.config.listen),
             "gain": round(float(self.config.channel_gain), 3),
             "id": CHANNEL_ROUTE_ID,
+            # 配置里每个音源的判定（能不能用、为什么不能、现在有没有数据）
+            "sources": report["sources"],
+            "usable": report["usable"],
+            "missing": report["missing"],
+            "excluded": report["excluded"],
+            # 广播真正会去采的设备，以及其中现在真的在出音频的
+            "effective": report["effective"],
+            "live": report["live"],
+            # 广播现在会不会真的发出音频（含"一个字节都不会发"的人话警告）
+            "will_send": report["will_send"],
+            "receivers": report["receivers"],
+            "warnings": report["warnings"],
         }
 
     def apply_routes(self) -> None:
@@ -1428,36 +1453,308 @@ class WaveLinkNode:
         except Exception:
             pass
 
+    def _local_capture_names(self) -> set[str]:
+        """这台电脑现在真的能采到的设备名（小写）。
+
+        判定口径只有一条：名字出现在本机采集设备清单里。刻意【不】用
+        `find_device()`：它还会按 id 匹配，而 Windows 后端给端点编号，
+        于是一台早就不在送声音的手机也能"解析"到恰好占了那个编号的随便哪块设备
+        （这正是以前把耳机当成音源、还被反馈保护判成啸叫的原因）。
+        """
+        names = {d.name.strip().lower() for d in self.devices
+                 if d.kind == audio_base.KIND_SOURCE and d.name}
+        try:
+            # 外加一份现列的清单：手机刚开始送声音时，先出现在这里，
+            # 比周期性刷新更快一步（周期刷新最多 4 秒一次）。
+            names |= {d.name.strip().lower() for d in audio_base.list_all_devices()
+                      if d.kind == audio_base.KIND_SOURCE and d.name}
+        except Exception:
+            pass
+        return names
+
     def _live_channel_sources(self) -> tuple[list[str], list[str]]:
         """Split the configured sources into (usable now, not available now).
 
         A name that cannot be resolved would make the whole mix fail to open, and then
         nothing plays at all - which is a very confusing way to react to a phone that
         happens to be away, or to a stale name left behind when a phone was renamed.
+
+        用不了的名单不再"静默丢掉"：`_explain_selectors()` / `channel_sources_report()`
+        会把每个名字为什么用不了写成人话，面板直接显示。
         """
         usable: list[str] = []
         missing: list[str] = []
-        # Exact *name* against a freshly listed source device. Not find_device(): that
-        # also matches by id, and the Windows backend numbers its endpoints - so a phone
-        # that had stopped sending still "resolved", to whichever endpoint happened to
-        # own that number. The mix was then built from the headphones, the feedback guard
-        # refused it as a howl, and the machine went silent over a phone that was simply
-        # offline.
-        names = {d.name.strip().lower() for d in self.devices
-                 if d.kind == audio_base.KIND_SOURCE and d.name}
-        try:
-            # Plus a fresh listing, which is where a phone that just started sending
-            # shows up before the periodic refresh has caught up.
-            names |= {d.name.strip().lower() for d in audio_base.list_all_devices()
-                      if d.kind == audio_base.KIND_SOURCE and d.name}
-        except Exception:
-            pass
+        names = self._local_capture_names()
         for selector in [str(s).strip() for s in self.config.channel_sources if str(s).strip()]:
             if selector.lower() in names:
                 usable.append(selector)
             else:
                 missing.append(selector)
         return usable, missing
+
+    def _phone_names(self) -> set[str]:
+        """之前通过网络送过声音的手机名（小写）。用来区分"拔掉的设备"和"没在送的手机"。"""
+        try:
+            from .audio.backends import netmic as netmic_backend
+
+            return {str(name).strip().lower() for name in list(netmic_backend.MICS.keys())
+                    if str(name).strip()}
+        except Exception:
+            return set()
+
+    def _peer_names(self) -> dict[str, str]:
+        """{局域网设备名(小写): node_id} —— 现在能被发现的其它节点。"""
+        out: dict[str, str] = {}
+        try:
+            for peer in self.registry.all(include_local=False):
+                name = str(getattr(peer, "name", "") or "").strip()
+                if name:
+                    out.setdefault(name.lower(), str(peer.node_id))
+        except Exception:
+            pass
+        return out
+
+    def _classify_missing_source(self, name: str, peers: dict[str, str] | None = None,
+                                 phones: set[str] | None = None) -> tuple[str, str]:
+        """(类别, 人话原因) —— 这个名字为什么不是本机可用的音源。
+
+        这是缺陷 1 的核心：用户很自然地把"要广播给谁"理解成了"音源是谁"，
+        于是把手机的名字选了进来。程序必须说清楚这不是本机的音源，
+        而不是收下、然后一个字节都不发。三类原因分开报，处置办法完全不同。
+        """
+        low = (name or "").strip().lower()
+        peers = self._peer_names() if peers is None else peers
+        phones = self._phone_names() if phones is None else phones
+        if low in peers:
+            return "remote_node", ("%s 是网络上的另一台设备，不是本机的音源 —— "
+                                   "它必须自己打开「广播我的声音」或「送声音」。" % name)
+        if low in phones:
+            return "phone_offline", ("%s 这台手机之前送过声音，现在没有在送 —— "
+                                     "要它自己打开「送声音」或「广播我的声音」。" % name)
+        return "gone", ("%s 现在不是这台电脑上的采集设备：它可能已经被拔掉、断开或改了名；"
+                        "如果它其实是另一台手机/电脑，那它必须自己打开「广播我的声音」或「送声音」。"
+                        % name)
+
+    def _explain_selectors(self, names: list[str]) -> str:
+        """把一批"用不了"的音源名连原因一起写成人话（引擎日志和面板共用）。"""
+        peers = self._peer_names()
+        phones = self._phone_names()
+        out = []
+        for name in names:
+            _kind, reason = self._classify_missing_source(name, peers, phones)
+            out.append(reason)
+        return "；".join(out)
+
+    @staticmethod
+    def _device_name_key(name: str) -> str:
+        """设备名归一化：去掉采集端自己加的 [loopback]/[capture] 后缀，大小写无关。
+
+        同一个端点在这两个地方写法不同：设备清单里是「扬声器 (Realtek(R) Audio)」，
+        采集对象的名字会多一个「 [loopback]」。不归一化就会"面板说在采、实际采的是另一块"。
+        """
+        text = str(name or "").strip().lower()
+        for suffix in ("[loopback]", "[capture]"):
+            if text.endswith(suffix):
+                text = text[: -len(suffix)].strip()
+        return text
+
+    def _capture_stat_for(self, name: str) -> dict[str, Any]:
+        """这块音源在采集端的实时计数（现在没在采它就是空字典）。"""
+        low = self._device_name_key(name)
+        if not low:
+            return {}
+        try:
+            items = self.hub.stats()
+        except Exception:
+            return {}
+        for item in items:
+            cap_name = self._device_name_key(item.get("name"))
+            spec_device = self._device_name_key((item.get("spec") or {}).get("device"))
+            if low == cap_name or (spec_device and low == spec_device):
+                return item
+        return {}
+
+    @staticmethod
+    def _capture_data_state(stat: dict[str, Any]) -> tuple[str, str, bool]:
+        """(状态, 人话原因, 是否"确定采不到") —— 一块采集源现在出不出音频。
+
+        "确定采不到"用来决定要不要对用户说"一个字节都不会发"：
+        设备打开后一直没数据、或者已经超过 NO_DATA_WARN_S 没有新音频，都是确定采不到；
+        而"还没开始采"只是暂时的，不该吓人。
+        """
+        if not stat:
+            return "not_running", "设备在，但现在没有在采集它", False
+        blocks = int(stat.get("blocks_read") or 0)
+        age = stat.get("last_data_age_s")
+        alive = float(stat.get("alive_for_s") or 0.0)
+        if blocks <= 0:
+            definite = alive > NO_DATA_WARN_S
+            return "no_data", "设备存在但当前没有数据：打开到现在一块音频都没收到", definite
+        if age is not None and float(age) > NO_DATA_WARN_S:
+            return "stalled", ("设备存在但当前没有数据：已经 %.0f 秒没有新音频" % float(age)), True
+        return "ok", "", False
+
+    def channel_sources_report(self) -> dict[str, Any]:
+        """「广播我的声音」现在采的是什么、发不发得出去、每个名字为什么不能用。
+
+        为什么要有这个：解析不出来的音源以前被静默丢掉，面板上只有一个 0 B。
+        他的真实配置就是：音源清单里只写了【手机的名字】，而这台还被
+        `broadcast_excluded` 排除了 —— 广播永远没有音源、一个字节都不发，
+        而界面上没有任何地方告诉他这件事。这里把结论写成人话，让面板直接显示。
+        """
+        configured = [str(s).strip() for s in self.config.channel_sources if str(s).strip()]
+        excluded = {str(s).strip() for s in getattr(self.config, "broadcast_excluded", [])}
+        usable, _missing = self._live_channel_sources()
+        usable_low = {s.lower() for s in usable}
+        peers = self._peer_names()
+        phones = self._phone_names()
+
+        entries: list[dict[str, Any]] = []
+        for name in configured:
+            low = name.lower()
+            entry: dict[str, Any] = {
+                "name": name,
+                "excluded": name in excluded,
+                "is_local": low in usable_low,
+                "state": "ok",
+                "reason": "",
+            }
+            if entry["is_local"]:
+                stat = self._capture_stat_for(name)
+                state, reason, _definite = self._capture_data_state(stat)
+                entry.update({
+                    "state": state,
+                    "reason": reason,
+                    "capturing": bool(stat),
+                    "blocks_read": int(stat.get("blocks_read") or 0),
+                    "last_data_age_s": stat.get("last_data_age_s"),
+                })
+                if name in excluded:
+                    entry["state"] = "excluded"
+                    entry["reason"] = "已被排除：这台设备自己把「广播」关掉了，广播时会跳过它"
+            else:
+                kind, reason = self._classify_missing_source(name, peers, phones)
+                entry.update({"state": kind, "reason": reason})
+                if name in excluded:
+                    entry["reason"] += "（它同时还在「已排除」名单里。）"
+            entries.append(entry)
+
+        # 广播实际会去采哪几块设备：配置里有能用的就用它们，否则退回「跟随采集设备」
+        # （default_source_spec）。面板必须能看到这个"实际"，否则用户以为在采 A、
+        # 程序其实在采 B，永远对不上。
+        effective: list[str] = []
+        try:
+            rule = {"kind": "broadcast", "id": CHANNEL_ROUTE_ID, "source_device": ""}
+            effective = self._capture_names_for(self._source_spec_for(rule))
+        except Exception:
+            effective = []
+
+        by_low = {e["name"].lower(): e for e in entries}
+        live: list[str] = []
+        blocked: list[str] = []
+        stuck_ones: list[tuple[str, str, str]] = []   # (名字, 状态, 原因)
+        definite = False
+        for name in effective:
+            entry = by_low.get(name.lower())
+            stat = self._capture_stat_for(name)
+            state, data_reason, is_definite = self._capture_data_state(stat)
+            if state == "ok":
+                # 真的在采、而且确实有数据。这里不看"排除了没有"：全部被排除时引擎会
+                # 回落到「跟随采集设备」，此刻采的就是默认输出设备，排除名单不参与。
+                live.append(name)
+                continue
+            # 原因里如果已经带了名字（"<名字> 是网络上的另一台设备…"），
+            # 外面又写了「名字」，就不必再说两遍。
+            reason = (entry or {}).get("reason") or data_reason or "现在不可用"
+            if reason.startswith(name):
+                reason = reason[len(name):].lstrip(" 　：:，,")
+            if entry is not None and not entry["is_local"]:
+                # 配置里那个名字根本不是本机设备：它一定开不起来，广播发不出去。
+                blocked.append("「%s」%s" % (name, reason))
+                definite = True
+            else:
+                blocked.append("「%s」%s" % (name, data_reason or reason))
+                definite = definite or is_definite
+            if state in ("stalled", "no_data"):
+                stuck_ones.append((name, state, data_reason))
+            elif entry is not None and entry["state"] in ("stalled", "no_data"):
+                stuck_ones.append((name, entry["state"], entry["reason"]))
+            elif entry is not None and entry["excluded"]:
+                stuck_ones.append((name, "excluded", entry["reason"]))
+
+        # 面板上的警告。scope=capture 的进「音源状态」区域，scope=channel 的进⑥频道卡片。
+        warnings: list[dict[str, Any]] = []
+        for name, _state, reason in stuck_ones:
+            warnings.append({
+                "scope": "capture",
+                "level": "warn",
+                "source": name,
+                "text": "音源「%s」%s。" % (name, reason),
+                "advice": ("这块设备当前没有声音在播（虚拟声卡空转时就是采不到，"
+                           "比如网易 UU 远程的虚拟声卡）；换成你真正的输出设备试试 —— "
+                           "⑥的「音源」里改，或 ⑧ 设置 → 采集设备。"),
+            })
+
+        receivers = 0
+        try:
+            receivers = len([p for p in self._matching_nodes(["*"])
+                             if p.node_id != self.node_id and p.online and p.audio_port])
+        except Exception:
+            receivers = 0
+
+        # 配置里"现在用不了"的那些条目：不管广播此刻有没有别的音源可用，都要说出来。
+        # 缺陷 1 就是这样被藏起来的 —— 用户选了手机的名字，程序收下了，然后什么都不说。
+        broken = [e for e in entries if not e["is_local"] or e["excluded"]]
+        if self.config.broadcast and broken:
+            parts = []
+            for e in broken:
+                reason = e["reason"] or "现在不可用"
+                # 单条展示时原因是以名字开头的完整句子（"<手机名> 是网络上的另一台设备…"）；
+                # 汇总成一条时名字已经在「」里了，就不必再说两遍。
+                if reason.startswith(e["name"]):
+                    reason = reason[len(e["name"]):].lstrip(" 　：:，,")
+                parts.append("「%s」%s" % (e["name"], reason))
+            warnings.append({
+                "scope": "channel",
+                "level": "warn" if live else "bad",
+                "text": "广播的音源清单里有 %d 条现在用不了：%s" % (len(broken), "；".join(parts)),
+                "advice": ("点下面的「移除用不了的音源」一键清掉，再选本机的采集设备 —— "
+                           "一般是「扬声器 (...) [loopback]」，也就是这台电脑正在播放的声音。"
+                           "网络上的另一台手机/电脑必须自己打开「广播我的声音」或「送声音」。"),
+            })
+
+        if self.config.broadcast and not live and definite:
+            warnings.append({
+                "scope": "channel",
+                "level": "bad",
+                "text": "广播没有音源，一个字节都不会发。" + "；".join(blocked),
+                "advice": ("请在⑥的「音源」里选一块本机设备 —— 一般是「扬声器 (...) [loopback]」，"
+                           "也就是这台电脑正在播放的声音。网络上的另一台手机/电脑不是本机的音源："
+                           "它必须自己打开「广播我的声音」或「送声音」。"),
+            })
+        if self.config.broadcast and receivers == 0:
+            warnings.append({
+                "scope": "channel",
+                "level": "warn",
+                "text": ("广播已打开，但局域网上现在没有任何其它设备在线 —— "
+                         "就算有音源也没有可发的对象（0 台）。"),
+                "advice": ("确认对端设备开着、连在同一个 Wi-Fi 下；手机端还要点「听广播」或「收听」，"
+                           "只打开网页不点是不会收的。"),
+            })
+
+        return {
+            "configured": configured,
+            "sources": entries,
+            "usable": [e["name"] for e in entries if e["is_local"]],
+            "missing": [e["name"] for e in entries if not e["is_local"]],
+            "excluded": [e["name"] for e in entries if e["excluded"]],
+            "effective": effective,
+            "live": live,
+            # 广播开着、而且现在确实有一块采集源在出音频，才叫"发得出去"。
+            "will_send": bool(self.config.broadcast) and bool(live),
+            "receivers": receivers,
+            "warnings": warnings,
+        }
 
     def _tap_wanted(self) -> bool:
         """现在有没有人需要这份音频：广播开着，或者有听众连着网页。"""
@@ -1513,7 +1810,9 @@ class WaveLinkNode:
         """(source, sink spec, change key) for the local capture->render path."""
         channels, missing = self._live_channel_sources()
         if missing:
-            self._note_once("音源里这些现在打不开，已跳过：%s" % "、".join(missing))
+            # 不再只说"打不开"：说清是网络上的另一台设备、是没在送的手机，还是真被拔了。
+            # 用户看到的就是这句话，含糊等于没说。
+            self._note_once("音源里这些现在用不了，已跳过：%s" % self._explain_selectors(missing))
         spec = dict(self.default_source_spec())
         if len(channels) > 1:
             spec["sources"] = channels

@@ -41,3 +41,7 @@ android/build/
 android/.gradle/
 android/out/
 android/local.properties
+
+# 打包产物：20MB 级二进制不进仓库（历史里已提交的不再追改）
+release/**/*.exe
+dist_nuitka/
