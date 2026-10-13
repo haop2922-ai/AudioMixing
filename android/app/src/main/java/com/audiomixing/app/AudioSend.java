@@ -298,7 +298,7 @@ public final class AudioSend {
         return peak;
     }
 
-    /** 发送增益，0.0~2.0（1.0 = 原样）。界面"本机音量"滑杆接这里。 */
+    /** 发送增益，0.0~2.0（1.0 = 原样）。界面「我们这一层的音量」滑杆接这里（只乘我们自己的 PCM）。 */
     public void setGain(float g) {
         setGainQ14(Math.round(Math.max(0f, Math.min(2f, g)) * Proto.GAIN_ONE));
     }

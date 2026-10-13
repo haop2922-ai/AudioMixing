@@ -171,6 +171,41 @@ public final class RecvProbe {
         check("控制包（对端统计）即使不在名单里也照收（controls=" + s.controls + "）", s.controls == 1);
 
         System.out.println();
+        System.out.println("== 4. 同一台设备的第 2 条流绝不叠加播放（用户说的「路由/广播混淆」）==");
+        InetAddress dupHost = InetAddress.getByName("192.168.0.77");
+        InetAddress otherHost = InetAddress.getByName("192.168.0.88");
+        int before = recv.stats().streamCount;
+        // 同一台设备、两个 ssrc（电脑同时开广播 + 点对点路由时就是这样），而且负载完全相同
+        byte[] routeA = Proto.encode(tonePkt(0x1111));
+        byte[] routeB = Proto.encode(tonePkt(0x2222));
+        feed(routeA, dupHost);
+        s = recv.stats();
+        check("第 1 条流正常建流（流数 " + before + " → " + s.streamCount + "）",
+                s.streamCount == before + 1);
+        for (int i = 0; i < 10; i++) {
+            feed(routeB, dupHost);
+        }
+        s = recv.stats();
+        check("第 2 条流被抑制、没有建流（流数仍是 " + s.streamCount + "）", s.streamCount == before + 1);
+        check("抑制计数 = 10（dupRoutePackets=" + s.dupRoutePackets + "）", s.dupRoutePackets == 10);
+        check("指纹确认是同一份声音（dupRouteConfirmed=" + s.dupRouteConfirmed + "）",
+                s.dupRouteConfirmed == 10);
+        check("现场描述点出了两条 ssrc：\"" + s.dupRouteText + "\"",
+                s.dupRouteText.contains("1111") && s.dupRouteText.contains("2222"));
+
+        byte[] otherRoute = Proto.encode(tonePkt(0x3333));
+        feed(otherRoute, otherHost);
+        s = recv.stats();
+        check("另一台设备不受影响、照常建流（流数 " + s.streamCount + "）", s.streamCount == before + 2);
+
+        // 第 1 条流走了（超过 3 秒没有包）之后，第 2 条流必须能接手，不能被无限抑制
+        SystemClock.now += 4000;
+        feed(routeB, dupHost);
+        s = recv.stats();
+        check("第 1 条流超时后第 2 条流接手（抑制计数不再增长，" + s.dupRoutePackets + "）",
+                s.dupRoutePackets == 10);
+
+        System.out.println();
         System.out.println("RESULT: " + (failures == 0 ? "PASS" : "FAIL")
                 + "  （" + checks + " 项断言"
                 + (failures == 0 ? "全部通过）" : "，失败 " + failures + " 项）"));
@@ -183,6 +218,24 @@ public final class RecvProbe {
         p.samples = samples;
         p.ssrc = 0x1234;
         p.payload = new byte[payloadLen];
+        return p;
+    }
+
+    /**
+     * 一条"有声音"的流。注意负载<b>不掺 ssrc</b>：现实里同一份声音从两条路进来时，
+     * 两条流的负载是同一份音频（这正是"指纹相同"要认出来的东西）。
+     * 负载也不能是全零 —— 静音不参与去重比对。
+     */
+    private static Proto.Pkt tonePkt(int ssrc) {
+        Proto.Pkt p = new Proto.Pkt(Proto.T_AUDIO);
+        p.codec = Proto.CODEC_PCM_S16;
+        p.samples = 480;
+        p.ssrc = ssrc;
+        byte[] payload = new byte[1920];
+        for (int i = 0; i < payload.length; i++) {
+            payload[i] = (byte) ((i * 37) & 0xFF);
+        }
+        p.payload = payload;
         return p;
     }
 

@@ -200,14 +200,46 @@ public final class Discovery {
     private Thread rxThread;
     private boolean dirty;                     // 列表有变化但还没通知界面
 
+    // ★ 节点身份必须持久化。
+    //
+    // 为什么这是硬需求（2026-10-12 真机反馈）：原来是每次启动都 UUID.randomUUID() 新建一个，
+    // 于是**手机每重启一次，电脑的发现列表里就多出一台重名设备**（实测：同一台手机在同一 IP
+    // 上挂了三份，三个不同的 node_id）。而且电脑端的路由表、ssrc 都是按 node_id 记的 ——
+    // 换了 id，之前配好的路由就等于指向了一个不存在的节点。
+    private static final String PREFS_NAME = "audiomixing";
+    private static final String KEY_NODE_ID = "node_id";
+
+    /** 取持久化的节点 ID；没有就生成一个存下来（装一次生成一次，之后永远不变）。 */
+    private static String loadOrCreateNodeId(Context ctx) {
+        if (ctx == null) {
+            return java.util.UUID.randomUUID().toString();
+        }
+        try {
+            android.content.SharedPreferences sp =
+                    ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            String id = sp.getString(KEY_NODE_ID, "");
+            if (id != null && !id.isEmpty()) {
+                return id;
+            }
+            String fresh = java.util.UUID.randomUUID().toString();
+            sp.edit().putString(KEY_NODE_ID, fresh).apply();
+            Log.i(TAG, "首次启动，生成节点 ID 并保存：" + fresh);
+            return fresh;
+        } catch (Throwable t) {
+            // 存不了就只能退回"每次新建"（旧行为），但要让日志/诊断看得见。
+            Log.w(TAG, "节点 ID 存不下来（这次会是临时的）：" + t);
+            return java.util.UUID.randomUUID().toString();
+        }
+    }
+
     public Discovery(Context context) {
         this(context, null, null, Proto.DEFAULT_AUDIO_PORT, 0);
     }
 
     public Discovery(Context context, String nodeId, String nodeName, int audioPort, int webPort) {
         this.appCtx = context == null ? null : context.getApplicationContext();
-        this.nodeId = (nodeId == null || nodeId.isEmpty())
-                ? java.util.UUID.randomUUID().toString() : nodeId;
+        this.nodeId = (nodeId != null && !nodeId.isEmpty())
+                ? nodeId : loadOrCreateNodeId(this.appCtx);
         this.nodeName = (nodeName == null || nodeName.isEmpty()) ? defaultName() : nodeName;
         this.audioPort = audioPort > 0 ? audioPort : Proto.DEFAULT_AUDIO_PORT;
         this.webPort = Math.max(0, webPort);
@@ -290,6 +322,24 @@ public final class Discovery {
 
     public String nodeId() {
         return nodeId;
+    }
+
+    /**
+     * 本机信标的原文（诊断报告里贴一行）。
+     *
+     * <p>为什么值得贴出来：「电脑那边看到我的 id 是空的」这类怀疑，只有把<b>我们自己真正
+     * 发出去的字节</b>摆出来才能一次说清 —— 里面有 id、有 audio_port、有多少字节，
+     * 不用再靠猜。顺带也能一眼看出信标有没有超协议上限（1200 字节）。
+     */
+    public String beaconPreview() {
+        try {
+            byte[] b = buildBeacon();
+            String s = new String(b, StandardCharsets.UTF_8);
+            return s.length() > 320 ? (s.substring(0, 320) + "…（共 " + b.length + " 字节）")
+                    : (s + "（共 " + b.length + " 字节）");
+        } catch (Throwable t) {
+            return "信标组装失败：" + t;
+        }
     }
 
     public String name() {
@@ -437,6 +487,9 @@ public final class Discovery {
         }
         sb.append("最近收到：").append(lastBeaconText()).append('\n');
         sb.append("本机网卡：").append(ifaceText()).append('\n');
+        // ★ 节点身份：持久化之后每次启动都一样，电脑端才不会把同一台手机记成好几台。
+        sb.append("我的节点 ID：").append(nodeId)
+                .append("（持久化保存，重启不变 ✓）\n");
         if (lastBadFrameSample.length() > 0) {
             sb.append("非信标帧：").append(lastBadFrameSample).append('\n');
         }

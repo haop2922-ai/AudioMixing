@@ -58,6 +58,15 @@ PRUNE_AFTER_S = 60.0
 # 判定只看"最后一次真的收到音频是什么时候"，与设备类型无关（虚拟声卡/蓝牙/USB/有线一视同仁）。
 NO_DATA_WARN_S = 10.0
 
+# 采集源空转时"自动换一块设备"的节奏。为什么是这几个数：
+#   · 冷却 180 秒 —— 换设备要重开采集（听感上是一次很短的断续），
+#     不能几块设备之间来回跳，也不能在用户刚手动选完就把他的选择改掉；
+#   · 试采 2 秒 —— 真去开一次那块设备，2 秒内一块音频都收不到就等于"这块也没数据"。
+#   判据只有一个：真的收到了音频块。设备清单里"存在"和"有数据"是两件事 ——
+#   网易 UU 的虚拟声卡一直存在、一直能打开，但一块音频都收不到。
+CAPTURE_FALLBACK_COOLDOWN_S = 180.0
+CAPTURE_PROBE_S = 2.0
+
 SELF_KEYWORDS = ("self", "*self*", "@self", "me", "本机", "自己")
 
 # One fixed route id for the whole LAN channel, so every station's audio lands in the
@@ -214,6 +223,16 @@ class WaveLinkNode:
         # 仍然把它报成可用，打开也不报错，就是没有数据。记下来，下次换一个。
         self._silent_captures: dict[str, float] = {}
         self._local_logged = ""
+        # 自动回退用的状态：最近一次切换、最近一次试采的结果、正在试采谁。
+        # 这些只影响"要不要换设备"这一个决定，不参与音频路径，所以放内存里就够了。
+        self._last_capture_switch: dict[str, Any] | None = None
+        self._capture_health: dict[str, dict[str, Any]] = {}
+        self._probe_name: str | None = None
+        self._probe_started = 0.0
+        self._probe_result: tuple[str, dict[str, Any]] | None = None
+        self._last_fallback_at = 0.0
+        # 每块设备"从什么时候开始一直没有数据"。必须跨采集重建记，理由见 _track_dead_captures。
+        self._dead_since: dict[str, float] = {}
         self.routes: list[dict[str, Any]] = []
         self._routes_lock = threading.RLock()
         self._stop = threading.Event()
@@ -1198,6 +1217,10 @@ class WaveLinkNode:
             "will_send": report["will_send"],
             "receivers": report["receivers"],
             "warnings": report["warnings"],
+            # 最近一次"自动换了一台设备"的记录。不能静默：用户手动选过设备时更要写清楚。
+            "switch": (dict(self._last_capture_switch,
+                            age_s=round(time.time() - float(self._last_capture_switch.get("at") or 0), 1))
+                       if self._last_capture_switch else None),
         }
 
     def apply_routes(self) -> None:
@@ -1368,6 +1391,11 @@ class WaveLinkNode:
                 % name
             )
         self._apply_local_loop()
+        # 先记下"哪块设备已经多久没数据了"（跨采集重建累计），再决定要不要换设备。
+        self._track_dead_captures()
+        # 采集源空转（一直采不到声音）→ 自动换一块真的收到过音频的设备。
+        # 放在本机直通之后：直通会把"现在到底在采哪一块"确定下来，判定才有依据。
+        self._recover_stalled_capture()
         self._sample_quality()
         # The real Bluetooth listing takes seconds, so it happens here, in the background
         # thread, and never on a request the panel makes.
@@ -1558,6 +1586,38 @@ class WaveLinkNode:
                 text = text[: -len(suffix)].strip()
         return text
 
+    def _dead_age_for(self, name: str) -> float | None:
+        """这块设备"一直没数据"持续了多久（跨采集重建累计）。没记录就是 None。"""
+        since = self._dead_since.get(self._device_name_key(name))
+        if since is None:
+            return None
+        return max(0.0, time.monotonic() - since)
+
+    def _track_dead_captures(self) -> None:
+        """记录每块采集设备"从什么时候开始一直没有数据"。
+
+        为什么必须跨采集重建来记：一块坏设备（网易 UU 的虚拟声卡就是这样）会被
+        看门狗每 6 秒判一次"卡住"并重建，而重建会把 alive_for_s 清零 ——
+        只看 alive_for_s 就永远等不到"连续 10 秒没有数据"，自动回退也就永远不会触发。
+        这里只按"有没有产出音频"记，与设备类型无关；一旦某块设备真的出数据了就立刻清掉。
+        """
+        now = time.monotonic()
+        try:
+            stats = self.hub.stats()
+        except Exception:
+            stats = []
+        for item in stats:
+            key = self._device_name_key(item.get("name"))
+            if not key:
+                continue
+            blocks = int(item.get("blocks_read") or 0)
+            age = item.get("last_data_age_s")
+            fresh = blocks > 0 and (age is None or float(age) <= NO_DATA_WARN_S)
+            if fresh:
+                self._dead_since.pop(key, None)
+            else:
+                self._dead_since.setdefault(key, now)
+
     def _capture_stat_for(self, name: str) -> dict[str, Any]:
         """这块音源在采集端的实时计数（现在没在采它就是空字典）。"""
         low = self._device_name_key(name)
@@ -1574,11 +1634,10 @@ class WaveLinkNode:
                 return item
         return {}
 
-    @staticmethod
-    def _capture_data_state(stat: dict[str, Any]) -> tuple[str, str, bool]:
+    def _capture_data_state(self, stat: dict[str, Any]) -> tuple[str, str, bool]:
         """(状态, 人话原因, 是否"确定采不到") —— 一块采集源现在出不出音频。
 
-        "确定采不到"用来决定要不要对用户说"一个字节都不会发"：
+        "确定采不到"用来决定要不要对用户说"一个字节都不会发"、要不要自动换设备：
         设备打开后一直没数据、或者已经超过 NO_DATA_WARN_S 没有新音频，都是确定采不到；
         而"还没开始采"只是暂时的，不该吓人。
         """
@@ -1588,8 +1647,14 @@ class WaveLinkNode:
         age = stat.get("last_data_age_s")
         alive = float(stat.get("alive_for_s") or 0.0)
         if blocks <= 0:
-            definite = alive > NO_DATA_WARN_S
-            return "no_data", "设备存在但当前没有数据：打开到现在一块音频都没收到", definite
+            # 跨重建累计的"一直没数据"时长优先：坏设备每 6 秒被重建一次，alive_for_s 永远很小。
+            dead_for = self._dead_age_for(str(stat.get("name") or ""))
+            if dead_for is None:
+                dead_for = alive
+            definite = dead_for > NO_DATA_WARN_S
+            reason = ("设备存在但当前没有数据：已经 %.0f 秒没有新音频" % dead_for) if definite \
+                else "设备存在但当前没有数据：打开到现在一块音频都没收到"
+            return "no_data", reason, definite
         if age is not None and float(age) > NO_DATA_WARN_S:
             return "stalled", ("设备存在但当前没有数据：已经 %.0f 秒没有新音频" % float(age)), True
         return "ok", "", False
@@ -1754,6 +1819,395 @@ class WaveLinkNode:
             "will_send": bool(self.config.broadcast) and bool(live),
             "receivers": receivers,
             "warnings": warnings,
+        }
+
+    # -- 采集源健康：候选、试采、空转自动回退 ------------------------------
+    def stalled_effective_sources(self) -> list[dict[str, Any]]:
+        """现在"确定采不到声音"的那几块音源（广播真正在采的范围内）。"""
+        out: list[dict[str, Any]] = []
+        try:
+            report = self.channel_sources_report()
+        except Exception:
+            return out
+        for name in report.get("effective") or []:
+            stat = self._capture_stat_for(name)
+            state, reason, definite = self._capture_data_state(stat)
+            if definite and state in ("stalled", "no_data"):
+                out.append({"name": name, "state": state, "reason": reason,
+                            "last_data_age_s": (stat or {}).get("last_data_age_s"),
+                            "blocks_read": int((stat or {}).get("blocks_read") or 0)})
+        return out
+
+    def capture_candidates(self, exclude: Iterable[str] = ()) -> list[dict[str, Any]]:
+        """能当"系统声音"音源的候选设备：本机输出设备的回环，真实声卡优先。
+
+        为什么只列输出设备：用户要的是"把电脑正在放的声音送出去"。
+        麦克风是另一个用途，不该在"这块设备没有声音"的修复清单里出现。
+        """
+        skip = {self._device_name_key(x) for x in exclude if str(x or "").strip()}
+        default_name = self._default_render_name()
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for device in self.devices:
+            if device.kind != audio_base.KIND_SINK or not device.name:
+                continue
+            if str(device.backend or "") in ("file", "null"):
+                continue          # 测试音源/写文件的后端不是"能让手机听到声音的设备"
+            key = self._device_name_key(device.name)
+            if not key or key in skip or key in seen:
+                continue
+            seen.add(key)
+            health = self._capture_health.get(key) or {}
+            out.append({
+                "device": device.name,
+                "virtual": bool(self._looks_virtual(device.name)),
+                "is_default": bool(self._same_endpoint(device.name, default_name))
+                if default_name else bool(getattr(device, "is_default", False)),
+                # alive=True 表示"最近真的试采过并且收到了音频"；None = 还没验过。
+                "alive": health.get("alive"),
+                "checked_s": health.get("checked_s"),
+                "note": health.get("note") or "",
+            })
+        # 排序：验过有数据的 > 没验过的 > 验过没数据的；同档里默认设备优先、真实声卡优先。
+        out.sort(key=lambda c: (
+            0 if c["alive"] is True else (1 if c["alive"] is None else 2),
+            0 if c["is_default"] else 1,
+            1 if c["virtual"] else 0,
+            c["device"].lower(),
+        ))
+        return out
+
+    def probe_candidates_async(self, limit: int = 4) -> dict[str, Any]:
+        """把还没验过的候选设备逐个试采一遍（面板上"先验一下候选设备"）。
+
+        试采同一时间只允许一块（`probe_capture_async` 自己会拒绝重复），
+        所以这里排队等前一块结束再开下一块；整个过程在后台线程里，
+        请求立刻返回，面板过几秒刷新就能看到"有数据 ✓ / 没数据 ✗"。
+        """
+        pending = [c["device"] for c in self.capture_candidates() if c.get("alive") is None][:max(1, limit)]
+        if not pending:
+            return {"started": False, "devices": [], "note": "候选设备都已经验过了"}
+
+        def run() -> None:
+            for name in pending:
+                deadline = time.time() + 8.0
+                while self._probe_name and time.time() < deadline:
+                    time.sleep(0.2)
+                if self._probe_name or not self.probe_capture_async(name):
+                    continue
+                until = time.time() + CAPTURE_PROBE_S + 4.0
+                while self._probe_name and time.time() < until:
+                    time.sleep(0.2)
+
+        threading.Thread(target=run, name="wavelink-probe-all", daemon=True).start()
+        return {"started": True, "devices": pending,
+                "note": "正在试采 %d 块候选设备（每块最多 %.0f 秒），大约 %d 秒后点「重新检查」。"
+                        % (len(pending), CAPTURE_PROBE_S, int((CAPTURE_PROBE_S + 2) * len(pending)))}
+
+    def capture_health(self) -> dict[str, dict[str, Any]]:
+        """最近一次试采的结论（面板据此写"有数据 ✓ / 没数据 ✗ / 未验证"）。"""
+        return dict(self._capture_health)
+
+    def probe_capture_async(self, name: str) -> bool:
+        """在后台试采一块设备：真的收到音频才算"有数据"。已经在试就别重复开。"""
+        name = str(name or "").strip()
+        if not name or self._probe_name:
+            return False
+        self._probe_name = name
+        self._probe_started = time.monotonic()
+        self._probe_result = None
+
+        def run() -> None:
+            self._probe_result = (name, self._probe_capture(name))
+
+        threading.Thread(target=run, name="wavelink-probe", daemon=True).start()
+        return True
+
+    def _probe_capture(self, name: str, timeout: float = CAPTURE_PROBE_S) -> dict[str, Any]:
+        """真开一次这块设备读几块音频。必须真开：
+
+        设备清单里"存在"和"有数据"是两件事 —— 网易 UU 的虚拟声卡一直在列表里、
+        也一直能被打开，但一块音频都收不到（用户机器的真实数据：blocks_read 停在 9512，
+        145 秒没有新数据）。不试采就没法说"换上它就有声音"。
+        """
+        result: dict[str, Any] = {"alive": False, "blocks": 0, "frames": 0,
+                                  "peak": 0.0, "error": "", "seconds": 0.0}
+        started = time.monotonic()
+        try:
+            spec = self._single_source_spec(name)
+            source = audio_base.open_source(spec)
+        except Exception as exc:
+            result["error"] = "%s: %s" % (type(exc).__name__, exc)
+            return result
+        try:
+            source.start()
+            deadline = started + timeout
+            while time.monotonic() < deadline:
+                block = source.read()
+                if block:
+                    result["blocks"] += 1
+                    result["frames"] += len(block) // CHANNELS
+                    result["peak"] = max(result["peak"], float(sample_peak(block)))
+                    if result["blocks"] >= 3:
+                        # 三块（约 30 毫秒）就足够证明"它在出数据"了，不必等满 2 秒。
+                        break
+            result["alive"] = result["blocks"] > 0
+        except Exception as exc:
+            result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        finally:
+            try:
+                source.stop()
+            except Exception:
+                pass
+        result["seconds"] = round(time.monotonic() - started, 2)
+        return result
+
+    def _capture_probe_tick(self) -> None:
+        """推进"试采 → 决定要不要换"这个状态机（在引擎自己的循环里跑）。"""
+        # 1) 收结果
+        if self._probe_result is not None:
+            name, res = self._probe_result
+            self._probe_result = None
+            self._probe_name = None
+            key = self._device_name_key(name)
+            self._capture_health[key] = {
+                "alive": bool(res.get("alive")),
+                "blocks": int(res.get("blocks") or 0),
+                "peak": round(float(res.get("peak") or 0.0), 4),
+                "error": str(res.get("error") or ""),
+                "checked_s": round(time.monotonic(), 1),
+                "note": ("试采到 %d 块音频（电平 %.3f）" % (res.get("blocks") or 0, res.get("peak") or 0.0)
+                         if res.get("alive") else
+                         ("打不开：%s" % res.get("error")) if res.get("error") else
+                         "试采 %.1f 秒，一块音频都没收到" % float(res.get("seconds") or 0)),
+            }
+        # 2) 试采超时（read() 可能永远不返回）：当作"这块也没数据"，换下一块
+        if self._probe_name and (time.monotonic() - self._probe_started) > (CAPTURE_PROBE_S + 3.0):
+            key = self._device_name_key(self._probe_name)
+            self._capture_health[key] = {"alive": False, "blocks": 0, "peak": 0.0,
+                                         "error": "读取一直没有返回",
+                                         "checked_s": round(time.monotonic(), 1),
+                                         "note": "试采超时：打开后读不到任何数据"}
+            self._note_once("试采「%s」超时，当作它也没有数据" % self._probe_name)
+            self._probe_name = None
+
+    def _recover_stalled_capture(self) -> None:
+        """采集源空转 → 自动换到一块**真的收到过音频**的设备；没有就只告警。
+
+        为什么要有：用户的电脑一直在采「扬声器 (UU远程虚拟音频设备)」——
+        一块空转的虚拟声卡。v1.8 只把这件事报出来，用户还是得自己找到该换成哪一块。
+        这里只做一件事：**确凿地**换到一块试采成功的设备；否则什么都不动。
+        """
+        self._capture_probe_tick()
+        if self._probe_name:
+            return                                   # 正在试采，等结果
+        if time.monotonic() - self._last_fallback_at < CAPTURE_FALLBACK_COOLDOWN_S:
+            return
+        # 便宜的预检：先看采集端自己报的计数里有没有"确定采不到"的。
+        # 没有就直接返回 —— 下面那步要重新枚举设备，不能每个循环都做。
+        try:
+            stats = self.hub.stats()
+        except Exception:
+            stats = []
+        if not any(self._capture_data_state(item)[2] for item in stats):
+            return
+        stalled = self.stalled_effective_sources()
+        if not stalled:
+            return
+        worst = max(stalled, key=lambda s: float(s.get("last_data_age_s") or 999.0))
+        candidates = self.capture_candidates(exclude=[s["name"] for s in stalled])
+        if not candidates:
+            self._note_once("采集源「%s」一直没有数据，但这台电脑上没有别的输出设备可以换"
+                            % worst["name"])
+            return
+        # 先在已经验过的里面找"有数据"的；没有就挑一块最像真的声卡的试采。
+        proven = [c for c in candidates if c.get("alive") is True]
+        if proven:
+            self._apply_capture_switch(proven[0]["device"], worst, auto=True)
+            return
+        fresh = [c for c in candidates if c.get("alive") is None and not c.get("virtual")]
+        if not fresh:
+            fresh = [c for c in candidates if c.get("alive") is None]
+        if not fresh:
+            self._note_once("采集源「%s」一直没有数据，试过的其它输出设备也都没有数据 —— "
+                            "没有自动切换（换过去也一样是静音）。" % worst["name"])
+            self._last_fallback_at = time.monotonic()
+            return
+        self.probe_capture_async(fresh[0]["device"])
+
+    def _apply_capture_switch(self, device: str, stalled: dict[str, Any], auto: bool,
+                              note: str = "") -> dict[str, Any]:
+        """把频道音源换成 device，并把这次切换明确记下来（日志 + 面板 + 配置）。"""
+        stalled_name = str(stalled.get("name") or "")
+        age = stalled.get("last_data_age_s")
+        why = note or ("「%s」%s" % (stalled_name, stalled.get("reason") or "现在采不到声音") +
+                       ("（%.0f 秒没有音频）" % float(age) if age is not None else ""))
+        before = [str(s).strip() for s in self.config.channel_sources if str(s).strip()]
+        bad = {self._device_name_key(s["name"]) for s in self.stalled_effective_sources()}
+        bad |= {self._device_name_key(e["name"]) for e in self.channel_sources_report()["sources"]
+                if not e["is_local"] or e["excluded"]}
+        kept: list[str] = []
+        for name in before:
+            if self._device_name_key(name) in bad:
+                continue
+            kept.append(name)
+        if not any(self._device_name_key(name) == self._device_name_key(device) for name in kept):
+            kept.append(device)
+        changed: list[str] = []
+        if kept != before:
+            self.config.channel_sources = kept
+            changed.append("channel_sources")
+        old_device = str(self.config.source_device or "")
+        if not self._same_endpoint(old_device, device):
+            # 也把"默认采集设备"指过去：否则广播一旦回落到「跟随采集设备」，
+            # 又会回到那块坏设备上。
+            self.config.source_device = device
+            changed.append("source_device")
+        if changed:
+            try:
+                self.config.save()
+            except Exception as exc:
+                self.note("切换后保存配置失败：%s" % exc)
+        self._last_capture_switch = {
+            "from": stalled_name or (before[0] if before else ""),
+            "to": device,
+            "why": why,
+            "auto": bool(auto),
+            "at": time.time(),
+            "changed": changed,
+        }
+        self._last_fallback_at = time.monotonic()
+        self.note("已自动从「%s」切到「%s」—— %s" % (stalled_name or "?", device, why)
+                  if auto else "已把音源换成「%s」—— %s" % (device, why))
+        # 注意：这里【不】调用 apply_routes()。自动回退是在 apply_routes 内部被调用的，
+        # 再进去一次就会重入；下一个循环（约 2 秒后）自然会把新的采集源用上。
+        # 面板点的"换成这块设备"走 switch_capture()，那里会立刻生效。
+        return self._last_capture_switch
+
+    def switch_capture(self, device: str, why: str = "", auto: bool = False) -> dict[str, Any]:
+        """公开入口：把频道音源换成 device（面板的"换成有数据的设备"和自动回退共用）。"""
+        device = str(device or "").strip()
+        if not device:
+            return {"ok": False, "error": "没有指定设备"}
+        stalled = self.stalled_effective_sources()
+        target = stalled[0] if stalled else {"name": "", "reason": why or "手动换设备"}
+        result = self._apply_capture_switch(device, target, auto=auto, note=why)
+        self.apply_routes()          # 面板点的：立刻生效，不等下一个循环
+        return {"ok": True, "switch": result, "sources": list(self.config.channel_sources),
+                "source_device": self.config.source_device}
+
+    def auto_fix_channel(self) -> dict[str, Any]:
+        """一键修广播：清掉用不了的音源，选一块真的有数据的设备，勾上广播。
+
+        对应向导第 2 步的【一键修】。判定全部复用 channel_sources_report()，
+        不另写一套口径；修完把"改了什么"原样回报给面板写文案。
+        """
+        before_sources = [str(s).strip() for s in self.config.channel_sources if str(s).strip()]
+        report = self.channel_sources_report()
+        dropped = [e["name"] for e in report["sources"]
+                   if not e["is_local"] or e["excluded"] or e["state"] in ("stalled", "no_data")]
+        usable = [e["name"] for e in report["sources"]
+                  if e["is_local"] and not e["excluded"] and e["state"] == "ok"]
+        picked = ""
+        if not usable:
+            # 没有一块能用的：从"真的收到过音频"的候选里挑（试采过的优先）。
+            candidates = self.capture_candidates(exclude=dropped)
+            proven = [c for c in candidates if c.get("alive") is True]
+            if proven:
+                picked = proven[0]["device"]
+            else:
+                live = [s.get("name") for s in (self.hub.stats() or []) if self._capture_is_fresh(s)]
+                picked = (live[0] if live else "")
+                if not picked:
+                    # 最后才用"Windows 当前的默认输出"，它是这台电脑正在出声的地方。
+                    picked = self._default_render_name() or self._default_loopback_name()
+        changed: list[str] = []
+        if picked:
+            kept = [n for n in before_sources if n not in dropped
+                    and self._device_name_key(n) != self._device_name_key(picked)]
+            kept.append(picked)
+            if kept != before_sources:
+                self.config.channel_sources = kept
+                changed.append("channel_sources")
+            if not self._same_endpoint(str(self.config.source_device or ""), picked):
+                self.config.source_device = picked
+                changed.append("source_device")
+        elif dropped:
+            kept = [n for n in before_sources if n not in dropped]
+            if kept != before_sources:
+                self.config.channel_sources = kept
+                changed.append("channel_sources")
+        if not self.config.broadcast:
+            self.config.broadcast = True
+            changed.append("broadcast")
+        if not self.config.local:
+            self.config.local = True
+            changed.append("local")
+        if changed:
+            try:
+                self.config.save()
+            except Exception as exc:
+                self.note("一键修广播后保存配置失败：%s" % exc)
+        note = "已清掉用不了的音源" if dropped else ""
+        if picked:
+            note = (note + "；" if note else "") + "音源改成「%s」" % picked
+        if "broadcast" in changed:
+            note = (note + "；" if note else "") + "打开了广播"
+        if not note:
+            note = "已经是好的，没有改动"
+        self.note("一键修广播：" + note)
+        if changed:
+            self.apply_routes()
+        return {"ok": True, "changed": changed, "dropped": dropped, "picked": picked,
+                "note": note, "sources": list(self.config.channel_sources)}
+
+    def _capture_is_fresh(self, stat: dict[str, Any]) -> bool:
+        """这块采集源现在是不是真的在出数据（面板/向导共用的唯一判据）。"""
+        state, _reason, _definite = self._capture_data_state(stat)
+        return state == "ok"
+
+    def capture_state(self) -> dict[str, Any]:
+        """向导第 1 步要的东西：现在在采什么、有没有数据、能换成什么。"""
+        sources = []
+        try:
+            stats = self.hub.stats()
+        except Exception:
+            stats = []
+        for item in stats:
+            state, reason, _definite = self._capture_data_state(item)
+            sources.append({
+                "name": item.get("name") or "",
+                "state": state,
+                "reason": reason,
+                "blocks_read": int(item.get("blocks_read") or 0),
+                "last_data_age_s": item.get("last_data_age_s"),
+                "consumers": int(item.get("consumers") or 0),
+            })
+        effective = []
+        try:
+            effective = self.channel_sources_report()["effective"]
+        except Exception:
+            pass
+        stalled = self.stalled_effective_sources()
+        # 采集对象可能正好卡在"重建的空档"里（坏设备每 6 秒被判一次卡住并重建，
+        # 那一瞬间 hub.stats() 里什么都没有）—— 用跨重建的"一直没数据"记录补上，
+        # 否则用户点「重新检查」正好赶上空档，看到的会是"采集设备还没起来"。
+        if not stalled:
+            for name in effective:
+                age = self._dead_age_for(name)
+                if age is not None and age > NO_DATA_WARN_S:
+                    stalled.append({"name": name, "state": "no_data",
+                                    "reason": "设备存在但当前没有数据：已经 %.0f 秒没有新音频" % age,
+                                    "last_data_age_s": round(age, 1), "blocks_read": 0})
+        last = self._last_capture_switch
+        return {
+            "sources": sources,
+            "effective": effective,
+            "stalled": stalled,
+            "healthy": [s["name"] for s in sources if s["state"] == "ok"],
+            "candidates": self.capture_candidates(exclude=[s["name"] for s in stalled]),
+            "switch": (dict(last, age_s=round(time.time() - float(last.get("at") or 0), 1))
+                       if last else None),
         }
 
     def _tap_wanted(self) -> bool:

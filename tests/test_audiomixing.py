@@ -2377,3 +2377,359 @@ class TestChannelSourceSafety(unittest.TestCase):
         self.assertEqual(html.count("async function loadChannelSources("), 1)
         # 候选清单必须按"现在真的能采到"过滤（netmic 只在正在送声音时才算设备）
         self.assertIn("x.extra && x.extra.live", html)
+
+
+class TestQuickStartAndVersion(unittest.TestCase):
+    """「🚀 快速上手」四步自检 + 采集源空转自动回退 + 版本可见性（2026-10-12 第二轮）。
+
+    用户的五个真实失败没有一个是他操作错，全是"没人告诉你怎么配"：
+      ① 电脑在采一块空转的虚拟声卡（145 秒没有数据）—— 面板只显示 0 B；
+      ② 广播音源被设成一台手机 —— 静默失效、0 字节；
+      ③ 桌面上三个 exe，他跑的是 7 小时前的 v1.2 —— 所有修复都不在里面。
+
+    这一组钉住的是"第一次用必然成功"：
+      · 向导四步的结论必须和人看到的一致，并且每步都能一键修；
+      · 采集源真的没数据时自动换到一块**试采确实收到过音频**的设备，并明确告知；
+      · 面板要显示版本号与构建时间，发现更新的 exe 要提醒。
+    """
+
+    UU = "扬声器 (UU远程虚拟音频设备)"
+    SPEAKER = "扬声器 (Realtek(R) Audio)"
+
+    def setUp(self) -> None:
+        from audiomixing.config import Config
+        from audiomixing.engine import WaveLinkNode
+        from audiomixing.webui import WaveLinkApi
+
+        cfg = Config()
+        cfg.node_id = "self-node"
+        cfg.name = "2024TSJ"
+        cfg.routes = []
+        cfg.broadcast = True
+        cfg.listen = False
+        cfg.local = True
+        cfg.channel_sources = []
+        cfg.broadcast_excluded = []
+        self.node = WaveLinkNode(cfg, audio_port=47899, discovery_port=47898, simulate=False)
+        self.node.devices = []
+        self.api = WaveLinkApi(self.node)
+        self._real_list_all = audio_base.list_all_devices
+        audio_base.list_all_devices = lambda: list(self.node.devices)
+        self._real_probe = self.node._probe_capture
+
+    def tearDown(self) -> None:
+        audio_base.list_all_devices = self._real_list_all
+        self.node._probe_capture = self._real_probe          # type: ignore[method-assign]
+        try:
+            self.node.stop()
+        except Exception:
+            pass
+
+    # -- 小工具 -----------------------------------------------------------
+    def _set_devices(self, *devices) -> None:
+        self.node.devices = list(devices)
+        self.node.devices_refreshed_at = time.time()
+
+    @staticmethod
+    def _source_device(name: str) -> audio_base.AudioDevice:
+        return audio_base.AudioDevice("src-1", name, audio_base.KIND_SOURCE, "wasapi",
+                                      "loopback", is_default=True)
+
+    @staticmethod
+    def _sink_device(name: str, default: bool = False) -> audio_base.AudioDevice:
+        return audio_base.AudioDevice("snk-" + name[:6], name, audio_base.KIND_SINK, "wasapi",
+                                      "render", is_default=default)
+
+    def _add_peer(self, name: str, host: str = "192.168.0.101") -> None:
+        self.node.registry.update(
+            {"wl": 1, "id": "peer-" + name, "name": name, "audio_port": 47831,
+             "web_port": 8080}, host)
+
+    def _fake_capture(self, name: str, blocks: int = 0, age: float | None = None,
+                      alive: float = 0.5) -> None:
+        self.node.hub.stats = lambda: [{          # type: ignore[method-assign]
+            "name": name + " [loopback]",
+            "spec": {"backend": "wasapi", "device": name, "loopback": True},
+            "blocks_read": blocks,
+            "frames_read": blocks * 480,
+            "last_data_age_s": age,
+            "alive_for_s": alive,
+            "error": "",
+        }]
+
+    def _mark_dead_for(self, name: str, seconds: float) -> None:
+        """把"这块设备已经连续 N 秒没数据"直接写进引擎的记录里（跨采集重建那份）。"""
+        self.node._dead_since[self.node._device_name_key(name)] = time.monotonic() - seconds
+
+    def _stub_probe_alive(self, alive: bool = True) -> list[str]:
+        """替掉真开设备的试采：记录被试采过谁，并按 alive 返回。"""
+        tried: list[str] = []
+
+        def fake(name, timeout=2.0):
+            tried.append(name)
+            return {"alive": alive, "blocks": 3 if alive else 0, "frames": 1440,
+                    "peak": 0.08 if alive else 0.0, "error": "", "seconds": 0.1}
+
+        self.node._probe_capture = fake                 # type: ignore[method-assign]
+        return tried
+
+    # -- 第 1 步：采集源到底有没有声音？ -----------------------------------
+    def test_the_guide_reports_a_stalled_capture(self) -> None:
+        """用户现场：采的是空转的虚拟声卡 —— 向导必须说"采不到声音"，并给一键换。"""
+        self._set_devices(self._sink_device(self.UU, default=True), self._source_device(self.UU),
+                          self._sink_device(self.SPEAKER))
+        self.node.config.channel_sources = [self.UU]
+        self.node.config.source_device = self.UU
+        self._fake_capture(self.UU)
+        self._mark_dead_for(self.UU, 145.5)
+        guide = self.api.guide()
+        step1 = guide["steps"][0]
+        self.assertEqual(step1["state"], "bad")
+        self.assertIn("采不到声音", step1["text"])
+        self.assertIn(self.UU, step1["text"])
+        apis = {a["api"] for a in step1["actions"]}
+        self.assertIn("/api/guide/fix", apis, "第 1 步必须给「一键修」按钮")
+
+    def test_the_guide_says_it_works_when_everything_is_green(self) -> None:
+        """四步都过时，必须给一句明确的结论（用户要的就是这句"可以用了"）。"""
+        self._add_peer("M332BF")
+        self._set_devices(self._sink_device(self.SPEAKER, default=True),
+                          self._source_device(self.SPEAKER))
+        self.node.config.channel_sources = [self.SPEAKER]
+        self.node.config.source_device = self.SPEAKER
+        self._fake_capture(self.SPEAKER, blocks=900, age=0.2)
+        guide = self.api.guide()
+        states = [s["state"] for s in guide["steps"][:3]]
+        self.assertEqual(states, ["ok", "ok", "ok"], guide["steps"][:3])
+        self.assertTrue(guide["ready"])
+        self.assertIn("可以用了 ✓", guide["summary"])
+
+    def test_the_guide_flags_a_network_device_as_the_source(self) -> None:
+        """第 2 步：音源是网络上的另一台设备 —— 直接说清"一个字节都不会发"。"""
+        self._add_peer("M332BF")
+        self.node.config.channel_sources = ["M332BF"]
+        self._set_devices(self._sink_device(self.SPEAKER, default=True),
+                          self._source_device(self.SPEAKER))
+        self._fake_capture(self.SPEAKER, blocks=900, age=0.2)
+        guide = self.api.guide()
+        step2 = guide["steps"][1]
+        self.assertEqual(step2["state"], "bad")
+        self.assertIn("一个字节都不会发", step2["text"])
+        self.assertTrue(any(a["payload"].get("action") == "fix_broadcast"
+                            for a in step2["actions"]), "必须给一键修")
+
+    def test_the_guide_lists_only_real_output_devices_as_candidates(self) -> None:
+        """候选里不能出现写文件/空输出这类测试后端 —— 换过去一样没声音。"""
+        self._set_devices(
+            self._sink_device(self.SPEAKER, default=True),
+            audio_base.AudioDevice("f1", "WAV 文件（输出）", audio_base.KIND_SINK, "file", "file"),
+            audio_base.AudioDevice("n1", "空输出（仅统计）", audio_base.KIND_SINK, "null", "null"),
+        )
+        names = [c["device"] for c in self.node.capture_candidates()]
+        self.assertEqual(names, [self.SPEAKER])
+
+    # -- 一键修：换设备 / 修广播 -------------------------------------------
+    def test_the_one_click_fix_moves_to_a_device_with_data(self) -> None:
+        """【一键修广播】：清掉用不了的音源，换到一块真有数据的设备，并打开广播。"""
+        self._set_devices(self._sink_device(self.UU, default=True), self._source_device(self.UU),
+                          self._sink_device(self.SPEAKER))
+        self.node.config.channel_sources = ["M332BF", self.UU]   # 一个是网络设备名，一个是空转设备
+        self.node.config.source_device = self.UU
+        self.node.config.broadcast = False
+        self._fake_capture(self.UU)
+        self._mark_dead_for(self.UU, 40.0)
+        # 让"试采过并且有数据"这件事有据可依（真机上由引擎自己试采）
+        self.node._capture_health[self.node._device_name_key(self.SPEAKER)] = {
+            "alive": True, "blocks": 3, "peak": 0.05, "error": "", "checked_s": time.monotonic(),
+            "note": "试采到 3 块音频（电平 0.050）"}
+        result = self.api.guide_fix({"action": "fix_broadcast"})
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.node.config.channel_sources, [self.SPEAKER])
+        self.assertEqual(self.node.config.source_device, self.SPEAKER)
+        self.assertTrue(self.node.config.broadcast, "一键修必须把广播打开")
+        self.assertIn("M332BF", result["dropped"])
+        self.assertIn(self.SPEAKER, result["note"])
+
+    # -- 采集源空转自动回退 ------------------------------------------------
+    def test_a_stalled_capture_is_switched_automatically_and_persisted(self) -> None:
+        """空转 10 秒以上 + 存在试采有数据的设备 → 自动切过去，并写进配置。"""
+        from audiomixing.config import Config as _Config
+
+        self._set_devices(self._sink_device(self.UU, default=True), self._source_device(self.UU),
+                          self._sink_device(self.SPEAKER))
+        self.node.config.channel_sources = [self.UU]
+        self.node.config.source_device = self.UU
+        self.node.config.save()
+        self._fake_capture(self.UU)
+        self._mark_dead_for(self.UU, 20.0)
+        tried = self._stub_probe_alive(True)
+
+        self.node._recover_stalled_capture()        # 起试采（后台线程）
+        deadline = time.time() + 5.0
+        while self.node._probe_result is None and time.time() < deadline:
+            time.sleep(0.05)
+        self.node._capture_probe_tick()             # 收试采结果
+        self.node._recover_stalled_capture()        # 应用切换
+
+        self.assertEqual(self.node.config.channel_sources, [self.SPEAKER])
+        self.assertEqual(self.node.config.source_device, self.SPEAKER)
+        self.assertIn(self.SPEAKER, tried, "必须先真的试采过那块设备")
+        switch = self.node._last_capture_switch or {}
+        self.assertEqual(switch.get("from"), self.UU)
+        self.assertEqual(switch.get("to"), self.SPEAKER)
+        self.assertTrue(switch.get("auto"))
+        self.assertIn("没有数据", switch.get("why") or "")
+        # 持久化：下次启动不再走那块坏设备
+        saved = _Config.load()
+        self.assertEqual(saved.channel_sources, [self.SPEAKER])
+        self.assertEqual(saved.source_device, self.SPEAKER)
+
+    def test_no_alternative_device_means_no_switch(self) -> None:
+        """没有别的输出设备（或试采也没有数据）时只告警，绝不能瞎切。"""
+        self._set_devices(self._sink_device(self.UU, default=True), self._source_device(self.UU))
+        self.node.config.channel_sources = [self.UU]
+        self.node.config.source_device = self.UU
+        self._fake_capture(self.UU)
+        self._mark_dead_for(self.UU, 30.0)
+        self.node._recover_stalled_capture()
+        self.assertIsNone(self.node._last_capture_switch, "没有替代设备就不能切")
+        self.assertEqual(self.node.config.channel_sources, [self.UU])
+
+    def test_the_dead_timer_survives_capture_rebuilds(self) -> None:
+        """坏设备每 6 秒被判一次"卡住"并重建 —— 判定必须跨重建累计，否则永远等不到 10 秒。"""
+        stat = {"name": self.UU + " [loopback]", "spec": {"device": self.UU},
+                "blocks_read": 0, "last_data_age_s": None, "alive_for_s": 0.4, "error": ""}
+        state, _reason, definite = self.node._capture_data_state(stat)
+        self.assertEqual(state, "no_data")
+        self.assertFalse(definite, "刚打开 0.4 秒不能算「确定采不到」")
+        self._mark_dead_for(self.UU, 12.0)
+        state, reason, definite = self.node._capture_data_state(stat)
+        self.assertTrue(definite, "连续 12 秒没数据才算「确定采不到」")
+        self.assertIn("12 秒", reason)
+        # 真的出数据了就立刻清掉，不能一直背着「坏设备」的标签
+        self.node.hub.stats = lambda: [{          # type: ignore[method-assign]
+            "name": self.UU + " [loopback]", "spec": {"device": self.UU},
+            "blocks_read": 500, "last_data_age_s": 0.1, "alive_for_s": 9.0, "error": ""}]
+        self.node._track_dead_captures()
+        self.assertIsNone(self.node._dead_age_for(self.UU))
+
+    def test_the_auto_switch_is_announced_with_from_and_to(self) -> None:
+        """自动切换不能静默：面板要拿到"从哪换到哪、为什么"。"""
+        self._set_devices(self._sink_device(self.UU, default=True), self._source_device(self.UU),
+                          self._sink_device(self.SPEAKER))
+        self.node.config.channel_sources = [self.UU]
+        self.node.config.source_device = self.UU
+        self._fake_capture(self.UU)
+        self._mark_dead_for(self.UU, 11.0)
+        self.node._stub_probe = None
+        result = self.node.switch_capture(self.SPEAKER, why="测试里手动换的")
+        self.assertTrue(result["ok"])
+        state = self.node.channel_state()
+        switch = state.get("switch") or {}
+        self.assertEqual(switch.get("from"), self.UU)
+        self.assertEqual(switch.get("to"), self.SPEAKER)
+        self.assertFalse(switch.get("auto"))
+        # capture_state() 是向导读的那份，也要带同样的记录
+        self.assertEqual((self.node.capture_state().get("switch") or {}).get("to"), self.SPEAKER)
+
+    # -- 版本可见性 --------------------------------------------------------
+    def test_build_info_finds_a_newer_exe_next_to_the_desktop(self) -> None:
+        """桌面上有更新版本时要提醒（用户就是拿旧 exe 测了一整天）。"""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            desk = pathlib.Path(tmp) / "Desktop"
+            desk.mkdir()
+            (desk / "Audio Mixing v9.9.exe").write_bytes(b"fake")
+            (desk / "Audio Mixing v0.1.exe").write_bytes(b"fake")
+            (desk / "别的东西.exe").write_bytes(b"fake")
+            with mock.patch.dict(os.environ, {"USERPROFILE": tmp}):
+                info = self.api.build_info()
+        self.assertEqual(info["version"], "1.9")
+        self.assertIn("Audio Mixing v1.9", info["text"])
+        self.assertTrue(info["build_time"], "必须给出构建时间")
+        self.assertIsNotNone(info["newer"], "应该发现 v9.9")
+        self.assertEqual(info["newer"]["name"], "Audio Mixing v9.9.exe")
+
+    def test_build_info_ignores_older_versions(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            desk = pathlib.Path(tmp) / "Desktop"
+            desk.mkdir()
+            (desk / "Audio Mixing v1.0.exe").write_bytes(b"fake")
+            with mock.patch.dict(os.environ, {"USERPROFILE": tmp}):
+                info = self.api.build_info()
+        self.assertIsNone(info["newer"], "旧版本不该被当成「更新的版本」")
+
+    def test_version_parsing(self) -> None:
+        from audiomixing.webui import WaveLinkApi
+
+        self.assertEqual(WaveLinkApi._version_tuple("Audio Mixing v1.9.exe"), (1, 9))
+        self.assertEqual(WaveLinkApi._version_tuple("v1.10.2"), (1, 10, 2))
+        self.assertEqual(WaveLinkApi._version_tuple("没有数字"), ())
+
+    def test_the_page_shows_the_version_and_the_guide(self) -> None:
+        """面板必须有版本号、更新提示和「快速上手」入口 —— 这是给人看的那一半。"""
+        html = (ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8")
+        for token in ('id="versionTag"', 'id="versionWarn"', 'id="guideMask"',
+                      'id="guideSteps"', "🚀 快速上手", "async function openGuide("):
+            self.assertIn(token, html)
+        self.assertEqual(html.count("async function openGuide("), 1)
+
+
+class TestDeviceCardUi(unittest.TestCase):
+    """④ 电脑端路由改成"对设备的按键"（用户原话：不要拖动了，都改成对设备的按键）。
+
+    旧版靠"把设备拖进两个框"生成路由：要先用鼠标拖，还得先理解"源→目标"这套模型；
+    用户觉得手机端那种"一台设备一张卡片、卡片上两个按钮"更好用。
+    这里钉住：卡片在、按钮在、拖拽那套真的清掉了、多目标/音量/编码这些能力没丢。
+    """
+
+    @staticmethod
+    def _html() -> str:
+        return (ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8")
+
+    def test_every_device_gets_a_card_with_two_buttons(self) -> None:
+        html = self._html()
+        self.assertIn('id="deviceCards"', html)
+        self.assertEqual(html.count("function renderDeviceCards("), 1)
+        self.assertIn("🎧 收听它的", html)
+        self.assertIn("🎤 送给它", html)
+        # 卡片上要能看到"名字 · IP · 状态 · 电平"
+        for token in ("dvname", "dvmeta", "dvbar", "dvflow", "dvtag"):
+            self.assertIn(token, html)
+        # 路由增删走按钮：一个方向一条路由，再点一次断开
+        self.assertEqual(html.count("async function quickRoute("), 1)
+        self.assertIn("/api/routes/add", html)
+        self.assertIn("/api/routes/delete", html)
+
+    def test_the_drag_based_route_builder_is_gone(self) -> None:
+        html = self._html()
+        for gone in ("renderDragList", "addToDraft", "beginDrag", "moveDrag", "endDrag",
+                     'id="dropFrom"', 'id="dropTo"', 'id="dragList"', 'id="ghost"',
+                     "拖到这里", "拖两个框就是一条路由"):
+            self.assertNotIn(gone, html, "拖拽式路由应该已经删干净：%s" % gone)
+
+    def test_multi_target_and_per_route_controls_survive(self) -> None:
+        """能力不能丢：多目标混音、每路音量、静音、编码、指定输出设备。"""
+        html = self._html()
+        for token in ('id="pickFrom"', 'id="pickTo"', 'id="newGain"', 'id="newCodec"',
+                      'id="newSinkDevice"', "function toggleDraft(", "setGain(",
+                      "toggleMute(", "async function addRoute("):
+            self.assertIn(token, html)
+        # 本机 ID 的几种写法要先归一，否则卡片上的按钮认不出"这条路由已经存在"
+        self.assertIn("function normEnds(", html)
+        self.assertIn("isLocalId(x) ? 'self' : String(x)", html)
+        self.assertIn("renderDeviceCards();", html, "刷新循环里必须真的重建卡片")
+
+    def test_gain_wording_says_which_layer_it_controls(self) -> None:
+        """音量语义要和手机端对齐：滑杆管的是"我们这一层"，不是系统音量。
+
+        手机端这一轮把滑杆标题改成了「我们这一层的音量」（另有一行只读的系统媒体音量）。
+        电脑端如果还写着光秃秃的"频道音量"，用户就会以为它能改 Windows 的音量。
+        """
+        html = self._html()
+        self.assertIn("频道音量（我们这一层，不动 Windows 系统音量）", html)
+        self.assertIn("我们这一层的音量（不动 Windows 系统音量）", html)
+        self.assertIn("我们这一层的音量：只改这台手机传进来的增益", html)
