@@ -1851,6 +1851,109 @@ public final class Engine {
         }
     }
 
+    /**
+     * ★ 监控档的实时数字面板（一屏读完）。
+     *
+     * <p>为什么放在 Engine 而不是界面里拼：这四段用的全是本类已有的查询接口
+     * （发现层、收端、发端、音量），界面只负责把它画出来 —— 这样"同一份数据三种呈现"
+     * 才成立，不会出现"监控档的数字和诊断报告对不上"这种事。
+     */
+    public String monitorText() {
+        StringBuilder sb = new StringBuilder(1024);
+
+        // ── 发现 ──
+        sb.append("── 发现 ──\n");
+        Discovery d = discovery;
+        if (d == null || !d.isRunning()) {
+            sb.append("发现没在跑 ✗\n");
+        } else {
+            sb.append("信标 收 ").append(d.beaconsReceived())
+                    .append(" · 发 ").append(d.beaconsSent())
+                    .append(" · 自己绕回 ").append(d.beaconsSelfReceived()).append('\n');
+            sb.append("组播 ").append(d.multicastIfaces().isEmpty() ? "没加进去 ✗" : d.multicastIfaces())
+                    .append(" · 组播锁 ").append(d.multicastLockHeld() ? "✓" : "✗")
+                    .append(" · 端口 ").append(d.boundPort()).append('\n');
+            sb.append("最近 ").append(d.lastBeaconText()).append('\n');
+        }
+
+        // ── 接收 ──
+        sb.append("── 接收 ──\n");
+        AudioRecv.Stats st = recvStats();
+        if (st == null || !receiverRunning()) {
+            sb.append("接收器没跑（没开听广播、也没点过收听）\n");
+        } else {
+            sb.append("收 ").append(st.received).append(" · 丢 ").append(st.lost)
+                    .append(" · 迟到 ").append(st.late).append(" · 重复 ").append(st.duplicates)
+                    .append(" · 坏包 ").append(st.badPackets).append('\n');
+            sb.append("坏包分类 magic ").append(st.badMagic).append(" / 版本 ").append(st.badVersion)
+                    .append(" / 太短 ").append(st.badShort).append(" / 编码 ").append(st.badCodec)
+                    .append(" / 帧长 ").append(st.badFrames).append('\n');
+            sb.append("缓冲 ").append(st.bufferedMs).append("ms（目标 ").append(st.targetMs)
+                    .append("）· 流 ").append(st.streamCount)
+                    .append(" · 混音 ").append(pctText(st.peak)).append('\n');
+            if (st.streams != null) {
+                for (AudioRecv.StreamStats ss : st.streams) {
+                    sb.append("  · ").append(ss.host).append(" 收 ").append(ss.received)
+                            .append(" · 丢 ").append(ss.lost)
+                            .append(" · 缓冲 ").append(ss.bufferedMs).append("ms")
+                            .append(" · 电平 ").append(pctText(ss.peak))
+                            .append(" · ").append(ss.ageMs).append("ms 前\n");
+                }
+            }
+            if (st.dupRoutePackets > 0) {
+                sb.append("  重复流已抑制 ").append(st.dupRoutePackets).append(" 包\n");
+            }
+        }
+
+        // ── 发送 ──
+        sb.append("── 发送 ──\n");
+        AudioSend snd = sender;
+        if (snd == null || !snd.isRunning()) {
+            sb.append("发送器没跑（没点过送声音、也没开发广播）\n");
+        } else {
+            sb.append("目标 ").append(snd.targetCount()).append(" 台")
+                    .append(broadcastOn ? "（📢 广播中）" : "")
+                    .append(" · 合计 ").append(snd.packetsSent()).append(" 包 / ")
+                    .append(Diagnosis.bytesText(snd.bytesSent()))
+                    .append(" · 失败 ").append(snd.sendErrors()).append('\n');
+            for (SendFanout.TargetStats ts : snd.targetStats()) {
+                sb.append("  · ").append(ts.host).append(':').append(ts.port)
+                        .append(" 发 ").append(ts.packetsSent).append(" 包")
+                        .append(" · ").append(pctText(ts.peak));
+                if (ts.sendErrors > 0) {
+                    sb.append(" · 失败 ").append(ts.sendErrors);
+                }
+                if (ts.lastOkAgeMs < 0) {
+                    sb.append(" · 还没成功 ✗");
+                } else if (ts.lastOkAgeMs > 2000) {
+                    sb.append(" · ").append(ts.lastOkAgeMs / 1000).append(" 秒前 ✗");
+                } else {
+                    sb.append(" · 正在发 ✓");
+                }
+                sb.append('\n');
+            }
+            int n = Math.max(1, snd.targetCount());
+            sb.append("带宽 每台约 0.19 MB/s（1.5 Mbit/s）· 合计约 ")
+                    .append(String.format(java.util.Locale.US, "%.2f",
+                            n * (Proto.SAMPLE_RATE * Proto.CHANNELS * 2) / 1048576.0))
+                    .append(" MB/s\n");
+        }
+
+        // ── 音量（三层）──
+        sb.append("── 音量 ──\n");
+        sb.append("我们这一层 ").append(volumeText()).append('\n');
+        sb.append("系统 ").append(systemVolumeText()).append('\n');
+        return sb.toString();
+    }
+
+    /** 0~1 变成 "34%"（监控面板里数字要短）。 */
+    private static String pctText(float v) {
+        if (Float.isNaN(v) || v < 0f) {
+            v = 0f;
+        }
+        return Math.round(Math.min(1f, v) * 100f) + "%";
+    }
+
     /** 三层关系的人话（界面和报告共用一处，免得两种说法）。 */
     public String volumeExplainText() {
         return "实际听到的大小 = 系统音量 × 播放器自己的音量 × 我们这一层的音量。"
