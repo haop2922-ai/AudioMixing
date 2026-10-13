@@ -68,6 +68,15 @@ public class MixService extends Service {
     private final Runnable tick = new Runnable() {
         @Override
         public void run() {
+            // ★ 安全检查必须在后台也跑：用户把手机揣兜里、电脑那边关掉了 App，
+            //   界面的 150ms tick 停了，但"对端是不是走了"的判断不能停 ——
+            //   否则会一直对着一个已经关掉的程序发声音（2026-10-14 用户反馈）。
+            //   这里每 3 秒过一遍，用的是和界面完全同一段逻辑（Engine.pruneGoneTargets）。
+            try {
+                engine.pruneGoneTargets();
+            } catch (Throwable t) {
+                Log.w(TAG, "后台目标检查失败（不影响通知）", t);
+            }
             updateNotification();
             handler.postDelayed(this, TICK_MS);
         }
@@ -305,6 +314,19 @@ public class MixService extends Service {
                 sb.append("送声 ").append(send)
                         .append("（").append(AudioSend.sourceShortName(engine.activeSourceKind()))
                         .append("）");
+                // ★ 安全检查的可见结果：有目标因为"确认走了"被暂停时，通知栏必须如实说，
+                //   不能出现"在广播但实际一台都没在收"的假象。
+                if (engine.sendSuspendedText().length() > 0) {
+                    int actual = engine.sendTargetCount();
+                    if (actual == 0) {
+                        sb.append(" · ⚠ 目标已离线，已停止发送");
+                    } else {
+                        sb.append(" · ⚠ 有目标已离线（实际在发 ").append(actual).append(" 台）");
+                    }
+                }
+            } else if (engine.isBroadcasting()) {
+                // 广播开着但一台都没在发（目标全离线）
+                sb.append("· 广播中，但一台设备都联系不上");
             }
         }
         return sb.toString();

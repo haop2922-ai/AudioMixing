@@ -555,6 +555,8 @@ class Receiver:
             body = pkt.json()
             body["_from"] = "%s:%d" % addr
             body["_type"] = proto.TYPE_NAMES.get(pkt.type, str(pkt.type))
+            # 到达时刻：引擎判"这台对端还在不在"要用它，否则一条旧消息会被反复当成新证据。
+            body["_at"] = time.monotonic()
             with self._lock:
                 self.control_messages.append(body)
                 if len(self.control_messages) > 200:
@@ -564,6 +566,7 @@ class Receiver:
             body = pkt.json()
             body["_from"] = "%s:%d" % addr
             body["_type"] = "STATS"
+            body["_at"] = time.monotonic()
             with self._lock:
                 self.control_messages.append(body)
             return
@@ -678,6 +681,14 @@ class Receiver:
                 self.buffers.pop(s, None)
                 self._decoders.pop(s, None)
                 self._owners.pop(s, None)
+
+    def send_control(self, ptype: int, body: dict[str, Any], addr: tuple[str, int]) -> None:
+        """公开入口：往某个地址发一个控制包（PONG 内部走的就是同一个函数）。
+
+        引擎用它把「请求对方收听」「这条路由的增益」这些信息带出去 ——
+        复用的是既有的 T_STATS（JSON 负载），旧版本收到会当未知字段忽略，不会崩。
+        """
+        self._send_control(ptype, body, addr)
 
     def _send_control(self, ptype: int, body: dict[str, Any], addr: tuple[str, int]) -> None:
         sock = self._sock

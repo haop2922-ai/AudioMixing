@@ -67,6 +67,18 @@ NO_DATA_WARN_S = 10.0
 CAPTURE_FALLBACK_COOLDOWN_S = 180.0
 CAPTURE_PROBE_S = 2.0
 
+# ★ 对端"还活着"的宽限期（秒）★
+# 为什么必须有它：路由的「到」只在用户点选的那一刻写一次，对方关机 / 退出程序 / 换网络之后
+# 没有任何人把它从目标表里拿掉 —— 于是我们会一直朝一个死地址发声音（用户实测：电脑关掉了，
+# 手机还在往里发）。判据不看"能不能连上"（UDP 没有握手，手机也不回 PING），只看
+# 【最近还有没有它的任何消息】：信标、手机每 2 秒的统计包、它的音频流、HTTP 探测成功。
+# 12 秒：正常网络下这四种证据任何一种出现就算活着，Wi-Fi 抖一下不会误判；
+# 而真关机后 12 秒内一定停。
+PEER_SILENCE_GRACE_S = 12.0
+
+# 对端请求"我听它"时自动建的那条路由的标签。面板原样显示，用户才知道设置被改过。
+AUTO_LISTEN_LABEL = "对方请求收听（自动）"
+
 SELF_KEYWORDS = ("self", "*self*", "@self", "me", "本机", "自己")
 
 # One fixed route id for the whole LAN channel, so every station's audio lands in the
@@ -233,6 +245,16 @@ class WaveLinkNode:
         self._last_fallback_at = 0.0
         # 每块设备"从什么时候开始一直没有数据"。必须跨采集重建记，理由见 _track_dead_captures。
         self._dead_since: dict[str, float] = {}
+        # 对端活跃度：{node_id 或 host（小写）: 最后一次听到它的时刻（monotonic）}。
+        self._peer_seen: dict[str, float] = {}
+        # 这一轮被"对端已经没了"挡住的发送：{route|peer: {...}}，给面板显示用。
+        self._senders_blocked: dict[str, dict[str, Any]] = {}
+        # 自动收听：对端请求我听它时自动建的路由（可撤销）。
+        self._auto_listen_granted: dict[str, dict[str, Any]] = {}
+        # 共享增益：本机最近一次改某条路由音量的时刻（monotonic），用来判"谁最后动"。
+        self._gain_local_at: dict[str, float] = {}
+        self._handled_stats_at = 0.0
+        self._last_peer_stats = 0.0
         self.routes: list[dict[str, Any]] = []
         self._routes_lock = threading.RLock()
         self._stop = threading.Event()
@@ -910,6 +932,8 @@ class WaveLinkNode:
                         real_id, host, int(node.get("audio_port") or 0),
                         int(node.get("web_port") or port), str(node.get("name") or ""))
                     peer_id = real_id
+                # 能问到它的状态页 = 它确实还活着。这条证据比信标更硬。
+                self._note_peer_seen(host, real_id or peer_id)
             except Exception:
                 pass
             url = "http://%s:%d/api/routes" % (host, port)
@@ -990,6 +1014,9 @@ class WaveLinkNode:
             "sink_device": raw.get("sink_device") or "",
             "label": str(raw.get("label") or ""),
             "origin": origin,
+            # ① 自动收听建的那条路由要留个记号：面板据此写"对方请求收听（自动）"，
+            # 撤销时也只撤这一种，用户自己建的路由绝不动。
+            "auto": bool(raw.get("auto", False)),
         }
 
     def _is_origin_for(self, rule: dict[str, Any]) -> bool:
@@ -1059,6 +1086,8 @@ class WaveLinkNode:
         # 结果是在发送端打开「只听」会让点对点的声音凭空消失：对方什么都收不到。
         # 现场就是这样：开启点对点后，发送端再开广播或只听，音频直接消失。
         out: list[tuple[str, PeerEndpoints, dict[str, Any]]] = []
+        # 每轮重建：这一轮谁被"对端已经没了"挡住了，面板要看得到。
+        self._senders_blocked = {}
         for rule in self.effective_routes():
             if rule.get("kind") == "listen":
                 continue
@@ -1071,7 +1100,26 @@ class WaveLinkNode:
             for target in self._matching_nodes(rule["to"]):
                 if target.node_id == self.node_id:
                     continue
-                if not target.online or not target.audio_port:
+                if not target.audio_port:
+                    continue
+                # ★ 对端已经没了就别再发 ★ 见 PEER_SILENCE_GRACE_S 的注释：
+                # 路由的「到」是用户点选时写下的，对方关机后没人移除它，会一直白发。
+                # 注意：这里【不看】PeerEndpoints.online —— 它对"手动添加"的对端恒为 True
+                # （连 15 秒超时都不生效），而且信标超时并不等于对方没了：手机可能只是
+                # 丢了几个信标，统计包还在每 2 秒来一次。活跃度是更准的那把尺子。
+                silent = self._peer_silent_for(target)
+                if silent > PEER_SILENCE_GRACE_S:
+                    key = "%s|%s" % (rule["id"], target.node_id)
+                    self._senders_blocked[key] = {
+                        "session_key": key,
+                        "route_id": rule["id"],
+                        "node_id": target.node_id,
+                        "name": target.name,
+                        "host": target.host,
+                        "silent_for_s": round(silent, 1),
+                        "text": ("已停止向「%s」发送：它已经 %.0f 秒没有任何消息"
+                                 "（关机 / 退出程序 / 换了网络）。" % (target.name, silent)),
+                    }
                     continue
                 if rule["sink_device"] and target.sinks:
                     if not any(rule["sink_device"].lower() in (s.get("name") or "").lower() or rule["sink_device"] == s.get("id") for s in target.sinks):
@@ -1225,6 +1273,10 @@ class WaveLinkNode:
 
     def apply_routes(self) -> None:
         self.last_reconcile_at = time.time()
+        # 0. 先把"哪台对端最近还在"的证据收齐：desired_senders() 要靠它决定还发不发。
+        self._track_peer_liveness()
+        # 0b. 对端发来的请求（请求收听 / 共享增益）在这里落地。
+        self._handle_peer_requests()
         # 1. Senders ---------------------------------------------------------
         wanted = self.desired_senders()
         wanted_ids = {rid for rid, _t, _r in wanted}
@@ -1391,6 +1443,8 @@ class WaveLinkNode:
                 % name
             )
         self._apply_local_loop()
+        # 把"我在给你发声音 / 请收听我 / 这条路由的增益"告诉对端（每 2 秒一次）。
+        self._send_peer_stats()
         # 先记下"哪块设备已经多久没数据了"（跨采集重建累计），再决定要不要换设备。
         self._track_dead_captures()
         # 采集源空转（一直采不到声音）→ 自动换一块真的收到过音频的设备。
@@ -1433,6 +1487,254 @@ class WaveLinkNode:
                 self._pull_peer_routes()
         except Exception as exc:
             self._note_once("蓝牙列表刷新失败：%s: %s" % (type(exc).__name__, exc))
+
+    def _note_peer_seen(self, *keys: str) -> None:
+        """记下"刚刚听到这台对端"（信标 / 统计包 / 它的音频流 / HTTP 探测成功都算）。"""
+        now = time.monotonic()
+        for key in keys:
+            text = str(key or "").strip().lower()
+            if text:
+                self._peer_seen[text] = now
+
+    def _peer_silent_for(self, peer) -> float:
+        """这台对端已经多久没有任何消息了（秒）。越小越新鲜。"""
+        # 信标是最常见的一种"它还在"：age_s 就是"上次听到它的信标是几秒前"。
+        try:
+            age = float(getattr(peer, "age_s", 999.0))
+        except Exception:
+            age = 999.0
+        best = 0.0
+        for key in (str(getattr(peer, "node_id", "") or ""), str(getattr(peer, "host", "") or "")):
+            seen = self._peer_seen.get(key.strip().lower())
+            if seen and seen > best:
+                best = seen
+        # 取"最硬的那条证据"：信标年龄 vs 最近一次统计包/音频/HTTP 探测。
+        if best:
+            return min(age, time.monotonic() - best)
+        return age
+
+    def _track_peer_liveness(self) -> None:
+        """把"这台对端最近还在"的证据都收进来（引擎每个循环跑一次）。
+
+        为什么不能只看"能不能连上"：UDP 没有握手，手机端也不回 PING/PONG，
+        连通性根本问不出来。能问出来的只有"最近有没有它的任何消息"。
+        """
+        # 1) 它正在给我们发音频（接收端有它的活跃流）
+        try:
+            for item in (self.receiver.stats().get("streams") or []):
+                self._note_peer_seen(str(item.get("node_id") or ""))
+        except Exception:
+            pass
+        # 2) 它的控制包（T_STATS 每 2 秒一次、HELLO、PONG…）。只认"还不够老"的那些 ——
+        #    否则一条旧消息会在每个循环里被反复当成新证据，死掉的对端就永远不会被判死。
+        try:
+            cutoff = time.monotonic() - PEER_SILENCE_GRACE_S
+            for msg in list(self.receiver.control_messages):
+                if float(msg.get("_at") or 0.0) <= cutoff:
+                    continue
+                src = str(msg.get("_from") or "")
+                self._note_peer_seen(src.split(":")[0],
+                                     str(msg.get("node") or msg.get("node_id") or ""))
+        except Exception:
+            pass
+        # 3) 对"眼看要被判死"的对端做一次便宜的 HTTP 探测（只探这一种，不是每个循环探所有人）。
+        #    电脑↔电脑时这条路最可靠；手机没有网页服务，探不到也没关系 —— 它还有信标和统计包。
+        try:
+            for peer in self.registry.all(include_local=True):
+                silent = self._peer_silent_for(peer)
+                if not (PEER_SILENCE_GRACE_S * 0.5 <= silent <= PEER_SILENCE_GRACE_S * 4):
+                    continue
+                host = str(getattr(peer, "host", "") or "")
+                if not host:
+                    continue
+                port = int(getattr(peer, "web_port", 0) or 0) or 17800
+                try:
+                    with urllib.request.urlopen("http://%s:%d/api/status" % (host, port),
+                                                timeout=0.8) as resp:
+                        json.loads(resp.read().decode("utf-8"))
+                except Exception:
+                    continue
+                # 能问到它的状态页 = 它确实还活着（这一条比信标更硬）。
+                self._note_peer_seen(peer.node_id, host)
+        except Exception:
+            pass
+
+    def blocked_senders(self) -> list[dict[str, Any]]:
+        """这一轮因为"对端已经没了"而停发的那些（面板据此说明原因）。"""
+        return list(self._senders_blocked.values())
+
+    # -- ① 自动收听 / 共享增益：复用 T_STATS 的 JSON 负载（旧版本忽略未知字段） ----
+    # 包类型: T_STATS (7)，UDP 单播到对端 audio_port。新增字段：
+    #   "request_listen": true|false  请对方开始 / 停止收听我
+    #   "listen_from": "<我的 node_id>"、"listen_name": "<我的名字>"
+    #   "route_gain": 0.0~2.0        这条 我→你 的增益（两端共享同一个值）
+    #   "gain_ts": <毫秒>            可选（两台机器墙钟可能不等，接收端按本地先后判最新）
+    #   "gain_route": "<我这边的路由 id>"
+    def _send_peer_stats(self, force: bool = False) -> None:
+        """给"正在给它发声音"的对端发统计 + 收听请求 + 这条路由的增益。
+
+        用户要的两件事都搭在这个每 2 秒一次的统计包上：
+          · 我点「送给它」→ 对方自动开始收听（不用对方再手点一次）；
+          · 两端音量条是同一个增益，谁调都以最新为准。
+        """
+        now = time.monotonic()
+        if not force and now - getattr(self, "_last_peer_stats", 0.0) < 2.0:
+            return
+        self._last_peer_stats = now
+        try:
+            sessions = list(self.sender.sessions.values())
+        except Exception:
+            return
+        for session in sessions:
+            if int(getattr(session, "packets_sent", 0) or 0) <= 0:
+                continue          # 还没真发出过东西的先不发，免得对端收到"空统计"
+            route_id = str(getattr(session, "route_id", "") or "")
+            rule = next((r for r in self.routes if str(r.get("id")) == route_id), None)
+            gain = float((rule or {}).get("gain", 1.0))
+            body = {
+                "t": "stats",
+                "node": self.node_id,
+                "name": self.name,
+                "sending": True,
+                "sent": int(getattr(session, "packets_sent", 0) or 0),
+                "bytes": int(getattr(session, "bytes_sent", 0) or 0),
+                # ★ 请对方收听我（对方会自动建"从我到它"的路由，并可一键撤销）
+                "request_listen": True,
+                "listen_from": self.node_id,
+                "listen_name": self.name,
+                # ★ 共享增益
+                "route_gain": round(gain, 3),
+                "gain_ts": int(time.time() * 1000),
+                "gain_route": route_id,
+            }
+            try:
+                self.receiver.send_control(proto.T_STATS, body,
+                                           (str(session.host), int(session.port)))
+            except Exception:
+                pass
+
+    def _handle_peer_requests(self) -> None:
+        """处理对端发来的统计：① 它请我听它 → 自动建路由（可撤销）；② 共享增益同步。"""
+        now = time.monotonic()
+        try:
+            messages = list(self.receiver.control_messages)
+        except Exception:
+            return
+        for msg in messages:
+            if str(msg.get("_type") or "") != "STATS":
+                continue
+            at = float(msg.get("_at") or 0.0)
+            if at <= getattr(self, "_handled_stats_at", 0.0):
+                continue
+            src = str(msg.get("_from") or "")
+            host = src.split(":")[0]
+            node_id = str(msg.get("listen_from") or msg.get("node") or msg.get("node_id") or "")
+            name = str(msg.get("listen_name") or msg.get("name") or host or "对端")
+            if "request_listen" in msg:
+                if msg.get("request_listen"):
+                    self._grant_listen_request(node_id, name, host)
+                else:
+                    self._revoke_auto_listen(node_id, name)
+            gain = msg.get("route_gain")
+            if gain is not None and node_id:
+                self._apply_shared_gain(node_id, float(gain))
+        self._handled_stats_at = now
+
+    def _grant_listen_request(self, node_id: str, name: str, host: str) -> None:
+        """对端说"我在给你发声音，请收听我" → 自动建一条 从它到本机 的路由。
+
+        用户要的是"按下发送键，对方自动就能听见"。但【不能静默改别人的设置】：
+        这条路由带 auto 标记、面板上明确写"对方请求收听，已自动打开"，并且能一键撤销。
+        """
+        if not node_id or node_id == self.node_id:
+            return
+        existing = None
+        for rule in self.routes:
+            frm = [str(t) for t in rule.get("from") or []]
+            to = [str(t) for t in rule.get("to") or []]
+            if node_id in frm and any(is_self_token(t, self.node_id, self.name) for t in to):
+                existing = rule
+                break
+        if existing is not None:
+            self._auto_listen_granted[node_id] = {
+                "node_id": node_id, "name": name, "host": host,
+                "route_id": str(existing.get("id") or ""), "created": False,
+                "at": time.time(),
+            }
+            return
+        rule = {
+            "id": "auto-listen-%s" % short_id(node_id),
+            "from": [node_id],
+            "to": [self.node_id],
+            "gain": 1.0, "mute": False, "codec": self.config.codec,
+            "source_device": "", "sink_device": "",
+            "label": AUTO_LISTEN_LABEL, "origin": node_id, "auto": True,
+        }
+        try:
+            self.set_routes(list(self.routes) + [rule])
+        except Exception as exc:
+            self.note("自动收听失败：%s" % exc)
+            return
+        self._auto_listen_granted[node_id] = {
+            "node_id": node_id, "name": name, "host": host,
+            "route_id": rule["id"], "created": True, "at": time.time(),
+        }
+        self.note("「%s」请求收听本机 → 已自动加了一条路由（可在面板上一键撤销）" % name)
+
+    def _revoke_auto_listen(self, node_id: str, name: str = "") -> None:
+        """对端说"不用听了"→ 只撤掉【自动建的】那一条，用户自己建的路由不动。"""
+        if not node_id:
+            return
+        auto_ids = [str(r.get("id")) for r in self.routes
+                    if r.get("auto") and node_id in [str(t) for t in r.get("from") or []]]
+        if auto_ids:
+            kept = [r for r in self.routes if str(r.get("id")) not in auto_ids]
+            try:
+                self.set_routes(kept, drop=auto_ids)
+            except Exception:
+                pass
+            self.note("「%s」不再送声音 → 自动收听已撤销" % (name or node_id))
+        self._auto_listen_granted.pop(node_id, None)
+
+    def _apply_shared_gain(self, peer_id: str, gain: float) -> None:
+        """共享增益：对端调了音量条 → 本机这条 我→它 的路由跟着变（谁最后动以谁为准）。
+
+        "最新"按本机看到的先后判（monotonic），不用对端的时间戳 ——
+        两台机器的墙钟可能差很多，拿对端时间戳比会把滑杆锁死在一端。
+        """
+        gain = max(0.0, min(2.0, float(gain)))
+        for rule in self.local_routes():
+            to = [str(t) for t in rule.get("to") or []]
+            if peer_id not in to:
+                continue
+            if abs(float(rule.get("gain", 1.0)) - gain) < 0.005:
+                return
+            now = time.monotonic()
+            # 本机刚动过（1.5 秒内）就不接受对端的旧值 —— 否则拖动时会被来回抢。
+            if now - self._gain_local_at.get(str(rule.get("id")), 0.0) < 1.5:
+                return
+            updated = [dict(r) if str(r.get("id")) == str(rule.get("id")) else r
+                       for r in self.routes]
+            for item in updated:
+                if str(item.get("id")) == str(rule.get("id")):
+                    item["gain"] = gain
+            try:
+                self.set_routes(updated)
+            except Exception:
+                return
+            self._gain_local_at[str(rule.get("id"))] = now
+            self.note("对端把音量条调成了 %.2f，本机这条路由同步过去了" % gain)
+            return
+
+    def auto_listen_state(self) -> dict[str, Any]:
+        """面板要的那份"自动收听"记录：谁请求的、建了哪条路由、还能不能撤销。"""
+        items = []
+        for info in self._auto_listen_granted.values():
+            rule_id = str(info.get("route_id") or "")
+            alive = any(str(r.get("id")) == rule_id for r in self.routes)
+            items.append(dict(info, active=alive,
+                              age_s=round(time.time() - float(info.get("at") or 0), 1)))
+        return {"items": items, "label": AUTO_LISTEN_LABEL}
 
     def _auto_play_sources(self) -> None:
         """Adopt a phone the moment it starts sending.
@@ -2986,6 +3288,10 @@ class WaveLinkNode:
             "channel": self.channel_state(),
             "local": self.local_state(),
             "senders": self.sender.stats(),
+            # 因为"对端已经没了"而停发的那些：面板要说清为什么没声音
+            "senders_blocked": self.blocked_senders(),
+            "auto_listen": self.auto_listen_state(),
+            "peer_silence_grace_s": PEER_SILENCE_GRACE_S,
             "sinks": [engine.describe() for engine in self.sinks.values()],
             "multi_out": self.multi_out.stats(),
             # 每块采集源的实时状态（收到过多少、最后一次什么时候收到）。
