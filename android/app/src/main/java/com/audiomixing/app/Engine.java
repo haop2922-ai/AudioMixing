@@ -140,6 +140,17 @@ public final class Engine {
      */
     private volatile boolean channelListen;
 
+    /**
+     * ★ 「📢 广播我的声音」：我的声音同时送给发现列表里每一台在线设备。
+     *
+     * <p>和上面那个「听广播」是一对：一个是"我收谁的"，一个是"我发给谁"。
+     * 采集永远只有一份（一次采集 → 一包编码 → 分发给 N 个目标），
+     * 所以开着广播不会多占一份麦克风/MediaProjection。
+     */
+    private volatile boolean broadcastOn;
+    /** 上一次同步给发送端的目标签名：没变就不重复设置（界面 tick 每 150ms 调一次）。 */
+    private volatile String lastTargetSig = "";
+
     /** Discovery 回调线程推过来的快照；peers() 优先问 Discovery，失败时退回这份。 */
     private volatile List<Discovery.Peer> cache = Collections.emptyList();
 
@@ -233,6 +244,7 @@ public final class Engine {
             listenPorts.clear();
             sendIds.clear();
             channelListen = false;      // 「停止」= 一切都停，重启后不要留着一个用户看不见的开关
+            broadcastOn = false;
             stopReceiver();
             stopSender();
             // 采集停了就把投屏授权也放掉：一直攥着它，系统状态栏会一直挂着"正在投放"的提示。
@@ -361,7 +373,13 @@ public final class Engine {
         stopReceiver();
     }
 
-    /** 点「送声音」：把我的麦克风送给这台。换目标会自动切换，不需要先关。 */
+    /**
+     * 点「送声音」：把我的声音送给这台（<b>可以同时送给好几台</b>，不再互斥）。
+     *
+     * <p>为什么改成可累加（2026-10-14 用户反馈）：用户要「📢 广播我的声音」和
+     * "每台设备独立的收/送电平条"，这两条的前提都是"一次采集、同时送给多台"。
+     * 采集仍然只有一份（见 {@link #syncSenderTargets()}），多送一台只是多一个收包人。
+     */
     public void setSending(Discovery.Peer p, boolean on) {
         if (p == null) {
             return;
@@ -369,47 +387,202 @@ public final class Engine {
         String id = idOf(p);
         synchronized (lock) {
             if (on) {
-                sendIds.clear();
                 sendIds.add(id);
             } else {
                 sendIds.remove(id);
             }
-            stopSender();
-            if (sendIds.isEmpty()) {
+            syncSenderTargets();
+            if (sendIds.isEmpty() && !broadcastOn) {
                 // 送声停了、又没有别的收听目标：接收器只是刚才为了收对端统计才开着的，
                 // 一起收掉（否则它会一直占着 UDP 端口和一个 WifiLock）。
                 // ★ 但「听广播」开着就不能收 —— 那正是它存在的理由。
                 stopReceiverIfIdle();
-                return;
             }
-            Discovery.Peer target = findById(id);
-            if (target == null || target.host == null || target.host.isEmpty()) {
-                return;
+        }
+    }
+
+    // ────────────────── ★ 「📢 广播我的声音」（一次采集 → 送给每一台在线设备） ──────────────────
+
+    /**
+     * 「📢 广播我的声音」开关。
+     *
+     * <p>做法照电脑端：**对发现列表里每个在线节点各建一条单播发送**，
+     * 而不是往广播地址盲发（Wi-Fi 上盲发不可靠，电脑端也没那么做）。
+     * 对用户来说就是"我的声音，谁在线谁就能听见"。
+     */
+    public void setBroadcasting(boolean on) {
+        synchronized (lock) {
+            broadcastOn = on;
+            syncSenderTargets();
+            if (!on && sendIds.isEmpty()) {
+                stopReceiverIfIdle();
             }
-            int port = target.audioPort > 0 ? target.audioPort : Proto.DEFAULT_AUDIO_PORT;
+        }
+    }
+
+    public boolean isBroadcasting() {
+        return broadcastOn;
+    }
+
+    /**
+     * 把"现在应该送给谁"同步给发送端。
+     *
+     * <p><b>关键</b>：目标集合变化<b>不会重启采集</b> —— 采集器只在"从没送过/停了"时起一次，
+     * 之后都是 {@code setTargets()}。所以对方上线/下线时正在送的声音不会断一下。
+     */
+    private void syncSenderTargets() {
+        List<String> eps = collectSendTargets();
+        // 这个函数每 150ms 会被界面 tick 调一次：目标没变就什么都不做，
+        // 免得一直重建目标表（目标表的比较用字符串签名，几分之一微秒的事）。
+        String sig = eps.toString();
+        boolean changed = !sig.equals(lastTargetSig);
+        lastTargetSig = sig;
+        AudioSend s = sender;
+        if (eps.isEmpty()) {
+            if (s != null) {
+                stopSender();
+            }
+            return;
+        }
+        if (s == null || !s.isRunning()) {
             try {
-                // 用带 Context 的构造：它会顺手拿一个 WifiLock，息屏后不至于一顿一顿的。
-                AudioSend s = new AudioSend(app, target.host, port);
-                s.setGain(volume);
+                // 用不带目标的构造：采集只有一份，目标随后由 setTargets 给。
+                AudioSend fresh = new AudioSend(app);
+                fresh.setGain(volume);
                 // ★ 把"送什么声音"接上：音源 + 本机声音的授权。
                 //   拿不到授权、或低于 Android 10 时，AudioSend 自己会退回麦克风并记下原因，
                 //   界面拿 activeSourceKind() 如实显示"现在实际送的是哪一个"。
-                s.setProjection(projection);
-                s.setSourceKind(sourceKind);
-                s.start();
-                sender = s;
+                fresh.setProjection(projection);
+                fresh.setSourceKind(sourceKind);
+                fresh.setTargets(eps);
+                fresh.start();
+                sender = fresh;
                 lastSendError = "";
                 // ★ 送声音的同时把接收器也开起来：对方会把"我收到了多少"用统计包发回来，
                 //   没有接收器就收不到这句回话（白名单里没有收听目标，所以不会出声）。
-                //   两边互报状态，用户才能一眼看出"是哪一端没在发/没收"。
                 ensureReceiver();
             } catch (Throwable t) {
                 // 拿不到采集（被别的 App 占用 / 没权限）时不要把界面搞崩。
-                Log.w(TAG, "启动送声音失败 -> " + target.host + ":" + port, t);
+                Log.w(TAG, "启动发送失败 -> " + eps, t);
                 lastSendError = String.valueOf(t);
                 sendIds.clear();
+                broadcastOn = false;
+            }
+        } else if (changed) {
+            s.setTargets(eps);      // ★ 不重启采集，只换目标
+            Log.i(TAG, "发送目标已更新：" + eps);
+        }
+    }
+
+    /** 算出现在该送给哪些地址："广播"给全部在线设备 + 用户单独勾的那几台。 */
+    private List<String> collectSendTargets() {
+        List<String> out = new ArrayList<String>();
+        boolean needAll = broadcastOn;
+        for (Discovery.Peer p : peers()) {
+            if (p == null || p.host == null || p.host.isEmpty()) {
+                continue;
+            }
+            String id = idOf(p);
+            if (!needAll && !sendIds.contains(id)) {
+                continue;
+            }
+            int port = p.audioPort > 0 ? p.audioPort : Proto.DEFAULT_AUDIO_PORT;
+            String ep = p.host + ":" + port;
+            if (!out.contains(ep)) {
+                out.add(ep);
             }
         }
+        // 「广播」时如果发现列表暂时空了（Wi-Fi 抖动/对端刚走），不要把 sendIds 里
+        // 用户显式点过的那几台也一起丢掉 —— 它们还在等信标回来。
+        if (needAll) {
+            for (String id : sendIds) {
+                Discovery.Peer p = findById(id);
+                if (p != null && p.host != null && !p.host.isEmpty()) {
+                    int port = p.audioPort > 0 ? p.audioPort : Proto.DEFAULT_AUDIO_PORT;
+                    String ep = p.host + ":" + port;
+                    if (!out.contains(ep)) {
+                        out.add(ep);
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    /** 「📢 广播我的声音」界面状态用的人话。 */
+    public String broadcastStateText() {
+        int n = sendTargetCount();
+        StringBuilder sb = new StringBuilder(200);
+        if (!broadcastOn) {
+            sb.append("没开：只有你单独点了「送声音」的设备会收到。");
+            if (n > 0) {
+                sb.append("现在送 ").append(n).append(" 台。");
+            }
+            return sb.toString();
+        }
+        sb.append("正在广播：我的声音同时送给 ").append(n).append(" 台在线设备");
+        if (n == 0) {
+            sb.append("（现在一台都没看见 —— 对面得先能被发现）");
+        }
+        sb.append("。");
+        sb.append(bandwidthText());
+        return sb.toString();
+    }
+
+    /**
+     * ★ 带宽的实话。
+     *
+     * <p>PCM16 立体声 48kHz = 48000×2×2 = 192000 字节/秒 ≈ <b>0.19 MB/s（1.5 Mbit/s）每个目标</b>。
+     * （注意别把 1536 kbit/s 念成 1536 KB/s —— 差 8 倍。这里写的是字节数。）
+     * 真正先吃紧的不是带宽，而是每个 1948 字节的包会被 IP 层拆成 2 个分片、以及每多一个目标
+     * 就多一次系统调用 —— 所以目标多时提示"可能卡"，而不是编一个更吓人的数字。
+     */
+    public String bandwidthText() {
+        int n = Math.max(1, sendTargetCount());
+        double mbPerSec = n * (Proto.SAMPLE_RATE * Proto.CHANNELS * 2) / 1048576.0;
+        String s = String.format(java.util.Locale.US,
+                "每台约 0.19 MB/s（1.5 Mbit/s）；%d 台合计约 %.2f MB/s。", n, mbPerSec);
+        if (n >= 4) {
+            s += "⚠ 目标较多：包会被拆成 IP 分片、空口占用也成倍增加，可能卡顿。";
+        }
+        return s;
+    }
+
+    /** 当前实际送给了几台。 */
+    public int sendTargetCount() {
+        AudioSend s = sender;
+        return (s == null) ? 0 : s.targetCount();
+    }
+
+    /** 逐目标发送统计（界面"送"电平条 + 诊断报告）。发送器不在时返回空表。 */
+    public List<SendFanout.TargetStats> sendTargetStats() {
+        AudioSend s = sender;
+        if (s == null) {
+            return new ArrayList<SendFanout.TargetStats>();
+        }
+        try {
+            return s.targetStats();
+        } catch (Throwable t) {
+            return new ArrayList<SendFanout.TargetStats>();
+        }
+    }
+
+    /** 送给某一台的电平 0~1（界面"送"电平条用）。 */
+    public float sendPeakFor(String host) {
+        AudioSend s = sender;
+        if (s == null || host == null || host.isEmpty()) {
+            return 0f;
+        }
+        try {
+            return clamp01(s.targetPeak(host));
+        } catch (Throwable t) {
+            return 0f;
+        }
+    }
+
+    /** 在线设备数（含本机）。 */
+    public int onlineCountIncludingSelf() {
+        return peers().size() + 1;
     }
 
     public boolean isListening(Discovery.Peer p) {
@@ -418,9 +591,13 @@ public final class Engine {
         }
     }
 
+    /** 这台设备现在会不会收到我的声音（单独勾了它，或者开着广播）。 */
     public boolean isSending(Discovery.Peer p) {
         synchronized (lock) {
-            return p != null && sendIds.contains(idOf(p));
+            if (p == null) {
+                return false;
+            }
+            return broadcastOn || sendIds.contains(idOf(p));
         }
     }
 
@@ -432,15 +609,24 @@ public final class Engine {
 
     public int sendingCount() {
         synchronized (lock) {
+            if (broadcastOn) {
+                // 广播时"送声几台"就是实际目标数（否则通知栏会写"送声 0"而其实在广播）
+                return Math.max(sendIds.size(), sendTargetCount());
+            }
             return sendIds.size();
         }
     }
 
-    /** 「已连接几台」：收或发都算连上（同一台既收又发只算一台）。 */
+    /** 「已连接几台」：收或发都算连上（同一台既收又发只算一台；广播时算上所有在线设备）。 */
     public int connectedCount() {
         synchronized (lock) {
             Set<String> all = new LinkedHashSet<String>(listenIds);
             all.addAll(sendIds);
+            if (broadcastOn) {
+                for (Discovery.Peer p : peers()) {
+                    all.add(idOf(p));
+                }
+            }
             return all.size();
         }
     }
@@ -457,9 +643,10 @@ public final class Engine {
      */
     public void pruneGoneTargets() {
         synchronized (lock) {
-            // ★ 「听广播」开着时不能提前返回：那时候用户很可能一台设备都没看见
-            //   （这正是要用它的场景），而接收器的自愈就靠下面那几行。
-            if (!channelListen && (!sawPeer || (sendIds.isEmpty() && listenIds.isEmpty()))) {
+            // ★ 「听广播」或「广播我的声音」开着时不能提前返回：那时用户很可能一台设备都没看见，
+            //   而目标集合的同步（新设备上线要自动开始收我的声音）就靠下面那几行。
+            if (!channelListen && !broadcastOn
+                    && (!sawPeer || (sendIds.isEmpty() && listenIds.isEmpty()))) {
                 return;
             }
             Discovery d = discovery;
@@ -482,12 +669,14 @@ public final class Engine {
             // 设备只要在列表里闪一下，下面这段就会把 listenIds 清空 → 接收器被停 →
             // 而且再也不会自己起来。现场表现正是"界面显示收听中，但缓冲 0ms、流 0"。
             // 用户的勾选只有用户自己能取消；对方真的关机了，收不到包自然就没声音，不需要停。
-            if (sendIds.isEmpty()) {
-                stopSender();
-            } else if (changed) {
-                // 送声音的目标没了就真的没得送了（麦克风不该一直开着）。
-                stopSender();
-            }            // 自愈：只要还有收听目标（或开着听广播），接收器就必须活着（可能被别处停掉过）。
+            //
+            // ★ 发送侧改成"同步目标集合"（2026-10-14）：广播开着时，新上线的设备要自动开始收到
+            //   我的声音；目标没了就自动少发一份。全程不重启采集（见 syncSenderTargets）。
+            syncSenderTargets();
+            if (changed && sendIds.isEmpty() && !broadcastOn) {
+                Log.i(TAG, "送声音的目标没了，发送器已停");
+            }
+            // 自愈：只要还有收听目标（或开着听广播），接收器就必须活着（可能被别处停掉过）。
             if ((!listenIds.isEmpty() || channelListen) && receiver == null) {
                 ensureReceiver();
             } else if (listenIds.isEmpty() && sender == null && receiver != null && !channelListen) {
@@ -1085,10 +1274,15 @@ public final class Engine {
                 Integer port = listenPorts.get(e.getKey());
                 targets.put(host, (port != null && port > 0) ? port : Proto.DEFAULT_AUDIO_PORT);
             }
-            // 我正在送声音的那台：告诉它"我发了多少、我又收了你多少"。
+            // ★ 我正在送声音的每一台：逐台告诉它"我发给你多少、我又收了你多少"。
+            //   （原来是单目标，只报一台；现在广播/多目标时每台都要收到自己那一份回话。）
             snd = sender;
-            if (snd != null && snd.host() != null && !snd.host().isEmpty()) {
-                targets.put(snd.host(), snd.port() > 0 ? snd.port() : Proto.DEFAULT_AUDIO_PORT);
+            if (snd != null) {
+                for (SendFanout.TargetStats ts : snd.targetStats()) {
+                    if (ts.host != null && !ts.host.isEmpty()) {
+                        targets.put(ts.host, ts.port > 0 ? ts.port : Proto.DEFAULT_AUDIO_PORT);
+                    }
+                }
             }
         }
         // ★ 听广播时，把"我正在收的每一路"也告诉对方：对面才知道它广播的东西到没到我这儿。
@@ -1109,10 +1303,14 @@ public final class Engine {
             return;
         }
 
-        String sendHost = (snd == null) ? null : snd.host();
+        // ★ 每台各自算"我有没有在发给你、发了多少"：广播时每台都是"在发"，各报各的包数。
         boolean sendingNow = snd != null && snd.isRunning();
-        long sent = (snd == null) ? 0 : snd.packetsSent();
-        long bytes = (snd == null) ? 0 : snd.bytesSent();
+        Map<String, SendFanout.TargetStats> perTarget = new LinkedHashMap<String, SendFanout.TargetStats>();
+        if (snd != null) {
+            for (SendFanout.TargetStats ts : snd.targetStats()) {
+                perTarget.put(ts.host, ts);
+            }
+        }
         AudioRecv.Stats st = recvStats();
         int streams = (st == null) ? 0 : st.streamCount;
 
@@ -1123,9 +1321,12 @@ public final class Engine {
             }
             int port = (t.getValue() == null || t.getValue() <= 0)
                     ? Proto.DEFAULT_AUDIO_PORT : t.getValue();
-            // 只对"我正在送的那台"报已发包数；对别的设备要如实说"我没在发给你"，
+            // 只对"我正在送的那些"报已发包数；对别的设备要如实说"我没在发给你"，
             // 否则对面会以为那些包是发给它的（负载里的 target 字段就是干这个的）。
-            boolean iSendToIt = sendingNow && host.equals(sendHost);
+            SendFanout.TargetStats ts = perTarget.get(host);
+            boolean iSendToIt = sendingNow && ts != null;
+            long mySent = (ts == null) ? 0 : ts.packetsSent;
+            long myBytes = (ts == null) ? 0 : ts.bytesSent;
             // 这条链路的收包数单独取：对方最想知道的就是"我发出去的它到底收到多少"。
             long recv = 0;
             long lost = 0;
@@ -1141,7 +1342,7 @@ public final class Engine {
                 }
             }
             byte[] payload = Diagnosis.json(nodeName(),
-                    iSendToIt ? sent : 0, iSendToIt ? bytes : 0, iSendToIt,
+                    iSendToIt ? mySent : 0, iSendToIt ? myBytes : 0, iSendToIt,
                     recv, lost, buf, streams, host);
             Proto.Pkt pkt = new Proto.Pkt(Proto.T_STATS);
             pkt.ssrc = statsSsrc;                                  // 固定一个，对端日志里好认
@@ -1305,13 +1506,43 @@ public final class Engine {
         }
     }
 
-    /** 正在送声音给谁（"host:port"，没在送就是"（无）"）。 */
+    /** 正在送给谁（可能多台；没在送就是"（无）"）。 */
     public String sendTargetText() {
         AudioSend s = sender;
-        if (s == null || s.host() == null || s.host().isEmpty()) {
+        if (s == null || s.targetCount() == 0) {
             return "（无）";
         }
-        return s.host() + ":" + s.port() + (s.isRunning() ? "" : "（已停止）");
+        int n = s.targetCount();
+        String list = s.targetCount() <= 4 ? s.targetText() : (n + " 台");
+        return n + " 台 · " + list + (s.isRunning() ? "" : "（已停止）");
+    }
+
+    // ────────────────────────── ★ 本机名称（可编辑） ──────────────────────────
+
+    /**
+     * 改本机名称。
+     *
+     * <p>用户原话：「本机id最好支持自己编辑，不排除多人用同型号设备」。
+     * 注意分工：<b>用户编辑的是"名字"，节点 ID 是身份、永远保持持久唯一</b>（不能让人改成重复的，
+     * 否则电脑端的路由表就指向不清了）。改完立刻生效：下一个信标（≤2 秒）带出去，
+     * 别人列表里马上变。
+     */
+    public void setLocalName(String name) {
+        Discovery d = discovery;
+        if (d == null) {
+            return;
+        }
+        d.setName(name);
+    }
+
+    /** 本机名称（信标里对外用的那个）。 */
+    public String localName() {
+        return nodeName();
+    }
+
+    public boolean localNameIsCustom() {
+        Discovery d = discovery;
+        return d != null && d.customName();
     }
 
     public long sentPackets() {
@@ -1409,11 +1640,28 @@ public final class Engine {
         try {
             double mb = s.bytesSent() / 1048576.0;
             StringBuilder sb = new StringBuilder();
-            sb.append(s.host()).append(':').append(s.port());
-            sb.append("\n已发 ").append(s.packetsSent()).append(" 包 / ")
+            // ★ 多目标：逐台列出"发了多少包 / 多少字节 / 失败几次 / 最近一次成功多久前"，
+            //   用户才能看出"是哪一台没在收"（单目标时代只有一个数字，广播时根本不够用）。
+            sb.append("目标 ").append(s.targetCount()).append(" 台");
+            if (broadcastOn) {
+                sb.append("（📢 广播中）");
+            }
+            sb.append("\n合计已发 ").append(s.packetsSent()).append(" 包 / ")
                     .append(String.format(java.util.Locale.US, "%.1f", mb)).append(" MB");
             if (s.sendErrors() > 0) {
                 sb.append(" · 失败 ").append(s.sendErrors()).append(" 次");
+            }
+            for (SendFanout.TargetStats ts : s.targetStats()) {
+                sb.append("\n· ").append(ts.host).append(':').append(ts.port)
+                        .append(" 发 ").append(ts.packetsSent).append(" 包");
+                if (ts.sendErrors > 0) {
+                    sb.append(" 失败 ").append(ts.sendErrors).append(" 次");
+                }
+                if (ts.lastOkAgeMs < 0) {
+                    sb.append("（还没成功发出过）");
+                } else if (ts.lastOkAgeMs > 2000) {
+                    sb.append("（最近一次成功 ").append(ts.lastOkAgeMs / 1000).append(" 秒前）");
+                }
             }
             // ★ 音源写在详情里：用户看"送声音"到底送的是什么，这里是最直接的答案。
             int act = s.activeSourceKind();
@@ -1422,6 +1670,9 @@ public final class Engine {
                 sb.append("（你要的是 ").append(AudioSend.sourceName(sourceKind)).append("）");
             }
             sb.append(" · ").append(s.captureFormatText());
+            if (s.targetCount() > 1) {
+                sb.append("\n带宽 ").append(bandwidthText());
+            }
             String hint = silenceHintText();
             if (hint.length() > 0) {
                 sb.append('\n').append(hint);
@@ -1741,8 +1992,18 @@ public final class Engine {
         return audioPort;
     }
 
+    /**
+     * 本机名字（信标/通知/统计包里对外用的那个）。
+     *
+     * <p>注意必须取 {@link Discovery#name()}（用户可能改过），<b>不能</b>现算 {@code Build.MODEL}
+     * —— 那样用户改的名字在通知和对端列表里就不生效了。
+     */
     public String nodeName() {
-        String n = Discovery.defaultName();
+        Discovery d = discovery;
+        String n = (d != null) ? d.name() : null;
+        if (n == null || n.length() == 0) {
+            n = Discovery.defaultName();
+        }
         return (n == null || n.length() == 0) ? "Android 设备" : n;
     }
 

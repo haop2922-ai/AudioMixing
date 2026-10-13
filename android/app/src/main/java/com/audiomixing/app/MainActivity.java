@@ -40,6 +40,7 @@ import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.widget.EditText;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -108,6 +109,8 @@ public class MainActivity extends Activity {
     private SeekBar volumeBar;
     /** ★ 系统媒体音量那一行（只显示，不修改）。 */
     private TextView sysVolText;
+    /** 头部那行"本机名字 · 平台"（点它就能改名）。 */
+    private TextView subLine;
     // ★ 「送什么声音」那一块
     private TextView playChip;
     private TextView micChip;
@@ -118,6 +121,10 @@ public class MainActivity extends Activity {
     private TextView channelChip;
     private TextView channelNow;
     private boolean lastChannelOn;
+    // ★ 「📢 广播我的声音」（发出去）
+    private TextView broadcastChip;
+    private TextView broadcastNow;
+    private boolean lastBroadcastOn;
 
     private final Map<String, PeerRow> rows = new LinkedHashMap<String, PeerRow>();
     private final Map<String, TextView> kvValues = new LinkedHashMap<String, TextView>();
@@ -265,6 +272,10 @@ public class MainActivity extends Activity {
         refreshSourceRow();
         refreshChannelRow();
         refreshVolumeRow();
+        if (subLine != null) {
+            // 名字被改过之后，标题下面那行要跟着变（信标 2 秒内带出去，界面立刻变）
+            setTextIfChanged(subLine, engine.localName() + " ✏️ · " + engine.platform());
+        }
         updateHeader(peers.size());
     }
 
@@ -282,7 +293,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 刷新「听广播」那一块（状态会随"收到了几个包"变，所以每 150ms 一起刷）。 */
+    /** 刷新「听广播 / 广播我的声音」那一块（状态会随"收到几个包"变，所以每 150ms 一起刷）。 */
     private void refreshChannelRow() {
         if (channelNow == null) {
             return;
@@ -296,6 +307,23 @@ public class MainActivity extends Activity {
         int color = on ? OK : DIM;
         if (channelNow.getCurrentTextColor() != color) {
             channelNow.setTextColor(color);
+        }
+
+        // ★ 发送侧：📢 广播我的声音
+        boolean bc = engine.isBroadcasting();
+        if (broadcastChip != null && bc != lastBroadcastOn) {
+            lastBroadcastOn = bc;
+            styleChip(broadcastChip, bc, "📢 广播我的声音");
+        }
+        if (broadcastNow != null) {
+            setTextIfChanged(broadcastNow, engine.broadcastStateText());
+            broadcastNow.setVisibility(
+                    (bc || engine.sendTargetCount() > 0) ? View.VISIBLE : View.GONE);
+            // 目标多的时候用警告色 —— 带宽/分片的代价要显眼，但不拦着用户用
+            int bcColor = !bc ? DIM : (engine.sendTargetCount() >= 4 ? WARN : OK);
+            if (broadcastNow.getCurrentTextColor() != bcColor) {
+                broadcastNow.setTextColor(bcColor);
+            }
         }
     }
 
@@ -361,14 +389,17 @@ public class MainActivity extends Activity {
 
     private void updateHeader(int peerCount) {
         int conn = engine.connectedCount();
+        // ★ 在线数含本机（用户原话：「右上角应当显示三台设备在线。因为本机也算。」）。
+        //   文案上写清楚"含本机"，不让人自己猜这个数字包不包含自己。
+        int online = peerCount + 1;
         if (conn > 0) {
-            setTextIfChanged(pill, "正在传输 " + conn + " 台");
+            setTextIfChanged(pill, "正在传输 本机 + " + conn + " 台");
             stylePill(OK);
         } else if (peerCount > 0) {
-            setTextIfChanged(pill, peerCount + " 台在线");
+            setTextIfChanged(pill, online + " 台在线（含本机）");
             stylePill(ACC);
         } else {
-            setTextIfChanged(pill, "搜索中…");
+            setTextIfChanged(pill, "搜索中…（本机 1 台）");
             stylePill(DIM);
         }
     }
@@ -377,13 +408,16 @@ public class MainActivity extends Activity {
         if (!detailsOpen) {
             return;
         }
-        put("name", engine.nodeName() + " · " + engine.platform());
+        put("name", engine.nodeName() + " · " + engine.platform()
+                + (engine.localNameIsCustom() ? "（名字：用户自定义）" : "（名字：默认）"));
         put("ip", engine.localIpsText());
         put("port", engine.audioPort() + "（UDP，收发都用它）");
         put("found", engine.peers().size() + " 台");
         put("conn", "收听 " + engine.listeningCount() + " 台 / 送声 " + engine.sendingCount() + " 台");
         // ★ 「实际收到哪几路」：开关是意图，这一行才是事实（放最前面，跟"已连接"挨着）
         put("streams", engine.recvStreamsText());
+        // ★ 发出去：几台、逐台发了多少、带宽是多少（不藏代价）
+        put("send", engine.sendStatsText());
         put("volume", engine.volumeText() + "\n" + engine.systemVolumeText());
         put("recv", engine.statsText());
         put("send", engine.sendStatsText());
@@ -409,15 +443,20 @@ public class MainActivity extends Activity {
     }
 
     private void onSendClick(Discovery.Peer p) {
+        // ★ 广播开着的时候，每台都会收到我的声音 —— 单独关某一台没有意义（它还会从广播那条路收到），
+        //   所以这里直说清楚，而不是让用户点了没反应还以为是 bug。
+        if (engine.isBroadcasting()) {
+            toast("正在「📢 广播我的声音」，每一台都会收到；想只送给某台就先关掉广播");
+            return;
+        }
         if (engine.isSending(p)) {
             engine.setSending(p, false);
-            toast("已停止送声音");
+            toast("已停止送给 " + p.label());
             refreshNow();
             return;
         }
         startSendFlow(p);
     }
-
     /**
      * 「送声音」的完整流程。顺序是有原因的：
      * <ol>
@@ -506,6 +545,89 @@ public class MainActivity extends Activity {
     }
 
     // ────────────────────────────── 诊断 ──────────────────────────────
+
+    /**
+     * ★ 「✏️ 改本机名称」对话框。
+     *
+     * <p>用户原话：「本机id最好支持自己编辑，不排除多人用同型号设备」。
+     * 这里改的只是<b>名字</b>（别人列表里看到的那个）；节点 ID 是身份，不在界面上暴露、也不允许改
+     * —— 改重复了电脑端就分不清谁是谁，路由表也会指向不清。
+     */
+    private void showRenameDialog() {
+        final Dialog d = new Dialog(this);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackground(roundRect(0xF5070B12, dp(18), LINE, Math.max(1, dpi(1))));
+        int pad = dpi(16);
+        box.setPadding(pad, pad, pad, pad);
+
+        box.addView(text("✏️ 改本机名称", 16f, FG, true));
+        TextView hint = text("别人在设备列表里看到的就是这个名字（下一个信标 2 秒内带出去）。\n"
+                + "两台同型号手机默认名已经用后缀区分（例如 M332BF-7f3a），想改成「小红的手机」这种更好认的，在这里改。\n"
+                + "改完会记住，重启还在。（节点 ID 是身份，不在这里改 —— 改重了别人就分不清了。）",
+                11.5f, DIM, false);
+        hint.setLineSpacing(dp(3), 1f);
+        box.addView(hint, margins(MATCH, WRAP, 0, dpi(8), 0, dpi(10)));
+
+        final EditText et = new EditText(this);
+        et.setSingleLine(true);
+        et.setText(engine.localName());
+        et.setSelection(et.getText().length());
+        et.setTextColor(FG);
+        et.setHintTextColor(DIM);
+        et.setHint("例如：小红的手机");
+        et.setBackground(roundRect(0x12FFFFFF, dp(10), LINE, Math.max(1, dpi(1))));
+        et.setPadding(dpi(10), dpi(10), dpi(10), dpi(10));
+        box.addView(et, margins(MATCH, WRAP, 0, 0, 0, dpi(12)));
+
+        LinearLayout btns = new LinearLayout(this);
+        btns.setOrientation(LinearLayout.HORIZONTAL);
+
+        TextView save = chip("保存");
+        save.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                String name = et.getText() == null ? "" : et.getText().toString().trim();
+                if (name.isEmpty()) {
+                    toast("名字不能是空的（保持原名字就行）");
+                    return;
+                }
+                engine.setLocalName(name);
+                toast("已改名为：" + engine.localName());
+                d.dismiss();
+                refreshNow();
+            }
+        });
+        LinearLayout.LayoutParams slp = margins(0, dpi(46), 0, 0, dpi(8), 0);
+        slp.weight = 1f;
+        btns.addView(save, slp);
+
+        TextView cancel = chip("取消");
+        cancel.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                d.dismiss();
+            }
+        });
+        LinearLayout.LayoutParams clp = margins(0, dpi(46), 0, 0, 0, 0);
+        clp.weight = 1f;
+        btns.addView(cancel, clp);
+        box.addView(btns);
+
+        d.setContentView(box);
+        Window dw = d.getWindow();
+        if (dw != null) {
+            dw.setBackgroundDrawable(new ColorDrawable(0));
+            dw.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            dw.setDimAmount(0.62f);
+            dw.setLayout(MATCH, WRAP);
+            // 弹出键盘：改名是个纯输入动作，用户不该再点一次输入框
+            dw.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
+        }
+        d.show();
+    }
 
     /**
      * 「🩺 诊断」对话框：上半部分是可滚动、可长按选中的报告全文，下面是「复制」。
@@ -693,14 +815,18 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * ★ 「听广播」卡片（频道模式）。
+     * ★ 「频道」卡片：一对开关 —— 📻 听广播（我收谁的）+ 📢 广播我的声音（我发给谁）。
      *
-     * <p>为什么必须是独立开关：我们设计里广播和点对点是两条通道。电脑开「广播我的声音」时，
-     * 声音发给<b>所有在线节点</b>；而手机原来只播"用户点过🎧收听的那几台"，
+     * <p>为什么必须是独立开关：我们设计里广播和点对点是两条通道。
+     * 电脑开「广播我的声音」时声音发给<b>所有在线节点</b>，而手机原来只播"用户点过🎧收听的那几台"，
      * 于是电脑广播过来的包全被按名单过滤掉 —— 真机现场就是这样，一个包都没播。
+     * 反过来，手机原来也<b>没有</b>"把我的声音广播出去"（用户原话：「没有发广播」），这一对现在补齐。
      */
     private View buildChannelCard() {
         LinearLayout card = card();
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
 
         channelChip = chip("📻 听广播");
         channelChip.setOnClickListener(new View.OnClickListener() {
@@ -712,20 +838,44 @@ public class MainActivity extends Activity {
                 refreshNow();
             }
         });
-        card.addView(channelChip, margins(MATCH, dpi(44), 0, 0, 0, 0));
+        LinearLayout.LayoutParams clp = margins(0, dpi(44), 0, 0, 0, 0);
+        clp.weight = 1f;
+        row.addView(channelChip, clp);
+
+        // ★ 「📢 广播我的声音」：用户原话「没有发广播」。
+        //   做法：对发现列表里每个在线节点各建一条单播发送（一次采集、一包编码、发 N 份）。
+        broadcastChip = chip("📢 广播我的声音");
+        broadcastChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                boolean on = !engine.isBroadcasting();
+                engine.setBroadcasting(on);
+                toast(on ? "已开始广播：我的声音送给每一台在线设备" : "已停止广播");
+                refreshNow();
+            }
+        });
+        LinearLayout.LayoutParams blp = margins(0, dpi(44), dpi(8), 0, 0, 0);
+        blp.weight = 1f;
+        row.addView(broadcastChip, blp);
+        card.addView(row);
 
         channelNow = text("", 12f, DIM, false);
         channelNow.setLineSpacing(dp(3), 1f);
         card.addView(channelNow, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
 
+        // 发送侧的状态（含"送给几台 + 真实带宽"）
+        broadcastNow = text("", 12f, DIM, false);
+        broadcastNow.setLineSpacing(dp(3), 1f);
+        broadcastNow.setVisibility(View.GONE);
+        card.addView(broadcastNow, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+
         TextView hint = text("📻 听广播 = 「谁在广播就听谁」：电脑上开着「广播我的声音」时选这个就能听见，"
                 + "不用先在这里点某台设备。\n"
-                + "🎧 收听 = 点对点，只收你点名的那一台（列表里有设备时用）。\n"
-                + "两个开关是【并存】的，可以只开一个也可以都开 —— 上面那行「当前实际收到 N 路」"
-                + "写的就是真正在播的声音。\n"
-                + "同一台设备的声音如果从两条路都进来（电脑同时开着广播和点对点路由），"
-                + "只会播一路、不叠加 —— 不会出现声音翻倍或忽大忽小。\n"
-                + "（音频包里没有\"路由\"标记，所以听广播实际是\"谁发过来都听\"——局域网里只有主动发给你的声音才到得了你这台。）",
+                + "📢 广播我的声音 = 反过来：我这台的声音同时送给局域网里每一台在线设备"
+                + "（逐个单播，不往广播地址盲发 —— 盲发在 Wi-Fi 上不可靠）。\n"
+                + "🎧 收听 / 🔊 送声音 = 点对点，只跟你点名的那一台来往。\n"
+                + "这些开关是【并存】的：可以只开一个，也可以都开。上面两行写的就是现在实际在收/在发什么。\n"
+                + "同一台设备的声音如果从两条路都进来（电脑同时开着广播和点对点路由），只会播一路、不叠加。",
                 11.5f, DIM, false);
         hint.setLineSpacing(dp(3), 1f);
         card.addView(hint, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
@@ -746,8 +896,16 @@ public class MainActivity extends Activity {
         row.addView(titles, tlp);
 
         titles.addView(text("Audio Mixing", 16f, FG, true));
-        TextView sub = text(engine.nodeName() + " · " + engine.platform(), 12f, DIM, false);
+        TextView sub = text(engine.localName() + " ✏️ · " + engine.platform(), 12f, DIM, false);
         sub.setSingleLine(true);
+        // ★ 点名字就能改（用户原话：「本机id最好支持自己编辑，不排除多人用同型号设备」）
+        sub.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showRenameDialog();
+            }
+        });
+        subLine = sub;
         titles.addView(sub);
 
         pill = text("搜索中…", 11.5f, DIM, false);
@@ -902,6 +1060,16 @@ public class MainActivity extends Activity {
             }
         });
         tools.addView(diagChip, margins(dpi(100), dpi(40), 0, dpi(12), 0, 0));
+
+        // ★ 「✏️ 改名」：和「诊断」并排（点标题下那行名字也能改，这里再给一个显式入口）
+        TextView renameChip = chip("✏️ 改名");
+        renameChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showRenameDialog();
+            }
+        });
+        tools.addView(renameChip, margins(dpi(88), dpi(40), dpi(8), dpi(12), 0, 0));
         card.addView(tools);
 
         detailWrap = new LinearLayout(this);
@@ -935,6 +1103,29 @@ public class MainActivity extends Activity {
         t.setLineSpacing(dp(4), 1f);
         card.addView(t);
         return card;
+    }
+
+    /**
+     * 一条「标签 + 电平条 + 说明」的行（设备卡片上的「收」/「送」）。
+     *
+     * <p>为什么要带文字标签：用户原话「每个设备都应当配备独立的收/送声音音频条」——
+     * 光有两根条子还是分不清哪根是哪根，所以每条前面写「收」/「送」，后面写一句人话。
+     */
+    private LinearLayout levelRow(String tag, LevelBar bar, String tail) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView k = text(tag, 11.5f, DIM, true);
+        row.addView(k, new LinearLayout.LayoutParams(dpi(18), WRAP));
+
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(0, dpi(10));
+        blp.weight = 1f;
+        row.addView(bar, blp);
+
+        TextView t = text(tail, 10.5f, DIM, false);
+        row.addView(t, margins(WRAP, WRAP, dpi(8), 0, 0, 0));
+        return row;
     }
 
     /** 「送声音」按钮上的字：图标直接表达当前音源（🔊 本机声音 / 🎤 麦克风）。 */
@@ -1087,7 +1278,10 @@ public class MainActivity extends Activity {
         final TextView state;
         final TextView listenChip;
         final TextView sendChip;
-        final LevelBar level;
+        /** 「收」电平条：我从它收到多少。 */
+        final LevelBar recvLevel;
+        /** 「送」电平条：我送给它多少（逐目标统计，见 SendFanout）。 */
+        final LevelBar sendLevel;
         /** ★ 「对方：…」那一行（两台设备互报的统计）。 */
         final TextView peerLine;
         private boolean styledOnce;
@@ -1120,8 +1314,14 @@ public class MainActivity extends Activity {
             head.addView(state, margins(WRAP, WRAP, dpi(8), 0, 0, 0));
             card.addView(head);
 
-            level = new LevelBar(MainActivity.this, Math.max(2, dpi(3)));
-            card.addView(level, margins(MATCH, dpi(10), 0, dpi(11), 0, 0));
+            // ★ 两条独立电平条（收 / 送）—— 用户原话：
+            //   「每个设备都应当配备独立的收/送声音音频条」。原来只有一条，看不出是收还是送。
+            recvLevel = new LevelBar(MainActivity.this, Math.max(2, dpi(3)));
+            card.addView(levelRow("收", recvLevel, "我从它收到多少"),
+                    margins(MATCH, WRAP, 0, dpi(11), 0, 0));
+            sendLevel = new LevelBar(MainActivity.this, Math.max(2, dpi(3)));
+            card.addView(levelRow("送", sendLevel, "我送给它多少"),
+                    margins(MATCH, WRAP, 0, dpi(5), 0, 0));
 
             // ★ 「对方」那一行：两台设备互报的结果。用户原话是"不知道是哪一端没在发"，
             //   这一行就是答案 —— 对方自己说它有没有在发、它收了我多少。
@@ -1145,8 +1345,7 @@ public class MainActivity extends Activity {
             llp.weight = 1f;
             btns.addView(listenChip, llp);
 
-            sendChip = chip(sendChipLabel(engine.sourceKind()));
-            sendChip.setOnClickListener(new View.OnClickListener() {
+            sendChip = chip(sendChipLabel(engine.sourceKind()));            sendChip.setOnClickListener(new View.OnClickListener() {
                 @Override
                 public void onClick(View v) {
                     onSendClick(peer);
@@ -1185,33 +1384,29 @@ public class MainActivity extends Activity {
                 }
             }
 
-            // 电平条画的是"这一路"的电平：送声看采集电平，收听看对方那一路的收包电平，
-            // 而不是混音总电平 —— 否则多台一起听的时候每行都在跳同一个值，看不出谁在响。
-            float lv;
-            if (send) {
-                lv = engine.sendPeak();
-            } else if (listen) {
-                lv = engine.recvPeakFor(peer.host);
-            } else {
-                lv = 0f;
-            }
-            level.setLevel(lv);
+            // ★ 两条电平条各画各的（用户要的"每个设备独立的收/送音频条"）：
+            //   「收」= 我从它收到多少（对方那一路的收包电平，不是混音总值）；
+            //   「送」= 我送给它多少（SendFanout 逐目标统计，这一路发不出去它会自己塌下去）。
+            recvLevel.setLevel(listen ? engine.recvPeakFor(peer.host) : 0f);
+            sendLevel.setLevel(send ? engine.sendPeakFor(peer.host) : 0f);
 
             String st;
             int color;
             // ★ 「实际生效状态」：点了「收听」不等于真的在收 —— 用户说的"路由模式和广播模式
             //   混淆"就出在这里。所以这里区分三种：真的在收 / 点了但没收到包 / 没在听。
             boolean reallyReceiving = listen && engine.recvReceivingFrom(peer.host);
+            boolean broadcasting = engine.isBroadcasting();
             if (listen && send) {
-                st = reallyReceiving ? "收听✓ + 送声·" + AudioSend.sourceShortName(engine.activeSourceKind())
-                        : "收听 + 送声·" + AudioSend.sourceShortName(engine.activeSourceKind());
+                st = "收听✓ + 送声·" + AudioSend.sourceShortName(engine.activeSourceKind())
+                        + (broadcasting ? "（广播）" : "");
                 color = OK;
             } else if (listen) {
                 st = reallyReceiving ? "收听中 ✓ 正在收" : "收听中…（还没收到包）";
                 color = reallyReceiving ? OK : WARN;
             } else if (send) {
                 // 送声时把音源也写在状态里：用户一眼就知道送出去的是本机声音还是他说话
-                st = "送声·" + AudioSend.sourceShortName(engine.activeSourceKind());
+                st = "送声·" + AudioSend.sourceShortName(engine.activeSourceKind())
+                        + (broadcasting ? "（广播）" : "");
                 color = WARN;
             } else if (peer.busy) {
                 st = "对端忙";

@@ -258,7 +258,9 @@ public final class Diagnosis {
 
         // ── 本机 ──
         sb.append("\n【本机】\n");
-        sb.append("名称    ：").append(e.nodeName()).append('\n');
+        sb.append("名称    ：").append(e.nodeName())
+                .append(e.localNameIsCustom() ? "（用户自定义）" : "（默认名，同型号用后缀区分）")
+                .append('\n');
         sb.append("平台    ：").append(e.platform()).append('\n');
         sb.append("本机 IP ：").append(e.localIpsText()).append('\n');
         sb.append("音频端口：").append(e.audioPort()).append("（UDP，收发都用它）\n");
@@ -266,7 +268,11 @@ public final class Diagnosis {
                 .append(e.listenTargetsText()).append('\n');
         // ★ 听广播（频道）：这是"电脑在广播、手机要能听见"的唯一入口，报告里必须有。
         sb.append("听广播  ：").append(e.isChannelListening() ? "已打开 ✓（谁来都听）" : "没开 ✗").append('\n');
+        // ★ 广播我的声音（发出去）：一次采集 → 一包编码 → 分发给 N 个目标。
+        sb.append("发广播  ：").append(e.isBroadcasting() ? "已打开 ✓（送给每一台在线设备）" : "没开 ✗")
+                .append('\n');
         sb.append("送声目标：").append(e.sendTargetText()).append('\n');
+        sb.append("带宽    ：").append(e.bandwidthText()).append('\n');
         sb.append("运行状态：发现 ").append(onOff(e.discoveryRunning()))
                 .append(" / 接收器 ").append(onOff(e.receiverRunning()))
                 .append(" / 发送器 ").append(onOff(e.senderRunning())).append('\n');
@@ -392,14 +398,40 @@ public final class Diagnosis {
         // ── 发送 ──
         sb.append("\n【发送（别人听我）】\n");
         if (!e.senderRunning()) {
-            sb.append("发送器没在运行（没点过任何一台的「送声音」）。\n");
+            sb.append("发送器没在运行（没点过任何一台的「送声音」，也没开「📢 广播我的声音」）。\n");
         } else {
+            sb.append("广播    ：").append(e.isBroadcasting() ? "开着 ✓（送给每一台在线设备）" : "没开").append('\n');
             sb.append("目标    ：").append(e.sendTargetText()).append('\n');
             // ★ 送出去的是本机声音还是麦克风，必须在报告里一眼看到（别再让人猜）
             sb.append("音源    ：").append(e.activeSourceText()).append('\n');
             sb.append("已发包  ：").append(e.sentPackets()).append(" 包 / ")
-                    .append(bytesText(e.sentBytes())).append('\n');
+                    .append(bytesText(e.sentBytes())).append("（多目标时是所有目标之和）\n");
             sb.append("发送失败：").append(e.sendErrors()).append(" 次\n");
+            // ★ 逐目标：广播时"总共发了多少"没用，用户要知道"是哪一台没在收"
+            List<SendFanout.TargetStats> ts = e.sendTargetStats();
+            if (!ts.isEmpty()) {
+                sb.append("每台情况：\n");
+                for (SendFanout.TargetStats t : ts) {
+                    sb.append("  · ").append(t.host).append(':').append(t.port)
+                            .append(" 发 ").append(t.packetsSent).append(" 包 / ")
+                            .append(bytesText(t.bytesSent));
+                    if (t.sendErrors > 0) {
+                        sb.append(" · 失败 ").append(t.sendErrors).append(" 次");
+                    }
+                    if (t.lastOkAgeMs < 0) {
+                        sb.append(" · 还没成功发出过 ✗");
+                    } else if (t.lastOkAgeMs > 2000) {
+                        sb.append(" · 最近一次成功 ").append(t.lastOkAgeMs / 1000).append(" 秒前 ✗");
+                    } else {
+                        sb.append(" · 正在发 ✓");
+                    }
+                    if (t.lastError != null && t.lastError.length() > 0) {
+                        sb.append("（").append(t.lastError).append("）");
+                    }
+                    sb.append('\n');
+                }
+            }
+            sb.append("带宽    ：").append(e.bandwidthText()).append('\n');
         }
 
         // ── 对端回话（这就是"让俩设备自己交流"的结果） ──

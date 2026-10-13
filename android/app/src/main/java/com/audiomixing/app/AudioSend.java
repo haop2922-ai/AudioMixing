@@ -113,7 +113,7 @@ public final class AudioSend {
     private Thread worker;
     private volatile AudioRecord record;
     private volatile Resampler resampler;   // 非空 = 采集格式要换算（绝大多数设备是 null）
-    private volatile DatagramSocket socket;
+    // 发送用的 UDP socket 现在归 SendFanout 管（它要同时发给 N 个目标，还负责逐目标统计）
     private WifiManager.WifiLock wifiLock;
 
     private volatile int gainQ14 = Proto.GAIN_ONE;
@@ -140,8 +140,23 @@ public final class AudioSend {
 
     private int ssrc;
 
+    // ★ 一发多：一次采集、一包编码 → 分发给 N 个目标（见 SendFanout 的类注释）。
+    //   单独拎出来还有一个好处：它是纯 java.net 逻辑，能拿真实 UDP 回环做离线门禁。
+    private final SendFanout fanout = new SendFanout();
+
     public AudioSend(String host, int port) {
         this(null, host, port);
+    }
+
+    /**
+     * ★ 不带目标的版本：先建好采集器，目标后面用 {@link #setTargets} 给。
+     *
+     * <p>「📢 广播我的声音」和"同时送给好几台"都走这个 —— 采集只有一份，
+     * 送给谁是一个可以随时变的集合。
+     */
+    public AudioSend(Context context) {
+        this(context, null, 0);
+        fanout.setTargets(java.util.Collections.<String>emptyList());
     }
 
     /**
@@ -158,6 +173,9 @@ public final class AudioSend {
         this.ssrc = new java.util.Random().nextInt();
         if (this.ssrc == 0) {
             this.ssrc = 1;
+        }
+        if (host != null && !host.isEmpty() && port > 0) {
+            fanout.setTargets(java.util.Collections.singletonList(host + ":" + port));
         }
     }
 
@@ -316,10 +334,53 @@ public final class AudioSend {
         return gainQ14;
     }
 
-    /** 运行中也能改目标（对端换 IP、用户改勾选都用得上）。 */
+    /** 运行中也能改目标（对端换 IP、用户改勾选都用得上）。单目标版本的便捷写法。 */
     public void setTarget(String host, int port) {
         this.host = host;
         this.port = port;
+        fanout.setTargets(java.util.Collections.singletonList(host + ":" + port));
+    }
+
+    /**
+     * ★ 设定"送给谁"（可以多台）。目标集合变化<b>不会重启采集</b> —— 麦克风/MediaProjection
+     * 一直开着，只是每包多发给几个人或几个人不发而已。
+     *
+     * @param endpoints "host:port" 列表（Engine 按发现列表 + 用户勾选算出来）
+     */
+    public void setTargets(java.util.List<String> endpoints) {
+        fanout.setTargets(endpoints);
+        if (endpoints != null && !endpoints.isEmpty()) {
+            String first = endpoints.get(0);
+            int colon = first.lastIndexOf(':');
+            if (colon > 0) {
+                this.host = first.substring(0, colon);
+                try {
+                    this.port = Integer.parseInt(first.substring(colon + 1).trim());
+                } catch (Throwable ignored) {
+                    // 端口解析不了就保持原值
+                }
+            }
+        }
+    }
+
+    /** 当前目标数（界面/诊断用）。 */
+    public int targetCount() {
+        return fanout.targetCount();
+    }
+
+    /** 目标列表的字符串（"192.168.0.109:47831 / …"，诊断报告用）。 */
+    public String targetText() {
+        return fanout.targetText();
+    }
+
+    /** 逐目标的发送统计（界面"送"电平条 + 诊断报告）。 */
+    public java.util.List<SendFanout.TargetStats> targetStats() {
+        return fanout.stats();
+    }
+
+    /** 发给某一台的电平 0~1（没送给它就是 0）。 */
+    public float targetPeak(String host) {
+        return fanout.peakFor(host);
     }
 
     public String host() {
@@ -361,17 +422,6 @@ public final class AudioSend {
 
     private void loop() {
         acquireWifiLock();
-        try {
-            DatagramSocket s = new DatagramSocket();   // 不绑端口：发送用临时端口就够
-            s.setSendBufferSize(64 * 1024);            // 减少 sendto 排队阻塞
-            socket = s;
-        } catch (IOException e) {
-            note("UDP socket 打不开：" + e);
-            running = false;
-            releaseAll();
-            return;
-        }
-
         if (!openCapture()) {
             running = false;
             releaseAll();
@@ -379,8 +429,8 @@ public final class AudioSend {
         }
         // 开机这一次已经按最新的 wantSource 打开了，把可能残留的换音源标记清掉。
         switchPending = false;
-        Log.i(TAG, "开始发送到 " + host + ":" + port + " 音源=" + sourceName(activeSource)
-                + " ssrc=" + ssrc);
+        Log.i(TAG, "开始发送：目标 " + fanout.targetCount() + " 个（" + fanout.targetText()
+                + "）音源=" + sourceName(activeSource) + " ssrc=" + ssrc);
 
         // 复用同一份缓冲和包头对象：每 10ms 跑一趟的循环里尽量不产生垃圾，
         // 否则一次 GC 停顿就是一次可听见的爆音。
@@ -391,9 +441,6 @@ public final class AudioSend {
         pkt.ssrc = ssrc;
         pkt.payload = frame;
         int seq = 0;
-        DatagramPacket out = null;
-        String outHost = null;
-        int outPort = -1;
         int consecutiveErrors = 0;
         int reopenCount = 0;
 
@@ -431,7 +478,7 @@ public final class AudioSend {
                 consecutiveErrors = 0;
                 reopenCount = 0;
 
-                // 静音观察用的是【加音量之前】的电平：用户把"本机音量"拖到 0 不该被当成
+                // 静音观察用的是【加音量之前】的电平：用户把"我们这一层的音量"拖到 0 不该被当成
                 // "采不到声音"（那会指向完全错误的排查方向）。
                 float rawPeak = rawPeak(frame);
                 float p = applyGain(frame, gainQ14);
@@ -445,29 +492,18 @@ public final class AudioSend {
                 pkt.seq = seq++ & 0xFFFF;                       // uint16 回绕
                 pkt.tsNs = System.currentTimeMillis() * 1_000_000L;
                 pkt.gainQ14 = gainQ14;
+                // ★ 一包只编码一次，然后分发给所有目标（所有人收到的字节完全一样）。
                 byte[] raw = Proto.encode(pkt);
-                String h = host;
-                int pt = port;
-                try {
-                    if (out == null || out.getLength() != raw.length || outPort != pt
-                            || outHost == null || !outHost.equals(h)) {
-                        // 目标变了（用户改勾选）就重新解析地址，不能继续往老对端发。
-                        out = new DatagramPacket(raw, raw.length, InetAddress.getByName(h), pt);
-                        outHost = h;
-                        outPort = pt;
-                    } else {
-                        out.setData(raw, 0, raw.length);        // 地址不变，只换负载
-                    }
-                    socket.send(out);
-                    packetsSent++;
-                    bytesSent += raw.length;
-                } catch (IOException | RuntimeException e) {
+                int sent = fanout.send(raw, raw.length, p);
+                if (sent > 0) {
+                    packetsSent += sent;
+                    bytesSent += (long) raw.length * sent;
+                } else {
                     sendErrors++;
-                    // 对端还没起来/刚走，这里报错很正常，不要因此退出线程。
+                    // 一个目标都没有 / 全都发不出去：很常见（对端刚走），不要因此退出线程。
                     if (sendErrors % 100 == 1) {
-                        note("发送失败：" + e);
+                        note("这一包没有发出去（目标 " + fanout.targetCount() + " 个）");
                     }
-                    out = null;                                  // 目标地址重新解析一次
                     sleepQuiet(5);
                 }
             }
@@ -801,14 +837,8 @@ public final class AudioSend {
 
     private void releaseAll() {
         closeRecord();
-        DatagramSocket s = socket;
-        socket = null;
-        if (s != null) {
-            try {
-                s.close();
-            } catch (Throwable ignored) {
-            }
-        }
+        // 发送 socket 归 SendFanout 管；这里一起收掉（目标集合保留，下次 start 会重开 socket）
+        fanout.close();
         WifiManager.WifiLock l = wifiLock;
         wifiLock = null;
         if (l != null) {
