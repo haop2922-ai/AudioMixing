@@ -128,10 +128,88 @@ public final class FanoutProbe {
         fan.close();
 
         System.out.println();
+        System.out.println("== 8. ★ 逐目标增益（「我送它的」滑杆）：只改那一路，别人收原包 ==");
+        // 注意：增益是"按设备"（host）记的 —— 真实局域网里一台设备就是一个 IP，
+        // 所以这里必须用两个不同的回环地址当两台设备（127.0.0.1 / 127.0.0.2），
+        // 否则"两个目标同一个 host"会被同一条滑杆一起改掉（那其实是正确行为）。
+        InetAddress local2 = InetAddress.getByName("127.0.0.2");
+        SendFanout fan2 = new SendFanout();
+        DatagramSocket gA = openReceiver(local);
+        DatagramSocket gB = openReceiver(local2);
+        String gpA = "127.0.0.1:" + gA.getLocalPort();
+        String gpB = "127.0.0.2:" + gB.getLocalPort();
+        fan2.setTargets(Arrays.asList(gpA, gpB));
+        byte[] flat = flatPcmPacket(1000);          // 每个样本都是 1000：缩放结果一眼能算出来
+        check("初始增益都是 1.00", fan2.targetGain("127.0.0.1") == 1f);
+        fan2.setTargetGain("127.0.0.1", 0.5f);
+        check("设完是 0.50", Math.abs(fan2.targetGain("127.0.0.1") - 0.5f) < 0.001f);
+        int n8 = fan2.send(flat, flat.length, 0.5f);
+        check("两个目标都发出去了（返回 " + n8 + "）", n8 == 2);
+        int aSample = firstSample(gA);
+        int bSample = firstSample(gB);
+        check("A（127.0.0.1，设了 0.50）收到缩放后的 500，实测 " + aSample, aSample == 500);
+        check("B（127.0.0.2，没设）收到原样本 1000，实测 " + bSample, bSample == 1000);
+        boolean sawHalf = false;
+        for (SendFanout.TargetStats t : fan2.stats()) {
+            if (Math.abs(t.gain - 0.5f) < 0.001f) {
+                sawHalf = true;
+            }
+        }
+        check("逐目标统计里带着各自的增益值", sawHalf);
+
+        System.out.println();
+        System.out.println("== 9. 削顶保护：增益 1.5 时大声样本不会回绕成爆音 ==");
+        fan2.setTargetGain("127.0.0.1", 1.5f);
+        byte[] loud = flatPcmPacket(30000);          // 30000 × 1.5 = 45000 > 32767 → 必须削成 32767
+        fan2.send(loud, loud.length, 1f);
+        int clipped = firstSample(gA);
+        check("30000 × 1.50 → 削顶成 32767（不是回绕的负数），实测 " + clipped, clipped == 32767);
+        fan2.setTargetGain("127.0.0.1", 9f);         // 越界值必须被夹住
+        check("越界的增益被夹到 1.50（实测 " + fan2.targetGain("127.0.0.1") + "）",
+                Math.abs(fan2.targetGain("127.0.0.1") - 1.5f) < 0.001f);
+
+        System.out.println();
+        System.out.println("== 10. 增益会被记住：目标下线再上线，滑杆不回跳 ==");
+        fan2.setTargetGain("127.0.0.1", 0.4f);
+        fan2.setTargets(Arrays.asList(gpB));         // A 下线
+        fan2.setTargets(Arrays.asList(gpA, gpB));    // A 又上线
+        check("重新上线后增益还是 0.40（实测 " + fan2.targetGain("127.0.0.1") + "）",
+                Math.abs(fan2.targetGain("127.0.0.1") - 0.4f) < 0.001f);
+        fan2.close();
+        gA.close();
+        gB.close();
+
+        System.out.println();
         System.out.println("RESULT: " + (failures == 0 ? "PASS" : "FAIL")
                 + "  （" + checks + " 项断言"
                 + (failures == 0 ? "全部通过）" : "，失败 " + failures + " 项）"));
         System.exit(failures == 0 ? 0 : 1);
+    }
+
+    /** 造一个"每个样本都是 v"的 PCM16 包（1948 字节），缩放结果一眼能算出来。 */
+    private static byte[] flatPcmPacket(int v) {
+        byte[] pkt = new byte[1948];
+        // 28 字节包头留空（本探针直接调 SendFanout，不经过解码，所以头内容无关）
+        for (int i = 28; i + 1 < pkt.length; i += 2) {
+            pkt[i] = (byte) v;
+            pkt[i + 1] = (byte) (v >> 8);
+        }
+        return pkt;
+    }
+
+    /** 收一包、返回负载第一个样本（超时返回 Integer.MIN_VALUE）。 */
+    private static int firstSample(DatagramSocket s) throws Exception {
+        byte[] buf = new byte[4096];
+        DatagramPacket p = new DatagramPacket(buf, buf.length);
+        try {
+            s.receive(p);
+        } catch (Exception e) {
+            return Integer.MIN_VALUE;
+        }
+        if (p.getLength() < 30) {
+            return Integer.MIN_VALUE;
+        }
+        return (short) ((buf[28] & 0xFF) | ((buf[29] & 0xFF) << 8));
     }
 
     /** 开一个"设备端"接收 socket：先把接收缓冲开大再 bind（默认 64KB 太小，连发会被内核丢）。 */

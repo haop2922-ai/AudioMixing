@@ -375,6 +375,13 @@ public final class Diagnosis {
             appendSample(sb, "最近帧长包", st.lastFramesSample);
             appendSample(sb, "最近短包", st.lastShortSample);
             appendSample(sb, "最近版本包", st.lastVersionSample);
+            // ★ 对面报的 samples 和负载长度对不上：包照收照播，但这件事必须写成人话 ——
+            //   否则下一个人会以为"包全坏了"去查丢包/编码（2026-10-14 就是这么卡住的一轮）。
+            if (st.samplesMismatch > 0) {
+                sb.append("帧数字段：").append(st.samplesMismatch)
+                        .append(" 个包的 samples 和负载长度对不上 —— ")
+                        .append(nz(st.lastSamplesNote)).append('\n');
+            }
             sb.append("缓冲    ：").append(st.bufferedMs).append("ms（目标 ")
                     .append(st.targetMs).append("ms）\n");
             sb.append("流数    ：").append(st.streamCount).append('\n');
@@ -390,6 +397,8 @@ public final class Diagnosis {
                             .append(" · 丢 ").append(ss.lost)
                             .append(" · 缓冲 ").append(ss.bufferedMs).append("ms")
                             .append(" · 电平 ").append(percent(ss.peak))
+                            .append(" · 我听它的音量 ")
+                            .append(String.format(Locale.US, "%.2f", e.peerRecvGain(ss.host)))
                             .append(" · 最后一包 ").append(ss.ageMs).append("ms 前\n");
                 }
             }
@@ -414,7 +423,9 @@ public final class Diagnosis {
                 for (SendFanout.TargetStats t : ts) {
                     sb.append("  · ").append(t.host).append(':').append(t.port)
                             .append(" 发 ").append(t.packetsSent).append(" 包 / ")
-                            .append(bytesText(t.bytesSent));
+                            .append(bytesText(t.bytesSent))
+                            .append(" · 我送它的音量 ")
+                            .append(String.format(Locale.US, "%.2f", t.gain));
                     if (t.sendErrors > 0) {
                         sb.append(" · 失败 ").append(t.sendErrors).append(" 次");
                     }

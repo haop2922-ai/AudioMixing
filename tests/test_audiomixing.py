@@ -2804,3 +2804,215 @@ class TestThemeParityWithPhone(unittest.TestCase):
         for word in (">简洁<", ">详细<", ">监控<"):
             self.assertIn(word, self.pc)
         self.assertIn('id="modeSeg"', self.pc)
+
+
+class TestAudioPacketSamplesField(unittest.TestCase):
+    """★ 根因回归 ★ `samples` 必须是【本包帧数】，不是累计帧偏移。
+
+    2026-10-14 用户真机诊断报告：手机端把电脑发出的**每一个**音频包都判成坏包
+    （"帧长不是 480：10266"），于是手机永远听不到电脑的声音。真凶在电脑端：
+
+        samples=frame_offset & 0xFFFFFFFF   # 480 × seq，一直在涨
+
+    Python 接收端不读这个字段（它按解码后的负载长度算帧数），所以电脑↔电脑一直没症状；
+    手机端拿它做准入判据（`samples > 每包帧数` 即判坏包）才暴露出来。
+    这组测试钉死语义：每包都写"这一包有多少帧"，与它是第几包无关。
+    """
+
+    class _SilentSource:
+        """什么都不产出的音源，让发送线程安静地待着，测试自己直接调 _send_chunk。"""
+
+        name = "silent"
+        sample_rate = SAMPLE_RATE
+        channels = CHANNELS
+
+        def start(self) -> None:
+            pass
+
+        def read(self):
+            time.sleep(0.01)
+            return []
+
+        def stop(self) -> None:
+            pass
+
+    def test_the_header_layout_is_untouched(self) -> None:
+        """28 字节布局与版本号是跨语言对拍过的，谁都不许改。"""
+        self.assertEqual(proto.HEADER_SIZE, 28)
+        self.assertEqual(proto.VERSION, 1)
+        self.assertEqual(proto.MAGIC, b"WL")
+        self.assertEqual([n for n, _f in proto.HEADER_FIELDS],
+                         ["magic", "version", "ptype", "flags", "codec", "seq", "ssrc",
+                          "samples", "ts_ns", "gain_q14", "payload_len"])
+
+    def test_every_packet_carries_its_own_frame_count(self) -> None:
+        """连发多包：每包 samples 都必须等于本包帧数（不能随包号变大）。"""
+        import socket
+
+        port = free_udp_port()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", port))
+        sock.settimeout(3.0)
+        session = SenderSession(ToneSource(440.0, 200, pace=0.0), "127.0.0.1", port,
+                                codec=proto.CODEC_PCM_S16)
+        session.start()
+        seen: list[tuple[int, int]] = []          # (samples, 按负载算出来的帧数)
+        try:
+            end = time.time() + 1.5
+            while time.time() < end and len(seen) < 12:
+                try:
+                    data, _addr = sock.recvfrom(4096)
+                except socket.timeout:
+                    break
+                pkt = proto.decode(data)
+                if pkt is None or pkt.type != proto.T_AUDIO:
+                    continue
+                seen.append((pkt.samples, len(pkt.payload) // 2 // CHANNELS))
+        finally:
+            session.stop()
+            sock.close()
+        self.assertGreaterEqual(len(seen), 5, "至少要收到几包才看得出语义：%s" % seen)
+        for samples, frames in seen:
+            self.assertEqual(
+                samples, frames,
+                "samples 必须是本包帧数；实际 %d，负载里是 %d 帧 —— 这就是那个根因" % (samples, frames))
+        self.assertLess(max(s for s, _f in seen), 480 * 20,
+                        "samples 不该随包号一路涨（一路涨就是累计偏移的写法）")
+
+    def test_a_short_tail_packet_reports_its_own_frames(self) -> None:
+        """收尾的短包也要按自己的帧数填，不能一律填 480。"""
+        import socket
+
+        port = free_udp_port()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", port))
+        sock.settimeout(3.0)
+        session = SenderSession(self._SilentSource(), "127.0.0.1", port, codec=proto.CODEC_PCM_S16)
+        session.start()
+        try:
+            time.sleep(0.05)
+            session._send_chunk(array("f", [0.0] * (300 * CHANNELS)))
+            data, _addr = sock.recvfrom(4096)
+        finally:
+            session.stop()
+            sock.close()
+        pkt = proto.decode(data)
+        self.assertIsNotNone(pkt)
+        self.assertEqual(pkt.type, proto.T_AUDIO)
+        self.assertEqual(pkt.samples, 300, "短包要填它自己的帧数")
+
+    def test_the_python_receiver_never_reads_samples(self) -> None:
+        """写清楚"为什么一直没暴露"：接收端不读这个字段，所以填错了它也不报错。
+
+        这条同时也是护栏：哪天接收端开始依赖 samples，就必须先跟手机端重新对拍语义。
+        用 AST 找真正的属性访问（`pkt.samples`），注释和文档字符串里提到它不算。
+        """
+        import ast
+        import inspect
+
+        from audiomixing.net import rtpaudio as _rtpaudio
+
+        tree = ast.parse(inspect.getsource(_rtpaudio))
+        reads = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Attribute) and node.attr == "samples"
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in ("pkt", "packet", "parsed")):
+                reads.append(getattr(node, "lineno", 0))
+        self.assertEqual(reads, [],
+                         "接收端一旦开始依赖 samples，就得重新跨语言对拍这个字段的语义（第 %s 行）" % reads)
+
+
+class TestCardVolumeSlidersAndPing(unittest.TestCase):
+    """设备卡片上的可调音量条 + "测连通"的诚实结论。
+
+    用户原话：「我要求的是各设备**可调节**的音量条。当然现在有的显示实际音量条也不错」
+    —— 所以滑块（可调）和电平条（实时显示）两个都要有，滑块控制我们这一层的增益。
+    另一条来自截图：面板写着「192.168.0.101 不通：timed out」——查清是手机没回还是我们等错了。
+    """
+
+    @staticmethod
+    def _html() -> str:
+        return (ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8")
+
+    def setUp(self) -> None:
+        from audiomixing.config import Config
+        from audiomixing.engine import WaveLinkNode
+        from audiomixing.webui import WaveLinkApi
+
+        cfg = Config()
+        cfg.node_id = "self-node"
+        cfg.name = "本机"
+        cfg.routes = []
+        self.node = WaveLinkNode(cfg, audio_port=free_udp_port(), discovery_port=free_udp_port(),
+                                 simulate=True)
+        self.api = WaveLinkApi(self.node)
+
+    def tearDown(self) -> None:
+        try:
+            self.node.stop()
+        except Exception:
+            pass
+
+    # -- 卡片上的滑块与电平条 ---------------------------------------------
+    def test_every_card_has_two_adjustable_sliders(self) -> None:
+        html = self._html()
+        self.assertIn("我听它的", html)
+        self.assertIn("我送它的", html)
+        self.assertIn("function setCardGain(", html)
+        self.assertIn("gainRow('in'", html)
+        self.assertIn("gainRow('out'", html)
+        # 调完立刻生效：走的是既有的路由更新接口（update_route → set_routes → apply_routes）
+        self.assertIn("/api/routes/update", html)
+        self.assertIn("cardGainTimer", html, "拖动时要防抖，不然每动一下打一次接口")
+        # 没有对应路由时滑块必须禁用，避免调一个不存在的音量
+        self.assertIn("${on ? '' : 'disabled'}", html)
+
+    def test_the_level_bars_are_kept_next_to_the_sliders(self) -> None:
+        """用户说了"显示实际音量条也不错" —— 收/送两条实时电平要留着。"""
+        html = self._html()
+        self.assertIn('<span class="lbl">收</span>', html)
+        self.assertIn('<span class="lbl">送</span>', html)
+        self.assertIn("function levelSegs(", html)
+        self.assertEqual(html.count("levelSegs(") >= 3, True, "收/送两条都要用 22 段电平条画")
+        self.assertIn("function inboundKbps(", html, "下行电平要按字节增量算，不能只看累计")
+
+    def test_slider_ids_are_per_device(self) -> None:
+        """多张卡片同时在页面上：数字标签的 id 必须带设备 id，否则会互相覆盖。"""
+        html = self._html()
+        self.assertNotIn('id="cg_in"', html)
+        self.assertNotIn('id="cg_out"', html)
+        self.assertIn("$('cg_' + slot + '_' + uid)", html)
+
+    def test_ping_uses_the_port_the_peer_advertised(self) -> None:
+        """对端端口要用它自己广播里报的：以前拿本机端口去探，探错了地方当然是超时。"""
+        port = free_udp_port()
+        receiver = Receiver("peer-node", port, bind_host="127.0.0.1")
+        receiver.start()
+        try:
+            self.node.registry.update(
+                {"wl": 1, "id": "peer-1", "name": "手机", "audio_port": port, "web_port": 0},
+                "127.0.0.1")
+            result = self.api.ping({"host": "127.0.0.1"})       # 不带 port
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["port"], port, "应该用对端广播里报的 audio_port")
+            self.assertEqual(result["type"], "PONG", "电脑↔电脑时对端会回 PONG")
+            self.assertIn("回了 PONG", result["note"])
+        finally:
+            receiver.stop()
+
+    def test_a_silent_peer_gets_an_honest_answer(self) -> None:
+        """没人监听时：不谎报"不通"，而是说清"手机端不回 PING/PONG"。"""
+        port = free_udp_port()
+        result = self.api.ping({"host": "127.0.0.1", "port": port})
+        self.assertFalse(result["ok"])
+        note = result.get("note") or ""
+        self.assertIn("没有回应 UDP 探测包", note)
+        self.assertIn("不回 PING/PONG", note, "必须告诉用户安卓端本来就不回，别让人以为坏了")
+        self.assertIn("不等于连不通", note)
+
+    def test_the_page_passes_the_peer_port_and_shows_the_note(self) -> None:
+        html = self._html()
+        self.assertIn("async function pingPeer(host, port)", html)
+        self.assertIn("pingPeer('${esc(n.host)}', ${Number(n.audio_port) || 0})", html)
+        self.assertIn("r.note ||", html, "超时时要把服务端那句解释原样显示出来")

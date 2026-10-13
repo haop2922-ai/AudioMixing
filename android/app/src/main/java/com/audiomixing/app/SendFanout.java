@@ -60,6 +60,8 @@ public final class SendFanout {
         /** 最近一次发送成功距今多少毫秒；-1 = 从来没成功过。 */
         public long lastOkAgeMs = -1;
         public String lastError = "";
+        /** ★ 这一路的增益（"我送它的"滑杆），1.00 = 原样。 */
+        public float gain = 1f;
     }
 
     /** 一个目标。字段只由发送线程改；volatile 的部分给界面线程读。 */
@@ -75,6 +77,13 @@ public final class SendFanout {
         volatile long lastSendOkMs;
         volatile float peak;
         volatile String lastError = "";
+        /**
+         * ★ 这一路自己的增益（"我送它的"滑杆，1.0 = 原样）。
+         *
+         * <p>各目标可以不一样，所以增益不同的目标需要**各自一份缩放后的包**
+         * （见 {@link #send}）。全都是 1.0 时走的是老路：一包编码一次、所有目标发同一份。
+         */
+        volatile float gain = 1f;
 
         Target(String host, int port) {
             this.host = host;
@@ -128,6 +137,11 @@ public final class SendFanout {
                 Target t = targets.get(key);
                 if (t == null) {
                     t = new Target(host, port);
+                    // 用户给这台设过的增益要带上（它下线又上线，滑杆不该跳回 1.00）
+                    Float dg = desiredGain.get(host);
+                    if (dg != null) {
+                        t.gain = dg;
+                    }
                 }
                 next.put(key, t);
             }
@@ -159,12 +173,80 @@ public final class SendFanout {
         }
     }
 
+    // ────────────── ★ 逐目标增益（"我送它的"滑杆） ──────────────
+
+    /**
+     * 设定某一台的发送增益（0~1.5，1.0 = 原样）。立刻生效。
+     *
+     * <p>找不到目标也没关系：值会被记下来，那台设备下次上线时自动带上（用户设过就不该丢）。
+     */
+    public void setTargetGain(String host, float g) {
+        if (host == null || host.isEmpty()) {
+            return;
+        }
+        float v = Math.max(0f, Math.min(1.5f, g));
+        synchronized (lock) {
+            for (Target t : targets.values()) {
+                if (host.equals(t.host)) {
+                    t.gain = v;
+                }
+            }
+            desiredGain.put(host, v);
+        }
+    }
+
+    /** 某一台现在的发送增益。 */
+    public float targetGain(String host) {
+        if (host == null) {
+            return 1f;
+        }
+        synchronized (lock) {
+            for (Target t : targets.values()) {
+                if (host.equals(t.host)) {
+                    return t.gain;
+                }
+            }
+            Float v = desiredGain.get(host);
+            return v == null ? 1f : v;
+        }
+    }
+
+    /** 用户设过的增益（目标还没上线也要记住）。 */
+    private final Map<String, Float> desiredGain = new java.util.HashMap<String, Float>();
+    /** 按增益缓存"缩放后的包"（跨包复用，避免每 10ms 分配）。 */
+    private java.util.Map<Float, byte[]> scaledBufs;
+
+    /**
+     * 把 PCM16 样本乘上增益；超过 32767 削顶（回绕会变成刺耳的爆音）。
+     *
+     * <p>和接收侧那套（{@code AudioRecv.Stream#scalePcm16}）是同一个数学，
+     * 但两边各自独立 —— 一处是"我听它的"，一处是"我送它的"。
+     */
+    private static void scalePcm16(byte[] src, byte[] dst, int len, float g) {
+        for (int i = 0; i + 1 < len; i += 2) {
+            int v = (short) ((src[i] & 0xFF) | ((src[i + 1] & 0xFF) << 8));
+            int out = Math.round(v * g);
+            if (out > 32767) {
+                out = 32767;
+            } else if (out < -32768) {
+                out = -32768;
+            }
+            dst[i] = (byte) out;
+            dst[i + 1] = (byte) (out >> 8);
+        }
+    }
+
     /**
      * 把同一包发给所有目标。
      *
-     * @param pkt  已经编码好的整包（所有目标共用这一个数组，<b>不再复制</b>）
+     * <p><b>快路径（绝大多数情况）</b>：所有目标的增益都是 1.00 → 一包编码一次，
+     * 所有目标发的是<b>同一个数组</b>，零额外拷贝。
+     * <b>慢路径</b>：某个目标设了自己的增益（"我送它的"滑杆），那就为那一路准备一份
+     * 缩放后的包（同一个增益值的目标共用一份），其余目标照旧用原包。
+     *
+     * @param pkt  已经编码好的整包
      * @param len  有效长度
-     * @param peak 这一包的电平（各目标正常时都用它）
+     * @param peak 这一包的电平（1.00 的目标用它；设了增益的目标按增益折算）
      * @return 成功发出去的目标数
      */
     public int send(byte[] pkt, int len, float peak) {
@@ -185,7 +267,29 @@ public final class SendFanout {
         }
         long now = SystemClock.elapsedRealtime();
         int ok = 0;
+        // 这一包用到的"按增益缩放过的副本"（同一个增益只做一份，缓冲跨包复用，不产生垃圾）
+        if (scaledBufs == null) {
+            scaledBufs = new java.util.HashMap<Float, byte[]>(4);
+        }
+
         for (Target t : list) {
+            float g = t.gain;
+            byte[] data = pkt;
+            float p = peak;
+            if (g != 1f) {
+                data = scaledBufs.get(g);
+                if (data == null || data.length < len) {
+                    data = new byte[len];
+                    scaledBufs.put(g, data);
+                    if (scaledBufs.size() > 8) {
+                        // 增益种类太多（不可能）：清掉重来，防止无限长
+                        scaledBufs.clear();
+                        scaledBufs.put(g, data);
+                    }
+                }
+                scalePcm16(pkt, data, len, g);
+                p = Math.min(1f, peak * g);
+            }
             try {
                 if (t.addr == null) {
                     t.addr = InetAddress.getByName(t.host);
@@ -193,15 +297,15 @@ public final class SendFanout {
                 }
                 if (t.out == null || t.out.getLength() != len) {
                     // 地址变了或长度变了才重建包头；否则只换负载（10ms 一趟的循环里别产生垃圾）
-                    t.out = new DatagramPacket(pkt, len, t.addr, t.port);
+                    t.out = new DatagramPacket(data, len, t.addr, t.port);
                 } else {
-                    t.out.setData(pkt, 0, len);
+                    t.out.setData(data, 0, len);
                 }
                 s.send(t.out);
                 t.packetsSent++;
                 t.bytesSent += len;
                 t.lastSendOkMs = now;
-                t.peak = peak;
+                t.peak = p;
                 ok++;
             } catch (Throwable e) {
                 // 单个目标失败（对端走了、地址解析不了、网卡抽风）绝不能影响别的目标。
@@ -237,6 +341,7 @@ public final class SendFanout {
                 st.bytesSent = t.bytesSent;
                 st.sendErrors = t.sendErrors;
                 st.lastError = t.lastError;
+                st.gain = t.gain;
                 long edad = t.lastSendOkMs <= 0 ? -1 : (now - t.lastSendOkMs);
                 st.lastOkAgeMs = edad;
                 // 超过 1 秒没成功发出去 → 这一路的电平归零（"这台没在收"一眼可见）

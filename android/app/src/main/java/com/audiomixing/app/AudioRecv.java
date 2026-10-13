@@ -150,6 +150,13 @@ public final class AudioRecv {
         public long dupRouteConfirmed;
         /** 现场描述：谁的哪两条 ssrc 在打架。 */
         public String dupRouteText = "";
+        /**
+         * ★ 对面报的 samples 和负载长度对不上的次数（包照收，不算坏包）。
+         * 电脑端历史版本填的是累计帧偏移，就靠这一条看出来。
+         */
+        public long samplesMismatch;
+        /** 这件事最近一次的现场（人话）。 */
+        public String lastSamplesNote = "";
 
         @Override
         public String toString() {
@@ -243,6 +250,14 @@ public final class AudioRecv {
     private volatile String lastFramesSample = "";
     /** 最近见过的编码（"codec=3（Opus…）"）：判断对面用什么编码发的最直接的证据。 */
     private volatile String lastCodecSeen = "";
+    /**
+     * ★ 对面报的 samples 和负载长度对不上的次数 + 最近一次的现场。
+     *
+     * <p>这不是错误计数（包照收照播），而是"对方那个字段语义不同"的证据 ——
+     * 电脑端历史版本把 samples 填成累计帧偏移，就是靠这两条看出来的。
+     */
+    private volatile long samplesMismatch;
+    private volatile String lastSamplesNote = "";
     /**
      * ★ 坏包按来源 IP 计数（只由收包线程写，读的时候拿 counters 锁）。
      * 上限 8 个来源：局域网里不会有更多，防的是被人乱刷撑爆内存。
@@ -486,6 +501,8 @@ public final class AudioRecv {
         st.dupRoutePackets = dupRoutePackets;
         st.dupRouteConfirmed = dupRouteConfirmed;
         st.dupRouteText = dupRouteText;
+        st.samplesMismatch = samplesMismatch;
+        st.lastSamplesNote = lastSamplesNote;
         st.trackErrors = trackErrors;
         st.targetMs = targetMs;
         st.peak = peak;
@@ -656,12 +673,29 @@ public final class AudioRecv {
             return;
         }
         int plen = plen0;
-        if (plen > FRAME_BYTES || pkt.samples > Proto.FRAME_SAMPLES) {
-            // 只认 480 帧一包（10ms）。别的帧长我们不做重采样 —— 宁可不要，也不要变速变调。
+        // ★★ 准入判据 = 【负载长度】，不再看 samples ★★
+        //
+        // 为什么（2026-10-14 跨端字段语义错误，用户报告里的真实数字）：
+        //   电脑端 audiomixing/net/rtpaudio.py 把 samples 填成了"累计帧偏移"
+        //   （4,924,800 = 480 × 10260），而 Python 接收端根本不读这个字段 ——
+        //   所以电脑↔电脑一直没症状；手机端以前严格校验它，于是那些包全部被拒，
+        //   表现就是"电脑在放声音、手机一个包都不收"。
+        //
+        // 新判据（只看负载；PCM16 立体声一包 1920 字节 = 480 帧 = 10ms）：
+        //   · plen == 1920 → 收下（标准包）
+        //   · plen <  1920 → 收下，尾巴补零（短读早就有这个能力，几毫秒静音听不出来）
+        //   · plen >  1920 → 拒绝（这才是真的"一包里塞了不止 480 帧"，我们不做重采样）
+        // samples 只作参考：和负载对不上就记一笔、在诊断报告里写人话，绝不因此拒收。
+        if (plen > FRAME_BYTES) {
             bumpBad(12, host, len);
-            sampleBad(5, buf, len, from, "samples=" + pkt.samples + "、负载 " + plen
-                    + " 字节（我们要 " + Proto.FRAME_SAMPLES + " 帧/" + FRAME_BYTES + " 字节）");
+            sampleBad(5, buf, len, from, "负载 " + plen + " 字节 > 一包 " + FRAME_BYTES
+                    + " 字节（samples=" + pkt.samples + "）");
             return;
+        }
+        String smpNote = samplesNote(pkt.samples, plen);
+        if (smpNote.length() > 0) {
+            samplesMismatch++;
+            lastSamplesNote = smpNote;
         }
         // ★ 同一台设备只让一条流出声（见上面那一大段说明）
         Integer busy = acceptStreamFor(host, pkt.ssrc);
@@ -783,6 +817,27 @@ public final class AudioRecv {
         fpIdx = (fpIdx + 1) % FP_HISTORY;
     }
 
+    /**
+     * 描述"对面报的 samples 和负载长度对不上"这件事（人话）；对得上就返回空串。
+     *
+     * <p>为什么值得单独写一句话：电脑端历史版本把 samples 填成<b>累计帧偏移</b>
+     * （用户报告里 4,924,800 = 480 × 10260）。这在真机上看起来像"包全坏了"，
+     * 其实只是对方一个字段的语义不同 —— 报告里必须把这件事说清楚，
+     * 否则下一个人又会去查"是不是丢包/是不是编码不对"。
+     */
+    private static String samplesNote(int samples, int plen) {
+        int expect = plen / 4;                       // PCM16 立体声：4 字节一帧
+        if (samples == expect) {
+            return "";
+        }
+        if (plen == FRAME_BYTES && samples > Proto.FRAME_SAMPLES) {
+            return "对面把 samples 填成了累计值（" + samples + "），不影响播放 —— 已按负载长度接收（"
+                    + Proto.FRAME_SAMPLES + " 帧/" + FRAME_BYTES + " 字节）";
+        }
+        return "对面报的 samples=" + samples + " 和负载 " + plen
+                + " 字节对不上（按负载算应是 " + expect + " 帧），已按负载长度接收";
+    }
+
     /** 编码的人话名字（和电脑端 proto.CODEC_NAMES 一致，报告里两边对得上）。 */
     private static String codecName(int c) {
         switch (c) {
@@ -877,6 +932,7 @@ public final class AudioRecv {
             }
         }
         Stream s = new Stream(key, host, ssrc);
+        s.gain = gainFor(host);      // 用户给这台设过的增益，新流也要带上
         streams.add(s);
         ssrcSeen++;
         Log.i(TAG, "新音频流：" + key);
@@ -1092,6 +1148,8 @@ public final class AudioRecv {
         volatile long late;
         volatile long dup;
         volatile float peak;
+        /** ★ 这一路自己的增益（"我听它的"滑杆，1.0 = 原样）。由界面线程改、收包线程读。 */
+        volatile float gain = 1f;
 
         Stream(String key, String host, int ssrc) {
             this.key = key;
@@ -1133,13 +1191,43 @@ public final class AudioRecv {
                 if (silent || len <= 0) {
                     // 对端明确标了"静音"：占住槽位但不拷数据，播放时就不会把它算成丢包。
                     Arrays.fill(slot, (byte) 0);
-                } else {
+                } else if (gain == 1f) {
+                    // 绝大多数情况走这条：原样拷贝，一次乘法都不做。
                     System.arraycopy(payload, 0, slot, 0, len);
                     if (len < FRAME_BYTES) {
                         Arrays.fill(slot, len, FRAME_BYTES, (byte) 0);   // 短包尾巴补零
                     }
+                } else {
+                    // ★ 这一台自己设了增益（"我听它的"滑杆）：只乘这一路的样本，别的流不受影响。
+                    scalePcm16(payload, slot, len, gain);
+                    if (len < FRAME_BYTES) {
+                        Arrays.fill(slot, len, FRAME_BYTES, (byte) 0);
+                    }
                 }
                 filled[idx] = true;
+            }
+        }
+
+        /**
+         * 把 PCM16 样本乘上增益后拷进目标缓冲（带削顶）。
+         *
+         * <p><b>为什么放在 Stream 里面</b>：它只服务这一路。放在外层会让
+         * {@code tools/extract_stream.awk} 抽出来的 Stream 类编译不过（抖动测试就废了），
+         * 所以凡是 Stream 用到的东西都留在 Stream 内部。
+         *
+         * <p>超过 32767 必须削顶 —— 回绕会变成刺耳的爆音。
+         */
+        private void scalePcm16(byte[] src, byte[] dst, int len, float g) {
+            for (int i = 0; i + 1 < len; i += 2) {
+                int v = (short) ((src[i] & 0xFF) | ((src[i + 1] & 0xFF) << 8));
+                int out = Math.round(v * g);
+                if (out > 32767) {
+                    out = 32767;
+                } else if (out < -32768) {
+                    out = -32768;
+                }
+                dst[i] = (byte) out;
+                dst[i + 1] = (byte) (out >> 8);
             }
         }
 
@@ -1242,6 +1330,45 @@ public final class AudioRecv {
             }
             return n * 10;
         }
+    }
+
+    /**
+     * ★ 每台设备各自的"我听它的"增益（界面滑杆）。
+     *
+     * <p>为什么不直接改总增益：用户要的是<b>每一台自己一条可调音量条</b>
+     * （原话：「我要求的是各设备可调节的音量条」）。做法是把增益乘在<b>这一路</b>的样本上
+     * （{@link Stream#store} 拷进槽位时乘），所以各台互不影响；总增益（AudioTrack 音量）照旧叠在上面。
+     *
+     * <p>写的是 copy-on-write 的不可变 map：收包线程每包要读一次，不能让它去抢锁。
+     */
+    private volatile Map<String, Float> hostGain = Collections.emptyMap();
+
+    /** 设定某一台的接收增益（0~1.5，1.0 = 原样）。立刻生效。 */
+    public void setHostGain(String host, float g) {
+        if (host == null || host.isEmpty()) {
+            return;
+        }
+        float v = Math.max(0f, Math.min(1.5f, g));
+        Map<String, Float> next = new HashMap<>(hostGain);
+        next.put(host, v);
+        hostGain = Collections.unmodifiableMap(next);   // 一次替换，收包线程永远读到完整的一份
+        for (Stream s : streams) {
+            if (host.equals(s.host)) {
+                s.gain = v;
+            }
+        }
+    }
+
+    /** 某一台现在的接收增益。 */
+    public float hostGain(String host) {
+        Float v = hostGain.get(host);
+        return v == null ? 1f : v;
+    }
+
+    /** 新建流时把用户设过的增益带上（不然新流的滑杆会"跳回 1.00"）。 */
+    private float gainFor(String host) {
+        Float v = hostGain.get(host);
+        return v == null ? 1f : v;
     }
 
     private void bump(int idx) {

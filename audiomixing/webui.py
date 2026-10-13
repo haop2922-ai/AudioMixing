@@ -1374,10 +1374,31 @@ class WaveLinkApi:
         return {"ok": True, "changed": changed, "config": node.config.to_json()}
 
     def ping(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Probe one device with a UDP PING. Reports what actually happened, not a verdict.
+
+        2026-10-14 的现场：用户截图里写着「192.168.0.101 不通：timed out」，看上去像
+        手机没救了 —— 其实【安卓端根本不回 PING/PONG】（AudioRecv 把控制包记一笔就返回，
+        它的注释也写明不做时钟对齐）。所以：
+
+        * 端口优先用对端广播里报的 audio_port。以前这里是拿【本机】的 audio_port 去探，
+          对端端口不一样时就探错了地方（编的端口当然没人回）。
+        * 超时不再等于"不通"：UDP 没有握手，"没回应"只是一个事实，note 里写清它意味着什么。
+        """
         host = str(payload.get("host") or "")
         if not host:
             raise ApiError("missing host")
-        port = int(payload.get("port") or self.node.config.audio_port)
+        # 1) 页面上带的端口 2) 发现列表里对端自己报的端口 3) 兜底才是本机端口
+        port = int(payload.get("port") or 0)
+        peer = None
+        if not port:
+            try:
+                peer = self.node.registry.resolve(host)
+            except Exception:
+                peer = None
+            if peer is not None and getattr(peer, "audio_port", 0):
+                port = int(peer.audio_port)
+        if not port:
+            port = int(self.node.config.audio_port)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(1.0)
         try:
@@ -1389,14 +1410,22 @@ class WaveLinkApi:
             data, addr = sock.recvfrom(4096)
             rtt_ms = (time.monotonic() - t0) * 1000.0
             parsed = proto.decode(data)
+            kind = proto.TYPE_NAMES.get(parsed.type, "?") if parsed else "invalid"
             return {
-                "ok": parsed is not None,
+                "ok": True,
                 "host": addr[0],
+                "port": port,
                 "rtt_ms": round(rtt_ms, 2),
-                "type": proto.TYPE_NAMES.get(parsed.type, "?") if parsed else "invalid",
+                "type": kind,
+                "note": "%s 回了 %s（往返 %.0f ms）" % (addr[0], kind, rtt_ms),
             }
         except OSError as exc:
-            return {"ok": False, "error": str(exc)}
+            note = ("%s:%d 没有回应 UDP 探测包（%s）。"
+                    "注意：安卓/手机端不回 PING/PONG（它只把控制包记一笔），"
+                    "所以「超时」不等于连不通 —— 能不能听到声音请看它有没有在发声音、"
+                    "以及「① 局域网里的设备」里是不是显示在线。"
+                    % (host, port, exc))
+            return {"ok": False, "error": str(exc), "host": host, "port": port, "note": note}
         finally:
             sock.close()
 

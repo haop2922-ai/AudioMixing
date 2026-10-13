@@ -17,11 +17,24 @@ import java.nio.ByteOrder;
  *  5    uint8    codec         2=PCM16（手机用这个）3=Opus
  *  6    uint16   seq           包序号
  *  8    uint32   ssrc          本流标识
- * 12    uint32   samples       本包帧数（每帧 2 声道）
+ * 12    uint32   samples       ★见下方说明★（本包帧数；对面历史版本可能填累计值）
  * 16    uint64   ts_ns         发送时刻墙钟纳秒
  * 24    int16    gain_q14      音量，Q14 定点（1.0 == 16384）
  * 26    uint16   payload_len   负载字节数
  * </pre>
+ *
+ * <p><b>★ samples 字段的语义（2026-10-14 跨端踩过的坑，接收端务必按这段处理）★</b>
+ * <ul>
+ *   <li><b>规范语义</b>：<b>本包</b>有多少帧（每帧 2 声道）。480 帧 = 10ms = 1920 字节负载。</li>
+ *   <li><b>历史事实</b>：电脑端 {@code audiomixing/net/rtpaudio.py} 曾经把它填成
+ *       <b>累计帧偏移</b>（用户报告里的 4,924,800 = 480 × 10260）。Python 接收端根本不读这个
+ *       字段，所以电脑↔电脑一直没症状；而手机端一旦严格校验它，就会把对方的包全部拒收 ——
+ *       现场表现是"电脑在放声音、手机一个包都不收到"。</li>
+ *   <li><b>因此</b>：接收端判"这一包是不是标准包"<b>一律以负载长度为准</b>
+ *       （1920 字节 = 480 帧；短的补零；只有 &gt; 1920 才拒），
+ *       {@code samples} 只作参考、不作拒绝条件（见 {@code AudioRecv.onPacket}）。</li>
+ *   <li><b>不要</b>因为这段说明去改包头布局或版本号 —— 这个类是和 Python 端逐字节对拍过的。</li>
+ * </ul>
  */
 public final class Proto {
 
