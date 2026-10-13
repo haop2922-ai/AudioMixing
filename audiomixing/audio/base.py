@@ -93,6 +93,7 @@ class BackendBase:
 # --------------------------------------------------------------------------
 
 _BACKENDS: dict[str, type] = {}
+_AUTOLOADED = False
 
 
 def register(backend_cls: type) -> type:
@@ -101,20 +102,48 @@ def register(backend_cls: type) -> type:
 
 
 def _autoload() -> None:
-    if _BACKENDS:
-        return
-    from .backends import file as _file  # noqa: F401
-    from .backends import netmic as _netmic  # noqa: F401
-    from .backends import null as _null  # noqa: F401
+    """把内置后端模块导入一遍（每个模块用 @register 自己登记）。
 
-    try:
-        from .backends import wasapi as _wasapi  # noqa: F401
-    except Exception:  # pragma: no cover - non-Windows
-        pass
-    try:
-        from .backends import pipewire as _pipewire  # noqa: F401
-    except Exception:  # pragma: no cover
-        pass
+    ★ 这里【不能】写成 "if _BACKENDS: return" ★
+    任何一处先 import 了单个后端（engine 里就有 `from .audio.backends import netmic`），
+    `_BACKENDS` 就不再为空 —— 旧写法会直接返回，file / null / wasapi 永远不加载，
+    于是后面要开 "null"（模拟/测试音）或 "wasapi"（真实声卡）时直接
+    `unknown audio backend 'null' (have: netmic)`，表现是"什么都打不开、一点声音都没有"。
+    2026-10-14 在测试里稳定复现（先跑过 netmic 的用例，后面 simulate 节点就开不了音源）。
+
+    另外：光"导入模块"还不够 —— 模块可能已经在 sys.modules 里、但登记丢了
+    （注册表被清空/重置过）。那种情况下 import 是空操作，注册表会一直缺后端；
+    所以补一步：从已经缓存的模块里把后端类找出来重新登记（见下面的循环）。
+    """
+    global _AUTOLOADED
+    if _AUTOLOADED:
+        return
+    _AUTOLOADED = True          # 先置位：下面的导入自己可能又调回来
+    import importlib
+    import sys as _sys
+
+    for name in ("file", "netmic", "null", "wasapi", "pipewire"):
+        if name in _BACKENDS:
+            continue            # 已经登记过就别动它
+        full = "%s.backends.%s" % (__package__, name)
+        try:
+            module = _sys.modules.get(full)
+            if module is None:
+                importlib.import_module(full)
+                continue
+        except Exception:  # pragma: no cover - 非 Windows 上没有 wasapi/pipewire
+            continue
+        # 模块已经在缓存里、但没登记（注册表被清空/重置过）：把它的后端类直接登记回来。
+        # ★ 这里【不要】用 importlib.reload ★ —— reload 会造出一个新的类对象和新的模块级
+        # 字典（比如 netmic 的 MICS），而别处手里还攥着旧的那一份引用，结果就是
+        # "设备列表永远是空的"这类鬼问题（2026-10-14 实测踩到）。
+        for value in list(vars(module).values()):
+            try:
+                if isinstance(value, type) and getattr(value, "name", "") == name:
+                    register(value)
+                    break
+            except Exception:
+                continue
 
 
 def backends() -> dict[str, type]:

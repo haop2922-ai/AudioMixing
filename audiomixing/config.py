@@ -90,6 +90,11 @@ class Config:
     # Several entries are mixed into one stream, which is how several phones - each on
     # its own Bluetooth adapter - or a phone plus this machine's sound travel as one.
     channel_sources: list[str] = field(default_factory=list)
+    # ① 自动收听（与手机端同名同义）：
+    #   auto_accept_listen —— 对方按「送声音」时，要不要自动让我收听它（默认开）
+    #   listen_optout      —— 用户明确关掉过的设备（node_id 或名字）：进过名单就不再自动加
+    auto_accept_listen: bool = True
+    listen_optout: list[str] = field(default_factory=list)
     # 本机多设备输出：勾选的输出设备（每项含 device/gain/delay_ms）
     multi_out_devices: list[dict[str, Any]] = field(default_factory=list)
     # Play the channel's sources on *this* machine's output as well. This is what makes
@@ -175,6 +180,8 @@ class Config:
             "listen": self.listen,
             "channel_gain": self.channel_gain,
             "channel_sources": self.channel_sources,
+            "auto_accept_listen": self.auto_accept_listen,
+            "listen_optout": self.listen_optout,
             "local": self.local,
             "autoconnect": self.autoconnect,
             "auto_play": self.auto_play,

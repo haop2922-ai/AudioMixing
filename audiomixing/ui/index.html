@@ -793,6 +793,9 @@ html:not(.fullui) .card .body { padding-top: 6px; }
         </div>
         <div class="fields" style="margin-top:10px">
           <label class="chk"><input type="checkbox" id="autoPlay" onchange="saveAutoPlay()"> 正在发送的手机自动播放</label>
+          <!-- ① 自动收听总开关：对方按「送声音」时要不要自动开始收。默认开，可整体关掉。 -->
+          <label class="chk"><input type="checkbox" id="autoAcceptListen" onchange="saveAutoAcceptListen()"
+            title="对方按「送声音」时自动打开收听；关掉之后每次都要你自己点"> 自动接受收听请求</label>
 
         </div>
         <div class="mini" style="margin-top:8px">
@@ -1112,27 +1115,47 @@ function extraBox(title, extra){
    —— 所以只作用于详细档（下面的表），简洁档那一列原样不动。 */
 const OFFLINE_KEEP_S = 60;
 
-/* ① 对方请求收听 → 面板必须明说"设置被改过了"，并给一键撤销（不能静默改用户设置）。 */
+/* ① 对方请求收听 → 面板必须明说"设置被改过了"，并给一键撤销（不能静默改用户设置）。
+   撤销之后这台设备进"永不再自动"名单（与手机端同名行为），以后再请求只提示、不自动打开。 */
 async function revokeAutoListen(nodeId, name){
   try{
     const cfg = await api('/api/routes');
     const route = (cfg.routes || []).find(r => r.auto && (r.from || []).includes(nodeId));
     if(route) await api('/api/routes/delete', {id: route.id});
-    toast('已撤销：不再自动收听 ' + name, 'ok');
+    await api('/api/listen/optout', {node_id: nodeId, name: name, on: true});
+    toast('已撤销：以后不再自动收听 ' + name + '（它再请求时会先问你）', 'ok');
     refreshAll();
   }catch(e){ toast('撤销失败：' + e.message, 'err'); }
+}
+
+async function allowAutoListen(nodeId, name, host){
+  try{
+    await api('/api/listen/optout', {node_id: nodeId, name: name, host: host || '', on: false});
+    toast('已允许自动收听 ' + name, 'ok');
+    refreshAll();
+  }catch(e){ toast('操作失败：' + e.message, 'err'); }
 }
 
 function renderAutoListen(){
   const box = $('autoListenBox');
   if(!box) return;
   const s = state.status || {};
-  const items = ((s.auto_listen && s.auto_listen.items) || []).filter(x => x.active);
-  box.innerHTML = items.map(x => `<div class="alrow">
+  const al = s.auto_listen || {};
+  const items = (al.items || []).filter(x => x.active);
+  let html = items.map(x => `<div class="alrow">
     <span class="grow">📡 <b>${esc(x.name || x.node_id)}</b> 请求收听本机 —— <b>已自动打开</b>
-      （${esc(s.auto_listen.label || '')}）。这是对方按了「送声音」时自动加的，不是你自己加的。</span>
+      （${esc(al.label || '')}）。这是对方按了「送声音」时自动加的，不是你自己加的。</span>
     <button class="tiny ghost" onclick="revokeAutoListen('${esc(x.node_id)}','${esc(x.name || '')}')">撤销</button>
   </div>`).join('');
+  // 被拒的请求也要说出来：用户关过它（或关了总开关）时，不能装作没发生。
+  (al.denied || []).forEach(d => {
+    html += `<div class="alrow" style="background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.25)">
+      <span class="grow">📡 <b>${esc(d.name || d.node_id)}</b> 请求收听 ——
+        <b>${esc(d.reason || '没有自动打开')}</b>，所以没有自动打开。要听它的话，点右边。</span>
+      <button class="tiny ghost" onclick="allowAutoListen('${esc(d.node_id)}','${esc(d.name || '')}','${esc(d.host || '')}')">这次打开</button>
+    </div>`;
+  });
+  box.innerHTML = html;
 }
 
 function renderPeers(){
@@ -2103,6 +2126,7 @@ async function loadNetMics(){
       const chosen = new Set(((cfg.config || {}).channel_sources) || []);
       window.__chosenSources = Array.from(chosen);
       window.__autoPlay = ((cfg.config || {}).auto_play !== false);
+      window.__autoAcceptListen = ((cfg.config || {}).auto_accept_listen !== false);
       const missing = mics.filter(x => !chosen.has(x.name)).map(x => x.name);
       if(missing.length){
         hint += `<div class="action">手机 <b>${missing.map(esc).join('、')}</b> 正在发送，但没加入「音源」，所以听不到。`
@@ -2133,6 +2157,7 @@ async function loadNetMics(){
     }
     lines.forEach(el => { el.innerHTML = html + hint; });
     if($('autoPlay')) $('autoPlay').checked = !!(window.__autoPlay);
+    if($('autoAcceptListen')) $('autoAcceptListen').checked = (window.__autoAcceptListen !== false);
   }catch(e){ /* ignore */ }
 }
 
@@ -2140,6 +2165,14 @@ async function saveAutoPlay(){
   try{
     await api('/api/settings', {auto_play: $('autoPlay').checked});
     toast($('autoPlay').checked ? '新手机一开始发送就会自动播放' : '已关闭自动播放，需要手动加入音源', 'ok');
+  }catch(e){ toast('失败：' + e.message, 'err'); }
+}
+async function saveAutoAcceptListen(){
+  try{
+    await api('/api/settings', {auto_accept_listen: $('autoAcceptListen').checked});
+    toast($('autoAcceptListen').checked ? '对方按「送声音」时会自动打开收听'
+                                        : '已关闭自动收听：以后每次都要你自己点', 'ok');
+    refreshAll();
   }catch(e){ toast('失败：' + e.message, 'err'); }
 }
 async function setMicGain(index, percent){

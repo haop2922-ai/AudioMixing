@@ -255,6 +255,10 @@ class WaveLinkNode:
         self._gain_local_at: dict[str, float] = {}
         self._handled_stats_at = 0.0
         self._last_peer_stats = 0.0
+        # 每条路由的增益"最后一次被改"的墙钟毫秒（和对端交换的就是它）＋本机改动时刻
+        self._gain_ts: dict[str, int] = {}
+        # 请求被拒的记录（用户关过它 / 总开关关了）——面板要说明"为什么没自动打开"
+        self._auto_listen_denied: dict[str, dict[str, Any]] = {}
         self.routes: list[dict[str, Any]] = []
         self._routes_lock = threading.RLock()
         self._stop = threading.Event()
@@ -1563,19 +1567,63 @@ class WaveLinkNode:
         """这一轮因为"对端已经没了"而停发的那些（面板据此说明原因）。"""
         return list(self._senders_blocked.values())
 
-    # -- ① 自动收听 / 共享增益：复用 T_STATS 的 JSON 负载（旧版本忽略未知字段） ----
-    # 包类型: T_STATS (7)，UDP 单播到对端 audio_port。新增字段：
-    #   "request_listen": true|false  请对方开始 / 停止收听我
-    #   "listen_from": "<我的 node_id>"、"listen_name": "<我的名字>"
-    #   "route_gain": 0.0~2.0        这条 我→你 的增益（两端共享同一个值）
-    #   "gain_ts": <毫秒>            可选（两台机器墙钟可能不等，接收端按本地先后判最新）
-    #   "gain_route": "<我这边的路由 id>"
+    # -- ① 自动收听 / 共享增益：复用 T_STATS 的 JSON 负载 -------------------------
+    # ★ 字段名与手机端（task-17）逐字对齐，两边各报"自己两个方向"的值，不新增包类型、
+    #   不改包头。老版本收到这 5 个键当未知字段忽略即可。
+    #   want_listen  bool    "我在把声音送给你，请自动打开收听"。幂等：还在送就一直 true
+    #   gain         0~1.50  我→你 这条链路的共享音量（= 我的「我送它的」= 对方的「我听它的」）
+    #   gain_ts      int ms  上面那个值最后一次被改的时刻
+    #   gain_rx      0~1.50  你→我 这条链路的共享音量（= 我的「我听它的」= 对方的「我送它的」）
+    #   gain_rx_ts   int ms
+    @staticmethod
+    def _as_ms(value: Any) -> int:
+        """把对端的时间戳按【整数】毫秒解析，绝不经过浮点。
+
+        手机端踩过这个坑：借道 float 会把 13 位毫秒时间戳截断成 1.7e8，
+        "谁后改谁赢"直接失效。这里按字符串取整数部分。
+        """
+        try:
+            text = str(value).strip()
+            if not text:
+                return 0
+            if "." in text:
+                text = text.split(".", 1)[0]
+            if text.lower().startswith("e"):
+                return 0
+            return int(text)
+        except (TypeError, ValueError):
+            return 0
+
+    def _route_between(self, peer_id: str, direction: str) -> dict[str, Any] | None:
+        """direction='out' → 我→它 那一条（我的「我送它的」）；'in' → 它→我 那一条。"""
+        for rule in self.local_routes():
+            frm = [str(t) for t in rule.get("from") or []]
+            to = [str(t) for t in rule.get("to") or []]
+            mine_from = any(is_self_token(t, self.node_id, self.name) for t in frm)
+            mine_to = any(is_self_token(t, self.node_id, self.name) for t in to)
+            if direction == "out" and mine_from and peer_id in to:
+                return rule
+            if direction == "in" and mine_to and peer_id in frm:
+                return rule
+        return None
+
+    def _link_gains(self, peer_id: str) -> dict[str, Any]:
+        """我和这台对端两条链路的当前增益 + "最后一次改动时刻"（整数毫秒）。"""
+        out = self._route_between(peer_id, "out")
+        inn = self._route_between(peer_id, "in")
+        return {
+            "gain": round(float((out or {}).get("gain", 1.0)), 3),
+            "gain_ts": int(self._gain_ts.get(str((out or {}).get("id") or ""), 0)),
+            "gain_rx": round(float((inn or {}).get("gain", 1.0)), 3),
+            "gain_rx_ts": int(self._gain_ts.get(str((inn or {}).get("id") or ""), 0)),
+        }
+
     def _send_peer_stats(self, force: bool = False) -> None:
-        """给"正在给它发声音"的对端发统计 + 收听请求 + 这条路由的增益。
+        """给"正在给它发声音"的对端发统计 + 收听请求 + 两条链路的共享增益。
 
         用户要的两件事都搭在这个每 2 秒一次的统计包上：
-          · 我点「送给它」→ 对方自动开始收听（不用对方再手点一次）；
-          · 两端音量条是同一个增益，谁调都以最新为准。
+          · 我点「送给它」→ 对方自动开始收听（want_listen，幂等）；
+          · 两端音量条是同一个增益，谁调都以最新为准（gain/gain_rx + 时间戳）。
         """
         now = time.monotonic()
         if not force and now - getattr(self, "_last_peer_stats", 0.0) < 2.0:
@@ -1588,9 +1636,8 @@ class WaveLinkNode:
         for session in sessions:
             if int(getattr(session, "packets_sent", 0) or 0) <= 0:
                 continue          # 还没真发出过东西的先不发，免得对端收到"空统计"
-            route_id = str(getattr(session, "route_id", "") or "")
-            rule = next((r for r in self.routes if str(r.get("id")) == route_id), None)
-            gain = float((rule or {}).get("gain", 1.0))
+            peer_id = str(getattr(session, "node_id", "") or "")
+            gains = self._link_gains(peer_id) if peer_id else {}
             body = {
                 "t": "stats",
                 "node": self.node_id,
@@ -1598,14 +1645,13 @@ class WaveLinkNode:
                 "sending": True,
                 "sent": int(getattr(session, "packets_sent", 0) or 0),
                 "bytes": int(getattr(session, "bytes_sent", 0) or 0),
-                # ★ 请对方收听我（对方会自动建"从我到它"的路由，并可一键撤销）
-                "request_listen": True,
-                "listen_from": self.node_id,
-                "listen_name": self.name,
-                # ★ 共享增益
-                "route_gain": round(gain, 3),
-                "gain_ts": int(time.time() * 1000),
-                "gain_route": route_id,
+                # ★ 请求对方自动收听我（幂等：还在送就一直 true）
+                "want_listen": True,
+                # ★ 两条链路的共享增益，字段名与手机端一致
+                "gain": gains.get("gain", 1.0),
+                "gain_ts": int(gains.get("gain_ts", 0)),
+                "gain_rx": gains.get("gain_rx", 1.0),
+                "gain_rx_ts": int(gains.get("gain_rx_ts", 0)),
             }
             try:
                 self.receiver.send_control(proto.T_STATS, body,
@@ -1614,7 +1660,7 @@ class WaveLinkNode:
                 pass
 
     def _handle_peer_requests(self) -> None:
-        """处理对端发来的统计：① 它请我听它 → 自动建路由（可撤销）；② 共享增益同步。"""
+        """处理对端发来的 T_STATS：① 它请我听它 → 自动建路由（可撤销）；② 共享增益。"""
         now = time.monotonic()
         try:
             messages = list(self.receiver.control_messages)
@@ -1628,25 +1674,70 @@ class WaveLinkNode:
                 continue
             src = str(msg.get("_from") or "")
             host = src.split(":")[0]
-            node_id = str(msg.get("listen_from") or msg.get("node") or msg.get("node_id") or "")
-            name = str(msg.get("listen_name") or msg.get("name") or host or "对端")
-            if "request_listen" in msg:
-                if msg.get("request_listen"):
-                    self._grant_listen_request(node_id, name, host)
-                else:
-                    self._revoke_auto_listen(node_id, name)
-            gain = msg.get("route_gain")
-            if gain is not None and node_id:
-                self._apply_shared_gain(node_id, float(gain))
+            node_id = str(msg.get("node") or msg.get("node_id") or msg.get("listen_from") or "")
+            name = str(msg.get("name") or msg.get("listen_name") or host or "对端")
+            if bool(msg.get("want_listen")):
+                self._grant_listen_request(node_id, name, host)
+            # 对端的 gain 是"它→我"这条链路（= 我的「我听它的」）
+            if msg.get("gain") is not None and node_id:
+                self._apply_shared_gain(node_id, "in", float(msg["gain"]),
+                                        self._as_ms(msg.get("gain_ts")))
+            # 对端的 gain_rx 是"我→它"这条链路（= 我的「我送它的」）
+            if msg.get("gain_rx") is not None and node_id:
+                self._apply_shared_gain(node_id, "out", float(msg["gain_rx"]),
+                                        self._as_ms(msg.get("gain_rx_ts")))
         self._handled_stats_at = now
+
+    def listen_optout_keys(self) -> set[str]:
+        """用户明确关掉过自动收听的设备（node_id / 名字，小写）。"""
+        return {str(x).strip().lower()
+                for x in (getattr(self.config, "listen_optout", None) or []) if str(x).strip()}
+
+    def set_listen_optout(self, node_id: str, name: str = "", on: bool = True) -> dict[str, Any]:
+        """把一台设备加进/移出"永不再自动收听"名单（面板上的撤销 / 这次打开）。"""
+        keys = [str(x).strip() for x in (getattr(self.config, "listen_optout", None) or [])
+                if str(x).strip()]
+        targets = {k.lower() for k in (node_id, name) if str(k).strip()}
+        kept = [k for k in keys if k.lower() not in targets]
+        if on:
+            for value in (node_id, name):
+                value = str(value).strip()
+                if value and value not in kept:
+                    kept.append(value)
+        self.config.listen_optout = kept
+        try:
+            self.config.save()
+        except Exception:
+            pass
+        if not on:
+            self._auto_listen_denied.pop(node_id, None)
+        return {"ok": True, "optout": kept, "on": bool(on)}
+
+    def _record_listen_denied(self, node_id: str, name: str, reason: str) -> None:
+        self._auto_listen_denied[node_id] = {
+            "node_id": node_id, "name": name, "reason": reason, "at": time.time(),
+        }
+        # 只留最近几条，免得一直堆着
+        if len(self._auto_listen_denied) > 5:
+            oldest = sorted(self._auto_listen_denied.items(), key=lambda kv: kv[1]["at"])[0][0]
+            self._auto_listen_denied.pop(oldest, None)
 
     def _grant_listen_request(self, node_id: str, name: str, host: str) -> None:
         """对端说"我在给你发声音，请收听我" → 自动建一条 从它到本机 的路由。
 
         用户要的是"按下发送键，对方自动就能听见"。但【不能静默改别人的设置】：
-        这条路由带 auto 标记、面板上明确写"对方请求收听，已自动打开"，并且能一键撤销。
+        · 这条路由带 auto 标记，面板上明确写"对方请求收听，已自动打开"，并且能一键撤销；
+        · 撤销过的设备进"永不再自动"名单（与手机端同名行为）；
+        · 总开关 auto_accept_listen 可以让用户整体关掉这件事。
         """
         if not node_id or node_id == self.node_id:
+            return
+        if not bool(getattr(self.config, "auto_accept_listen", True)):
+            self._record_listen_denied(node_id, name, "你已经关掉了「自动接受收听请求」")
+            return
+        keys = self.listen_optout_keys()
+        if node_id.lower() in keys or (name and name.lower() in keys):
+            self._record_listen_denied(node_id, name, "你之前关过它")
             return
         existing = None
         for rule in self.routes:
@@ -1682,7 +1773,7 @@ class WaveLinkNode:
         self.note("「%s」请求收听本机 → 已自动加了一条路由（可在面板上一键撤销）" % name)
 
     def _revoke_auto_listen(self, node_id: str, name: str = "") -> None:
-        """对端说"不用听了"→ 只撤掉【自动建的】那一条，用户自己建的路由不动。"""
+        """只撤掉【自动建的】那一条，用户自己建的路由不动（面板撤销走的是这条）。"""
         if not node_id:
             return
         auto_ids = [str(r.get("id")) for r in self.routes
@@ -1693,48 +1784,71 @@ class WaveLinkNode:
                 self.set_routes(kept, drop=auto_ids)
             except Exception:
                 pass
-            self.note("「%s」不再送声音 → 自动收听已撤销" % (name or node_id))
         self._auto_listen_granted.pop(node_id, None)
+        self.set_listen_optout(node_id, name, on=True)
 
-    def _apply_shared_gain(self, peer_id: str, gain: float) -> None:
-        """共享增益：对端调了音量条 → 本机这条 我→它 的路由跟着变（谁最后动以谁为准）。
+    def _apply_shared_gain(self, peer_id: str, direction: str, value: float, ts: int) -> None:
+        """共享增益：对端调了音量条 → 本机对应那条路由跟着变（谁最后动以谁为准）。
 
-        "最新"按本机看到的先后判（monotonic），不用对端的时间戳 ——
-        两台机器的墙钟可能差很多，拿对端时间戳比会把滑杆锁死在一端。
+        两条链路的语义（与手机端一致）：
+          direction='in'  → 它→我（我的「我听它的」），对端用 gain/gain_ts 报过来；
+          direction='out' → 我→它（我的「我送它的」），对端用 gain_rx/gain_rx_ts 报过来。
+        判新旧的规则：
+          · 时间戳按整数比，大者新；
+          · 值一样就只对齐时间戳、绝不回推（否则两端会互相弹）；
+          · 本机 0.8 秒内刚动过这条 → 不抢（用户正在拖）；
+          · 时钟偏差兜底：本机 5 秒没动过，就采纳对端的值（手机端同规则）。
         """
-        gain = max(0.0, min(2.0, float(gain)))
-        for rule in self.local_routes():
-            to = [str(t) for t in rule.get("to") or []]
-            if peer_id not in to:
-                continue
-            if abs(float(rule.get("gain", 1.0)) - gain) < 0.005:
-                return
-            now = time.monotonic()
-            # 本机刚动过（1.5 秒内）就不接受对端的旧值 —— 否则拖动时会被来回抢。
-            if now - self._gain_local_at.get(str(rule.get("id")), 0.0) < 1.5:
-                return
-            updated = [dict(r) if str(r.get("id")) == str(rule.get("id")) else r
-                       for r in self.routes]
-            for item in updated:
-                if str(item.get("id")) == str(rule.get("id")):
-                    item["gain"] = gain
-            try:
-                self.set_routes(updated)
-            except Exception:
-                return
-            self._gain_local_at[str(rule.get("id"))] = now
-            self.note("对端把音量条调成了 %.2f，本机这条路由同步过去了" % gain)
+        rule = self._route_between(peer_id, direction)
+        if rule is None:
             return
+        rid = str(rule.get("id") or "")
+        value = max(0.0, min(2.0, float(value)))
+        my_ts = int(self._gain_ts.get(rid, 0))
+        if abs(float(rule.get("gain", 1.0)) - value) < 0.005:
+            self._gain_ts[rid] = max(my_ts, ts)
+            return
+        idle = time.monotonic() - self._gain_local_at.get(rid, 0.0)
+        if idle < 0.8:
+            return
+        if not (ts > my_ts or idle > 5.0):
+            return
+        updated = [dict(r) if str(r.get("id")) == rid else r for r in self.routes]
+        for item in updated:
+            if str(item.get("id")) == rid:
+                item["gain"] = value
+        try:
+            self.set_routes(updated)
+        except Exception:
+            return
+        # 采纳对端的时间戳：这样我们下次报出去的还是"这个值最后一次被改的时刻"，
+        # 不会用自己的 now 把对端的更新顶掉（那就是回环）。
+        self._gain_ts[rid] = max(my_ts, ts)
+        self._gain_local_at[rid] = time.monotonic()
+        self.note("对端把「%s」的音量调成了 %.2f，本机同步过去了"
+                  % ("我听它的" if direction == "in" else "我送它的", value))
+
+    def note_local_gain_change(self, route_id: str) -> None:
+        """用户在本机动了某条路由的音量条 → 记下时刻（判"谁最后动"用）。"""
+        rid = str(route_id or "")
+        if not rid:
+            return
+        self._gain_local_at[rid] = time.monotonic()
+        self._gain_ts[rid] = int(time.time() * 1000)
 
     def auto_listen_state(self) -> dict[str, Any]:
-        """面板要的那份"自动收听"记录：谁请求的、建了哪条路由、还能不能撤销。"""
+        """面板要的那份"自动收听"记录：谁请求的、建了哪条路由、以及被拒的原因。"""
         items = []
         for info in self._auto_listen_granted.values():
             rule_id = str(info.get("route_id") or "")
             alive = any(str(r.get("id")) == rule_id for r in self.routes)
             items.append(dict(info, active=alive,
                               age_s=round(time.time() - float(info.get("at") or 0), 1)))
-        return {"items": items, "label": AUTO_LISTEN_LABEL}
+        denied = [dict(v, age_s=round(time.time() - float(v.get("at") or 0), 1))
+                  for v in self._auto_listen_denied.values()
+                  if time.time() - float(v.get("at") or 0) < 600.0]
+        return {"items": items, "denied": denied, "label": AUTO_LISTEN_LABEL,
+                "auto_accept": bool(getattr(self.config, "auto_accept_listen", True))}
 
     def _auto_play_sources(self) -> None:
         """Adopt a phone the moment it starts sending.
