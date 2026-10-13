@@ -3016,3 +3016,274 @@ class TestCardVolumeSlidersAndPing(unittest.TestCase):
         self.assertIn("async function pingPeer(host, port)", html)
         self.assertIn("pingPeer('${esc(n.host)}', ${Number(n.audio_port) || 0})", html)
         self.assertIn("r.note ||", html, "超时时要把服务端那句解释原样显示出来")
+
+
+class TestPeerLivenessAndAutoListen(unittest.TestCase):
+    """④ 对端没了就停发（安全）+ ① 自动收听 / 共享增益。
+
+    用户真机现场：「手机蓝牙向电脑传输音频，电脑关闭应用，手机声音还在向电脑发送」。
+    根因是发送端的目标表只在用户点选时写一次，对方关机后没人移除它 ——
+    而且 `PeerEndpoints.online` 对【手动添加】的对端恒为 True，连 15 秒的超时都不生效。
+    """
+
+    def setUp(self) -> None:
+        from audiomixing.config import Config
+        from audiomixing.engine import WaveLinkNode
+
+        cfg = Config()
+        cfg.node_id = "self-node"
+        cfg.name = "本机"
+        cfg.routes = []
+        cfg.codec = "pcm_s16"
+        self.node = WaveLinkNode(cfg, audio_port=free_udp_port(), discovery_port=free_udp_port(),
+                                 simulate=True)
+        self.node.devices = []
+
+    def tearDown(self) -> None:
+        try:
+            self.node.stop()
+        except Exception:
+            pass
+
+    def _peer(self, node_id: str = "peer-1", name: str = "手机", host: str = "192.168.0.101",
+              age: float = 0.0, audio_port: int = 47831) -> None:
+        """登记一台对端，并把它"最后一次被听到"设成 age 秒之前。"""
+        self.node.registry.update(
+            {"wl": 1, "id": node_id, "name": name, "audio_port": audio_port, "web_port": 0}, host)
+        peer = self.node.registry.get(node_id)
+        peer.last_seen = time.time() - age
+
+    def _route_to_peer(self, peer: str = "peer-1") -> None:
+        self.node.set_routes([{"id": "r1", "from": ["self"], "to": [peer]}], persist=False)
+
+    def _stats_from(self, node_id: str, host: str, **extra) -> None:
+        body = {"t": "stats", "node": node_id, "name": node_id, "_type": "STATS",
+                "_from": "%s:47831" % host, "_at": time.monotonic()}
+        body.update(extra)
+        self.node.receiver.control_messages.append(body)
+
+    # ---- ④ 对端没了就停发 -------------------------------------------------
+    def test_a_peer_that_went_silent_is_not_sent_to(self) -> None:
+        self._peer(age=30.0)
+        self._route_to_peer()
+        self.assertEqual(self.node.desired_senders(), [],
+                         "对端 30 秒没有任何消息了，不能再往它发声音")
+        blocked = self.node.status()["senders_blocked"]
+        self.assertTrue(blocked, "面板要能说明为什么停发")
+        self.assertIn("已停止向", blocked[0]["text"])
+        self.assertIn("秒没有任何消息", blocked[0]["text"])
+        self.assertGreaterEqual(blocked[0]["silent_for_s"], 30.0)
+
+    def test_a_manual_peer_also_expires(self) -> None:
+        """手动添加的对端以前永远 online（online 对 manual 恒 True）→ 会一直白发。"""
+        self.node.registry.add_manual("192.168.0.101", 47831, "手机")
+        peer = self.node.registry.resolve("192.168.0.101")
+        self.assertTrue(peer.online, "Discovery 层对手动设备就是这么设计的（不改它）")
+        peer.last_seen = time.time() - 40.0
+        self._route_to_peer(peer.node_id)
+        self.assertEqual(self.node.desired_senders(), [], "手动对端同样要按活跃度判死活")
+
+    def test_a_freshly_heard_peer_is_still_sent_to(self) -> None:
+        self._peer(age=1.0)
+        self._route_to_peer()
+        wanted = self.node.desired_senders()
+        self.assertEqual(len(wanted), 1, "刚听到的对端当然要继续发")
+        self.assertEqual(self.node.status()["senders_blocked"], [])
+
+    def test_the_grace_period_is_between_ten_and_fifteen_seconds(self) -> None:
+        from audiomixing.engine import PEER_SILENCE_GRACE_S
+
+        self.assertGreaterEqual(PEER_SILENCE_GRACE_S, 10.0, "太短会把 Wi-Fi 抖动判成离线")
+        self.assertLessEqual(PEER_SILENCE_GRACE_S, 15.0, "太长会让用户觉得「关了还在发」")
+        self._route_to_peer()
+        self._peer(age=PEER_SILENCE_GRACE_S - 1.0)
+        self.assertEqual(len(self.node.desired_senders()), 1)
+        self._peer(age=PEER_SILENCE_GRACE_S + 1.0)
+        self.assertEqual(self.node.desired_senders(), [])
+
+    def test_recent_stats_keep_a_peer_alive_without_beacons(self) -> None:
+        """信标停了但手机还在每 2 秒发统计包 → 它活着，不能停发。"""
+        self._peer(age=60.0)
+        self._route_to_peer()
+        self._stats_from("peer-1", "192.168.0.101")
+        self.node._track_peer_liveness()
+        self.assertEqual(len(self.node.desired_senders()), 1)
+
+    def test_an_old_stats_message_stops_counting(self) -> None:
+        """旧消息不能反复当成新证据，否则死掉的对端永远不会被判死。"""
+        self._peer(age=60.0)
+        self._route_to_peer()
+        self._stats_from("peer-1", "192.168.0.101")
+        self.node.receiver.control_messages[-1]["_at"] = time.monotonic() - 60.0
+        self.node._track_peer_liveness()
+        self.assertEqual(self.node.desired_senders(), [],
+                         "60 秒前的统计包不能再算「它还活着」")
+
+    def test_audio_arriving_from_the_peer_keeps_it_alive(self) -> None:
+        self._peer(age=60.0)
+        self._route_to_peer()
+        self.node.receiver.stats = lambda: {"streams": [{"node_id": "peer-1"}]}   # type: ignore[method-assign]
+        self.node._track_peer_liveness()
+        self.assertEqual(len(self.node.desired_senders()), 1)
+
+    # ---- ① 自动收听 -------------------------------------------------------
+    def test_a_listen_request_creates_a_route_marked_auto(self) -> None:
+        self.node.config.save()
+        self._stats_from("peer-1", "192.168.0.101",
+                         request_listen=True, listen_from="peer-1", listen_name="手机")
+        self.node._handle_peer_requests()
+        auto = [r for r in self.node.routes if r.get("auto")]
+        self.assertEqual(len(auto), 1, "对方请求收听 → 自动建一条路由")
+        self.assertEqual(auto[0]["from"], ["peer-1"])
+        self.assertEqual(auto[0]["to"], [self.node.config.node_id])
+        self.assertIn("对方请求收听", auto[0]["label"])
+        state = self.node.auto_listen_state()
+        self.assertEqual(state["items"][0]["node_id"], "peer-1")
+        self.assertTrue(state["items"][0]["active"])
+
+    def test_a_listen_request_does_not_duplicate_an_existing_route(self) -> None:
+        self.node.set_routes([{"id": "mine", "from": ["peer-1"], "to": ["self"]}], persist=False)
+        self._stats_from("peer-1", "192.168.0.101", request_listen=True, listen_from="peer-1")
+        self.node._handle_peer_requests()
+        self.assertEqual([r["id"] for r in self.node.routes], ["mine"], "已经有路由就别再加一条")
+
+    def test_revoking_removes_only_the_auto_route(self) -> None:
+        self.node.set_routes([{"id": "mine", "from": ["peer-1"], "to": ["self"]}], persist=False)
+        self._stats_from("peer-1", "192.168.0.101", request_listen=True, listen_from="peer-1")
+        self.node._handle_peer_requests()
+        self.assertEqual([r["id"] for r in self.node.routes], ["mine"],
+                         "已经有一条 它→本机 的路由了，不该再加一条")
+        # 对方关掉送声音：只撤"自动"那种，用户自己建的路由必须原样留着
+        self.node.receiver.control_messages.clear()
+        self._stats_from("peer-1", "192.168.0.101", request_listen=False, listen_from="peer-1")
+        self.node._handle_peer_requests()
+        self.assertEqual([r["id"] for r in self.node.routes], ["mine"],
+                         "撤销只能撤自动建的那条，用户自己建的不能动")
+
+    def test_revoking_removes_the_auto_route_but_keeps_the_users(self) -> None:
+        """自动建了一条之后，用户自己又建了一条 → 撤销只删自动那条。"""
+        self.node.config.save()
+        self._stats_from("peer-1", "192.168.0.101", request_listen=True, listen_from="peer-1")
+        self.node._handle_peer_requests()
+        self.node.set_routes(list(self.node.routes)
+                             + [{"id": "mine", "from": ["peer-1"], "to": ["self"]}],
+                             persist=False)
+        self.assertEqual(len(self.node.routes), 2)
+        self.node.receiver.control_messages.clear()
+        self._stats_from("peer-1", "192.168.0.101", request_listen=False, listen_from="peer-1")
+        self.node._handle_peer_requests()
+        self.assertEqual([r["id"] for r in self.node.routes], ["mine"],
+                         "撤销只删自动那条")
+
+    # ---- ① 共享增益 -------------------------------------------------------
+    def test_a_shared_gain_from_the_peer_updates_our_route(self) -> None:
+        self.node.set_routes([{"id": "r1", "from": ["self"], "to": ["peer-1"], "gain": 1.0}],
+                             persist=False)
+        self._stats_from("peer-1", "192.168.0.101", listen_from="peer-1", route_gain=0.5)
+        self.node._handle_peer_requests()
+        rule = [r for r in self.node.routes if r["id"] == "r1"][0]
+        self.assertAlmostEqual(rule["gain"], 0.5, places=3, msg="两端共享同一个增益")
+
+    def test_a_local_gain_change_wins_over_an_in_flight_value(self) -> None:
+        self.node.set_routes([{"id": "r1", "from": ["self"], "to": ["peer-1"], "gain": 1.2}],
+                             persist=False)
+        self.node._gain_local_at["r1"] = time.monotonic()      # 用户刚拖过这个滑块
+        self._stats_from("peer-1", "192.168.0.101", listen_from="peer-1", route_gain=0.5)
+        self.node._handle_peer_requests()
+        rule = [r for r in self.node.routes if r["id"] == "r1"][0]
+        self.assertAlmostEqual(rule["gain"], 1.2, places=3,
+                               msg="本机刚动过，不能被对端在途的旧值抢回去")
+
+    # ---- ① 发出去的报文（给手机端对齐用） --------------------------------
+    def test_the_python_sender_announces_request_and_gain(self) -> None:
+        """T_STATS 的负载里必须真的带 request_listen / route_gain，字段名就是协议。"""
+        import socket
+
+        from audiomixing import proto
+
+        port = free_udp_port()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", port))
+        sock.settimeout(3.0)
+        self.node.set_routes([{"id": "r1", "from": ["self"], "to": ["peer-1"], "gain": 0.75}],
+                             persist=False)
+
+        class _FakeSession:
+            host = "127.0.0.1"
+            port = 0            # 类体里不能写 `port = port`（那会去全局找，NameError）
+            node_id = "peer-1"
+            route_id = "r1"
+            packets_sent = 42
+            bytes_sent = 80640
+
+        _FakeSession.port = port
+        self.node.sender.sessions["r1|peer-1"] = _FakeSession()   # type: ignore[assignment]
+        # 控制包是从接收端那个 socket 发出去的；测试里不启动整个节点，直接给它一个。
+        self.node.receiver._sock = sock
+        self.node._send_peer_stats(force=True)
+        try:
+            data, _addr = sock.recvfrom(4096)
+        finally:
+            sock.close()
+        pkt = proto.decode(data)
+        self.assertIsNotNone(pkt)
+        self.assertEqual(pkt.type, proto.T_STATS, "复用 T_STATS（旧版本忽略未知字段，不会崩）")
+        body = pkt.json()
+        for key in ("request_listen", "listen_from", "listen_name", "route_gain",
+                    "gain_ts", "gain_route"):
+            self.assertIn(key, body, "手机端要对齐的字段：%s" % key)
+        self.assertTrue(body["request_listen"])
+        self.assertEqual(body["listen_from"], "self-node")
+        self.assertAlmostEqual(float(body["route_gain"]), 0.75, places=3)
+        self.assertEqual(body["gain_route"], "r1")
+
+
+class TestTask16PanelTexts(unittest.TestCase):
+    """②③ 面板行为 + ①④ 的文案（这些是用户直接看到的那一半）。"""
+
+    @staticmethod
+    def _html() -> str:
+        return (ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8")
+
+    def test_detail_view_keeps_offline_devices_for_a_minute(self) -> None:
+        import re  # noqa: F401  (本方法以外的用例也可能用到)
+        html = self._html()
+        self.assertIn("const OFFLINE_KEEP_S = 60;", html)
+        self.assertIn("已离线 ", html)
+        # 只作用于详细档的那张表：简洁档那一列（brief）不动
+        self.assertIn("n.local || n.online || (n.age_s || 0) <= OFFLINE_KEEP_S", html)
+        self.assertIn("tr class=\"${n.local || n.online ? '' : 'offline'}\"", html)
+
+    def test_the_bluetooth_rows_use_an_aligned_grid(self) -> None:
+        """⑦/⑧ 的行要按列对齐（用户："上下不对齐好难受"）。"""
+        import re
+
+        html = self._html()
+        m = re.search(r"#btList \.btrow, #netAudioList \.btrow\{[^}]*display:grid", html, re.S)
+        self.assertTrue(m, "蓝牙/网络音源行要用栅格对齐")
+        self.assertIn("minmax(96px,150px)", html, "名字列固定宽度是「对齐」的关键")
+
+    def test_blocked_senders_are_explained_on_the_panel(self) -> None:
+        html = self._html()
+        self.assertIn("senders_blocked", html)
+        self.assertIn("已停发", html)
+        self.assertIn("badrow", html)
+        self.assertIn("blockedHere", html, "设备卡片上也要写清它为什么停发")
+
+    def test_the_card_slider_says_which_layer_it_controls(self) -> None:
+        """①-3 的修复：滑块要知道对象是哪一层（路由 / 手机采集增益 / 频道音量）。"""
+        html = self._html()
+        self.assertIn("function gainTargetFor(", html)
+        self.assertIn("kind:'route'", html)
+        self.assertIn("kind:'mic'", html)
+        self.assertIn("kind:'channel'", html)
+        self.assertIn("/api/mic/gain", html, "手机送进来的声音要能调（走这台手机的采集增益）")
+        self.assertIn("channel_gain", html, "频道/直通那一路要能调")
+        self.assertIn("dvtag2", html, "滑块旁边要标出调的是哪一层")
+
+    def test_the_auto_listen_notice_is_visible_and_revocable(self) -> None:
+        html = self._html()
+        self.assertIn('id="autoListenBox"', html)
+        self.assertIn("已自动打开", html)
+        self.assertIn("function revokeAutoListen(", html)
+        self.assertIn("撤销", html)

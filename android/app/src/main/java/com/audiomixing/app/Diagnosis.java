@@ -60,7 +60,7 @@ public final class Diagnosis {
      * <p>对象一旦发布就不再修改（Engine 每次收到新包都换一个新对象），
      * 所以界面线程读到一半也不会看到"半新半旧"的字段。
      */
-    public static final class PeerStats {
+    public static final class PeerStats implements LinkPolicy.LinkFields {
         /** 报告方的地址（Engine 按来源填，负载里的 target 只是它自己以为的对端）。 */
         public String host = "";
         /** 报告方的名字。 */
@@ -84,6 +84,27 @@ public final class Diagnosis {
         /** 本机收到这份统计的时刻（elapsedRealtime，用于判断新鲜度；由 Engine 填）。 */
         public long receivedAtMs;
 
+        // ── ★ 2026-10-14 新增两个字段（复用 T_STATS，不加新包类型、不动包头）──
+        /**
+         * 对端是不是在请求我收听它（它正在把声音送给我，希望我自动打开「收听」）。
+         *
+         * <p>幂等：只要它还在送就一直为 true；它停了就自然变 false，不需要额外的"取消"消息。
+         */
+        public boolean wantListen;
+        /**
+         * 这条链路（对端→我）的<b>共享音量</b>，0.00~1.50，两端同一个值。
+         * 老版本不发这个字段时按 {@link #GAIN_UNSET} 处理（= 没同步过，保持各自的本地值）。
+         */
+        public float gain = GAIN_UNSET;
+        /** 上面那个值最后一次被修改的墙钟毫秒（谁后改以谁为准）。 */
+        public long gainTs;
+        /**
+         * 对端报的<b>反向</b>共享音量（对端"听我的"那条链路，也就是我"送它的"），
+         * 老版本不发就是 {@link #GAIN_UNSET}。
+         */
+        public float gainRx = GAIN_UNSET;
+        public long gainRxTs;
+
         /** 这份统计还新鲜吗（{@code nowMs} 用 elapsedRealtime）。 */
         public boolean fresh(long nowMs) {
             return receivedAtMs > 0 && (nowMs - receivedAtMs) <= PEER_TTL_MS;
@@ -93,7 +114,34 @@ public final class Diagnosis {
         public long ageMs(long nowMs) {
             return receivedAtMs <= 0 ? -1 : (nowMs - receivedAtMs);
         }
+
+        /** 对端有没有报过共享音量。 */
+        public boolean hasGain() {
+            return gain != GAIN_UNSET;
+        }
+
+        // ── LinkPolicy.LinkFields 的实现：新字段的落点（解析在 LinkPolicy 里，纯逻辑好测）──
+
+        @Override
+        public void setWantListen(boolean v) {
+            wantListen = v;
+        }
+
+        @Override
+        public void setGain(float g, long ts, boolean unset) {
+            gain = unset ? GAIN_UNSET : g;
+            gainTs = ts;
+        }
+
+        @Override
+        public void setGainRx(float g, long ts, boolean unset) {
+            gainRx = unset ? GAIN_UNSET : g;
+            gainRxTs = ts;
+        }
     }
+
+    /** "对端没报共享音量"的哨兵值（合法的增益是 0.00~1.50，负数不可能撞上）。 */
+    public static final float GAIN_UNSET = -1f;
 
     // ══════════════════════════════ 生成统计负载 ══════════════════════════════
 
@@ -106,7 +154,52 @@ public final class Diagnosis {
      */
     public static byte[] json(String name, long sent, long bytes, boolean sending,
                               long recv, long lost, int bufMs, int streams, String target) {
-        StringBuilder sb = new StringBuilder(192);
+        return json(name, sent, bytes, sending, recv, lost, bufMs, streams, target,
+                false, GAIN_UNSET, 0L);
+    }
+
+    /**
+     * ★ 带"请求收听 + 共享音量"两个新字段的版本（2026-10-14，task-17）。
+     *
+     * <p><b>协议约定（和电脑端 task-16 对齐用）</b>：不新增包类型、不改包头，
+     * 就在现有 {@code T_STATS}(ptype=7) 的 JSON 负载里多加三个字段：
+     * <ul>
+     *   <li>{@code "want_listen": true|false} —— 发送方正在把声音送给对端，<b>请求对端自动打开收听</b>。
+     *       幂等：还在送就一直是 true，停了自然变 false（不需要额外的取消消息）。</li>
+     *   <li>{@code "gain": 0.00~1.50} —— 这条链路（发送方→接收方）的<b>共享音量</b>，两端同一个值。</li>
+     *   <li>{@code "gain_ts": <墙钟毫秒>} —— 该值最后一次被修改的时刻，用来判"谁后改以谁为准"。</li>
+     * </ul>
+     * 老版本收到这些字段<b>当未知字段忽略即可</b>（我们的 {@link #parse} 也只读自己认识的键），
+     * 所以新旧版本可以混跑，不会崩。
+     */
+    public static byte[] json(String name, long sent, long bytes, boolean sending,
+                              long recv, long lost, int bufMs, int streams, String target,
+                              boolean wantListen, float gain, long gainTs) {
+        return json(name, sent, bytes, sending, recv, lost, bufMs, streams, target,
+                wantListen, gain, gainTs, GAIN_UNSET, 0L);
+    }
+
+    /**
+     * ★ 带"请求收听 + 双向共享音量"字段的完整版本（2026-10-14，task-17）。
+     *
+     * <p><b>协议约定（拿去和电脑端 task-16 对齐）</b>：不新增包类型、不改包头，
+     * 就在现有 {@code T_STATS}(ptype=7) 的 JSON 负载里多加这几个字段：
+     * <ul>
+     *   <li>{@code "want_listen": true|false} —— 我正把声音送给对端，<b>请求对端自动打开收听</b>；
+     *       幂等（还在送就一直 true，停了自然 false，不需要额外的取消消息）。</li>
+     *   <li>{@code "gain": 0.00~1.50} + {@code "gain_ts": <墙钟毫秒>} ——
+     *       <b>我→对端</b>这条链路的共享音量（= 我这边的"我送它的"，= 对端那边的"我听它的"）。</li>
+     *   <li>{@code "gain_rx": 0.00~1.50} + {@code "gain_rx_ts": <墙钟毫秒>} ——
+     *       <b>对端→我</b>这条链路的共享音量（= 我这边的"我听它的"，= 对端那边的"我送它的"）。</li>
+     * </ul>
+     * 规则：一个增益两端同一个值，谁后改以谁为准（比 {@code *_ts}）；值一样就什么都不做，
+     * 所以不会来回弹。老版本收到这些字段当未知字段忽略即可，可以新旧混跑。
+     */
+    public static byte[] json(String name, long sent, long bytes, boolean sending,
+                              long recv, long lost, int bufMs, int streams, String target,
+                              boolean wantListen, float gain, long gainTs,
+                              float gainRx, long gainRxTs) {
+        StringBuilder sb = new StringBuilder(256);
         sb.append("{\"t\":\"").append(TAG_STATS).append("\",\"v\":1");
         sb.append(",\"name\":\"").append(escape(name)).append('"');
         sb.append(",\"sent\":").append(sent);
@@ -117,9 +210,24 @@ public final class Diagnosis {
         sb.append(",\"buf_ms\":").append(bufMs);
         sb.append(",\"streams\":").append(streams);
         sb.append(",\"target\":\"").append(escape(target)).append('"');
+        // ★ 新字段：老版本会忽略，不影响它们
+        sb.append(",\"want_listen\":").append(wantListen);
+        if (gain != GAIN_UNSET) {
+            sb.append(",\"gain\":").append(gainText(gain));
+            sb.append(",\"gain_ts\":").append(gainTs);
+        }
+        if (gainRx != GAIN_UNSET) {
+            sb.append(",\"gain_rx\":").append(gainText(gainRx));
+            sb.append(",\"gain_rx_ts\":").append(gainRxTs);
+        }
         sb.append(",\"ts\":").append(System.currentTimeMillis());
         sb.append('}');
         return sb.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    /** 增益写成两位小数（"0.77"）—— 不要写成 "0.7700000001" 那种。 */
+    static String gainText(float g) {
+        return String.format(java.util.Locale.US, "%.2f", g);
     }
 
     // ══════════════════════════════ 解析统计负载 ══════════════════════════════
@@ -160,6 +268,9 @@ public final class Diagnosis {
             ps.streams = (int) clamp(num(s, "streams", 0), 0, 10000);
             ps.target = nz(str(s, "target"));
             ps.reportTsMs = num(s, "ts", 0);
+            // ★ 新字段（want_listen / gain / gain_ts / gain_rx / gain_rx_ts）交给 LinkPolicy 读：
+            //   那段是纯逻辑，有专门的离线门禁逐条断言；老版本没有这些键时它什么都不做。
+            LinkPolicy.readLinkFields(s, ps);
             // 什么都不像：不是我们的统计包（比如一段纯文本里正好有个 {}）。
             if (t == null && ps.name.isEmpty() && ps.sent == 0 && ps.recv == 0 && !ps.sending) {
                 return null;
@@ -268,6 +379,10 @@ public final class Diagnosis {
                 .append(e.listenTargetsText()).append('\n');
         // ★ 听广播（频道）：这是"电脑在广播、手机要能听见"的唯一入口，报告里必须有。
         sb.append("听广播  ：").append(e.isChannelListening() ? "已打开 ✓（谁来都听）" : "没开 ✗").append('\n');
+        // ★ ① 自动接受别人的「请求收听」（默认开）
+        sb.append("自动收听：").append(e.isAutoAcceptListen()
+                ? "接受别人的请求 ✓（别人点「送给它」我就自动听，可随时关掉那台的收听）"
+                : "已关 ✗（别人点「送给它」我也不会自动听）").append('\n');
         // ★ 广播我的声音（发出去）：一次采集 → 一包编码 → 分发给 N 个目标。
         sb.append("发广播  ：").append(e.isBroadcasting() ? "已打开 ✓（送给每一台在线设备）" : "没开 ✗")
                 .append('\n');
@@ -443,6 +558,11 @@ public final class Diagnosis {
                 }
             }
             sb.append("带宽    ：").append(e.bandwidthText()).append('\n');
+            // ★ ④ 安全检查：有目标因为"确认走了"被暂停时，报告里必须写明白（这是安全项）
+            String susp = e.sendSuspendedText();
+            if (susp != null && susp.length() > 0) {
+                sb.append("已暂停  ：").append(susp.replace('\n', ' ')).append('\n');
+            }
         }
 
         // ── 对端回话（这就是"让俩设备自己交流"的结果） ──
@@ -839,8 +959,49 @@ public final class Diagnosis {
         return out.toString();   // 没有收尾引号（被截断）：返回已读到的部分
     }
 
-    private static long num(String s, String key, long def) {
+    /** 读一个小数（"0.77"）。我们的值只有两位小数，所以整数部分 + 两位小数就够了。 */
+    private static float numF(String s, String key, float def) {
         int v = valueStart(s, key);
+        if (v < 0) {
+            return def;
+        }
+        int i = v;
+        boolean neg = i < s.length() && s.charAt(i) == '-';
+        if (neg) {
+            i++;
+        }
+        long whole = 0;
+        int digits = 0;
+        while (i < s.length() && digits < 9) {
+            char c = s.charAt(i);
+            if (c < '0' || c > '9') {
+                break;
+            }
+            whole = whole * 10 + (c - '0');
+            i++;
+            digits++;
+        }
+        if (digits == 0) {
+            return def;
+        }
+        int frac = 0;
+        int scale = 1;
+        if (i < s.length() && s.charAt(i) == '.') {
+            i++;
+            for (int k = 0; k < 2 && i < s.length(); k++, i++) {
+                char c = s.charAt(i);
+                if (c < '0' || c > '9') {
+                    break;
+                }
+                frac = frac * 10 + (c - '0');
+                scale *= 10;
+            }
+        }
+        float out = whole + frac / (float) scale;
+        return neg ? -out : out;
+    }
+
+    private static long num(String s, String key, long def) {        int v = valueStart(s, key);
         if (v < 0) {
             return def;
         }

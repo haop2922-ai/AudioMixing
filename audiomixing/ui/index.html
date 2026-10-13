@@ -206,6 +206,7 @@ td.addr{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--d
 .dvslide input[type=range]{flex:1;min-width:80px;accent-color:var(--acc)}
 .dvslide .val{flex:0 0 auto;min-width:34px;text-align:right;font-size:11.5px;color:var(--dim);
   font-family:ui-monospace,Menlo,Consolas,monospace}
+.dvslide .dvtag2{flex:0 0 auto;font-size:10.5px;color:var(--dim2);white-space:nowrap}
 .dvslide input[type=range]:disabled{opacity:.45}
 .dvacts{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
 .dvself{font-size:12px;color:var(--dim)}
@@ -359,10 +360,26 @@ html:not(.fullui) .action { display: block !important; }
    the ideal. A volume meter showed that something was playing; this shows which link is
    misbehaving, which is the question that actually comes up. */
 .micgain { width: 96px; vertical-align: middle; }
-.btrow { flex-wrap: wrap; row-gap: 6px; }
-.btrow .nm { flex: 0 0 auto; min-width: 84px; font-weight: 600; }
-.btrow .chip .k { white-space: nowrap; }
-.btrow input[type=range] { width: 84px; }
+/* ⑦ 蓝牙 / ⑧ 网络音源：每一行用同一套栅格。
+   用户原话「第七部分标签页蓝牙设备上下不对齐好难受啊」—— 以前是 flex + 名字列 auto 宽，
+   每行名字长度不同，后面的状态胶囊和按钮就一行一个位置，看上去歪歪扭扭。
+   现在名字列固定宽度、胶囊与按钮各自对齐（只作用于这两个列表，不动 ③ 的输入行）。 */
+#btList .btrow, #netAudioList .btrow{
+  display:grid; grid-template-columns:minmax(96px,150px) repeat(5, minmax(0,auto));
+  gap:8px 10px; align-items:center;
+}
+#btList .btrow .nm, #netAudioList .btrow .nm{
+  min-width:0; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+#btList .btrow .chip, #netAudioList .btrow .chip{
+  justify-self:start; min-width:126px; justify-content:flex-start;
+}
+#btList .btrow button, #netAudioList .btrow button{ justify-self:start; min-width:56px; }
+#btList .btrow .meta, #netAudioList .btrow .meta{ justify-self:start; }
+#btList .btrow input[type=range], #netAudioList .btrow input[type=range]{ width:96px; }
+@media(max-width:900px){
+  #btList .btrow, #netAudioList .btrow{ grid-template-columns:minmax(96px,1fr) auto auto; }
+}
 .qbox { margin-top: 12px; }
 .qchart { width: 100%; height: 36px; display: block; background: rgba(0,0,0,.28);
           border: 1px solid var(--line); border-radius: 12px; }
@@ -425,6 +442,17 @@ details summary:hover{color:var(--fg)}
   #streamsBox{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:9px}
   #statusRows{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:9px}
 }
+/* ④ 因为"对端已经没了"而停发的那一行：红色，让人一眼看到为什么没声音 */
+.row.badrow{border-color:rgba(248,113,113,.35);background:rgba(248,113,113,.06)}
+.dvblocked{color:var(--err);font-size:12px;line-height:1.6;margin-top:8px}
+tr.offline td{opacity:.55}
+tr.offline .addr{color:var(--warn)}
+/* ① 自动收听提示条：对方请求收听时，明确告诉用户设置被改过，并给一键撤销 */
+#autoListenBox .alrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:10px 12px;margin-top:8px;border-radius:12px;
+  background:rgba(56,189,248,.08);border:1px solid rgba(56,189,248,.25)}
+#autoListenBox .alrow .grow{flex:1;min-width:200px;font-size:12.5px;line-height:1.6}
+
 /* ---------- ③ 大状态圆环 + 22 段电平条（照手机端 .ring / .bars） ---------- */
 .stage{display:flex;flex-direction:column;align-items:center;gap:6px;padding:6px 0 10px}
 .ring{position:relative;width:150px;height:150px;display:grid;place-items:center}
@@ -509,6 +537,8 @@ html:not(.fullui) .card .body { padding-top: 6px; }
         <span class="right"><span class="tag off" id="discoveryTag">发现中…</span></span>
       </h2>
       <div class="body tight">
+        <!-- ① 对方请求收听时，这里明确写出"设置被自动改过"，并给撤销按钮 -->
+        <div id="autoListenBox"></div>
         <div id="peersBox"></div>
         <div class="fields" style="margin-top:12px;padding-top:12px">
           <div class="f grow"><label>手动添加设备 IP</label>
@@ -1077,19 +1107,50 @@ function extraBox(title, extra){
     <div class="list">${extra.map(s=>`<span>${esc(s.name)}</span>`).join('')}</div></details>`;
 }
 
+/* 详细档里给离线设备留 1 分钟宽限期：Wi-Fi 丢几个信标不该让列表忽闪。
+   用户原话：「你在第二部分标签页等待一分钟，如果还没有上线的话就移除。第一部分标签页不动。」
+   —— 所以只作用于详细档（下面的表），简洁档那一列原样不动。 */
+const OFFLINE_KEEP_S = 60;
+
+/* ① 对方请求收听 → 面板必须明说"设置被改过了"，并给一键撤销（不能静默改用户设置）。 */
+async function revokeAutoListen(nodeId, name){
+  try{
+    const cfg = await api('/api/routes');
+    const route = (cfg.routes || []).find(r => r.auto && (r.from || []).includes(nodeId));
+    if(route) await api('/api/routes/delete', {id: route.id});
+    toast('已撤销：不再自动收听 ' + name, 'ok');
+    refreshAll();
+  }catch(e){ toast('撤销失败：' + e.message, 'err'); }
+}
+
+function renderAutoListen(){
+  const box = $('autoListenBox');
+  if(!box) return;
+  const s = state.status || {};
+  const items = ((s.auto_listen && s.auto_listen.items) || []).filter(x => x.active);
+  box.innerHTML = items.map(x => `<div class="alrow">
+    <span class="grow">📡 <b>${esc(x.name || x.node_id)}</b> 请求收听本机 —— <b>已自动打开</b>
+      （${esc(s.auto_listen.label || '')}）。这是对方按了「送声音」时自动加的，不是你自己加的。</span>
+    <button class="tiny ghost" onclick="revokeAutoListen('${esc(x.node_id)}','${esc(x.name || '')}')">撤销</button>
+  </div>`).join('');
+}
+
 function renderPeers(){
   const nodes = allNodes();
   if(!nodes.length){ $('peersBox').innerHTML = '<div class="empty">正在发现设备…</div>'; return; }
-  const rows = nodes.map(n => {
+  const rows = nodes.filter(n => n.local || n.online || (n.age_s || 0) <= OFFLINE_KEEP_S).map(n => {
     const [ms, es] = splitExtra(n.sources);
     const [mk, ek] = splitExtra(n.sinks);
     const cls = n.local ? 'self' : (n.online ? 'on' : 'off');
-    const stateTxt = n.local ? '本机' : (n.online ? Math.round(n.age_s) + ' 秒前' : '离线');
+    // 离线时把"已经离线多久"写出来：它在宽限期里，让人知道列表为什么还留着它。
+    const stateTxt = n.local ? '本机'
+      : (n.online ? Math.round(n.age_s) + ' 秒前'
+                  : '已离线 ' + Math.round(n.age_s) + ' 秒（等它回来，满 ' + OFFLINE_KEEP_S + ' 秒才移除）');
     // The local machine cannot be removed; every other entry can.
     const del = n.local ? ''
       : `<button class="tiny danger" onclick="removePeer('${esc(n.value)}','${esc(n.name)}')"
            title="从列表移除这台设备">移除</button>`;
-    return `<tr>
+    return `<tr class="${n.local || n.online ? '' : 'offline'}">
       <td class="name"><span class="dot ${cls}"></span>${esc(n.name)}${n.manual?' <span class="chip"><span class="k">手动</span></span>':''}</td>
       <td class="addr">${esc(n.host||'—')}${n.host ? `<br><button class="tiny ghost"
         title="发一个 UDP 探测包；手机端不回 PING/PONG，所以『没回应』不等于不通"
@@ -1199,19 +1260,47 @@ function levelSegs(pct){
   }).join('');
 }
 
-/* ★ 卡片上的音量滑块 ★ 控制的是【我们这一层】的增益（不动 Windows 系统音量）：
-   把这条路由的 gain 直接改掉，立刻生效（update_route → set_routes → apply_routes）。
-   拖动时只更新数字、不整页刷新，否则滑块会被重画打断。 */
+/* ★ 卡片上的音量滑块 ★ 控制的是【我们这一层】的增益（不动 Windows 系统音量）。
+   关键：手机送进来的声音常常【根本没有路由】—— 自动收编会把它加成"频道音源"，
+   走的是本机直通/频道那一路。以前滑块只会改"路由的 gain"，这种时候没有对象可改，
+   表现就是"电脑的音量条改动无效"。所以这里按下面顺序找【真的有对象】的那一层：
+     1) 有 它→本机 的路由        → 改那条路由的 gain（T_STATS 会把新值同步给对端）
+     2) 它是网络音源（netmic）    → 改这台手机的采集增益 /api/mic/gain
+     3) 它是频道/直通正在采的音源 → 改频道音量 channel_gain（所有音源共用，界面上写清楚）
+   找到哪一层，就在滑块旁边标出来，用户才知道自己调的是什么。 */
+function gainTargetFor(node, dir){
+  const ch = (state.status && state.status.channel) || {};
+  const routes = state.routes || [];
+  const from = dir === 'in' ? [node.value] : ['self'];
+  const to = dir === 'in' ? ['self'] : [node.value];
+  const route = routes.find(r => sameEnds(r.from, from) && sameEnds(r.to, to));
+  if(route) return {kind:'route', id:route.id, gain:Number(route.gain || 1), tag:'这条路由'};
+  const name = String(node.name || '');
+  const mic = (state.mics || []).find(m => m.name === name);
+  if(dir === 'in' && mic) return {kind:'mic', name:mic.name, gain:Number(mic.gain || 1),
+                                  tag:'这台手机送进来的'};
+  const eff = (ch.effective || []).some(x => String(x).toLowerCase() === name.toLowerCase());
+  if(eff && (ch.local || ch.broadcast || dir === 'out')){
+    return {kind:'channel', gain:Number(ch.gain || 1),
+            tag: dir === 'in' ? '频道音量（所有音源共用）' : '频道音量（所有听众共用）'};
+  }
+  return null;
+}
+
 let cardGainTimer = {};
-function setCardGain(routeId, slot, uid, value, el){
+function setCardGain(target, slot, uid, value, el){
   const val = Math.max(0, Math.min(2, parseFloat(value) || 0));
   // 数字标签带上设备 id：多张卡片同时存在，不带就会互相覆盖（同名 id 只认第一个）
   const label = $('cg_' + slot + '_' + uid);
   if(label) label.textContent = val.toFixed(2);
+  if(!target || !target.kind) return;
   clearTimeout(cardGainTimer[slot]);
   cardGainTimer[slot] = setTimeout(async () => {
-    try{ await api('/api/routes/update', {id: routeId, gain: val}); }
-    catch(e){ toast('音量设置失败：' + e.message, 'err'); }
+    try{
+      if(target.kind === 'route') await api('/api/routes/update', {id: target.id, gain: val});
+      else if(target.kind === 'mic') await api('/api/mic/gain', {name: target.name, gain: val});
+      else await api('/api/settings', {channel_gain: val});
+    }catch(e){ toast('音量设置失败：' + e.message, 'err'); }
   }, 350);
 }
 
@@ -1220,6 +1309,9 @@ function deviceCard(n, routes){
   const inRoute = routes.find(r => sameEnds(r.from, [n.value]) && sameEnds(r.to, ['self']));
   const outRoute = routes.find(r => sameEnds(r.from, ['self']) && sameEnds(r.to, [n.value]));
   const flows = deviceFlow(n.value === 'self' ? '' : n.value, n.host);
+  // ④ 这台对端已经没了 → 明确写出来（不然用户只看到"送 0 kbps"，不知道是为什么）
+  const blockedHere = ((state.status && state.status.senders_blocked) || [])
+    .find(b => b.node_id === n.value || (b.host && b.host === n.host));
   const local = (state.status && state.status.local) || {};
   const peak = self ? Number(local.peak || 0) : 0;
   const online = self || n.online !== false;
@@ -1252,16 +1344,21 @@ function deviceCard(n, routes){
   //   没有对应的那条路由时滑块禁用（先点下面的按钮连上），避免调了个不存在的音量。
   // DOM id 只留安全字符（设备 id 里可能有 ':' 之类）
   const uid = String(n.value || n.node_id || 'x').replace(/[^A-Za-z0-9_-]/g, '_');
-  const gainRow = (slot, route, label) => {
-    const on = !!route;
-    const val = on ? Number(route.gain || 1) : 1;
+  const gainRow = (dir, label) => {
+    const target = gainTargetFor(n, dir);
+    const on = !!target;
+    const val = on ? Number(target.gain) : 1;
+    const payload = on ? esc(JSON.stringify(target)) : '';
+    const why = on
+      ? ('我们这一层的增益（' + target.tag + '），不动 Windows 系统音量')
+      : '先把这一路连上（或让它开始送声音），才有可调的音量';
     return `<div class="dvslide">
-      <span class="lbl" title="我们这一层的增益，不动 Windows 系统音量">${label}</span>
+      <span class="lbl" title="${esc(why)}">${label}</span>
       <input type="range" min="0" max="2" step="0.05" value="${val.toFixed(2)}"
-             ${on ? '' : 'disabled'}
-             title="${on ? '我们这一层的增益，不动 Windows 系统音量' : '先点下面的按钮连上，才能调这一路的音量'}"
-             oninput="setCardGain('${esc(on ? route.id : '')}','${slot}','${esc(uid)}',this.value,this)">
-      <span class="val" id="cg_${slot}_${esc(uid)}">${on ? val.toFixed(2) : '—'}</span>
+             ${on ? '' : 'disabled'} title="${esc(why)}"
+             oninput='setCardGain(${payload || 'null'},"${dir}","${esc(uid)}",this.value,this)'>
+      <span class="val" id="cg_${dir}_${esc(uid)}">${on ? val.toFixed(2) : '—'}</span>
+      <span class="dvtag2">${on ? esc(target.tag) : '不可调'}</span>
     </div>`;
   };
 
@@ -1282,12 +1379,13 @@ function deviceCard(n, routes){
       ${tags.map(t => `<span class="dvtag${t === '本机' ? ' me' : ''}">${esc(t)}</span>`).join('')}
     </div>
     <div class="dvmeta">${esc(meta || '—')}</div>
+    ${blockedHere ? `<div class="dvblocked">⛔ ${esc(blockedHere.text)}</div>` : ''}
     ${self ? '' : `<div class="dvlevel"><span class="lbl">收</span>
       <span class="dvbar">${levelSegs(inPct)}</span><span class="num">${esc(inNum)}</span></div>`}
     <div class="dvlevel"><span class="lbl">送</span>
       <span class="dvbar">${levelSegs(outPct)}</span><span class="num">${esc(outNum)}</span></div>
-    ${self ? '' : gainRow('in', inRoute, '我听它的')}
-    ${self ? '' : gainRow('out', outRoute, '我送它的')}
+    ${self ? '' : gainRow('in', '我听它的')}
+    ${self ? '' : gainRow('out', '我送它的')}
     ${acts}
   </div>`;
 }
@@ -1386,6 +1484,7 @@ function renderRoutes(){
         <span class="arrow">→</span>
         <span class="node dst">${esc(r.to.map(nameOf).join(' + '))}</span>
         ${r.mute ? '<span class="meta">已静音</span>' : ''}
+        ${r.auto ? `<span class="meta" title="对端按了「送声音」时自动加的，可以断开">${esc(r.label || '对方请求收听（自动）')}</span>` : ''}
       </div>
       <div class="gainbox">
         <span title="我们这一层的音量，不动 Windows 系统音量">音量</span>
@@ -1640,6 +1739,7 @@ function renderStatus(){
   renderSourceHealth();
   renderChannelHealth();
   renderVersion();
+  renderAutoListen();
 }
 
 /* ---------------- 版本可见性 ----------------
@@ -1859,6 +1959,7 @@ async function dropUnusableChannelSources(){
 function renderStreams(){
   const s = state.status; if(!s) return;
   const send = s.senders || [];
+  const blocked = s.senders_blocked || [];
   const recv = (s.receiver && s.receiver.streams) || [];
   const clocks = (s.receiver && s.receiver.clocks) || [];
   let html = '';
@@ -1879,6 +1980,12 @@ function renderStreams(){
     html += `<div class="row"><span class="dot"></span><span class="grow">时钟同步
       ${clocks.map(c=>`${esc(c.peer)} 偏移 ${c.offset_ms}ms (往返 ${c.rtt_ms}ms)`).join(' · ')}</span></div>`;
   }
+  // ④ 停发的那些排在最前面：这是"为什么没声音"的答案。
+  blocked.forEach(b => {
+    html = `<div class="row badrow"><span class="dot off"></span>
+      <span class="grow">${esc(b.text)}</span>
+      <span class="num bad">已停发</span></div>` + html;
+  });
   $('streamsBox').innerHTML = html || '<div class="empty">当前没有音频在传输。添加一条路由就开始。</div>';
 }
 
@@ -1979,6 +2086,9 @@ async function loadNetMics(){
   try{
     const m = await api('/api/mic');
     const mics = m.mics || [];
+    // 存到 state 上：② 的"我听它的"滑块需要知道"这台手机是不是网络音源"，
+    // 才知道该去改哪一层（路由 gain / 这台手机的采集增益）。
+    state.mics = mics;
     const html = !mics.length
       ? ''
       : '<span class="meta">' + mics.map(x =>

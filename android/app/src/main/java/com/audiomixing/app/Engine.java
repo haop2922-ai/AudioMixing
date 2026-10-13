@@ -151,6 +151,14 @@ public final class Engine {
     /** 上一次同步给发送端的目标签名：没变就不重复设置（界面 tick 每 150ms 调一次）。 */
     private volatile String lastTargetSig = "";
 
+    // ── ★ ④ 对端活性（安全检查：对方关掉了就不能再发）──
+    /** 目标 id → 它的地址（发现列表里掉出去之后还要靠它判断/恢复）。 */
+    private final Map<String, String> sendHosts = new LinkedHashMap<String, String>();
+    /** 目标 id → 最近一次"确认它还活着"的时刻（elapsedRealtime）：信标或心跳都算。 */
+    private final Map<String, Long> sendLastAliveMs = new LinkedHashMap<String, Long>();
+    /** "已停止向 XXX 发送"的说明（空 = 没有暂停的目标）。 */
+    private volatile String sendSuspendedText = "";
+
     /** Discovery 回调线程推过来的快照；peers() 优先问 Discovery，失败时退回这份。 */
     private volatile List<Discovery.Peer> cache = Collections.emptyList();
 
@@ -195,6 +203,7 @@ public final class Engine {
 
     private Engine(Context ctx) {
         this.app = ctx;
+        this.autoAcceptListen = loadAutoAccept();   // 默认开，用户关过就记着
     }
 
     // ────────────────────────────── 生命周期 ──────────────────────────────
@@ -316,6 +325,7 @@ public final class Engine {
         synchronized (lock) {
             if (on) {
                 listenIds.add(id);
+                listenRevoked.remove(p.host);      // 用户自己打开了：撤销名单里去掉它
                 if (p.host != null && !p.host.isEmpty()) {
                     // 记下地址：设备列表以后怎么抖，这条收听都不受影响。
                     listenHosts.put(id, p.host);
@@ -326,6 +336,10 @@ public final class Engine {
                 listenIds.remove(id);
                 listenHosts.remove(id);
                 listenPorts.remove(id);
+                // ★ 必须可撤销：用户手动关掉的设备，之后不再被"请求收听"自动打开
+                if (p.host != null && !p.host.isEmpty()) {
+                    listenRevoked.add(p.host);
+                }
             }
             if (listenIds.isEmpty()) {
                 // 用户明确取消了全部收听：这时候才停接收器。
@@ -455,6 +469,7 @@ public final class Engine {
                 fresh.setProjection(projection);
                 fresh.setSourceKind(sourceKind);
                 fresh.setTargets(eps);
+                restoreGains(fresh);     // ★ 把（用户或对端同步来的）逐目标音量补回去
                 fresh.start();
                 sender = fresh;
                 lastSendError = "";
@@ -474,39 +489,119 @@ public final class Engine {
         }
     }
 
-    /** 算出现在该送给哪些地址："广播"给全部在线设备 + 用户单独勾的那几台。 */
+    /**
+     * 算出现在该送给哪些地址："广播"给全部在线设备 + 用户单独勾的那几台。
+     *
+     * <p><b>并且判"对端是不是确认走了"</b>（2026-10-14 用户反馈的安全问题：
+     * 「电脑关闭应用，手机声音还在向电脑发送」）：勾选/广播是<b>意图</b>，
+     * 这里再叠一层<b>活性</b> —— 确认走了的就不发，但意图保留，对方回来自动恢复。
+     */
     private List<String> collectSendTargets() {
         List<String> out = new ArrayList<String>();
-        boolean needAll = broadcastOn;
+        long nowMs = SystemClock.elapsedRealtime();
+        StringBuilder gone = new StringBuilder();
+
+        // ① 发现层看得见的设备：能看见 = 它活着（信标就是活性证据）
         for (Discovery.Peer p : peers()) {
             if (p == null || p.host == null || p.host.isEmpty()) {
                 continue;
             }
             String id = idOf(p);
-            if (!needAll && !sendIds.contains(id)) {
+            if (!broadcastOn && !sendIds.contains(id)) {
                 continue;
             }
+            sendHosts.put(id, p.host);
+            sendLastAliveMs.put(id, nowMs);
             int port = p.audioPort > 0 ? p.audioPort : Proto.DEFAULT_AUDIO_PORT;
             String ep = p.host + ":" + port;
             if (!out.contains(ep)) {
                 out.add(ep);
             }
         }
-        // 「广播」时如果发现列表暂时空了（Wi-Fi 抖动/对端刚走），不要把 sendIds 里
-        // 用户显式点过的那几台也一起丢掉 —— 它们还在等信标回来。
-        if (needAll) {
-            for (String id : sendIds) {
+        // ② 用户单独勾过、但发现列表里暂时没有的：看心跳（T_STATS）还在不在，
+        //    以及"上次确认它还活着"距今多久。超过宽限期就不发（意图保留）。
+        for (String id : new ArrayList<String>(sendIds)) {
+            if (out.contains(endpointOf(id))) {
+                continue;
+            }
+            if (broadcastOn && out.size() > 0) {
+                continue;   // 广播模式下别的设备已经在发了，这台单独走下面的活性判断
+            }
+            String host = sendHosts.get(id);
+            Long last = sendLastAliveMs.get(id);
+            if (host == null || last == null) {
+                continue;   // 还没见过它长什么样：交给发现层去发现，不算"走了"
+            }
+            long silent = nowMs - last;
+            if (silent > LinkPolicy.GRACE_MS) {
+                gone.append(LinkPolicy.goneText(nameOfHost(host), silent)).append('\n');
+            } else {
                 Discovery.Peer p = findById(id);
-                if (p != null && p.host != null && !p.host.isEmpty()) {
-                    int port = p.audioPort > 0 ? p.audioPort : Proto.DEFAULT_AUDIO_PORT;
-                    String ep = p.host + ":" + port;
-                    if (!out.contains(ep)) {
-                        out.add(ep);
-                    }
+                int port = (p != null && p.audioPort > 0) ? p.audioPort : Proto.DEFAULT_AUDIO_PORT;
+                String ep = host + ":" + port;
+                if (!out.contains(ep)) {
+                    out.add(ep);
                 }
             }
         }
+        if (broadcastOn && out.isEmpty() && !sendIds.isEmpty()) {
+            gone.append("广播开着，但现在一台设备都联系不上（都离线了）。\n");
+        }
+        String gt = gone.toString().trim();
+        if (!gt.equals(sendSuspendedText)) {
+            sendSuspendedText = gt;
+            if (gt.length() > 0) {
+                Log.i(TAG, "发送目标被暂停：" + gt.replace('\n', ' '));
+            }
+        }
         return out;
+    }
+
+    /** 取 map 里的增益；没有就返回 GAIN_UNSET（= "我没报过"，对端会保持它自己的值）。 */
+    private static float gainOf(Map<String, Float> m, String host) {
+        Float v = m.get(host);
+        return v == null ? Diagnosis.GAIN_UNSET : v;
+    }
+
+    private static long tsOf(Map<String, Long> m, String host) {
+        Long v = m.get(host);
+        return v == null ? 0L : v;
+    }
+
+    /** 某一台的目标地址（"host:port"）；不知道就返回空串。 */
+    private String endpointOf(String id) {        String host = sendHosts.get(id);
+        if (host == null || host.isEmpty()) {
+            return "";
+        }
+        Discovery.Peer p = findById(id);
+        int port = (p != null && p.audioPort > 0) ? p.audioPort : Proto.DEFAULT_AUDIO_PORT;
+        return host + ":" + port;
+    }
+
+    /** ★ 因为"确认走了"而暂停发送的说明（没有就返回空串）。界面/通知/报告都用它。 */
+    public String sendSuspendedText() {
+        return sendSuspendedText == null ? "" : sendSuspendedText;
+    }
+
+    /** 某台设备现在是不是"用户想送、但确认走了所以暂停了"（界面显示用）。 */
+    public boolean isSuspendedTarget(String host) {
+        if (host == null || host.isEmpty()) {
+            return false;
+        }
+        AudioSend s = sender;
+        if (s != null) {
+            for (SendFanout.TargetStats ts : s.targetStats()) {
+                if (host.equals(ts.host)) {
+                    return false;      // 还在目标表里 = 还在发
+                }
+            }
+        }
+        for (Map.Entry<String, String> e : sendHosts.entrySet()) {
+            if (host.equals(e.getValue()) && (sendIds.contains(e.getKey()) || broadcastOn)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** 「📢 广播我的声音」界面状态用的人话。 */
@@ -594,20 +689,20 @@ public final class Engine {
     //   · 我送它的 → SendFanout 里只缩放发给这一台的那份包
     // 主音量滑杆（"我们这一层的音量"）是总增益，叠在这些单台增益之上，互不冲突。
 
-    /** 设定"我听它的"增益（0~1.5，1.0 = 原样）。立刻生效。 */
+    /** 设定"我听它的"增益（0~1.5，1.0 = 原样）。立刻生效，并且会同步给对端（共享增益）。 */
     public void setPeerRecvGain(String host, float g) {
-        AudioRecv r = receiver;
-        if (r != null) {
-            try {
-                r.setHostGain(host, g);
-            } catch (Throwable t) {
-                Log.w(TAG, "设置接收增益失败", t);
-            }
-        }
+        float v = LinkPolicy.clampGain(g);
+        applyRecvGain(host, v);
+        linkRecvGainTs.put(host, System.currentTimeMillis());     // 本地改的：时间戳最新
+        linkGainChangedAtMs.put(host, SystemClock.elapsedRealtime());
     }
 
-    /** 某一台现在的"我听它的"增益。接收器没跑时返回 1.00（还没法记）。 */
+    /** 某一台现在的"我听它的"增益。 */
     public float peerRecvGain(String host) {
+        Float v = linkRecvGain.get(host);
+        if (v != null) {
+            return v;
+        }
         AudioRecv r = receiver;
         if (r == null || host == null) {
             return 1f;
@@ -619,38 +714,22 @@ public final class Engine {
         }
     }
 
-    /** 设定"我送它的"增益（0~1.5，1.0 = 原样）。立刻生效；目标没上线也会记住。 */
+    /** 设定"我送它的"增益（0~1.5，1.0 = 原样）。立刻生效，并且会同步给对端（共享增益）。 */
     public void setPeerSendGain(String host, float g) {
-        AudioSend s = sender;
-        if (s != null) {
-            try {
-                s.setTargetGain(host, g);
-            } catch (Throwable t) {
-                Log.w(TAG, "设置发送增益失败", t);
-            }
-        }
-        peerSendGain.put(host, g);
+        float v = LinkPolicy.clampGain(g);
+        applySendGain(host, v);
+        linkSendGainTs.put(host, System.currentTimeMillis());
+        linkGainChangedAtMs.put(host, SystemClock.elapsedRealtime());
     }
 
-    /** 某一台现在的"我送它的"增益（发送器不在时用记下来的值）。 */
+    /** 某一台现在的"我送它的"增益。 */
     public float peerSendGain(String host) {
-        AudioSend s = sender;
-        if (s != null && host != null) {
-            try {
-                float v = s.targetGain(host);
-                if (v != 1f || s.targetCount() > 0) {
-                    return v;
-                }
-            } catch (Throwable ignored) {
-                // 落到下面记着的值
-            }
+        Float v = linkSendGain.get(host);
+        if (v != null) {
+            return v;
         }
-        Float v = peerSendGain.get(host);
-        return v == null ? 1f : v;
+        return 1f;
     }
-
-    /** 用户设过的"我送它的"增益（发送器重建/目标重新上线时补回去）。 */
-    private final Map<String, Float> peerSendGain = new java.util.HashMap<String, Float>();
 
     public boolean isListening(Discovery.Peer p) {
         synchronized (lock) {
@@ -727,7 +806,9 @@ public final class Engine {
             boolean changed = false;
             for (String id : new ArrayList<String>(sendIds)) {
                 if (!alive.contains(id)) {
-                    sendIds.remove(id);
+                    // ★ 不再把用户的"送声音"意图删掉（2026-10-14 安全检查）：
+                    //   对方关掉 App 之后我们要停止发送，但**意图要留着** —— 它回来自动恢复，
+                    //   不该让用户再点一次。真正决定"发不发"的是 collectSendTargets 里的活性判断。
                     changed = true;
                 }
             }
@@ -1218,6 +1299,13 @@ public final class Engine {
             }
             ps.host = host;
             ps.receivedAtMs = SystemClock.elapsedRealtime();
+            // ★ 心跳也是一条"它还活着"的证据：电脑关掉 App 之后信标和心跳都会停，
+            //   这两条一起构成"确认走了"的判据（见 collectSendTargets 的宽限期）。
+            onHeartbeat(host);
+            // ★ ① 对端请求我收听它（它正在把声音送给我）→ 自动打开收听（可撤销）
+            handleWantListen(host, ps);
+            // ★ ① 共享音量：对端报的"它送我的那条链路"的音量 = 我这条接收链路的音量
+            handleRemoteGain(host, ps);
             synchronized (peerLock) {
                 peerStats.remove(host);
                 peerStats.put(host, ps);   // 重新插入 = 最新的排在最后，下面按顺序淘汰最老的
@@ -1235,9 +1323,215 @@ public final class Engine {
         }
     }
 
+    // ────────────────── ★ ④ 心跳 / ① 自动收听 / ① 共享音量 ──────────────────
+
+    /** 收到一个统计包 = 对端还活着：把这台设备的"最后确认活着"时间刷新。 */
+    private void onHeartbeat(String host) {
+        long nowMs = SystemClock.elapsedRealtime();
+        for (Map.Entry<String, String> e : sendHosts.entrySet()) {
+            if (host.equals(e.getValue())) {
+                sendLastAliveMs.put(e.getKey(), nowMs);
+            }
+        }
+    }
+
+    /** 全局开关：自动接受别人的「请求收听」（默认开，用户可关）。 */
+    private volatile boolean autoAcceptListen = true;
+    /** 用户手动关过收听的设备（host）：关过就永远不再自动加 —— "必须可撤销"。 */
+    private final Set<String> listenRevoked = new LinkedHashSet<String>();
+    /** 界面要显示的那句提示（"XXX 请求收听，已自动打开…"）。 */
+    private volatile String autoListenNotice = "";
+    private volatile long autoListenNoticeAtMs;
+
+    public boolean isAutoAcceptListen() {
+        return autoAcceptListen;
+    }
+
+    public void setAutoAcceptListen(boolean on) {
+        autoAcceptListen = on;
+        saveAutoAccept(on);
+    }
+
+    /** 界面拿走一条提示就清掉（避免一直挂着）。 */
+    public void clearAutoListenNotice() {
+        autoListenNotice = "";
+    }
+
+    /** 刚刚那条"自动收听"提示（10 秒内有效；没有就返回空串）。 */
+    public String autoListenNotice() {
+        if (autoListenNotice == null || autoListenNotice.isEmpty()) {
+            return "";
+        }
+        if (SystemClock.elapsedRealtime() - autoListenNoticeAtMs > 10000L) {
+            return "";
+        }
+        return autoListenNotice;
+    }
+
+    /** 对端在请求我收听：按策略自动加进收听名单（可撤销、可全局关掉）。 */
+    private void handleWantListen(String host, Diagnosis.PeerStats ps) {
+        synchronized (lock) {
+            boolean already = false;
+            for (String id : listenIds) {
+                if (host.equals(listenHosts.get(id))) {
+                    already = true;
+                    break;
+                }
+            }
+            boolean revoked = listenRevoked.contains(host);
+            int action = LinkPolicy.autoListenAction(autoAcceptListen, already, revoked, ps.wantListen);
+            if (action == LinkPolicy.LISTEN_ADD) {
+                // 用节点 id 做键（找不到 Peer 就用地址兜底，和 listenHosts 的约定一致）
+                Discovery.Peer p = peerByHost(host);
+                String id = (p != null) ? idOf(p) : host;
+                listenIds.add(id);
+                listenHosts.put(id, host);
+                listenPorts.put(id, (p != null && p.audioPort > 0) ? p.audioPort : Proto.DEFAULT_AUDIO_PORT);
+                String name = (p != null) ? p.label() : host;
+                autoListenNotice = name + " 请求收听，已自动打开（你可以随时关掉）";
+                autoListenNoticeAtMs = SystemClock.elapsedRealtime();
+                Log.i(TAG, autoListenNotice);
+                ensureReceiver();
+                applyAllowedHosts();
+            } else if (action == LinkPolicy.LISTEN_REVOKED
+                    && (autoListenNotice == null || !autoListenNotice.startsWith(nameOrHost(host)))) {
+                // 用户关过它：尊重用户，不再自动加，但提示一句（否则用户会以为功能坏了）
+                autoListenNotice = nameOrHost(host) + " 请求收听 —— 你之前关过它，所以没有自动打开";
+                autoListenNoticeAtMs = SystemClock.elapsedRealtime();
+            }
+        }
+    }
+
+    private String nameOrHost(String host) {
+        Discovery.Peer p = peerByHost(host);
+        return (p != null) ? p.label() : host;
+    }
+
+    private Discovery.Peer peerByHost(String host) {
+        for (Discovery.Peer p : peers()) {
+            if (p != null && host != null && host.equals(p.host)) {
+                return p;
+            }
+        }
+        return null;
+    }
+
+    // ── 共享音量（一个增益，两端同一个值；谁后改以谁为准）──
+
+    /** host → 我"送"它的增益（= 我→它那条链路的共享音量）。 */
+    private final Map<String, Float> linkSendGain = new LinkedHashMap<String, Float>();
+    /** host → 我"听"它的增益（= 它→我那条链路的共享音量）。 */
+    private final Map<String, Float> linkRecvGain = new LinkedHashMap<String, Float>();
+    /** 我最后一次修改"我送它的"的墙钟毫秒（发给对端用于判新旧）。 */
+    private final Map<String, Long> linkSendGainTs = new LinkedHashMap<String, Long>();
+    /** 我最后一次修改"我听它的"的墙钟毫秒（对端会采纳它当它的"送"）。 */
+    private final Map<String, Long> linkRecvGainTs = new LinkedHashMap<String, Long>();
+    /** 我最后一次修改的时刻（elapsedRealtime，给"时钟偏差兜底"那条规则用）。 */
+    private final Map<String, Long> linkGainChangedAtMs = new LinkedHashMap<String, Long>();
+
+    /** 对端报来的增益：采纳"它送我的那条链路"的音量，作为我的"我听它的"。 */
+    private void handleRemoteGain(String host, Diagnosis.PeerStats ps) {
+        if (!ps.hasGain()) {
+            return;      // 老版本没有这个字段：什么都不做（混跑兼容）
+        }
+        float mine = linkRecvGain.containsKey(host) ? linkRecvGain.get(host) : 1f;
+        Long localTsObj = linkRecvGainTs.get(host);
+        long localTs = localTsObj == null ? 0L : localTsObj;
+        long sinceLocal = LinkPolicy.NEVER;
+        Long at = linkGainChangedAtMs.get(host);
+        if (at != null) {
+            sinceLocal = SystemClock.elapsedRealtime() - at;
+        }
+        if (LinkPolicy.adoptRemoteGain(ps.gainTs, localTs, sinceLocal, ps.gain, mine)) {
+            applyRecvGain(host, ps.gain);
+            linkRecvGainTs.put(host, ps.gainTs);
+            linkGainChangedAtMs.put(host, SystemClock.elapsedRealtime());
+            Log.i(TAG, "采纳对端报的共享音量：" + host + " → 我听它的 " + ps.gain);
+        }
+        // ★ 对端报的"我听它的"（gain_rx）= 它→我这条链路的另一个视角 = 我的"我送它的"
+        if (ps.gainRx != Diagnosis.GAIN_UNSET) {
+            float mySend = linkSendGain.containsKey(host) ? linkSendGain.get(host) : 1f;
+            Long mySendTsObj = linkSendGainTs.get(host);
+            long mySendTs = mySendTsObj == null ? 0L : mySendTsObj;
+            if (LinkPolicy.adoptRemoteGain(ps.gainRxTs, mySendTs, sinceLocal, ps.gainRx, mySend)) {
+                applySendGain(host, ps.gainRx);
+                linkSendGainTs.put(host, ps.gainRxTs);
+                linkGainChangedAtMs.put(host, SystemClock.elapsedRealtime());
+                Log.i(TAG, "采纳对端报的共享音量：" + host + " → 我送它的 " + ps.gainRx);
+            }
+        }
+    }
+
+    /** 真正把"我听它的"落到接收端（+记住值）。 */
+    private void applyRecvGain(String host, float g) {
+        float v = LinkPolicy.clampGain(g);
+        linkRecvGain.put(host, v);
+        AudioRecv r = receiver;
+        if (r != null) {
+            try {
+                r.setHostGain(host, v);
+            } catch (Throwable t) {
+                Log.w(TAG, "设置接收增益失败", t);
+            }
+        }
+    }
+
+    /** 真正把"我送它的"落到发送端（+记住值）。 */
+    private void applySendGain(String host, float g) {
+        float v = LinkPolicy.clampGain(g);
+        linkSendGain.put(host, v);
+        AudioSend s = sender;
+        if (s != null) {
+            try {
+                s.setTargetGain(host, v);
+            } catch (Throwable t) {
+                Log.w(TAG, "设置发送增益失败", t);
+            }
+        }
+    }
+
+    /** 发送端新建/目标重新上线时，把用户（或对端同步过来）的增益补回去。 */
+    private void restoreGains(AudioSend s) {
+        if (s == null) {
+            return;
+        }
+        for (Map.Entry<String, Float> e : linkSendGain.entrySet()) {
+            try {
+                s.setTargetGain(e.getKey(), e.getValue());
+            } catch (Throwable ignored) {
+                // 补不上就保持默认 1.00
+            }
+        }
+    }
+
+    // ── 自动接受开关的持久化 ──
+
+    private void saveAutoAccept(boolean on) {
+        if (app == null) {
+            return;
+        }
+        try {
+            app.getSharedPreferences("audiomixing", Context.MODE_PRIVATE)
+                    .edit().putBoolean("auto_accept_listen", on).apply();
+        } catch (Throwable t) {
+            Log.w(TAG, "自动接受开关存不下来", t);
+        }
+    }
+
+    private boolean loadAutoAccept() {
+        if (app == null) {
+            return true;
+        }
+        try {
+            return app.getSharedPreferences("audiomixing", Context.MODE_PRIVATE)
+                    .getBoolean("auto_accept_listen", true);
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
     /** 某一台自己报告的状态；没有就是 null（界面据此显示"等它回话…"）。 */
-    public Diagnosis.PeerStats peerStats(String host) {
-        if (host == null) {
+    public Diagnosis.PeerStats peerStats(String host) {        if (host == null) {
             return null;
         }
         synchronized (peerLock) {
@@ -1410,7 +1704,13 @@ public final class Engine {
             }
             byte[] payload = Diagnosis.json(nodeName(),
                     iSendToIt ? mySent : 0, iSendToIt ? myBytes : 0, iSendToIt,
-                    recv, lost, buf, streams, host);
+                    recv, lost, buf, streams, host,
+                    // ★ ① 请求对端自动收听：我正在送给它就一直为 true（幂等）
+                    iSendToIt,
+                    // ★ ① 我→它这条链路的共享音量（我这边的"我送它的"）
+                    gainOf(linkSendGain, host), tsOf(linkSendGainTs, host),
+                    // ★ ① 它→我这条链路的共享音量（我这边的"我听它的"）
+                    gainOf(linkRecvGain, host), tsOf(linkRecvGainTs, host));
             Proto.Pkt pkt = new Proto.Pkt(Proto.T_STATS);
             pkt.ssrc = statsSsrc;                                  // 固定一个，对端日志里好认
             pkt.tsNs = System.currentTimeMillis() * 1_000_000L;

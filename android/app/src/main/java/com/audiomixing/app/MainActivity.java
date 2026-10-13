@@ -125,8 +125,15 @@ public class MainActivity extends Activity {
     private TextView broadcastChip;
     private TextView broadcastNow;
     private boolean lastBroadcastOn;
+    /** 「自动接受收听请求」开关上一次的选中态（只在变了才重建背景）。 */
+    private boolean lastAutoAccept;
     /** 「❔ 展开说明」/「收起说明」（简洁档里把长文字收起来用）。 */
     private TextView helpChip;
+    // ★ ①④ 自动收听 + 安全停发的界面元素
+    private TextView autoListenLine;
+    private TextView suspendedLine;
+    private TextView autoAcceptChip;
+    private TextView autoAcceptHint;
 
     private final Map<String, PeerRow> rows = new LinkedHashMap<String, PeerRow>();
     private final Map<String, TextView> kvValues = new LinkedHashMap<String, TextView>();
@@ -433,6 +440,30 @@ public class MainActivity extends Activity {
             if (broadcastNow.getCurrentTextColor() != bcColor) {
                 broadcastNow.setTextColor(bcColor);
             }
+        }
+
+        // ★ ① 「XXX 请求收听，已自动打开（你可以随时关掉）」
+        if (autoListenLine != null) {
+            String notice = engine.autoListenNotice();
+            setTextIfChanged(autoListenLine, notice.length() > 0 ? ("📣 " + notice) : "");
+            autoListenLine.setVisibility(notice.length() > 0 ? View.VISIBLE : View.GONE);
+        }
+        // ★ ④ 「已停止向 XXX 发送 —— 它已经 18 秒没有消息了…」
+        if (suspendedLine != null) {
+            String susp = engine.sendSuspendedText();
+            setTextIfChanged(suspendedLine, susp.length() > 0 ? ("⏸ " + susp) : "");
+            suspendedLine.setVisibility(susp.length() > 0 ? View.VISIBLE : View.GONE);
+        }
+        // 自动接受开关的选中态 + 一句解释
+        if (autoAcceptChip != null) {
+            boolean autoOn = engine.isAutoAcceptListen();
+            if (autoOn != lastAutoAccept) {
+                lastAutoAccept = autoOn;
+                styleChip(autoAcceptChip, autoOn, "自动接受收听请求");
+            }
+            setTextIfChanged(autoAcceptHint, autoOn
+                    ? "开：别人点「送给它」我就自动开始听（那台的收听按钮随时能关）"
+                    : "关：别人点「送给它」我也不会自动听，要自己点「🎧 收听」");
         }
     }
 
@@ -1154,6 +1185,51 @@ public class MainActivity extends Activity {
         channelNow = text("", 12f, DIM, false);
         channelNow.setLineSpacing(dp(3), 1f);
         card.addView(channelNow, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
+
+        // ★ ① 「请求收听」的横幅：别人点「送给它」时我这边自动打开了收听，
+        //   界面上必须明说 + 可撤销（点一下收起；那台的「收听」按钮照常能关）。
+        autoListenLine = text("", 11.5f, OK, false);
+        autoListenLine.setLineSpacing(dp(3), 1f);
+        autoListenLine.setVisibility(View.GONE);
+        autoListenLine.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                engine.clearAutoListenNotice();     // 点一下先收起这句话
+                refreshNow();
+            }
+        });
+        card.addView(autoListenLine, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+
+        // ★ ④ 安全检查的结果：「已停止向 XXX 发送 —— 它已经 18 秒没有消息了…」
+        suspendedLine = text("", 11.5f, WARN, false);
+        suspendedLine.setLineSpacing(dp(3), 1f);
+        suspendedLine.setVisibility(View.GONE);
+        card.addView(suspendedLine, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+
+        // ★ 「自动接受别人的收听请求」全局开关（默认开，用户可关）
+        LinearLayout autoRow = new LinearLayout(this);
+        autoRow.setOrientation(LinearLayout.HORIZONTAL);
+        autoRow.setGravity(Gravity.CENTER_VERTICAL);
+        autoAcceptChip = chip("自动接受收听请求");
+        autoAcceptChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                boolean on = !engine.isAutoAcceptListen();
+                engine.setAutoAcceptListen(on);
+                toast(on ? "已打开：别人点「送给它」时我会自动打开收听"
+                        : "已关闭：别人点「送给它」时我要自己点收听");
+                refreshNow();
+            }
+        });
+        LinearLayout.LayoutParams alp = margins(0, dpi(38), 0, 0, dpi(8), 0);
+        alp.weight = 1f;
+        autoRow.addView(autoAcceptChip, alp);
+        autoAcceptHint = text("", 10.5f, DIM, false);
+        autoAcceptHint.setLineSpacing(dp(2), 1f);
+        LinearLayout.LayoutParams hlp = margins(0, WRAP, 0, 0, 0, 0);
+        hlp.weight = 1.1f;
+        autoRow.addView(autoAcceptHint, hlp);
+        card.addView(autoRow, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
 
         // 发送侧的状态（含"送给几台 + 真实带宽"）
         broadcastNow = text("", 12f, DIM, false);
