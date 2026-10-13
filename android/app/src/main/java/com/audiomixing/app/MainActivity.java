@@ -125,6 +125,8 @@ public class MainActivity extends Activity {
     private TextView broadcastChip;
     private TextView broadcastNow;
     private boolean lastBroadcastOn;
+    /** 「❔ 展开说明」/「收起说明」（简洁档里把长文字收起来用）。 */
+    private TextView helpChip;
 
     private final Map<String, PeerRow> rows = new LinkedHashMap<String, PeerRow>();
     private final Map<String, TextView> kvValues = new LinkedHashMap<String, TextView>();
@@ -136,6 +138,94 @@ public class MainActivity extends Activity {
     private int tickCount;
     /** 等权限 / 等投屏授权回来之后再开始送的那台设备。 */
     private Discovery.Peer pendingSend;
+
+    // ══════════════════ ★ 三档浏览模式：简洁 / 详细 / 监控 ══════════════════
+    //
+    // 用户原话：「补充：手机app也应当设置监控/简洁/详细，三个页面。」
+    // 三档的定位（和电脑端、和用户统一的口径，名字不再改）：
+    //   · 简洁：只留最关键的东西 —— 打开就知道点哪里（长说明收起来）
+    //   · 详细：把"详情"里的东西变成一档常驻显示（本机信息 + 每台的完整信息）
+    //   · 监控：只读的实时数字面板（收发/丢包/坏包/缓冲/带宽/逐流/发现层自检），一屏读完
+    // ★ 同一份数据三种呈现：三档全部复用 Engine 的查询接口，没有第二套取数逻辑。
+    private static final int MODE_SIMPLE = 0;
+    private static final int MODE_DETAIL = 1;
+    private static final int MODE_MONITOR = 2;
+    private static final String PREFS_NAME = "audiomixing";
+    private static final String KEY_VIEW_MODE = "view_mode";
+
+    private int viewMode = MODE_SIMPLE;
+    private TextView modeSimple;
+    private TextView modeDetail;
+    private TextView modeMonitor;
+    private TextView monitorText;
+    private View monitorCard;
+    private View channelCard;
+    private View controlCard;
+    private View hintCard;
+    /** 「简洁」档里被收起来的长说明（点「❔ 展开说明」还能看）。 */
+    private final List<View> longTextViews = new ArrayList<View>();
+    private boolean helpExpanded;
+
+    /** 三档切换（分段控件，和「送什么声音」同一套视觉）。 */
+    private void setViewMode(int mode) {
+        viewMode = mode;
+        saveViewMode();
+        applyMode();
+        refreshNow();
+    }
+
+    private void saveViewMode() {
+        try {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit().putInt(KEY_VIEW_MODE, viewMode).apply();
+        } catch (Throwable ignored) {
+            // 存不了就只是"下次打开回到默认档"，不影响使用
+        }
+    }
+
+    private int loadViewMode() {
+        try {
+            int m = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getInt(KEY_VIEW_MODE, MODE_SIMPLE);
+            return (m == MODE_DETAIL || m == MODE_MONITOR) ? m : MODE_SIMPLE;
+        } catch (Throwable t) {
+            return MODE_SIMPLE;      // 默认「简洁」：第一次用的人最需要"点哪里"
+        }
+    }
+
+    /** 按当前档位切换"显示什么"—— 数据一份，呈现三样。 */
+    private void applyMode() {
+        boolean monitor = viewMode == MODE_MONITOR;
+        // 「简洁」把长说明收起来（可展开）；「详细」一律展开
+        boolean showLong = viewMode == MODE_DETAIL || helpExpanded;
+        if (modeSimple != null) {
+            styleChip(modeSimple, viewMode == MODE_SIMPLE, "简洁");
+            styleChip(modeDetail, viewMode == MODE_DETAIL, "详细");
+            styleChip(modeMonitor, viewMode == MODE_MONITOR, "监控");
+        }
+        if (monitorCard != null) {
+            monitorCard.setVisibility(monitor ? View.VISIBLE : View.GONE);
+        }
+        if (channelCard != null) {
+            channelCard.setVisibility(monitor ? View.GONE : View.VISIBLE);
+        }
+        if (listBox != null) {
+            listBox.setVisibility(monitor ? View.GONE : View.VISIBLE);
+        }
+        if (controlCard != null) {
+            controlCard.setVisibility(monitor ? View.GONE : View.VISIBLE);
+        }
+        if (hintCard != null) {
+            hintCard.setVisibility(monitor || !showLong ? View.GONE : View.VISIBLE);
+        }
+        for (View v : longTextViews) {
+            v.setVisibility(showLong ? View.VISIBLE : View.GONE);
+        }
+        if (helpChip != null) {
+            setTextIfChanged(helpChip, helpExpanded ? "❔ 收起说明" : "❔ 展开说明");
+            helpChip.setVisibility(viewMode == MODE_DETAIL ? View.GONE : View.VISIBLE);
+        }
+    }
 
     private final Runnable tick = new Runnable() {
         @Override
@@ -162,6 +252,7 @@ public class MainActivity extends Activity {
         audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
         sysVolMax = (audioManager == null)
                 ? 0 : audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        viewMode = loadViewMode();     // ★ 上次看的是哪一档，这次还看哪一档
 
         Window w = getWindow();
         w.setStatusBarColor(BG);
@@ -275,6 +366,10 @@ public class MainActivity extends Activity {
         if (subLine != null) {
             // 名字被改过之后，标题下面那行要跟着变（信标 2 秒内带出去，界面立刻变）
             setTextIfChanged(subLine, engine.localName() + " ✏️ · " + engine.platform());
+        }
+        if (viewMode == MODE_MONITOR && monitorText != null && tickCount % 2 == 0) {
+            // 监控档的数字每 300ms 刷一次就够（屏幕上的数字跳得太快反而看不清）
+            setTextIfChanged(monitorText, engine.monitorText());
         }
         updateHeader(peers.size());
     }
@@ -547,6 +642,62 @@ public class MainActivity extends Activity {
     // ────────────────────────────── 诊断 ──────────────────────────────
 
     /**
+     * ★ 「🚀 快速上手」对话框：把"该点哪里"写成 30 秒能读完的步骤。
+     *
+     * <p>为什么要有它：用户的评价标准是"打开就知道点哪里"。三档切换之后，
+     * 简洁档把长说明收起来了，所以必须有一个**三档都进得来**的地方把这些话说清楚。
+     */
+    private void showQuickStartDialog() {
+        final Dialog d = new Dialog(this);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackground(roundRect(0xF5070B12, dp(18), LINE, Math.max(1, dpi(1))));
+        int pad = dpi(16);
+        box.setPadding(pad, pad, pad, pad);
+
+        box.addView(text("🚀 快速上手（30 秒）", 16f, FG, true));
+
+        TextView body = text(
+                "① 手机和电脑 / 另一台手机连同一个 Wi-Fi，打开 App —— 设备会自己出现，不用配对、不用扫码。\n"
+                + "② 想听电脑正在放的声音：电脑上开「广播我的声音」→ 手机上点「📻 听广播」。\n"
+                + "③ 想让别的设备听我这台的声音：点「📢 广播我的声音」（所有人都听，逐个单播、不盲发），"
+                + "或者点某一台的「🔊 送声音」（只送它）。\n"
+                + "④ 送出去的是手机正在放的音乐/视频/游戏（第一次会让你授权一次）；"
+                + "换成「🎤 麦克风」就是对讲。\n"
+                + "⑤ 没声音时点「🩺 诊断」，把整段复制出来发给对方 —— 报告里写明了是哪一端没在发。\n"
+                + "⑥ 音量滑杆只管「我们这一层」（不改你的系统音量）；系统音量单独一行只显示。\n"
+                + "⑦ 顶部三档：简洁（只留操作）/ 详细（带完整信息）/ 监控（只读实时数字）。",
+                12f, FG, false);
+        body.setLineSpacing(dp(5), 1f);
+        ScrollView sv = new ScrollView(this);
+        sv.addView(body, new ViewGroup.LayoutParams(MATCH, WRAP));
+        int bodyH = Math.max(dpi(200),
+                (int) (getResources().getDisplayMetrics().heightPixels * 0.46f));
+        box.addView(sv, margins(MATCH, bodyH, 0, dpi(10), 0, dpi(12)));
+
+        TextView ok = chip("知道了");
+        ok.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                d.dismiss();
+            }
+        });
+        box.addView(ok, margins(MATCH, dpi(46), 0, 0, 0, 0));
+
+        d.setContentView(box);
+        Window dw = d.getWindow();
+        if (dw != null) {
+            dw.setBackgroundDrawable(new ColorDrawable(0));
+            dw.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            dw.setDimAmount(0.62f);
+            dw.setLayout(MATCH, WRAP);
+        }
+        d.show();
+    }
+
+    /**
      * ★ 「✏️ 改本机名称」对话框。
      *
      * <p>用户原话：「本机id最好支持自己编辑，不排除多人用同型号设备」。
@@ -800,18 +951,145 @@ public class MainActivity extends Activity {
         scroll.addView(root, new ViewGroup.LayoutParams(MATCH, WRAP));
 
         root.addView(buildHeader());
-        // ★ 「听广播」放在设备列表【上面】：用户现在最常见的情况就是列表里 0 台设备
+        root.addView(buildModeBar());
+        // ★ 工具栏（🩺 诊断 / 🚀 快速上手 / ✏️ 改名）放在三档切换下面、三档都看得见 ——
+        //   用户明确要求过"不要藏在某一档里"。
+        root.addView(buildToolsCard());
+        // ★ 「听广播 / 广播我的声音」放在设备列表【上面】：用户现在最常见的情况就是列表里 0 台设备
         //   （电脑在广播、手机看不见它），那时候列表里没有任何东西可点，
         //   而这个开关恰恰是"电脑在广播，我要能听见"的唯一入口 —— 放进列表里等于藏起来。
-        root.addView(buildChannelCard());
+        channelCard = buildChannelCard();
+        root.addView(channelCard);
 
         listBox = new LinearLayout(this);
         listBox.setOrientation(LinearLayout.VERTICAL);
         root.addView(listBox, margins(MATCH, WRAP, 0, dpi(16), 0, 0));
 
-        root.addView(buildControlCard());
-        root.addView(buildHintCard());
+        // 监控档：只读的实时数字面板（其他两档隐藏）
+        monitorCard = buildMonitorCard();
+        root.addView(monitorCard);
+
+        controlCard = buildControlCard();
+        root.addView(controlCard);
+        hintCard = buildHintCard();
+        root.addView(hintCard);
+        applyMode();
         return scroll;
+    }
+
+    /** ★ 顶部三档切换：简洁 / 详细 / 监控（分段控件，和「送什么声音」同一套视觉）。 */
+    private View buildModeBar() {
+        LinearLayout card = card();
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+
+        modeSimple = chip("简洁");
+        modeSimple.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                setViewMode(MODE_SIMPLE);
+            }
+        });
+        LinearLayout.LayoutParams p1 = margins(0, dpi(40), 0, 0, dpi(6), 0);
+        p1.weight = 1f;
+        row.addView(modeSimple, p1);
+
+        modeDetail = chip("详细");
+        modeDetail.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                setViewMode(MODE_DETAIL);
+            }
+        });
+        LinearLayout.LayoutParams p2 = margins(0, dpi(40), 0, 0, dpi(6), 0);
+        p2.weight = 1f;
+        row.addView(modeDetail, p2);
+
+        modeMonitor = chip("监控");
+        modeMonitor.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                setViewMode(MODE_MONITOR);
+            }
+        });
+        LinearLayout.LayoutParams p3 = margins(0, dpi(40), 0, 0, 0, 0);
+        p3.weight = 1f;
+        row.addView(modeMonitor, p3);
+        card.addView(row);
+
+        // 一键展开/收起长说明（简洁档用；详细档不需要，监控档没有这些块）
+        helpChip = chip("❔ 展开说明");
+        helpChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                helpExpanded = !helpExpanded;
+                applyMode();
+            }
+        });
+        card.addView(helpChip, margins(MATCH, dpi(36), 0, dpi(8), 0, 0));
+        return card;
+    }
+
+    /** ★ 工具栏：三档都常驻（用户要求"不要藏在某一档里"）。 */
+    private View buildToolsCard() {
+        LinearLayout card = card();
+        LinearLayout tools = new LinearLayout(this);
+        tools.setOrientation(LinearLayout.HORIZONTAL);
+        tools.setGravity(Gravity.CENTER_VERTICAL);
+
+        // ★ 「诊断」入口：用户原话"要不加个诊断吧"——点开就是一段可复制的完整报告。
+        TextView diagChip = chip("🩺 诊断");
+        diagChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showDiagnosisDialog();
+            }
+        });
+        LinearLayout.LayoutParams dlp = margins(0, dpi(42), 0, 0, dpi(6), 0);
+        dlp.weight = 1f;
+        tools.addView(diagChip, dlp);
+
+        // ★ 「快速上手」：把"该点哪里"写成 30 秒能读完的步骤（三档都进得来）
+        TextView qsChip = chip("🚀 快速上手");
+        qsChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showQuickStartDialog();
+            }
+        });
+        LinearLayout.LayoutParams qlp = margins(0, dpi(42), 0, 0, dpi(6), 0);
+        qlp.weight = 1f;
+        tools.addView(qsChip, qlp);
+
+        // ★ 「✏️ 改名」：点标题下那行名字也能改，这里再给一个显式入口
+        TextView renameChip = chip("✏️ 改名");
+        renameChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showRenameDialog();
+            }
+        });
+        LinearLayout.LayoutParams rlp = margins(0, dpi(42), 0, 0, 0, 0);
+        rlp.weight = 1f;
+        tools.addView(renameChip, rlp);
+        card.addView(tools);
+        return card;
+    }
+
+    /** ★ 监控档：一屏读完的实时数字面板（全部来自 Engine 已有的查询接口，不另算一套）。 */
+    private View buildMonitorCard() {
+        LinearLayout card = card();
+        card.addView(text("📈 监控（只读）", 12.5f, DIM, false));
+        monitorText = text("", 11f, FG, false);
+        monitorText.setTypeface(Typeface.MONOSPACE);
+        monitorText.setLineSpacing(dp(2), 1f);
+        monitorText.setTextIsSelectable(true);
+        card.addView(monitorText, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+        TextView note = text("这一档只看数字；要操作（收听 / 送声音 / 广播）点上面的「简洁」或「详细」。",
+                11f, DIM, false);
+        note.setLineSpacing(dp(2), 1f);
+        card.addView(note, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+        return card;
     }
 
     /**
@@ -878,6 +1156,7 @@ public class MainActivity extends Activity {
                 + "同一台设备的声音如果从两条路都进来（电脑同时开着广播和点对点路由），只会播一路、不叠加。",
                 11.5f, DIM, false);
         hint.setLineSpacing(dp(3), 1f);
+        longTextViews.add(hint);      // 简洁档收起来
         card.addView(hint, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
         return card;
     }
@@ -969,6 +1248,7 @@ public class MainActivity extends Activity {
                 + "🎤 麦克风 = 对讲：说给对面听。两种都走同一条音频链路，音质一样。", 11.5f, DIM, false);
         limit.setLineSpacing(dp(3), 1f);
         card.addView(limit, margins(MATCH, WRAP, 0, dpi(10), 0, dpi(4)));
+        longTextViews.add(limit);     // 简洁档收起来（点「❔ 展开说明」还能看）
 
         View hr = new View(this);
         hr.setBackgroundColor(LINE);
@@ -1102,6 +1382,7 @@ public class MainActivity extends Activity {
                 + "手机之间直连，关掉电脑照常工作。", 12f, DIM, false);
         t.setLineSpacing(dp(4), 1f);
         card.addView(t);
+        longTextViews.add(card);      // 简洁档收起来（点「❔ 展开说明」还能看）
         return card;
     }
 
@@ -1424,7 +1705,8 @@ public class MainActivity extends Activity {
             // ★ 「对方：已发 5938 包 / 11.0 MB · 正在发 ✓」/「没在发 ✗」那一行。
             //   只在有「收听/送声音」关系时显示：没关系时对方本来就不会回话，
             //   显示了反而让人以为"对方坏了"。
-            if (listen || send) {
+            //   ★ 三档差异：简洁档不显示（"打开就知道点哪里"），详细/监控档显示。
+            if ((listen || send) && viewMode != MODE_SIMPLE) {
                 long nowMs = SystemClock.elapsedRealtime();
                 Diagnosis.PeerStats ps = engine.peerStats(peer.host);
                 setTextIfChanged(peerLine, Diagnosis.cardLine(ps, nowMs));
