@@ -270,8 +270,13 @@ public final class Diagnosis {
         sb.append("运行状态：发现 ").append(onOff(e.discoveryRunning()))
                 .append(" / 接收器 ").append(onOff(e.receiverRunning()))
                 .append(" / 发送器 ").append(onOff(e.senderRunning())).append('\n');
-        sb.append("本机音量：").append(String.format(Locale.US, "%.2f", e.volume()))
-                .append("（1.00 = 原样）\n");
+        // ★ 音量：把"三层"写清楚。用户明确要求过：我们只负责我们自己这一层，
+        //   绝不能顺手改系统音量（以前的滑杆就是错的）。
+        sb.append("我们这一层：").append(e.volumeText()).append('\n');
+        sb.append("系统音量：").append(e.systemVolumeText()).append('\n');
+        sb.append("音量关系：").append(e.volumeExplainText()).append('\n');
+        // ★ 节点 ID：持久化的，重启不变 —— 电脑端才不会把同一台手机记成好几台设备。
+        sb.append("节点 ID ：").append(e.nodeIdText()).append('\n');
         sb.append("统计包  ：已发 ").append(e.statsPacketsSent())
                 .append(" 个（每 2 秒一次，收发双方互报）\n");
 
@@ -300,6 +305,9 @@ public final class Diagnosis {
         // ── 发现 ──
         sb.append("\n【发现（信标）】\n");
         sb.append(indent(e.discoveryStatsText())).append('\n');
+        // ★ 把我们真正发出去的信标贴一行：里面有 id / audio_port / 总字节数，
+        //   "电脑那边看到我的 id 是空的"这类怀疑一次就能说清。
+        sb.append("我发的信标：").append(e.beaconPreviewText()).append('\n');
         List<Discovery.Peer> peers = safePeers(e);
         sb.append("当前看到 ").append(peers.size()).append(" 台设备：\n");
         if (peers.isEmpty()) {
@@ -324,6 +332,12 @@ public final class Diagnosis {
         } else {
             sb.append("听广播  ：").append(e.isChannelListening()
                     ? "开着（接收端不按名单过滤，谁来都听）" : "没开（只收点过「收听」的那几台）").append('\n');
+            // ★ 「开关是意图，这一行才是事实」——用户说的"路由/广播混淆"就靠它对质。
+            sb.append("实际收到：").append(e.recvStreamsText()).append('\n');
+            String dup = e.dupRouteStatsText();
+            if (dup != null && dup.length() > 0) {
+                sb.append("重复流  ：").append(dup).append('\n');
+            }
             sb.append("已收包  ：").append(st.received).append(" 包\n");
             sb.append("丢包    ：").append(st.lost).append("（迟到 ").append(st.late)
                     .append(" · 重复 ").append(st.duplicates).append("）\n");

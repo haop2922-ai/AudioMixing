@@ -183,11 +183,353 @@ class WaveLinkApi:
     def status(self) -> dict[str, Any]:
         data = self.node.status()
         data["page_rev"] = self.page_rev()
+        # 版本号 + 构建时间必须每次刷新都带上：用户上次就是拿一个 7 小时前的旧 exe
+        # 测了一整天，而面板上没有任何地方能让他发现这件事。
+        data["build"] = self.build_info()
         web = getattr(self, "web", None)
         raw = getattr(web, "raw", None) if web is not None else None
         data["raw_audio"] = raw.stats() if raw is not None else {
             "port": 0, "error": "未启动", "clients": 0, "bytes_in": 0}
         return data
+
+    # -- 版本可见性 --------------------------------------------------------
+    @staticmethod
+    def _version_tuple(text: str) -> tuple[int, ...]:
+        """"1.9" / "v1.9" / "Audio Mixing v1.9.exe" → (1, 9)。解析不出来就是空元组。"""
+        import re
+
+        found = re.search(r"(\d+(?:\.\d+)*)", str(text or ""))
+        if not found:
+            return ()
+        try:
+            return tuple(int(x) for x in found.group(1).split("."))
+        except ValueError:
+            return ()
+
+    @staticmethod
+    def _is_frozen() -> bool:
+        """现在是打包后的 exe 还是源码在跑（Nuitka 不设 sys.frozen，所以两个都看）。"""
+        return bool(globals().get("__compiled__")) or bool(getattr(sys, "frozen", False))
+
+    def build_info(self) -> dict[str, Any]:
+        """当前跑的是哪个版本、什么时候编出来的、旁边有没有更新的版本。
+
+        用户的真实现场：桌面上摆着 v1.2/v1.3/v1.4 三个 exe，他双击的是 v1.2
+        （比当时的代码早 7 个小时），于是所有修复都不在他测的那个程序里 ——
+        而面板上没有任何地方写着版本。这条必须显眼。
+        """
+        from . import __version__
+
+        frozen = self._is_frozen()
+        if frozen:
+            path = Path(sys.executable)
+            channel = "exe"
+        else:
+            path = Path(__file__).resolve().parent / "__init__.py"
+            channel = "源码"
+        build_time = ""
+        try:
+            build_time = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        except OSError:
+            pass
+        running = self._version_tuple(__version__)
+
+        # 旁边有没有更新的版本：桌面 + 当前程序所在目录。
+        # 只认 "Audio Mixing v<数字>.exe" 这个命名（交付规则就是这么命名的）。
+        import re
+
+        newer: dict[str, Any] | None = None
+        dirs: list[Path] = []
+        try:
+            dirs.append(path.resolve().parent)
+        except OSError:
+            pass
+        desktop = os.path.join(os.environ.get("USERPROFILE") or os.path.expanduser("~"), "Desktop")
+        if os.path.isdir(desktop):
+            dirs.append(Path(desktop))
+        pattern = re.compile(r"Audio\s*Mixing\s*v(\d+(?:\.\d+)*)\.exe$", re.IGNORECASE)
+        seen: set[str] = set()
+        for folder in dirs:
+            try:
+                entries = list(folder.glob("*.exe"))
+            except OSError:
+                continue
+            for item in entries:
+                found = pattern.search(item.name)
+                if not found:
+                    continue
+                version = self._version_tuple(found.group(1))
+                if version <= running:
+                    continue
+                try:
+                    if frozen and item.resolve() == path.resolve():
+                        continue           # 就是现在跑的这个，别自己提醒自己
+                except OSError:
+                    pass
+                key = str(item).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                if newer is None or version > self._version_tuple(newer["version"]):
+                    newer = {
+                        "name": item.name,
+                        "version": found.group(1),
+                        "path": str(item),
+                        "size_mb": round(item.stat().st_size / 1048576.0, 1),
+                        "built_at": datetime.fromtimestamp(item.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                    }
+        text = "Audio Mixing v%s · %s · 构建于 %s" % (__version__, channel, build_time or "未知")
+        return {
+            "version": __version__,
+            "channel": channel,
+            "build_time": build_time,
+            "path": str(path),
+            "text": text,
+            "newer": newer,
+        }
+
+    def guide(self) -> dict[str, Any]:
+        """「🚀 快速上手」四步自检：每步给结论 + 一键修。
+
+        用户的五个真实失败没有一个是代码算错，全是"没人告诉你怎么配"。
+        所以这里不引入任何新判定：结论全部复用引擎里已有的口径
+        （capture_state / channel_sources_report / peers / test-tone）。
+        """
+        node = self.node
+        st = self.status()
+        channel = st.get("channel") or {}
+        cap = node.capture_state()
+        local = st.get("local") or {}
+        steps: list[dict[str, Any]] = []
+
+        # ---- 第 1 步：采集源到底有没有声音？ ----
+        live = [s for s in cap["sources"] if s["state"] == "ok"]
+        stalled = cap["stalled"]
+        candidates = cap["candidates"]
+        actions: list[dict[str, Any]] = []
+        if live:
+            worst_age = max((s.get("last_data_age_s") or 0.0) for s in live)
+            text = "正在采集：%s —— %.1f 秒前还有数据 ✓" % (
+                "、".join(s["name"] for s in live), worst_age)
+            detail = ""
+            # 有数据 ≠ 有声音：真声卡的环回在没人放声音时也会一直给静音块。
+            # 所以再报一句电平，用户才知道"现在到底有没有声音在走这条路"。
+            playing = bool(local.get("enabled")) and not local.get("error") \
+                and int(local.get("frames") or 0) > 0
+            if playing and not float(local.get("peak") or 0.0):
+                detail = ("不过电平一直是 0 —— 如果你的游戏/音乐正在放，说明声音走的是另一块设备，"
+                          "把系统的输出设备也切到这块，或在 ⑥ 的「音源」里改选声音真正在走的那一块。")
+            steps.append({"id": "capture", "n": 1, "title": "采集源到底有没有声音？",
+                          "state": "ok", "text": text, "detail": detail, "actions": []})
+        elif stalled:
+            worst = max(stalled, key=lambda s: float(s.get("last_data_age_s") or 999.0))
+            text = ("采不到声音：「%s」%s。" % (worst["name"], worst.get("reason") or "现在没有数据")
+                    + "虚拟声卡空转时就是采不到 —— 换成一块真有声音的设备。")
+            actions.append({"label": "🔧 一键换到有声音的设备", "api": "/api/guide/fix",
+                            "payload": {"action": "fix_broadcast"}, "kind": "primary"})
+            for cand in candidates[:6]:
+                alive = cand.get("alive")
+                mark = ("有数据 ✓" if alive is True else
+                        ("没数据 ✗" if alive is False else "未验证"))
+                actions.append({"label": "换成 %s（%s）" % (cand["device"], mark),
+                                "api": "/api/guide/fix",
+                                "payload": {"action": "switch_capture", "device": cand["device"]},
+                                "kind": "ghost"})
+            if any(c.get("alive") is None for c in candidates):
+                actions.insert(1, {"label": "先验一下候选设备（每块 2 秒）",
+                                   "api": "/api/guide/fix",
+                                   "payload": {"action": "probe_all"}, "kind": "ghost"})
+            steps.append({"id": "capture", "n": 1, "title": "采集源到底有没有声音？",
+                          "state": "bad", "text": text,
+                          "detail": ("试采候选设备要 2 秒左右；标「未验证」的可以先换过去，"
+                                     "换完这一步会自己重新判定。"),
+                          "actions": actions})
+        else:
+            # 没在采集：分开说"还没打开"和"开了但设备还没起来"，否则用户会以为是自己没开。
+            wanted = []
+            if channel.get("broadcast"):
+                wanted.append("广播")
+            if local.get("enabled"):
+                wanted.append("本机直通")
+            if wanted:
+                sw = cap.get("switch") or {}
+                if sw and float(sw.get("age_s") or 9999) < 20:
+                    # 刚刚自动换过设备：这时候"还没起来"是正常的，直接说清发生了什么。
+                    text = ("刚刚自动把音源从「%s」换成了「%s」（%s）—— 正在重新开始采集，"
+                            "两秒后点「重新检查」看结果。" % (
+                                sw.get("from") or "?", sw.get("to") or "?", sw.get("why") or ""))
+                    detail = "这次切换已经写进配置，下次启动不会再走那块坏设备。"
+                else:
+                    text = ("「%s」已经开着，但采集设备还没起来 —— 等两秒再点「重新检查」；"
+                            "如果一直是这样，看第 2 步的音源是不是配错了。" % "、".join(wanted))
+                    detail = ""
+            else:
+                text = "现在没有在采集任何设备（「广播我的声音」和「本机直通」都没开）。"
+                detail = "开了之后这一台电脑的声音才有东西可发。"
+            steps.append({"id": "capture", "n": 1, "title": "采集源到底有没有声音？",
+                          "state": "warn", "text": text, "detail": detail,
+                          "actions": [{"label": "打开广播并开始采集", "api": "/api/guide/fix",
+                                       "payload": {"action": "fix_broadcast"}, "kind": "primary"}]})
+
+        # ---- 第 2 步：声音发得出去吗？ ----
+        name = str((st.get("node") or {}).get("name") or "本机")
+        warnings = [w for w in (channel.get("warnings") or []) if w.get("scope") != "capture"]
+        if not channel.get("broadcast"):
+            steps.append({"id": "send", "n": 2, "title": "声音发得出去吗？", "state": "bad",
+                          "text": "「广播我的声音」没开 —— 这台电脑的声音不会发给任何人。",
+                          "detail": "", "actions": [{"label": "一键打开广播", "api": "/api/guide/fix",
+                                                     "payload": {"action": "fix_broadcast"},
+                                                     "kind": "primary"}]})
+        elif channel.get("will_send"):
+            who = "、".join(channel.get("live") or []) or "?"
+            if int(channel.get("receivers") or 0):
+                steps.append({"id": "send", "n": 2, "title": "声音发得出去吗？", "state": "ok",
+                              "text": "广播正在发出声音（采的是「%s」），局域网里有 %d 台设备能收到 ✓"
+                                      % (who, int(channel.get("receivers") or 0)),
+                              "detail": "", "actions": []})
+            else:
+                steps.append({"id": "send", "n": 2, "title": "声音发得出去吗？", "state": "warn",
+                              "text": "广播正在发出声音（采的是「%s」），但局域网上现在 0 台设备在线 —— "
+                                      "还没有人听得到。" % who,
+                              "detail": "声音这一半已经好了；下一步解决「谁来收」：两台设备要互相看得见（第 3 步）。",
+                              "actions": []})
+        elif not int(channel.get("receivers") or 0) and channel.get("live"):
+            steps.append({"id": "send", "n": 2, "title": "声音发得出去吗？", "state": "bad",
+                          "text": "就算有音源也没有可发的对象：局域网上现在 0 台设备在线。",
+                          "detail": "先看第 3 步 —— 两台设备要互相看得见才谈得上发声音。",
+                          "actions": []})
+        else:
+            # 注意优先级：没有音源比"没有听众"更根本，先说这一条。
+            # 原因只取"音源本身"的那些（接收端 0 台是另一件事，放在补充说明里）。
+            broken = [e for e in (channel.get("sources") or [])
+                      if not e.get("is_local") or e.get("excluded")
+                      or e.get("state") in ("stalled", "no_data")]
+            if broken:
+                reasons = "；".join("「%s」%s" % (e.get("name"), e.get("reason") or "现在不可用")
+                                   for e in broken)
+            elif not (channel.get("live") or []):
+                reasons = "现在配置的音源一块都没在出声音（也可能是采集设备还没起来）"
+            else:
+                reasons = "现在配置的音源一个都用不了"
+            detail = "点下面的按钮：清掉用不了的音源、换到本机默认输出、并打开广播。"
+            if not int(channel.get("receivers") or 0):
+                detail += "另外，局域网上现在 0 台设备在线 —— 修好音源之后还需要有人能收到（看第 3 步）。"
+            steps.append({"id": "send", "n": 2, "title": "声音发得出去吗？", "state": "bad",
+                          "text": "广播没有音源，一个字节都不会发。" + reasons,
+                          "detail": detail,
+                          "actions": [{"label": "🔧 一键修广播", "api": "/api/guide/fix",
+                                       "payload": {"action": "fix_broadcast"}, "kind": "primary"}]})
+
+        # ---- 第 3 步：局域网里能看到别的设备吗？ ----
+        peers = [p for p in (st.get("peers") or [])
+                 if p.get("online") and not p.get("local") and p.get("node_id") != (st.get("node") or {}).get("id")]
+        if peers:
+            steps.append({"id": "lan", "n": 3, "title": "局域网里能看到别的设备吗？", "state": "ok",
+                          "text": "看到 %d 台：%s ✓" % (
+                              len(peers),
+                              "、".join("%s（%s）" % (p.get("name"), p.get("host")) for p in peers[:6])),
+                          "detail": "", "actions": []})
+        else:
+            steps.append({
+                "id": "lan", "n": 3, "title": "局域网里能看到别的设备吗？", "state": "bad",
+                "text": "一台都没看到 —— 两台设备互相看不见时，声音一定发不过去。",
+                "detail": ("按可能性从高到低排查：① 两台设备不在同一个 Wi-Fi（手机连了 4G/5G 或访客网络）；"
+                           "② 路由器开了「AP 隔离 / 客户端隔离」；③ 电脑防火墙拦了入站 UDP（发现广播收不到）；"
+                           "④ 手机上的 App 没打开（只打开网页的手机不是一个节点，永远不会出现在这里）；"
+                           "⑤ 这台电脑有多个网卡/VPN，发现广播走错了网卡。"),
+                "actions": [
+                    {"label": "🧱 本机防火墙自检（约 5 秒）", "api": "/api/netcheck", "kind": "ghost"},
+                    {"label": "以管理员放行防火墙", "api": "/api/firewall", "kind": "ghost"},
+                ]})
+
+        # ---- 第 4 步：放一段测试音，让人耳确认 ----
+        # 优先放到"广播正在采、而且确实有数据"的那块设备上 —— 只有放给它，
+        # 走 UDP 广播的手机才听得到。那块设备采不到声音时退回到本机默认输出：
+        # 至少用户自己的耳朵和网页听众（tap）能听到，能确认播放这一半是好的。
+        tone_device = ""
+        for item in (channel.get("live") or []):
+            try:
+                if node._selector_is_loopback(item):
+                    tone_device = item
+                    break
+            except Exception:
+                continue
+        payload: dict[str, Any] = {"seconds": 2, "freq": 440}
+        if tone_device:
+            payload["device"] = tone_device
+        where = ("从「%s」采出去" % tone_device) if tone_device else "走本机默认输出"
+        url = self.phone_listen_url()
+        steps.append({
+            "id": "tone", "n": 4, "title": "放一段测试音，让人耳确认", "state": "manual",
+            "text": ("点下面的按钮：这台电脑会响 2 秒 440Hz 蜂鸣（%s），同时把它送给正在收听的人。" % where),
+            "detail": ("手机上点「📻 听广播」，或者手机浏览器打开 %s 也能听到（不用装 App）—— "
+                       "听到了说明整条链路是通的 ✓。没听到：先看手机端的「🩺 诊断」，"
+                       "再回来确认第 1 步（电脑这边到底采到声音没有）。" % (url or "这个页面的地址 + /listen")),
+            "actions": [{"label": "🔔 播放测试音（2 秒）", "api": "/api/test-tone",
+                         "payload": payload, "kind": "primary"}]})
+
+        # 前 3 步全绿才算"可以用了"；第 4 步是让人耳确认，不参与自动判定。
+        problems = [s for s in steps[:3] if s["state"] != "ok"]
+        ready = not problems
+        if ready:
+            summary = ("可以用了 ✓ 手机上点「📻 听广播」，或点「🎧 收听 %s」。" % name)
+        else:
+            summary = "还有 %d 步没过 —— 按上面的按钮修一下，再点「重新检查」。" % len(problems)
+        return {
+            "steps": steps,
+            "summary": summary,
+            "ready": ready,
+            "build": st.get("build") or {},
+            "capture": cap,
+            "channel": {k: channel.get(k) for k in
+                        ("broadcast", "will_send", "live", "effective", "receivers", "missing")},
+        }
+
+    def phone_listen_url(self) -> str:
+        """手机浏览器能直接打开、用来听声音的地址（用发现层挑出来的第一块网卡）。"""
+        try:
+            report = disc.lan_report()
+            primary = (report.get("interfaces") or [{}])[0]
+            host = str(primary.get("address") or "")
+        except Exception:
+            host = ""
+        if not host:
+            return ""
+        return "http://%s:%s/listen" % (host, self.node.config.web_port)
+
+    def guide_fix(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """向导里的"一键修"。只做用户点的那一件事，做完把改了什么原样回报。"""
+        action = str(payload.get("action") or "")
+        node = self.node
+        if action == "switch_capture":
+            device = str(payload.get("device") or "").strip()
+            if not device:
+                raise ApiError("没有指定要换成哪一块设备")
+            result = node.switch_capture(device, why="在「快速上手」里点的「换成这块设备」")
+            note = "已把音源换成「%s」。" % device
+            if result.get("switch", {}).get("from"):
+                note = "已从「%s」换成「%s」。" % (result["switch"]["from"], device)
+            return {"ok": True, "note": note, "switch": result.get("switch"),
+                    "sources": result.get("sources")}
+        if action == "probe":
+            device = str(payload.get("device") or "").strip()
+            if not device:
+                raise ApiError("没有指定要试采哪一块设备")
+            started = node.probe_capture_async(device)
+            return {"ok": True, "started": bool(started),
+                    "note": ("正在试采「%s」，约 2 秒后看结果。" % device) if started
+                            else "已经有一块设备在试采了，等一下再看。"}
+        if action == "probe_all":
+            result = node.probe_candidates_async()
+            return {"ok": True, "started": bool(result.get("started")),
+                    "devices": result.get("devices") or [],
+                    "note": result.get("note") or ""}
+        if action == "fix_broadcast":
+            result = node.auto_fix_channel()
+            return {"ok": True, "note": result.get("note") or "已修好",
+                    "changed": result.get("changed"), "picked": result.get("picked"),
+                    "dropped": result.get("dropped")}
+        raise ApiError("不认识的修复动作: %s" % action)
 
     def peers(self) -> dict[str, Any]:
         node = self.node
@@ -323,6 +665,18 @@ class WaveLinkApi:
         except Exception:
             pass
         lines.append("程序 %s" % (sys.executable if getattr(sys, "frozen", False) else "源码运行"))
+        # 版本必须在报告里：用户上次拿一个 7 小时前的旧 exe 测了一整天，
+        # 而报告里没有任何一处写着"这是哪个版本"。
+        try:
+            build = self.build_info()
+            lines.append("版本 %s" % build.get("text"))
+            if build.get("newer"):
+                lines.append("★ 发现更新的版本：%s（%s 构建）—— 现在跑的是 v%s，"
+                             "请关掉现在这个，双击新的那个" % (
+                                 build["newer"]["name"], build["newer"]["built_at"],
+                                 build.get("version")))
+        except Exception as exc:
+            lines.append("版本读取失败: %s: %s" % (type(exc).__name__, exc))
 
         head("本机")
         st = self.status()
@@ -412,6 +766,15 @@ class WaveLinkApi:
                 lines.append("[%s] %s" % (warn.get("level"), warn.get("text")))
                 if warn.get("advice"):
                     lines.append("      建议：%s" % warn.get("advice"))
+
+        head("快速上手自检（面板上「🚀 快速上手」那四步的结论）")
+        try:
+            for step in (self.guide().get("steps") or []):
+                lines.append("第 %d 步 %s → %s" % (step.get("n"), step.get("title"), step.get("text")))
+                if step.get("detail"):
+                    lines.append("      %s" % step["detail"])
+        except Exception as exc:
+            lines.append("自检失败: %s: %s" % (type(exc).__name__, exc))
 
         head("接收端（本机收进来的流）")
         recv = (self.streams().get("receiver") or {}).get("streams") or []
@@ -1649,6 +2012,10 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/status":
                 self._json(200, self.api.status())
                 return
+            if path == "/api/guide":
+                # 「快速上手」四步自检：结论 + 一键修。判定全部复用引擎里已有的口径。
+                self._json(200, self.api.guide())
+                return
             if path == "/api/peers":
                 self._json(200, self.api.peers())
                 return
@@ -1898,6 +2265,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, self.api.remove_peer(body))
             elif path == "/api/settings":
                 self._json(200, self.api.set_settings(body))
+            elif path == "/api/guide/fix":
+                # 「快速上手」里的"一键修"：换设备 / 试采 / 修广播。一次只做用户点的那一件。
+                self._json(200, self.api.guide_fix(body))
             elif path == "/api/bluetooth/connect":
                 bluetooth.invalidate_cache()
                 self._json(200, bluetooth.connect(str(body.get("id") or "")))

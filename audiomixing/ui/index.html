@@ -157,63 +157,39 @@ td.addr{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--d
 .route .gainbox{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--dim)}
 .route input[type=range]{width:74px;accent-color:var(--acc)}
 
-/* ---------- drag & drop route builder ---------- */
-.builder{display:grid;grid-template-columns:minmax(0,1fr) 34px minmax(0,1fr);gap:12px;align-items:stretch}
-@media(max-width:760px){.builder{grid-template-columns:1fr;gap:10px}.builder .mid{display:none}}
-.panel{
-  display:flex;flex-direction:column;gap:9px;padding:13px;
-  background:var(--card2);border:1px solid var(--line);border-radius:var(--r2);min-height:150px;
+/* ---------- ② 设备卡片 + 勾选式路由 ----------
+   用户要"照手机端的样子、不要拖拽"。所以这里是设备为中心的卡片：
+   名字 · 平台/IP · 状态标签 · 电平条 · 两个按钮（收听它的 / 送给它）。 */
+.dvtitle{font-size:12px;color:var(--dim);margin:14px 0 8px;padding-top:12px;border-top:1px solid var(--line)}
+.dvcard{
+  background:var(--card2);border:1px solid var(--line);border-radius:var(--r2);
+  padding:12px 13px;margin-bottom:9px;transition:.14s;
 }
-.panel .head{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--dim)}
-.panel .head b{color:var(--fg);font-size:13px;font-weight:600}
-.builder .mid{display:grid;place-items:center;color:var(--dim2);font-size:18px}
+.dvcard:hover{border-color:var(--line2)}
+.dvcard.self{border-color:rgba(96,165,250,.28);background:linear-gradient(180deg,rgba(96,165,250,.06),transparent)}
+.dvcard.off{opacity:.55}
+.dvhead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.dvname{font-weight:650;font-size:14px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dvtag{font-size:10.5px;padding:1px 7px;border-radius:999px;background:rgba(74,222,128,.13);color:#7ee7a4;white-space:nowrap}
+.dvtag.me{background:rgba(96,165,250,.14);color:#93c5fd}
+.dvmeta{font-size:11.5px;color:var(--dim2);margin-top:5px;font-family:ui-monospace,Consolas,monospace}
+.dvbar{height:6px;border-radius:999px;background:#0d1219;border:1px solid var(--line);margin-top:9px;overflow:hidden}
+.dvbar i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .3s}
+.dvflow{font-size:11.5px;color:var(--dim);margin-top:5px;font-variant-numeric:tabular-nums}
+.dvacts{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.dvself{font-size:11.5px;color:var(--dim2)}
+@media(max-width:560px){.dvacts button{flex:1 1 auto}}
 
-.drop{
-  flex:1;display:flex;flex-direction:column;gap:7px;padding:10px;border-radius:9px;
-  border:1.5px dashed var(--line2);background:rgba(0,0,0,.18);
-  min-height:76px;transition:.15s;position:relative;
-}
-.drop.hot{border-color:var(--acc);background:rgba(74,222,128,.09);box-shadow:inset 0 0 22px rgba(74,222,128,.08)}
-.drop .ph{color:var(--dim2);font-size:12px;margin:auto;text-align:center;line-height:1.7;pointer-events:none}
-.drop .ph b{color:var(--dim);font-weight:600}
-.drop.bad{border-color:rgba(248,113,113,.5);background:rgba(248,113,113,.06)}
+.pick{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px}
+@media(max-width:760px){.pick{grid-template-columns:1fr}}
+.pickcol{background:var(--card2);border:1px solid var(--line);border-radius:var(--r2);padding:11px 12px}
+.pickcol .head{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--dim);margin-bottom:8px}
+.pickcol .head b{color:var(--fg);font-size:13px;font-weight:600}
+.picklist{display:flex;flex-direction:column;gap:6px}
+.picklist .chk{display:flex;align-items:center;gap:8px;font-size:12.5px}
 
-.dchip{
-  display:inline-flex;align-items:center;gap:8px;align-self:flex-start;max-width:100%;
-  padding:5px 9px 5px 11px;border-radius:8px;font-size:12.5px;font-weight:600;
-  background:rgba(96,165,250,.13);border:1px solid rgba(96,165,250,.3);color:#cfe3ff;
-}
-.dchip.dst{background:rgba(74,222,128,.13);border-color:rgba(74,222,128,.32);color:#c9f7da}
-.dchip .rm{
-  cursor:pointer;color:var(--dim);font-size:14px;line-height:1;padding:0 2px;border-radius:4px;
-}
-.dchip .rm:hover{color:var(--bad)}
-.dchip .kind{font-size:10.5px;font-weight:600;padding:1px 5px;border-radius:4px;background:rgba(255,255,255,.09);color:var(--dim)}
-
-/* the draggable device cards on the left */
-.srcgrid{display:flex;flex-direction:column;gap:7px;margin-top:12px;padding-top:13px;border-top:1px solid var(--line)}
-.srcgrid .title{font-size:12px;color:var(--dim);display:flex;align-items:center;gap:7px}
-.drag{
-  display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:9px;cursor:grab;
-  background:#0f141c;border:1px solid var(--line);transition:.14s;user-select:none;touch-action:none;
-}
-.drag:hover{border-color:var(--line2);background:#131a24;transform:translateX(2px)}
-.drag:active{cursor:grabbing}
-.drag.dragging{opacity:.4}
-.drag .grip{color:var(--dim2);font-size:13px;letter-spacing:-1px;line-height:1}
-.drag .nm{font-weight:600;font-size:13px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.drag .tags{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}
-.drag .tags span{font-size:10.5px;padding:1px 6px;border-radius:4px;background:rgba(74,222,128,.12);color:#7ee7a4}
-.drag.self .tags span{background:rgba(96,165,250,.12);color:#93c5fd}
-
-#ghost{
-  position:fixed;z-index:200;pointer-events:none;opacity:.92;
-  padding:8px 13px;border-radius:9px;font-size:12.5px;font-weight:600;
-  background:#1f2a38;border:1px solid var(--acc);color:#d7f7e3;
-  box-shadow:0 12px 34px rgba(0,0,0,.55);transform:translate(-50%,-140%);
-  display:none;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-}
-body.dragging{cursor:grabbing}
+/* 卡片摆放的抓手（moveCard 用，和路由拖拽无关） */
+.grip{color:var(--dim2);font-size:13px;letter-spacing:-1px;line-height:1;cursor:grab}
 
 .fields{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
 .f{display:flex;flex-direction:column;gap:5px}
@@ -260,6 +236,35 @@ pre{
 .warnbox.amber{background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.28);color:#fcd34d}
 .warnbox .act{margin-top:7px}
 .warnbox .act button{margin-right:6px}
+
+/* ---------- 「🚀 快速上手」 ---------- */
+#guideMask{
+  display:none; position:fixed; inset:0; z-index:150; background:rgba(6,9,14,.72);
+  padding:26px 16px; overflow:auto;
+}
+#guideMask.show{display:block}
+#guideBox{
+  max-width:760px; margin:0 auto; background:var(--card); border:1px solid var(--line2);
+  border-radius:var(--r); padding:18px 20px 20px; box-shadow:0 24px 60px rgba(0,0,0,.55);
+}
+#guideHead{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:12px}
+#guideHead .ghTitle{font-size:16px;font-weight:700}
+#guideHead .ghVer{font-size:11.5px;color:var(--dim2);font-family:ui-monospace,Consolas,monospace}
+.gsum{padding:10px 13px;border-radius:8px;font-size:13px;background:rgba(96,165,250,.08);
+  border:1px solid rgba(96,165,250,.2);color:#bcd2ec;margin-bottom:12px}
+.gsum.ok{background:rgba(74,222,128,.09);border-color:rgba(74,222,128,.28);color:#9ff0bd}
+.gstep{border:1px solid var(--line);border-radius:var(--r2);padding:12px 13px;margin-bottom:10px;background:var(--card2)}
+.gstep.ok{border-color:rgba(74,222,128,.3)}
+.gstep.bad{border-color:rgba(248,113,113,.34)}
+.gstep.warn,.gstep.manual{border-color:rgba(251,191,36,.3)}
+.gstep .gt{display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:600;margin-bottom:6px}
+.gstep .gt .n{font-size:11px;font-weight:700;padding:1px 7px;border-radius:999px;background:#0f141c;color:var(--dim)}
+.gstep .gx{font-size:13px;line-height:1.7;color:#dbe5f2}
+.gstep .gd{font-size:12px;line-height:1.7;color:#93a1b3;margin-top:5px}
+.gstep .ga{display:flex;gap:8px;flex-wrap:wrap;margin-top:9px}
+.gnote{font-size:11.5px;color:var(--dim2);margin-top:6px;line-height:1.7}
+/* 版本提示条：不放进 .warn（简洁视图会隐藏 .warn），这条必须一直看得见 */
+#versionWarn .warnbox{margin:10px 22px 0}
 
 .toast{
   position:fixed;left:50%;bottom:28px;transform:translate(-50%,18px);opacity:0;pointer-events:none;
@@ -398,6 +403,11 @@ html:not(.fullui) .card .body { padding-top: 6px; }
 <div class="top">
   <div class="brand"><span class="mark">W</span>Audio Mixing</div>
   <span class="tag" id="nodeTag"><b>…</b></span>
+  <!-- 版本号必须显眼：用户上次拿一个 7 小时前的旧 exe 测了一整天，
+       而面板上没有任何地方写着自己在跑哪一版。 -->
+  <span class="tag" id="versionTag" title="当前运行的版本与构建时间">v…</span>
+  <button class="primary" id="guideBtn" onclick="openGuide()" style="flex:0 0 auto"
+          title="第一次用就点这里：四步自检，每步都能一键修">🚀 快速上手</button>
   <span class="spacer"></span>
           <a class="linkbtn" href="/monitor" title="看谁给谁数据、走哪个通道、数据量与延迟" style="flex:0 0 auto">监控</a>
         <span class="seg" id="modeSeg">
@@ -410,6 +420,9 @@ html:not(.fullui) .card .body { padding-top: 6px; }
   <button id="testBtn" onclick="testTone()" title="在本机默认输出播 2 秒测试音，确认耳机/音箱是通的">测试音箱</button>
   <button class="ghost icon" onclick="refreshAll()" title="立即刷新">⟳</button>
 </div>
+
+<!-- 发现更新版本时的提示（用户跑旧版本一整天就是这么发生的）。 -->
+<div id="versionWarn"></div>
 
 <div class="banner" id="lanBanner">
   <span class="k">别的电脑/手机用这个网址打开：</span>
@@ -453,10 +466,10 @@ html:not(.fullui) .card .body { padding-top: 6px; }
       </div>
     </section>
 
-    <!-- ② 路由 -->
+    <!-- ② 设备与路由 -->
     <section class="card">
-      <h2><span class="n">②</span>路由
-        <span class="sub">把谁的声音，送到谁的耳机</span>
+      <h2><span class="n">②</span>设备与路由
+        <span class="sub">每台设备一张卡片，点按钮就连上</span>
         <span class="right"><button class="tiny ghost" onclick="showTemplates()">常用例子</button></span>
       </h2>
       <div class="body">
@@ -464,52 +477,53 @@ html:not(.fullui) .card .body { padding-top: 6px; }
           <svg class="qchart" id="qP2p" viewBox="0 0 200 36" preserveAspectRatio="none"></svg>
           <div class="qmeta" id="qP2pText">等待数据…</div>
         </div>
+
+        <!-- 设备卡片：照手机端那种卡片（名字 · 平台 · IP · 状态 · 电平条 · 按钮）。
+             用户原话："电脑端的路由可以效仿手机端，也不要拖动了，都改成对设备的按键。"
+             所以路由的入口是这里的两个按钮，不再是拖拽区。 -->
+        <div class="dvtitle">局域网里的设备</div>
+        <div id="deviceCards"></div>
+
+        <div class="dvtitle">已经连上的（谁的声音 → 放到谁的耳机）</div>
         <div class="routes" id="routesBox"></div>
 
-        <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--line)">
-          <div class="builder">
-            <div class="panel" id="panelFrom">
-              <div class="head">🎧 <b>要听谁的</b><span class="mini">把设备拖进来 · 可多个混音</span></div>
-              <div class="drop" id="dropFrom" data-slot="from">
-                <div class="ph"><b>拖到这里</b><span class="mini"><br>例：伴侣的电脑</span></div>
+        <details class="more" style="margin-top:12px">
+          <summary>▸ 高级：一次连多台 / 指定输出设备 / 音量 / 编码</summary>
+          <div style="padding:10px 2px 2px">
+            <div class="pick">
+              <div class="pickcol">
+                <div class="head">🎧 <b>要听谁的</b><span class="mini">可多选，会混成一路</span></div>
+                <div id="pickFrom" class="picklist"></div>
+              </div>
+              <div class="pickcol">
+                <div class="head">🔊 <b>用谁的耳机听</b><span class="mini">可多选，同时出声</span></div>
+                <div id="pickTo" class="picklist"></div>
               </div>
             </div>
-            <div class="mid">→</div>
-            <div class="panel" id="panelTo">
-              <div class="head">🔊 <b>用谁的耳机听</b><span class="mini">可拖多个 · 同时出声</span></div>
-              <div class="drop" id="dropTo" data-slot="to">
-                <div class="ph"><b>拖到这里</b><span class="mini"><br>例：本机</span></div>
-              </div>
-            </div>
-          </div>
-
-          <div class="srcgrid">
-            <div class="title">可拖拽的设备 <span style="color:var(--dim2)">按住卡片拖到上面的框里</span></div>
-            <div id="dragList"></div>
             <div id="multiHint"></div>
+            <div class="fields">
+              <div class="f grow"><label>输出设备</label>
+                <input type="text" id="newSinkDevice" placeholder="留空 = 系统默认"></div>
+              <div class="f"><label>音量</label>
+                <input type="number" id="newGain" value="1" min="0" max="4" step="0.1" style="width:84px"></div>
+              <div class="f"><label>编码</label>
+                <select id="newCodec" style="width:180px">
+                  <option value="pcm_s16">PCM 16bit（低延迟，推荐）</option>
+                  <option value="opus">Opus（省带宽 ~64kbps）</option>
+                </select></div>
+              <button class="primary" onclick="addRoute()">添加这条路由</button>
+              <button class="ghost" onclick="clearDraft()">清空勾选</button>
+            </div>
           </div>
+        </details>
 
-          <div class="fields">
-            <div class="f grow"><label>输出设备</label>
-              <input type="text" id="newSinkDevice" placeholder="留空 = 系统默认"></div>
-            <div class="f"><label>音量</label>
-              <input type="number" id="newGain" value="1" min="0" max="4" step="0.1" style="width:84px"></div>
-            <div class="f"><label>编码</label>
-              <select id="newCodec" style="width:180px">
-                <option value="pcm_s16">PCM 16bit（低延迟，推荐）</option>
-                <option value="opus">Opus（省带宽 ~64kbps）</option>
-              </select></div>
-            <button class="primary" onclick="addRoute()">添加这条路由</button>
-            <button class="ghost" onclick="clearDraft()">清空</button>
-          </div>
-
-          <div class="note">
-            <b>拖两个框就是一条路由。</b>「用谁的耳机听」里放多台设备 → 同一路声音会<b>同时</b>在那些设备上响
-            （例如你自己 + 客厅音箱）。<br>
-            想<b>听别的电脑</b> → 左 <code>伴侣的电脑</code>，右 <code>本机</code>。<br>
-            想<b>把自己电脑的声音送到伴侣耳机</b> → 左 <code>本机</code>，右 <code>伴侣的电脑</code>。<br>
-            <span style="color:#8b97a8">两边都放 <code>本机</code> 没有意义（自己的声音放给自己听），程序会拒绝。</span>
-          </div>
+        <div class="note">
+          <b>在设备卡片上点一下就行：</b>
+          <code>🎧 收听它的</code>＝把它的声音放到本机耳机；
+          <code>🎤 送给它</code>＝把本机的声音放到它的音箱。再点一次就断开。<br>
+          想<b>同时听几台</b>（例如 3 台手机 + 2 台电脑混成一路）：展开上面的「高级」，
+          两边各勾设备、再点「添加这条路由」。<br>
+          <span style="color:#8b97a8">一台设备的「收听它的」和「送给它」是两条独立的路由，互不影响。</span>
         </div>
       </div>
     </section>
@@ -583,7 +597,7 @@ html:not(.fullui) .card .body { padding-top: 6px; }
           <label class="chk"><input type="checkbox" id="chBroadcast" onchange="saveChannel()"> 广播我的声音</label>
           <label class="chk"><input type="checkbox" id="chListen" onchange="saveChannel()"> 只听（收听频道，且不发送本机声音）</label>
           <label class="chk"><input type="checkbox" id="chLocal" onchange="saveChannel()"> 本机直通（把音源直接放到本机耳机）</label>
-          <div class="f"><label>频道音量</label>
+          <div class="f"><label>频道音量（我们这一层，不动 Windows 系统音量）</label>
             <input type="range" id="chGain" min="0" max="2" step="0.05" value="1"
                    oninput="chGainLabel(); setChannelGain(this.value)" style="width:150px">
             <span class="mono" id="chGainVal">1.00</span></div>
@@ -697,7 +711,26 @@ html:not(.fullui) .card .body { padding-top: 6px; }
 </div>
 
 <div class="toast" id="toast"></div>
-<div id="ghost"></div>
+
+<!-- 「🚀 快速上手」：四步自检，每步给结论 + 一键修。
+     用户的五个真实失败全是"没人告诉你怎么配"，所以这张卡的任务只有一个：
+     让第一次用的人照着点就能成功。内容全部由 /api/guide 给出（服务端算，面板只负责显示）。 -->
+<div id="guideMask" onclick="if(event.target===this) closeGuide()">
+  <div id="guideBox">
+    <div id="guideHead">
+      <span class="ghTitle">🚀 快速上手 · 四步自检</span>
+      <span class="ghVer" id="guideVer">v…</span>
+      <span class="spacer"></span>
+      <button class="tiny ghost" onclick="loadGuide()">重新检查</button>
+      <button class="tiny ghost" onclick="closeGuide()">关闭</button>
+    </div>
+    <div id="guideSummary" class="gsum">正在检查…</div>
+    <div id="guideSteps"></div>
+    <div class="gnote">
+      这四步只读，不会改你的路由。带「🔧 / 换成 …」的按钮才会动设置，点了会告诉你改了什么。
+    </div>
+  </div>
+</div>
 
       <section class="card" id="multiOutCard">
         <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -1014,139 +1047,177 @@ const draft = {from:[], to:[]};
 
 // The draggable device cards. Every device can be dragged into either box; the
 // local machine is marked because as a *source* it is almost always a mistake.
-function renderDragList(){
+/* ---------------- ② 设备卡片（路由的入口在这里） ----------------
+   用户原话："手机的 UI 确实相对而言更美观，电脑端的路由可以效仿，也不要拖动了，
+   都改成对设备的按键。" 所以这里以【设备】为中心：每台设备一张卡片，
+   卡片上两个按钮就是一个方向的路由；多目标/增益/静音/编码仍在下面（按钮式）。
+   旧版是"拖进两个框生成路由"——拖拽对鼠标不友好，还要求用户先理解"源→目标"这套模型。 */
+
+/* 路由端点比较：把'本机'的几种写法归一，再当集合比。 */
+function normEnds(ids){
+  return (ids || []).map(x => (isLocalId(x) ? 'self' : String(x))).sort();
+}
+function sameEnds(ids, wanted){
+  return JSON.stringify(normEnds(ids)) === JSON.stringify(normEnds(wanted));
+}
+
+/* 这台设备现在有没有数据在流：上行取发送端统计，下行取接收端统计。 */
+function deviceFlow(nodeId, host){
+  const st = state.status || {};
+  const flows = {up_kbps: 0, down_packets: 0, down_mb: 0, buf_ms: null, target_ms: null};
+  for(const s of (st.senders || [])){
+    if(host && s.host === host) flows.up_kbps += Number(s.kbps || 0);
+  }
+  const recv = (st.receiver && st.receiver.streams) || [];
+  for(const r of recv){
+    const match = (r.node_id && r.node_id === nodeId) ||
+                  (r.node_name && state.peers && state.peers.some(p => p.node_id === nodeId && p.name === r.node_name));
+    if(!match) continue;
+    flows.down_packets += Number(r.packets || 0);
+    flows.down_mb += Number(r.bytes || 0) / 1048576;
+    if(r.buffered_ms != null) flows.buf_ms = Number(r.buffered_ms);
+    if(r.target_ms != null) flows.target_ms = Number(r.target_ms);
+  }
+  return flows;
+}
+
+function deviceCard(n, routes){
+  const self = n.node_id === 'self';
+  const inRoute = routes.find(r => sameEnds(r.from, [n.value]) && sameEnds(r.to, ['self']));
+  const outRoute = routes.find(r => sameEnds(r.from, ['self']) && sameEnds(r.to, [n.value]));
+  const flows = deviceFlow(n.value === 'self' ? '' : n.value, n.host);
+  const local = (state.status && state.status.local) || {};
+  const peak = self ? Number(local.peak || 0) : 0;
+  const online = self || n.online !== false;
+
+  // 电平条：本机看播放电平，对端看上行码率（PCM 约 1536kbps、Opus 约 64kbps），
+  // 有下行时显示缓冲深度。跟手机端一样，一条细条就够说明"有没有在流"。
+  let bar = 0, barText = '空闲';
+  if(self && peak > 0){ bar = Math.min(100, peak * 100); barText = `播放电平 ${(peak * 100).toFixed(1)}%`; }
+  else if(flows.up_kbps > 0){ bar = Math.min(100, flows.up_kbps / 16); barText = `上行 ${flows.up_kbps.toFixed(0)} kbps`; }
+  else if(flows.buf_ms != null){ bar = Math.min(100, (flows.buf_ms / Math.max(1, flows.target_ms || 150)) * 100); barText = `下行缓冲 ${flows.buf_ms.toFixed(0)} ms`; }
+
+  const tags = [];
+  if(self) tags.push('本机');
+  if(!online) tags.push('离线');
+  if(!self && (n.sources || []).length) tags.push('可采声音');
+  if((n.sinks || []).length) tags.push('可当音响');
+
+  const meta = [n.platform || '', n.host || '', n.version ? ('v' + n.version) : '']
+    .filter(Boolean).join(' · ');
+  // 第二行只放"上面那条没说到的"事实，不重复同一个数字。
+  const extra = [];
+  if(flows.down_packets) extra.push(`↓ 已收 ${flows.down_packets} 包 / ${flows.down_mb.toFixed(1)} MB`);
+  if(flows.buf_ms != null && !/缓冲/.test(barText)) extra.push(`缓冲 ${flows.buf_ms.toFixed(0)} ms`);
+  if(flows.up_kbps > 0 && !/上行/.test(barText)) extra.push(`↑ ${flows.up_kbps.toFixed(0)} kbps`);
+
+  const acts = self
+    ? `<div class="dvacts"><span class="dvself">这台电脑：用下面的 ⑥ 频道开关决定它广播什么、听什么</span></div>`
+    : `<div class="dvacts">
+         <button class="${inRoute ? 'primary' : ''}" onclick="quickRoute('${esc(n.value)}','in')">
+           ${inRoute ? '✓ 正在收听它的（点一下断开）' : '🎧 收听它的'}</button>
+         <button class="${outRoute ? 'primary' : ''}" onclick="quickRoute('${esc(n.value)}','out')">
+           ${outRoute ? '✓ 正在送给它（点一下断开）' : '🎤 送给它'}</button>
+         ${n.host ? `<button class="tiny ghost" onclick="pingPeer('${esc(n.host)}')">测连通</button>` : ''}
+       </div>`;
+
+  return `<div class="dvcard${self ? ' self' : ''}${online ? '' : ' off'}">
+    <div class="dvhead">
+      <span class="dvname">${esc(n.name)}</span>
+      ${tags.map(t => `<span class="dvtag${t === '本机' ? ' me' : ''}">${esc(t)}</span>`).join('')}
+    </div>
+    <div class="dvmeta">${esc(meta || '—')}</div>
+    <div class="dvbar"><i style="width:${bar.toFixed(0)}%"></i></div>
+    <div class="dvflow">${esc(barText)}${extra.length ? '　' + esc(extra.join('　')) : ''}</div>
+    ${acts}
+  </div>`;
+}
+
+function renderDeviceCards(){
+  const box = $('deviceCards');
+  if(!box) return;
   const nodes = allNodes();
-  $('dragList').innerHTML = nodes.map(n => {
-    const self = n.node_id === 'self';
-    const [ms] = splitExtra(n.sources);
-    const [mk] = splitExtra(n.sinks);
-    const tags = [];
-    if(!self && ms.length) tags.push('可采声音');
-    if(mk.length) tags.push('可当音响');
-    if(self) tags.push('本机');
-    return `<div class="drag${self?' self':''}" data-id="${esc(n.value)}" data-name="${esc(n.name)}">
-      <span class="grip">⣿</span>
-      <span class="nm">${esc(n.name)}</span>
-      <span class="tags">${tags.map(t=>`<span>${esc(t)}</span>`).join('')}</span>
-    </div>`;
-  }).join('') || '<div class="empty">还没有发现别的设备。在另一台电脑上也启动 Audio Mixing，或在上方手动填它的 IP。</div>';
-  // Delegated once per render; the list is rebuilt on every refresh.
-  $('dragList').querySelectorAll('.drag').forEach(el => el.addEventListener('pointerdown', beginDrag));
+  const routes = state.routes || [];
+  box.innerHTML = nodes.map(n => deviceCard(n, routes)).join('')
+    || '<div class="empty">还没有发现别的设备。在另一台电脑上也启动 Audio Mixing，或在上方手动填它的 IP。</div>';
 }
 
-function chipOf(slot, id){
-  const name = nodeLabel(id);
-  return `<span class="dchip${slot==='to'?' dst':''}" data-id="${esc(id)}">
-    ${slot==='to'?'🔊':'🎧'} ${esc(name)}
-    <span class="rm" title="移除" onclick="removeChip('${slot}','${esc(id)}')">×</span></span>`;
+/* 卡片上的按钮：一条路由的开关。
+   「收听它的」= 从它到本机；「送给它」= 从本机到它。再点一次就删掉这条路由。 */
+async function quickRoute(id, dir){
+  const from = dir === 'in' ? [id] : ['self'];
+  const to = dir === 'in' ? ['self'] : [id];
+  // 同方向可能有多条（旧版本拖拽时很容易重复添加），点一次就把它们都断掉。
+  const existing = (state.routes || []).filter(r => sameEnds(r.from, from) && sameEnds(r.to, to));
+  try{
+    if(existing.length){
+      for(const r of existing) await api('/api/routes/delete', {id: r.id});
+      toast(dir === 'in' ? '已断开：不再收听它' : '已断开：不再送给它', 'ok');
+    } else {
+      await api('/api/routes/add', {route: {
+        from, to,
+        gain: parseFloat($('newGain').value) || 1,
+        codec: $('newCodec').value,
+        // 输出设备只对"送到对方"有意义：对方机上的播放设备名字，本机不知道。
+        sink_device: dir === 'out' ? $('newSinkDevice').value.trim() : '',
+      }});
+      toast(dir === 'in' ? '开始收听它的声音' : '开始把本机声音送给它', 'ok');
+    }
+    refreshAll();
+  }catch(e){ toast('操作失败：' + e.message, 'err'); }
 }
 
-function renderDraft(){
-  for(const slot of ['from','to']){
-    const box = slot === 'from' ? $('dropFrom') : $('dropTo');
-    const ids = draft[slot];
-    const ph = slot === 'from'
-      ? '<div class="ph"><b>拖到这里</b><span class="mini"><br>例：伴侣的电脑，或本机</span></div>'
-      : '<div class="ph"><b>拖到这里</b><span class="mini"><br>例：本机，或伴侣的电脑</span></div>';
-    box.innerHTML = ids.length ? ids.map(id => chipOf(slot, id)).join('') : ph;
-    box.classList.toggle('hot', false);
+/* 高级区：勾选式（不再拖拽），保留多目标、增益、编码、指定输出设备这些能力。 */
+function renderPickers(){
+  const nodes = allNodes();
+  for(const slot of ['from', 'to']){
+    const box = slot === 'from' ? $('pickFrom') : $('pickTo');
+    if(!box) continue;
+    box.innerHTML = nodes.map(n => {
+      const on = draft[slot].includes(n.value) ? ' checked' : '';
+      const dis = (n.node_id !== 'self' && n.online === false) ? ' <span class="mini">（离线）</span>' : '';
+      return `<label class="chk"><input type="checkbox"${on}
+        onchange="toggleDraft('${slot}','${esc(n.value)}',this.checked)"> ${esc(n.name)}${dis}</label>`;
+    }).join('') || '<span class="mini">还没有别的设备</span>';
   }
-  const toHint = draft.to.length > 1
-    ? `<div class="x" style="font-size:11.5px;color:var(--acc);margin-top:4px">这路声音会同时在这 ${draft.to.length} 台设备上播放</div>`
-    : '';
   const hint = $('multiHint');
-  if(hint) hint.innerHTML = toHint;
-}
-
-function removeChip(slot, id){
-  draft[slot] = draft[slot].filter(v => v !== id);
-  renderDraft();
-}
-function clearDraft(){
-  draft.from = []; draft.to = [];
-  renderDraft();
-  toast('已清空');
-}
-
-/* pointer-based dragging: works with mouse and touch, unlike HTML5 drag & drop */
-let drag = null;
-
-function beginDrag(ev){
-  const card = ev.target.closest('.drag');
-  if(!card || ev.button > 0) return;
-  ev.preventDefault();
-  drag = {id: card.dataset.id, name: card.dataset.name, card: card, moved: false, x: ev.clientX, y: ev.clientY};
-  card.classList.add('dragging');
-  window.addEventListener('pointermove', moveDrag);
-  window.addEventListener('pointerup', endDrag);
-  window.addEventListener('pointercancel', endDrag);
-}
-
-function moveDrag(ev){
-  if(!drag) return;
-  if(!drag.moved){
-    if(Math.hypot(ev.clientX - drag.x, ev.clientY - drag.y) < 5) return;
-    drag.moved = true;
-    document.body.classList.add('dragging');
-    const ghost = $('ghost');
-    ghost.textContent = drag.name;
-    ghost.style.display = 'block';
-  }
-  const ghost = $('ghost');
-  ghost.style.left = ev.clientX + 'px';
-  ghost.style.top = ev.clientY + 'px';
-
-  for(const box of [$('dropFrom'), $('dropTo')]){
-    box.classList.remove('hot');
-    const r = box.getBoundingClientRect();
-    const over = ev.clientX >= r.left - 26 && ev.clientX <= r.right + 26 &&
-                 ev.clientY >= r.top - 26 && ev.clientY <= r.bottom + 26;
-    if(over) box.classList.add('hot');
+  if(hint){
+    hint.innerHTML = draft.to.length > 1
+      ? `<div class="x" style="font-size:11.5px;color:var(--acc);margin-top:6px">这路声音会同时在这 ${draft.to.length} 台设备上播放</div>`
+      : '';
   }
 }
 
-function endDrag(ev){
-  window.removeEventListener('pointermove', moveDrag);
-  window.removeEventListener('pointerup', endDrag);
-  window.removeEventListener('pointercancel', endDrag);
-  if(!drag) return;
-  const d = drag; drag = null;
-  document.body.classList.remove('dragging');
-  $('ghost').style.display = 'none';
-  d.card.classList.remove('dragging');
-  for(const box of [$('dropFrom'), $('dropTo')]) box.classList.remove('hot');
-  if(!d.moved) return;
-
-  for(const box of [$('dropFrom'), $('dropTo')]){
-    const r = box.getBoundingClientRect();
-    const over = ev.clientX >= r.left - 26 && ev.clientX <= r.right + 26 &&
-                 ev.clientY >= r.top - 26 && ev.clientY <= r.bottom + 26;
-    if(over){ addToDraft(box.dataset.slot, d.id, d.name); return; }
-  }
-}
-
-function addToDraft(slot, id, name){
+function toggleDraft(slot, id, on){
   if(!slot) return;
-  if(draft[slot].includes(id)){ toast('已经在框里了'); return; }
+  const next = {from: draft.from.slice(), to: draft.to.slice()};
+  if(on){
+    if(!next[slot].includes(id)) next[slot].push(id);
+  } else {
+    next[slot] = next[slot].filter(v => v !== id);
+  }
   // 本机 on the "要听谁的" side is how you send *your* sound to the other machine's
   // headphones, so it must be allowed. Only "本机 -> 本机" is pointless: that sound
   // is already playing here and the engine deliberately ignores self-loops.
-  const next = {from: draft.from.slice(), to: draft.to.slice()};
-  next[slot].push(id);
   if(next.from.length && next.to.length && next.from.every(isLocalId) && next.to.every(isLocalId)){
     toast('左边右边都是本机 = 把自己的声音放给自己听，不会有任何效果。', 'err');
+    renderPickers();
     return;
   }
-  draft[slot].push(id);
-  renderDraft();
-  toast(`已加入「${slot === 'from' ? '要听谁的' : '用谁的耳机听'}」：${name}`, 'ok');
+  draft[slot] = next[slot];
+  renderPickers();
+}
+function clearDraft(){
+  draft.from = []; draft.to = [];
+  renderPickers();
+  toast('已清空勾选');
 }
 
 function renderRoutes(){
   const nameOf = (id) => nodeLabel(id);
   const routes = state.routes || [];
   if(!routes.length){
-    $('routesBox').innerHTML = '<div class="empty">还没有路由。下面选好「要听谁的」和「用谁的耳机听」，然后点添加。</div>';
+    $('routesBox').innerHTML = '<div class="empty">还没有连上任何设备。在上面那台设备的卡片上点「🎧 收听它的」或「🎤 送给它」。</div>';
     return;
   }
   $('routesBox').innerHTML = routes.map(r => `
@@ -1158,22 +1229,23 @@ function renderRoutes(){
         ${r.mute ? '<span class="meta">已静音</span>' : ''}
       </div>
       <div class="gainbox">
-        <span>音量</span>
+        <span title="我们这一层的音量，不动 Windows 系统音量">音量</span>
         <input type="range" min="0" max="2" step="0.05" value="${r.gain}"
-               oninput="setGain('${esc(r.id)}', this.value, this)" title="拖动调整音量">
+               oninput="setGain('${esc(r.id)}', this.value, this)"
+               title="我们这一层的音量（不动 Windows 系统音量）">
         <span class="mono" id="g_${esc(r.id)}">${Number(r.gain).toFixed(2)}</span>
       </div>
       <div class="meta">${esc(r.codec)}${r.sink_device ? ' · ' + esc(r.sink_device) : ''}</div>
       <div class="acts">
         <button class="tiny" onclick="toggleMute('${esc(r.id)}', ${!r.mute})">${r.mute?'取消静音':'静音'}</button>
-        <button class="tiny danger" onclick="delRoute('${esc(r.id)}')">删除</button>
+        <button class="tiny danger" onclick="delRoute('${esc(r.id)}')">断开</button>
       </div>
     </div>`).join('');
 }
 
 async function addRoute(){
-  if(!draft.from.length){ toast('请先把设备拖到左边「要听谁的」框里', 'err'); return; }
-  if(!draft.to.length){ toast('请先把设备拖到右边「用谁的耳机听」框里', 'err'); return; }
+  if(!draft.from.length){ toast('请先在上面「要听谁的」里勾一台设备', 'err'); return; }
+  if(!draft.to.length){ toast('请先在上面「用谁的耳机听」里勾一台设备', 'err'); return; }
   // `self` travels as-is; the engine resolves it to this machine's node id when it
   // stores the route, which is what makes the route mean the same thing everywhere.
   const from = draft.from.slice();
@@ -1223,16 +1295,14 @@ function showTemplates(){
   alert(
     '常用例子\n' +
     '─────────────────────\n' +
-    '1) 在这台电脑的耳机里听伴侣电脑的声音\n' +
-    '     要听谁的 = 伴侣的电脑\n' +
-    '     用谁的耳机听 = 本机\n\n' +
-    '2) 让伴侣也听到你的声音（再补一条反向的）\n' +
-    '     要听谁的 = 本机 …… 不行！要选「本机」的话请这样做：\n' +
-    '     如果你想让别人听你，需要在【对方那台电脑】的控制台上\n' +
-    '     加一条：要听谁的 = 你的电脑，用谁的耳机听 = 对方（本机）。\n\n' +
-    '3) 办公室：把 3 台手机 + 2 台电脑都收进自己的耳机\n' +
-    '     要听谁的 = 勾选所有其它设备（多选）\n' +
-    '     用谁的耳机听 = 本机\n\n' +
+    '在这台电脑的耳机里听伴侣电脑的声音\n' +
+    '     ② 里找到「伴侣的电脑」那张卡片 → 点 🎧 收听它的\n\n' +
+    '让伴侣也听到你的声音\n' +
+    '     在【对方那台电脑】的控制台上，找到你这台机器的卡片 → 点 🎧 收听它的\n' +
+    '     （或者在本机卡片上点 🎤 送给它，效果一样，看你在哪台机器上点）\n\n' +
+    '办公室：把 3 台手机 + 2 台电脑都收进自己的耳机\n' +
+    '     ② → 展开「高级」→ 「要听谁的」勾选所有其它设备 →\n' +
+    '     「用谁的耳机听」勾本机 → 点「添加这条路由」（多选就是混成一路）\n\n' +
     (has ? '' : '提示：现在只发现了一台设备，先在另一台电脑上也启动 Audio Mixing。')
   );
 }
@@ -1348,6 +1418,113 @@ function renderStatus(){
   // 因为它们要回答的是"为什么没声音"，晚 2.5 秒才出现就等于没出现。
   renderSourceHealth();
   renderChannelHealth();
+  renderVersion();
+}
+
+/* ---------------- 版本可见性 ----------------
+   用户上次拿一个 7 小时前的旧 exe 测了一整天，而面板上没有任何地方写着版本。
+   所以：顶栏常显"v1.9"，旁边/桌面发现更新的 exe 时直接弹黄条让他去双击新的那个。 */
+function renderVersion(){
+  const b = (state.status && state.status.build) || null;
+  const tag = $('versionTag');
+  if(tag && b){
+    tag.innerHTML = `<b>v${esc(b.version)}</b>`;
+    tag.title = (b.text || '') + (b.path ? ('\n' + b.path) : '');
+  }
+  const box = $('versionWarn');
+  if(!box) return;
+  const newer = b && b.newer;
+  if(!newer){ box.innerHTML = ''; return; }
+  box.innerHTML = `<div class="warnbox amber">⚠ 发现更新的版本 <b>${esc(newer.name)}</b>
+    （构建于 ${esc(newer.built_at)}，${esc(newer.size_mb)} MB），当前运行的是
+    <b>v${esc(b.version)}</b>（构建于 ${esc(b.build_time || '未知')}）—— 请关掉现在这个窗口，
+    双击 <b>${esc(newer.name)}</b> 重新开始。</div>`;
+}
+
+/* ---------------- 🚀 快速上手（四步自检） ----------------
+   用户的五个真实失败没有一个是代码算错，全是"没人告诉你怎么配"。
+   这里只负责显示：每一步的结论都是服务端 /api/guide 算好的（和引擎实际做的事同一套口径），
+   面板不自己判断，免得又出现"面板说没问题、引擎其实没在发"。 */
+let guideData = null;
+async function openGuide(){
+  const mask = $('guideMask');
+  if(!mask) return;
+  mask.classList.add('show');
+  await loadGuide();
+}
+function closeGuide(){ const m = $('guideMask'); if(m) m.classList.remove('show'); }
+async function loadGuide(){
+  const box = $('guideSteps');
+  if(box) box.innerHTML = '<div class="gstep"><div class="gx">正在检查…（要打开一次音频设备，约 1～2 秒）</div></div>';
+  try{
+    const d = await api('/api/guide');
+    guideData = d;
+    renderGuide(d);
+  }catch(e){
+    if(box) box.innerHTML = `<div class="gstep bad"><div class="gx">检查失败：${esc(e.message)}</div></div>`;
+  }
+}
+function renderGuide(d){
+  const sum = $('guideSummary');
+  if(sum){ sum.textContent = d.summary || ''; sum.className = 'gsum' + (d.ready ? ' ok' : ''); }
+  const ver = $('guideVer');
+  if(ver && d.build) ver.textContent = d.build.text || '';
+  const marks = {ok:'✓', bad:'✗', warn:'!', manual:'🎧'};
+  const box = $('guideSteps');
+  if(!box) return;
+  box.innerHTML = (d.steps || []).map((s, si) => {
+    const acts = (s.actions || []).map((a, ai) =>
+      `<button class="${a.kind === 'primary' ? 'primary' : 'tiny ghost'}"
+               onclick="guideAction(${si},${ai})">${esc(a.label)}</button>`).join('');
+    const checks = s.netcheck
+      ? `<div class="gd">${s.netcheck.map(x => esc(x)).join('<br>')}</div>` : '';
+    const tone = (s.id === 'tone' && d.tonePlayed)
+      ? `<div class="gd">手机/耳机里听到了吗？　
+           <button class="tiny" onclick="toneHeard(true)">听到了 ✓</button>
+           <button class="tiny ghost" onclick="toneHeard(false)">没听到 ✗</button>
+           ${d.toneAnswer ? '<br>' + esc(d.toneAnswer) : ''}</div>` : '';
+    return `<div class="gstep ${esc(s.state)}">
+      <div class="gt"><span class="n">${marks[s.state] || s.n}</span>第 ${s.n} 步 · ${esc(s.title)}</div>
+      <div class="gx">${esc(s.text)}</div>
+      ${s.detail ? `<div class="gd">${esc(s.detail)}</div>` : ''}
+      ${checks}${tone}
+      ${acts ? `<div class="ga">${acts}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+function toneHeard(ok){
+  if(!guideData) return;
+  const name = ((state.status && state.status.node) || {}).name || '本机';
+  guideData.toneAnswer = ok
+    ? ('好 —— 整条链路是通的 ✓ 手机上点「📻 听广播」，或点「🎧 收听 ' + name + '」。')
+    : ('那先在手机上看「🩺 诊断」，再回来重点看第 1 步（电脑这边有没有采到声音）和第 3 步（两台设备看没看见）。');
+  renderGuide(guideData);
+}
+async function guideAction(si, ai){
+  const step = guideData && guideData.steps && guideData.steps[si];
+  const act = step && step.actions && step.actions[ai];
+  if(!act) return;
+  try{
+    if(act.api === '/api/netcheck'){
+      toast('正在检查防火墙（约 5 秒）…');
+      const r = await api('/api/netcheck');
+      step.netcheck = (r.checks || []).map(c =>
+        '[' + (c.ok === null ? '?' : (c.ok ? '通过' : '不通过')) + '] ' + c.name + '：' + c.detail);
+      const bad = (r.checks || []).filter(c => c.ok === false).length;
+      toast(bad ? ('防火墙有 ' + bad + ' 项不通过（见第 3 步下面）') : '防火墙检查通过', bad ? 'err' : 'ok');
+      renderGuide(guideData);
+      return;
+    }
+    const r = await api(act.api, act.payload || undefined);
+    toast(r.note || '已执行', 'ok');
+    if(act.api === '/api/test-tone'){
+      if(guideData){ guideData.tonePlayed = true; guideData.toneAnswer = ''; renderGuide(guideData); }
+      return;
+    }
+    // 换设备/修广播之后：立刻重新检查一次，让用户直接看到结论变了没有
+    await loadGuide();
+    refreshAll();
+  }catch(e){ toast('执行失败：' + e.message, 'err'); }
 }
 
 /* 音源空转告警的阈值：与引擎 engine.NO_DATA_WARN_S 保持一致。
@@ -1378,6 +1555,14 @@ function renderSourceHealth(){
   const key = (n) => String(n || '').toLowerCase().replace(/\s*\[(loopback|capture)\]\s*$/, '');
   const warned = new Set();
   let html = '';
+  // ★ 自动换过设备必须显著告知 —— 尤其用户自己手动选过设备的时候。
+  // 引擎只换"试采确实收到了音频"的那一块，这里把"从哪换到哪、为什么"原样写出来。
+  const sw = (s.channel && s.channel.switch) || null;
+  if(sw && sw.to){
+    html += `<div class="warnbox amber">🔁 已自动把音源从「${esc(sw.from || '?')}」换成「${esc(sw.to)}」—— ${esc(sw.why || '')}
+      <div style="margin-top:6px;font-size:12px;opacity:.92">本次切换发生在 ${Math.round(sw.age_s || 0)} 秒前，
+      已经写进配置（下次启动不会再走那块设备）。如果这不是你想要的，在 ⑥ 的「音源」里改回来。</div></div>`;
+  }
   for(const w of ((s.channel && s.channel.warnings) || [])){
     if(w.scope !== 'capture') continue;               // 引擎给的那份带着更具体的建议
     warned.add(key(w.source));
@@ -1610,7 +1795,7 @@ async function loadNetMics(){
               <span class="chip"><span class="k">${chosen ? '已加入' : '未加入'}</span></span>
               <button class="tiny ${x.muted ? 'danger' : 'ghost'}" onclick="muteMic(${i})">${x.muted ? '已静音' : '静音'}</button>
               <input type="range" class="micgain" min="0" max="200" value="${Math.round((x.gain || 1) * 100)}"
-                     title="这台手机的音量（手机自己的音量键不一定有效，见说明）"
+                     title="我们这一层的音量：只改这台手机传进来的增益，手机的系统媒体音量我们不碰（手机端滑杆同名同义）"
                      oninput="setMicGain(${i}, this.value)" onchange="setMicGain(${i}, this.value)">
             </div>`;
           }).join('');
@@ -1875,8 +2060,8 @@ async function refreshAll(){
 
     renderNetwork(peers.network);
     renderPeers();
-    renderDragList();
-    renderDraft();
+    renderDeviceCards();
+    renderPickers();
     renderRoutes();
     renderStatus();
     renderStreams();

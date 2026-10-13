@@ -106,6 +106,8 @@ public class MainActivity extends Activity {
     private LinearLayout detailWrap;
     private TextView volumeVal;
     private SeekBar volumeBar;
+    /** ★ 系统媒体音量那一行（只显示，不修改）。 */
+    private TextView sysVolText;
     // ★ 「送什么声音」那一块
     private TextView playChip;
     private TextView micChip;
@@ -262,7 +264,22 @@ public class MainActivity extends Activity {
         }
         refreshSourceRow();
         refreshChannelRow();
+        refreshVolumeRow();
         updateHeader(peers.size());
+    }
+
+    /** 刷新音量那两块（我们这一层的值 + 只读的系统音量）。 */
+    private void refreshVolumeRow() {
+        if (sysVolText != null) {
+            setTextIfChanged(sysVolText, readSystemVolume() + " · " + engine.volumeExplainText());
+        }
+        if (volumeBar != null && !volumeBar.isPressed()) {
+            // 滑杆没被按住时跟一下引擎里的真实值（比如服务重启后回到默认）
+            int want = Math.round(engine.volume() * 100);
+            if (volumeBar.getProgress() != want) {
+                volumeBar.setProgress(want);
+            }
+        }
     }
 
     /** 刷新「听广播」那一块（状态会随"收到了几个包"变，所以每 150ms 一起刷）。 */
@@ -365,6 +382,9 @@ public class MainActivity extends Activity {
         put("port", engine.audioPort() + "（UDP，收发都用它）");
         put("found", engine.peers().size() + " 台");
         put("conn", "收听 " + engine.listeningCount() + " 台 / 送声 " + engine.sendingCount() + " 台");
+        // ★ 「实际收到哪几路」：开关是意图，这一行才是事实（放最前面，跟"已连接"挨着）
+        put("streams", engine.recvStreamsText());
+        put("volume", engine.volumeText() + "\n" + engine.systemVolumeText());
         put("recv", engine.statsText());
         put("send", engine.sendStatsText());
         // 对端回话：这是"哪一端没在发"最直接的证据（对方自己说的）。
@@ -618,16 +638,23 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void applySystemVolume(int progress) {
-        // 只有用户真的拖了滑杆才动系统音量，别一打开 App 就把人家的媒体音量改了。
+    /**
+     * 读系统媒体音量（<b>只读</b>）。
+     *
+     * <p>这里原来叫 {@code applySystemVolume}，会调用 {@code AudioManager.setStreamVolume}
+     * 真的去改系统音量 —— 那是错的（用户明确指出过）：我们要调的是"我们这一层"的增益，
+     * 不该顺手把用户手机自己的声音也改了。现在这个函数只读不写，读出来是为了把
+     * "系统音量 × 播放器音量 × 我们这一层"这三层关系摆在界面上。
+     */
+    private String readSystemVolume() {
         if (audioManager == null || sysVolMax <= 0) {
-            return;
+            return "系统媒体音量：读不到（没有音频服务）";
         }
-        int idx = Math.round(Math.min(1f, progress / 100f) * sysVolMax);
         try {
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, idx, 0);
-        } catch (Throwable ignored) {
-            // 某些 ROM 在勿扰模式下会拒绝，忽略即可
+            int cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+            return "系统媒体音量 " + cur + " / " + sysVolMax + "（只显示，我们不改它）";
+        } catch (Throwable t) {
+            return "系统媒体音量：读不到（" + t + "）";
         }
     }
 
@@ -694,6 +721,10 @@ public class MainActivity extends Activity {
         TextView hint = text("📻 听广播 = 「谁在广播就听谁」：电脑上开着「广播我的声音」时选这个就能听见，"
                 + "不用先在这里点某台设备。\n"
                 + "🎧 收听 = 点对点，只收你点名的那一台（列表里有设备时用）。\n"
+                + "两个开关是【并存】的，可以只开一个也可以都开 —— 上面那行「当前实际收到 N 路」"
+                + "写的就是真正在播的声音。\n"
+                + "同一台设备的声音如果从两条路都进来（电脑同时开着广播和点对点路由），"
+                + "只会播一路、不叠加 —— 不会出现声音翻倍或忽大忽小。\n"
                 + "（音频包里没有\"路由\"标记，所以听广播实际是\"谁发过来都听\"——局域网里只有主动发给你的声音才到得了你这台。）",
                 11.5f, DIM, false);
         hint.setLineSpacing(dp(3), 1f);
@@ -785,11 +816,17 @@ public class MainActivity extends Activity {
         hr.setBackgroundColor(LINE);
         card.addView(hr, margins(MATCH, Math.max(1, dpi(1)), 0, dpi(4), 0, dpi(12)));
 
+        // ★ 音量：只管"我们这一层"，绝不动系统音量。
+        //
+        //   用户原话（2026-10-12）：「手机在调节本机音量时（本意应当是使收听方音量更适合），
+        //   会直接调节系统声音大小。我们的声音计算方式应当是：
+        //   系统声音 × 被监听软件声音 × 我们软件声音 = 实际接收端声音大小」。
+        //   所以这里：滑杆 → 只作用于我们自己处理的 PCM；系统音量单独一行【只读】。
+        card.addView(text("我们这一层的音量", 12.5f, DIM, false));
+
         LinearLayout volRow = new LinearLayout(this);
         volRow.setOrientation(LinearLayout.HORIZONTAL);
         volRow.setGravity(Gravity.CENTER_VERTICAL);
-        volRow.addView(text("本机音量", 12.5f, DIM, false),
-                new LinearLayout.LayoutParams(dpi(62), WRAP));
 
         volumeBar = new SeekBar(this);
         volumeBar.setMax(150);          // 0~1.5 倍，和网页版滑杆一致
@@ -812,10 +849,9 @@ public class MainActivity extends Activity {
                 if (volumeVal != null) {
                     setTextIfChanged(volumeVal, String.format(Locale.US, "%.2f", g));
                 }
+                // 只改我们自己的增益（发侧乘 PCM / 收侧 AudioTrack 音量）。
+                // 注意：这里<b>刻意不再调用</b> AudioManager.setStreamVolume —— 见上面那段说明。
                 engine.setVolume(g);
-                if (fromUser) {
-                    applySystemVolume(progress);
-                }
             }
 
             @Override
@@ -826,7 +862,17 @@ public class MainActivity extends Activity {
             public void onStopTrackingTouch(SeekBar sb) {
             }
         });
-        card.addView(volRow);
+        card.addView(volRow, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
+
+        TextView volHint = text("只影响 Audio Mixing 送出去/播放出来的声音，不改你的系统音量。"
+                + "（播放侧上限 1.00，发送侧可以到 1.50。）", 11.5f, DIM, false);
+        volHint.setLineSpacing(dp(3), 1f);
+        card.addView(volHint, margins(MATCH, WRAP, 0, dpi(4), 0, 0));
+
+        // 系统音量：只显示、不修改。写在界面上是为了让三层关系一眼可见。
+        sysVolText = text("", 11.5f, DIM, false);
+        sysVolText.setLineSpacing(dp(3), 1f);
+        card.addView(sysVolText, margins(MATCH, WRAP, 0, dpi(2), 0, dpi(6)));
 
         // 「详情」和「诊断」并排：详情是常驻的实时统计（看一眼），
         // 诊断是一次性的完整快照（能整段复制发出去）—— 真机排查要的正是后者。
@@ -868,6 +914,8 @@ public class MainActivity extends Activity {
         kv("音频端口", "port");
         kv("已发现", "found");
         kv("已连接", "conn");
+        kv("实际收到", "streams");
+        kv("音量分层", "volume");
         kv("收端统计", "recv");
         kv("发端统计", "send");
         // ★ 对端自己报的统计（两台设备互报的"我发了多少/我收了你多少"）
@@ -1151,12 +1199,16 @@ public class MainActivity extends Activity {
 
             String st;
             int color;
+            // ★ 「实际生效状态」：点了「收听」不等于真的在收 —— 用户说的"路由模式和广播模式
+            //   混淆"就出在这里。所以这里区分三种：真的在收 / 点了但没收到包 / 没在听。
+            boolean reallyReceiving = listen && engine.recvReceivingFrom(peer.host);
             if (listen && send) {
-                st = "收听 + 送声";
+                st = reallyReceiving ? "收听✓ + 送声·" + AudioSend.sourceShortName(engine.activeSourceKind())
+                        : "收听 + 送声·" + AudioSend.sourceShortName(engine.activeSourceKind());
                 color = OK;
             } else if (listen) {
-                st = "收听中";
-                color = OK;
+                st = reallyReceiving ? "收听中 ✓ 正在收" : "收听中…（还没收到包）";
+                color = reallyReceiving ? OK : WARN;
             } else if (send) {
                 // 送声时把音源也写在状态里：用户一眼就知道送出去的是本机声音还是他说话
                 st = "送声·" + AudioSend.sourceShortName(engine.activeSourceKind());

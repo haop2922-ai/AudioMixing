@@ -144,6 +144,12 @@ public final class AudioRecv {
          * 有了这一条，"3171 个坏包到底是什么"就不必再猜。
          */
         public String badByLen = "";
+        /** ★ 被抑制掉的"同一台设备第 2 条流"的包数（去重生效的证据）。 */
+        public long dupRoutePackets;
+        /** 其中"内容指纹确认是同一份声音"的包数（>0 = 确认是同一音源从两条路进来）。 */
+        public long dupRouteConfirmed;
+        /** 现场描述：谁的哪两条 ssrc 在打架。 */
+        public String dupRouteText = "";
 
         @Override
         public String toString() {
@@ -162,6 +168,36 @@ public final class AudioRecv {
         public float peak;
         public long ageMs;
     }
+
+    // ══════════════════ ★ 同一台设备只让一条流出声（去重） ══════════════════
+    //
+    // 为什么必须去重（2026-10-12 真机反馈，用户原话「路由模式和广播模式有些许混淆了」）：
+    // 电脑同时开着「广播」和「点对点路由」时，**同一份声音会从两条路各来一份**，而两条路的
+    // ssrc 不一样（电脑端 ssrc = crc32(node_id|route_id)），在接收端就是两条独立的流 ——
+    // 叠加播放的结果是音量翻倍 + 两路的时序差打架（梳状滤波），听感就是"糊、忽大忽小"。
+    //
+    // 音频包里没有路由 id（电脑端协议注释写得很清楚：An audio packet carries no route id），
+    // 所以接收端没法问"你是哪条路由"。能站得住的判据只有一条：**一台设备同一时刻只播一条流**。
+    // 它同时也能兜住"同一个 ssrc 被两个 socket 收到"这种更少见的情况。
+    //
+    // 代价（必须说清楚，不藏着）：如果某一台设备<b>故意</b>同时给你送两路不同的声音
+    //   （比如电脑的系统声音 + 电脑的麦克风），这里只会播其中一路 —— 另一路会被抑制，
+    //   并在诊断报告里写明"抑制了谁"。宁可少一路，也不要叠着放把音量翻倍。
+    /** 每台设备当前允许出声的那条流（ssrc）。只由收包线程读写。 */
+    private final Map<String, Integer> hostActiveSsrc = new HashMap<>();
+    /** 被抑制掉的重复流包数 / 其中"内容指纹确认是同一份声音"的包数。 */
+    private volatile long dupRoutePackets;
+    private volatile long dupRouteConfirmed;
+    /** 现场描述（诊断报告直接用）。 */
+    private volatile String dupRouteText = "";
+    /** 指纹历史：只用来"确认"两条流是不是同一份声音，不参与"是否抑制"的判定。 */
+    private static final int FP_HISTORY = 64;
+    private static final int FP_WINDOW_MS = 120;
+    private final int[] fpValue = new int[FP_HISTORY];
+    private final int[] fpSsrc = new int[FP_HISTORY];
+    private final String[] fpHost = new String[FP_HISTORY];
+    private final long[] fpAt = new long[FP_HISTORY];
+    private int fpIdx;
 
     private final Context appCtx;
     /** 端口不是 final：界面层可以"先建对象、启动时再定端口"（要先探测空闲端口就得这么用）。 */
@@ -343,7 +379,12 @@ public final class AudioRecv {
         }
     }
 
-    /** 本机音量 0.0~1.0，用 AudioTrack.setVolume，不动样本（省一次 960 次乘法）。 */
+    /**
+     * 「我们这一层」的播放增益 0.0~1.0：用 {@code AudioTrack.setVolume}，不动样本（省一次 960 次乘法）。
+     *
+     * <p>注意它<b>只影响我们这条 AudioTrack</b>，绝不碰系统媒体音量 —— 用户明确要求过：
+     * 三层是"系统音量 × 播放器自己的音量 × 我们这一层"，我们只负责最后一层。
+     */
     public void setGain(float g) {
         gain = Math.max(0f, Math.min(1f, g));
         AudioTrack t = track;
@@ -442,6 +483,9 @@ public final class AudioRecv {
         st.lastCodecSample = lastCodecSample;
         st.lastFramesSample = lastFramesSample;
         st.lastCodecSeen = lastCodecSeen;
+        st.dupRoutePackets = dupRoutePackets;
+        st.dupRouteConfirmed = dupRouteConfirmed;
+        st.dupRouteText = dupRouteText;
         st.trackErrors = trackErrors;
         st.targetMs = targetMs;
         st.peak = peak;
@@ -619,9 +663,124 @@ public final class AudioRecv {
                     + " 字节（我们要 " + Proto.FRAME_SAMPLES + " 帧/" + FRAME_BYTES + " 字节）");
             return;
         }
-        bump(0);   // received
+        // ★ 同一台设备只让一条流出声（见上面那一大段说明）
+        Integer busy = acceptStreamFor(host, pkt.ssrc);
+        if (busy != null) {
+            dupRoutePackets++;
+            if (fingerprintSeen(host, pkt.ssrc, pkt.payload, plen)) {
+                dupRouteConfirmed++;
+            }
+            dupRouteText = host + "：ssrc " + Integer.toHexString(busy) + " 正在放，"
+                    + "ssrc " + Integer.toHexString(pkt.ssrc) + " 已抑制（同一台设备的第 2 条流，不叠加）";
+            return;                      // 不建流、不混音 —— 只播一条
+        }
+        rememberFingerprint(host, pkt.ssrc, pkt.payload, plen);
+        // received 的口径 = 真正收下并会播出去的包；被抑制掉的重复流不算在里面
+        // （它们单独记在 dupRoutePackets，报告里分开写，免得"收包很多却没声音"这种假象）。
+        bump(0);
         Stream stream = streamFor(host, pkt.ssrc);
         stream.store(pkt.seq, pkt.payload, plen, (pkt.flags & Proto.FLAG_SILENCE) != 0);
+    }
+
+    /**
+     * 这台设备现在允许哪条流出声。
+     *
+     * @return null = 放行（这台还没有流，或者就是它自己在发）；否则返回<b>正在放</b>的那条流的 ssrc
+     *         （调用方据此抑制这一包）。
+     */
+    private Integer acceptStreamFor(String host, int ssrc) {
+        Integer cur = hostActiveSsrc.get(host);
+        if (cur == null) {
+            if (hostActiveSsrc.size() < 32) {      // 上限：防被人乱刷撑爆
+                hostActiveSsrc.put(host, ssrc);
+            }
+            return null;
+        }
+        if (cur == ssrc) {
+            return null;
+        }
+        // 已经有一条在放：它还在发吗？走了/断了就把位置让给新的这条。
+        Stream act = findStream(host, cur);
+        if (act == null || SystemClock.elapsedRealtime() - act.lastPacketMs > STREAM_IDLE_MS) {
+            hostActiveSsrc.put(host, ssrc);
+            return null;
+        }
+        return cur;
+    }
+
+    private Stream findStream(String host, int ssrc) {
+        for (Stream s : streams) {
+            if (s.ssrc == ssrc && host.equals(s.host)) {
+                return s;
+            }
+        }
+        return null;
+    }
+
+    /** 某台设备现在有没有在出声（界面用：显示"实际生效状态"）。 */
+    public boolean receivingFrom(String host) {
+        if (host == null || host.isEmpty()) {
+            return false;
+        }
+        long now = SystemClock.elapsedRealtime();
+        for (Stream s : streams) {
+            if (host.equals(s.host) && now - s.lastPacketMs <= 1000) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 一小段内容指纹；<b>0 = 静音/太短，不参与比对</b>。
+     *
+     * <p>为什么静音要排除：静音包的字节几乎一模一样，全都会被判成"同一份声音"，
+     * 那这个指标就永远是"确认"，一点信息量都没有。
+     */
+    private static int fingerprintOf(byte[] buf, int len) {
+        if (buf == null || len < 16) {
+            return 0;
+        }
+        int h = 0;
+        int peak = 0;
+        // 每 24 个样本取一个：够区分内容，又几乎不吃 CPU（一包 40 次循环，100 包/秒）
+        for (int i = 0; i + 1 < len; i += 48) {
+            int v = (short) ((buf[i] & 0xFF) | ((buf[i + 1] & 0xFF) << 8));
+            int a = v < 0 ? -v : v;
+            if (a > peak) {
+                peak = a;
+            }
+            h = h * 31 + v;
+        }
+        return peak < 64 ? 0 : h;
+    }
+
+    /** 这个包的内容，是不是"同一台设备另一条流最近发过的同一份声音"。 */
+    private boolean fingerprintSeen(String host, int ssrc, byte[] payload, int len) {
+        int fp = fingerprintOf(payload, len);
+        if (fp == 0) {
+            return false;
+        }
+        long now = SystemClock.elapsedRealtime();
+        for (int i = 0; i < FP_HISTORY; i++) {
+            if (fpValue[i] == fp && fpSsrc[i] != ssrc && host.equals(fpHost[i])
+                    && now - fpAt[i] <= FP_WINDOW_MS) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void rememberFingerprint(String host, int ssrc, byte[] payload, int len) {
+        int fp = fingerprintOf(payload, len);
+        if (fp == 0) {
+            return;
+        }
+        fpValue[fpIdx] = fp;
+        fpSsrc[fpIdx] = ssrc;
+        fpHost[fpIdx] = host;
+        fpAt[fpIdx] = SystemClock.elapsedRealtime();
+        fpIdx = (fpIdx + 1) % FP_HISTORY;
     }
 
     /** 编码的人话名字（和电脑端 proto.CODEC_NAMES 一致，报告里两边对得上）。 */

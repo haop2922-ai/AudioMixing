@@ -1454,7 +1454,10 @@ public final class Engine {
         } else if (streams == 0) {
             sb.append("累计收到 ").append(recv).append(" 包，但当前没有活跃的流（对面可能刚停）。");
         } else {
-            sb.append("正在收 ").append(streams).append(" 路 · 累计 ").append(recv).append(" 包。");
+            sb.append(recvStreamsText()).append("。");
+            if (st != null && st.dupRoutePackets > 0) {
+                sb.append("（另有同一台设备的重复流已被抑制，不会叠加播放）");
+            }
         }
         return sb.toString();
     }
@@ -1535,8 +1538,7 @@ public final class Engine {
     }
 
     /** 本机所有局域网地址（主地址在前），Discovery 那边扫到的也一起列出来。 */
-    public String localIpsText() {
-        String best = localIp();
+    public String localIpsText() {        String best = localIp();
         StringBuilder sb = new StringBuilder(best);
         Discovery d = discovery;
         if (d != null) {
@@ -1551,6 +1553,158 @@ public final class Engine {
             }
         }
         return sb.toString();
+    }
+
+    // ────────────────────── ★ 音量：只动我们这一层 ──────────────────────
+
+    /**
+     * 「我们这一层的音量」当前值（发送侧 / 播放侧各是多少）。
+     *
+     * <p><b>为什么要有这个方法</b>（2026-10-12 真机反馈，用户原话）：
+     * 「手机在调节本机音量时（本意应当是使收听方音量更适合），会直接调节系统声音大小。
+     * 我们的声音计算方式应当是：系统声音 × 被监听软件声音 × 我们软件声音 = 实际接收端声音大小」。
+     * 所以滑杆从此只作用于<b>我们自己处理的 PCM</b>（发侧采样后乘增益 / 收侧 AudioTrack 音量），
+     * <b>绝不碰系统媒体音量</b>。这一行就是"我们这一层"的如实值。
+     */
+    public String volumeText() {
+        AudioSend s = sender;
+        AudioRecv r = receiver;
+        float send = (s != null) ? s.gain() : volume;
+        float recv = (r != null) ? r.gain() : Math.min(1f, Math.max(0f, volume));
+        return String.format(java.util.Locale.US,
+                "发送 %.2f / 播放 %.2f（滑杆 %.2f）", send, recv, volume);
+    }
+
+    /**
+     * 系统媒体音量：<b>只显示，永远不修改</b>。
+     *
+     * <p>用户要的分层是：系统音量 × 播放器自己的音量 × 我们这一层 = 实际听到的大小。
+     * 我们只负责最后一层 —— 把系统音量读出来写在界面上，是让用户知道"这一层你得自己调"，
+     * 而不是让我们替他调。
+     */
+    public String systemVolumeText() {
+        if (app == null) {
+            return "读不到（没有 Context）";
+        }
+        try {
+            android.media.AudioManager am =
+                    (android.media.AudioManager) app.getSystemService(Context.AUDIO_SERVICE);
+            if (am == null) {
+                return "读不到（没有音频服务）";
+            }
+            int cur = am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC);
+            int max = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC);
+            return cur + " / " + max + "（只显示，我们不修改它）";
+        } catch (Throwable t) {
+            return "读不到：" + t;
+        }
+    }
+
+    /** 三层关系的人话（界面和报告共用一处，免得两种说法）。 */
+    public String volumeExplainText() {
+        return "实际听到的大小 = 系统音量 × 播放器自己的音量 × 我们这一层的音量。"
+                + "这个滑杆只管最后一层，不动你的系统音量。";
+    }
+
+    /** 节点 ID：持久化保存，重启不变（电脑端据此把同一台手机认成同一台）。 */
+    public String nodeIdText() {
+        Discovery d = discovery;
+        String id = (d != null) ? d.nodeId() : "";
+        if (id == null || id.isEmpty()) {
+            return "（还没有）";
+        }
+        return id + "（持久化，重启不变 ✓）";
+    }
+
+    /** 本机信标原文（诊断报告里贴一行，证明 id 不是空的、信标组得出来）。 */
+    public String beaconPreviewText() {
+        Discovery d = discovery;
+        if (d == null) {
+            return "发现未启动";
+        }
+        try {
+            return d.beaconPreview();
+        } catch (Throwable t) {
+            return "读取信标失败：" + t;
+        }
+    }
+
+    // ────────────────────── ★ 实际收到哪几路（界面要看得见） ──────────────────────
+
+    /**
+     * 「当前实际收到哪几路」——用户说的"路由模式和广播模式混淆"最后就落在这一行上：
+     * 开关是意图，这一行才是事实。
+     */
+    public String recvStreamsText() {
+        AudioRecv r = receiver;
+        if (r == null || !r.isRunning()) {
+            return "接收器没在跑（没开「听广播」，也没点过任何一台的「🎧 收听」）";
+        }
+        AudioRecv.Stats st = recvStats();
+        if (st == null || st.streams == null || st.streams.isEmpty()) {
+            return "当前没在收任何音频流（对面还没开始发，或者包没到）";
+        }
+        StringBuilder sb = new StringBuilder(96);
+        sb.append("当前实际收到 ").append(st.streams.size()).append(" 路：");
+        for (int i = 0; i < st.streams.size(); i++) {
+            AudioRecv.StreamStats ss = st.streams.get(i);
+            if (i > 0) {
+                sb.append('、');
+            }
+            sb.append(nameOfHost(ss.host));
+            if (ss.ageMs > 1000) {
+                sb.append("（静了 ").append(ss.ageMs / 1000).append(" 秒）");
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 某台设备现在有没有真的在出声（设备卡片上显示"实际生效状态"用）。 */
+    public boolean recvReceivingFrom(String host) {
+        AudioRecv r = receiver;
+        if (r == null) {
+            return false;
+        }
+        try {
+            return r.receivingFrom(host);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** 去重（同一台设备的第 2 条流被抑制）的情况，给人看的一句话；没有就返回空串。 */
+    public String dupRouteStatsText() {
+        AudioRecv.Stats st = recvStats();
+        if (st == null || st.dupRoutePackets <= 0) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(160);
+        sb.append("已抑制 ").append(st.dupRoutePackets).append(" 个包（同一台设备的第 2 条流，绝不叠加播放）");
+        if (st.dupRouteConfirmed > 0) {
+            sb.append("；其中 ").append(st.dupRouteConfirmed)
+                    .append(" 个包内容指纹相同 → 确认是同一份声音从两条路进来（广播 + 点对点路由）");
+        }
+        if (st.dupRouteText != null && st.dupRouteText.length() > 0) {
+            sb.append("；").append(st.dupRouteText);
+        }
+        return sb.toString();
+    }
+
+    /** 把一个 host 换成人能认的名字（找不到就退回 IP）。 */
+    public String nameOfHost(String host) {
+        if (host == null || host.isEmpty()) {
+            return "?";
+        }
+        try {
+            for (Discovery.Peer p : peers()) {
+                if (host.equals(p.host)) {
+                    return p.label() + "（" + host + "）";
+                }
+            }
+        } catch (Throwable ignored) {
+            // 查不到就用 IP
+        }
+        return host;
     }
 
     private static int scoreIp(String ip, String nic) {
@@ -1603,9 +1757,11 @@ public final class Engine {
     }
 
     /**
-     * 本机音量滑杆（0~1.5）。
-     * 发送侧交给 AudioSend.setGain()（协议里的 gain_q14 会如实描述音量），
-     * 接收侧交给 AudioRecv.setGain()（它只认 0~1，超出就削到 1）。
+     * 「我们这一层的音量」滑杆（0~1.5）。
+     *
+     * <p>只作用于我们自己处理的 PCM：发送侧交给 AudioSend.setGain()（协议里的 gain_q14 会如实
+     * 描述音量），接收侧交给 AudioRecv.setGain()（它只认 0~1，超出就削到 1）。
+     * <b>刻意不碰系统媒体音量</b> —— 用户明确要求过这一点（系统音量是另一层，我们只显示它）。
      */
     public void setVolume(float v) {
         volume = v;
