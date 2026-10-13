@@ -170,7 +170,13 @@ public class MainActivity extends Activity {
     private void setViewMode(int mode) {
         viewMode = mode;
         saveViewMode();
+        if (mode == MODE_DETAIL) {
+            detailsOpen = true;      // 「详细」档 = 把「详情」里的东西常驻展开
+        }
         applyMode();
+        if (mode == MODE_MONITOR && monitorText != null) {
+            setTextIfChanged(monitorText, engine.monitorText());   // 切过去立刻有内容，不等 300ms
+        }
         refreshNow();
     }
 
@@ -197,7 +203,7 @@ public class MainActivity extends Activity {
     private void applyMode() {
         boolean monitor = viewMode == MODE_MONITOR;
         // 「简洁」把长说明收起来（可展开）；「详细」一律展开
-        boolean showLong = viewMode == MODE_DETAIL || helpExpanded;
+        boolean showLong = viewMode == MODE_DETAIL || (viewMode == MODE_SIMPLE && helpExpanded);
         if (modeSimple != null) {
             styleChip(modeSimple, viewMode == MODE_SIMPLE, "简洁");
             styleChip(modeDetail, viewMode == MODE_DETAIL, "详细");
@@ -216,14 +222,22 @@ public class MainActivity extends Activity {
             controlCard.setVisibility(monitor ? View.GONE : View.VISIBLE);
         }
         if (hintCard != null) {
-            hintCard.setVisibility(monitor || !showLong ? View.GONE : View.VISIBLE);
+            // 底部说明：只有"简洁 + 展开了说明"或"详细"档才显示（监控档没有这些块）
+            hintCard.setVisibility(!monitor && showLong ? View.VISIBLE : View.GONE);
         }
         for (View v : longTextViews) {
             v.setVisibility(showLong ? View.VISIBLE : View.GONE);
         }
         if (helpChip != null) {
+            // 「展开/收起说明」只在简洁档有意义（详细档本来就全展开，监控档没有说明块）
             setTextIfChanged(helpChip, helpExpanded ? "❔ 收起说明" : "❔ 展开说明");
-            helpChip.setVisibility(viewMode == MODE_DETAIL ? View.GONE : View.VISIBLE);
+            helpChip.setVisibility(viewMode == MODE_SIMPLE ? View.VISIBLE : View.GONE);
+        }
+        if (detailWrap != null) {
+            // 「详细」档：本机信息块（IP/端口/统计/对端回话…）常驻展开；
+            // 其他档回到用户自己的「▸ 详情」开关。
+            boolean showDetails = viewMode == MODE_DETAIL || detailsOpen;
+            detailWrap.setVisibility(showDetails ? View.VISIBLE : View.GONE);
         }
     }
 
@@ -1382,7 +1396,6 @@ public class MainActivity extends Activity {
                 + "手机之间直连，关掉电脑照常工作。", 12f, DIM, false);
         t.setLineSpacing(dp(4), 1f);
         card.addView(t);
-        longTextViews.add(card);      // 简洁档收起来（点「❔ 展开说明」还能看）
         return card;
     }
 
