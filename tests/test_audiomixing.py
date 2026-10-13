@@ -2637,6 +2637,9 @@ class TestQuickStartAndVersion(unittest.TestCase):
         """桌面上有更新版本时要提醒（用户就是拿旧 exe 测了一整天）。"""
         from unittest import mock
 
+        from audiomixing import __version__
+        from audiomixing.webui import WaveLinkApi
+
         with tempfile.TemporaryDirectory() as tmp:
             desk = pathlib.Path(tmp) / "Desktop"
             desk.mkdir()
@@ -2645,9 +2648,11 @@ class TestQuickStartAndVersion(unittest.TestCase):
             (desk / "别的东西.exe").write_bytes(b"fake")
             with mock.patch.dict(os.environ, {"USERPROFILE": tmp}):
                 info = self.api.build_info()
-        self.assertEqual(info["version"], "1.9")
-        self.assertIn("Audio Mixing v1.9", info["text"])
+        # 版本号每轮都涨，测试跟着 __version__ 走，别把某一版写死
+        self.assertEqual(info["version"], __version__)
+        self.assertIn("Audio Mixing v%s" % __version__, info["text"])
         self.assertTrue(info["build_time"], "必须给出构建时间")
+        self.assertTrue(WaveLinkApi._version_tuple("9.9") > WaveLinkApi._version_tuple(__version__))
         self.assertIsNotNone(info["newer"], "应该发现 v9.9")
         self.assertEqual(info["newer"]["name"], "Audio Mixing v9.9.exe")
 
@@ -2733,3 +2738,69 @@ class TestDeviceCardUi(unittest.TestCase):
         self.assertIn("频道音量（我们这一层，不动 Windows 系统音量）", html)
         self.assertIn("我们这一层的音量（不动 Windows 系统音量）", html)
         self.assertIn("我们这一层的音量：只改这台手机传进来的增益", html)
+
+
+class TestThemeParityWithPhone(unittest.TestCase):
+    """⑥ 电脑面板的视觉必须和手机端是同一套（用户："手机 app 的 UI 我觉得电脑的太丑"）。
+
+    做法是【照抄】phone.html 的 :root 与那几个组件取值，不是在电脑端另创一套。
+    这组测试把"是同一套"变成可核对的事实：令牌逐个比、关键圆角/渐变/字号逐个比。
+    以后谁把电脑端改回自己的配色，这里会直接红。
+    """
+
+    #: 手机端 :root 定义的主题令牌 —— 电脑端必须逐个相同
+    SHARED_TOKENS = ("--bg", "--card", "--line", "--fg", "--dim", "--acc", "--acc2",
+                     "--ok", "--warn", "--err")
+
+    @staticmethod
+    def _tokens(text: str) -> dict:
+        import re
+
+        block = re.search(r":root\{(.*?)\}", text, re.S).group(1)
+        return {name: value.strip()
+                for name, value in re.findall(r"(--[a-z0-9-]+)\s*:\s*([^;]+);", block)}
+
+    def setUp(self) -> None:
+        self.pc = (ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8")
+        self.phone = (ROOT / "audiomixing" / "ui" / "phone.html").read_text(encoding="utf-8")
+
+    def test_the_theme_tokens_are_the_same_as_the_phone(self) -> None:
+        pc, phone = self._tokens(self.pc), self._tokens(self.phone)
+        for key in self.SHARED_TOKENS:
+            self.assertIn(key, pc, "电脑端缺少令牌 %s" % key)
+            self.assertEqual(pc[key], phone[key], "令牌 %s 与手机端不一致" % key)
+
+    def test_the_shared_component_values_match(self) -> None:
+        import re
+
+        pairs = [
+            ("卡片圆角", r"\.card\{[^}]*border-radius:(\d+px)", r"\.card\{[^}]*border-radius:(\d+px)"),
+            ("分段控件圆角", r"\.seg\{[^}]*border-radius:(\d+px)",
+             r"\.seg\{display:flex;background:var\(--card\)[^}]*border-radius:(\d+px)"),
+            ("电平条圆角", r"\.bars i\{[^}]*border-radius:(\d+px)",
+             r"\.bars i\{width:5px;border-radius:(\d+px)"),
+        ]
+        for label, pc_pat, ph_pat in pairs:
+            a = re.search(pc_pat, self.pc, re.S)
+            b = re.search(ph_pat, self.phone, re.S)
+            self.assertTrue(a and b, label)
+            self.assertEqual(a.group(1), b.group(1), label)
+        # 字号/行高与主按钮渐变：手机端是权威
+        self.assertIn("font:15px/1.5 -apple-system", self.pc)
+        self.assertIn("font:15px/1.5 -apple-system", self.phone)
+        self.assertIn("linear-gradient(140deg,var(--acc),var(--acc2))", self.pc)
+        self.assertIn("linear-gradient(140deg,var(--acc),var(--acc2))", self.phone)
+
+    def test_the_phone_style_big_ring_and_22_segment_meter_exist(self) -> None:
+        """手机端的大状态圆环 + 22 段电平条，电脑端也要有（同一套做法）。"""
+        for token in ('id="ring"', 'id="ringProg"', 'id="ringMetric"', 'id="ringUnit"',
+                      'id="ringState"', 'id="levelBars"', "const LEVEL_BARS = 22",
+                      "function pushLevel(", "function renderLevelMeter("):
+            self.assertIn(token, self.pc)
+        self.assertIn("const BARS = 22", self.phone, "手机端也是 22 段（改手机端时这里要跟着改）")
+
+    def test_the_browse_density_words_match_the_phone(self) -> None:
+        """浏览密度三档的词要和手机端一致：简洁 / 详细 / 监控。"""
+        for word in (">简洁<", ">详细<", ">监控<"):
+            self.assertIn(word, self.pc)
+        self.assertIn('id="modeSeg"', self.pc)

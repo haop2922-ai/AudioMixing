@@ -152,6 +152,8 @@ public final class Discovery {
     private final Map<String, Peer> peers = new LinkedHashMap<>();
 
     private volatile String nodeName;
+    /** 名字是用户自己改的吗（默认名带短后缀区分同型号；用户改过就以用户的为准）。 */
+    private volatile boolean customName;
     private volatile int audioPort;
     private volatile int webPort;
     private volatile boolean busy;
@@ -208,6 +210,10 @@ public final class Discovery {
     // 换了 id，之前配好的路由就等于指向了一个不存在的节点。
     private static final String PREFS_NAME = "audiomixing";
     private static final String KEY_NODE_ID = "node_id";
+    private static final String KEY_NAME = "node_name";
+
+    /** 名字最长多少字符（信标有 1200 字节上限，名字不该把它撑爆，也不该在列表里占半屏）。 */
+    private static final int MAX_NAME_LEN = 24;
 
     /** 取持久化的节点 ID；没有就生成一个存下来（装一次生成一次，之后永远不变）。 */
     private static String loadOrCreateNodeId(Context ctx) {
@@ -232,6 +238,33 @@ public final class Discovery {
         }
     }
 
+    /** 用户自己改过的名字（没改过返回空串）。 */
+    private static String loadSavedName(Context ctx) {
+        if (ctx == null) {
+            return "";
+        }
+        try {
+            android.content.SharedPreferences sp =
+                    ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            String n = sp.getString(KEY_NAME, "");
+            return (n == null) ? "" : n.trim();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private static void saveName(Context ctx, String name) {
+        if (ctx == null) {
+            return;
+        }
+        try {
+            ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit().putString(KEY_NAME, name).apply();
+        } catch (Throwable t) {
+            Log.w(TAG, "名字存不下来（这次改了，重启会变回默认）：" + t);
+        }
+    }
+
     public Discovery(Context context) {
         this(context, null, null, Proto.DEFAULT_AUDIO_PORT, 0);
     }
@@ -240,7 +273,18 @@ public final class Discovery {
         this.appCtx = context == null ? null : context.getApplicationContext();
         this.nodeId = (nodeId != null && !nodeId.isEmpty())
                 ? nodeId : loadOrCreateNodeId(this.appCtx);
-        this.nodeName = (nodeName == null || nodeName.isEmpty()) ? defaultName() : nodeName;
+        if (nodeName != null && !nodeName.isEmpty()) {
+            this.nodeName = nodeName;           // 显式传进来的名字（测试/特殊用途）
+            this.customName = true;
+        } else {
+            String saved = loadSavedName(this.appCtx);
+            if (!saved.isEmpty()) {
+                this.nodeName = saved;          // ★ 用户改过的名字，重启之后还在
+                this.customName = true;
+            } else {
+                this.nodeName = defaultNameWithSuffix(this.nodeId);
+            }
+        }
         this.audioPort = audioPort > 0 ? audioPort : Proto.DEFAULT_AUDIO_PORT;
         this.webPort = Math.max(0, webPort);
     }
@@ -251,6 +295,22 @@ public final class Discovery {
     public static String defaultName() {
         String model = Build.MODEL;
         return (model == null || model.isEmpty()) ? "Android 手机" : model;
+    }
+
+    /**
+     * ★ 默认名 + 一个短后缀，用来区分同型号设备。
+     *
+     * <p>用户原话：「本机id最好支持自己编辑，不排除多人用同型号设备」。
+     * 后缀取的是<b>持久化 node_id 的前 4 位</b>，所以同一台机器的默认名是稳定的
+     * （不会每次启动换一个），两台同型号手机一看就不一样（{@code M332BF-7f3a} / {@code M332BF-1c05}）。
+     * 用户可以随时把它改成"小红的手机"。
+     */
+    public static String defaultNameWithSuffix(String nodeId) {
+        String base = defaultName();
+        if (nodeId == null || nodeId.length() < 4) {
+            return base;
+        }
+        return base + "-" + nodeId.substring(0, 4);
     }
 
     public static String defaultPlatform() {
@@ -346,11 +406,27 @@ public final class Discovery {
         return nodeName;
     }
 
-    /** 改名字后下一个信标就带出去（2 秒内生效）。 */
+    /** 改名字后下一个信标就带出去（2 秒内生效）。<b>持久化</b>，重启后还在。 */
     public void setName(String name) {
-        if (name != null && !name.isEmpty()) {
-            nodeName = name;
+        if (name == null) {
+            return;
         }
+        String n = name.trim();
+        // 全是空白等于没改（否则列表里会出现一台"没名字"的设备）
+        if (n.isEmpty()) {
+            return;
+        }
+        if (n.length() > MAX_NAME_LEN) {
+            n = n.substring(0, MAX_NAME_LEN);
+        }
+        nodeName = n;
+        customName = true;
+        saveName(appCtx, n);
+    }
+
+    /** 这个名字是用户自己改的吗（诊断报告里写清"用户自定义 / 默认"）。 */
+    public boolean customName() {
+        return customName;
     }
 
     public int audioPort() {

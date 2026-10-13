@@ -6,15 +6,25 @@
 <title>Audio Mixing · 局域网声音投射</title>
 <style>
 :root{
-  --bg:#0b0e14; --card:#141922; --card2:#1a202c; --line:#242c3a; --line2:#2f3a4d;
-  --fg:#e8eef7; --dim:#8b97a8; --dim2:#5e6b7d;
-  --acc:#4ade80; --acc2:#60a5fa; --warn:#fbbf24; --bad:#f87171;
-  --r:12px; --r2:9px;
+  /* ★ 这一套令牌【直接抄】audiomixing/ui/phone.html 的 :root —— 手机端才是这套主题的
+     权威定义。改这里之前先去看手机端，两边必须是同一套取值，否则"看起来像一个产品"是空话。
+     下面几个 --card2/--line2/--dim2/--bad 是旧类名还在用的同义映射，不引入新颜色。 */
+  --bg:#070b12; --card:rgba(255,255,255,.045); --line:rgba(255,255,255,.09);
+  --fg:#eaf1fb; --dim:#8ea0b8; --acc:#38bdf8; --acc2:#6366f1;
+  --ok:#34d399; --warn:#fbbf24; --err:#f87171;
+  --card2:rgba(255,255,255,.03); --line2:rgba(255,255,255,.16);
+  --dim2:#7a8ba3; --bad:var(--err);
+  --r:16px; --r2:12px;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{
-  background:var(--bg); color:var(--fg); min-height:100vh;
-  font:14px/1.6 "Segoe UI Variable","Segoe UI",-apple-system,system-ui,"Microsoft YaHei",sans-serif;
+  /* 手机端那两层径向光晕 + 底色，照搬 */
+  background:
+    radial-gradient(120% 70% at 50% -10%, #14324d 0%, transparent 60%),
+    radial-gradient(90% 60% at 110% 110%, #2a1b52 0%, transparent 55%),
+    var(--bg);
+  color:var(--fg); min-height:100vh;
+  font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",system-ui,"Microsoft YaHei",sans-serif;
   -webkit-font-smoothing:antialiased;
 }
 code,.mono{font-family:ui-monospace,"Cascadia Code",Consolas,monospace;font-variant-numeric:tabular-nums}
@@ -22,60 +32,63 @@ code,.mono{font-family:ui-monospace,"Cascadia Code",Consolas,monospace;font-vari
 /* ---------- top bar ---------- */
 .top{
   position:sticky; top:0; z-index:30; display:flex; align-items:center; gap:12px;
-  padding:11px 22px; background:rgba(11,14,20,.86); backdrop-filter:blur(12px);
+  padding:12px 22px; background:rgba(7,11,18,.82); backdrop-filter:blur(12px);
   border-bottom:1px solid var(--line);
 }
-.brand{display:flex; align-items:center; gap:9px; font-weight:650; font-size:15.5px; letter-spacing:.2px}
+.brand{display:flex; align-items:center; gap:10px; font-weight:650; font-size:15.5px; letter-spacing:.2px}
 .brand .mark{
-  width:24px;height:24px;border-radius:7px;flex:0 0 auto;
+  /* 手机端的 logo：34px 圆角 11px 渐变方块 + 柔和外发光 */
+  width:34px;height:34px;border-radius:11px;flex:0 0 auto;
   background:linear-gradient(140deg,var(--acc),var(--acc2));
-  box-shadow:0 0 16px rgba(74,222,128,.28);
-  display:grid;place-items:center;color:#07110b;font-size:13px;font-weight:800;
+  box-shadow:0 6px 18px rgba(56,189,248,.28);
+  display:grid;place-items:center;color:#04121f;font-size:15px;font-weight:800;
 }
 .spacer{flex:1}
 .tag{
-  display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;
-  background:var(--card2);border:1px solid var(--line);color:var(--dim);
-  font-size:12px;white-space:nowrap;
+  display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;
+  background:rgba(255,255,255,.03);border:1px solid var(--line);color:var(--dim);
+  font-size:11.5px;white-space:nowrap;
 }
 .tag b{color:var(--fg);font-weight:600}
-.tag.live{color:var(--acc);border-color:rgba(74,222,128,.35);background:rgba(74,222,128,.08)}
+.tag.live{color:var(--ok);border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.08)}
 .tag.off{color:var(--dim2)}
 .dot{width:7px;height:7px;border-radius:50%;background:var(--dim2);flex:0 0 auto}
-.dot.on{background:var(--acc);box-shadow:0 0 8px var(--acc)}
-.dot.self{background:var(--acc2);box-shadow:0 0 8px var(--acc2)}
+.dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.dot.self{background:var(--acc);box-shadow:0 0 8px var(--acc)}
 .dot.off{background:var(--warn)}
 
 /* ---------- buttons ---------- */
 button{
-  font:inherit;font-size:13px;cursor:pointer;color:var(--fg);
-  background:var(--card2);border:1px solid var(--line);border-radius:var(--r2);
-  padding:7px 13px;transition:.14s ease;white-space:nowrap;
+  font:inherit;font-size:13px;font-weight:600;cursor:pointer;color:var(--fg);
+  background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:12px;
+  padding:8px 14px;transition:.16s ease;white-space:nowrap;
 }
-button:hover{border-color:var(--line2);background:#202836}
+button:hover{border-color:var(--line2);background:rgba(255,255,255,.06)}
 button:active{transform:translateY(1px)}
 button:disabled{opacity:.55;cursor:default;transform:none}
-button.primary{background:linear-gradient(180deg,#2f7d4f,#256b42);border-color:#2f8a55;font-weight:600}
-button.primary:hover{background:linear-gradient(180deg,#37945c,#2a7a4a)}
+/* 主按钮 = 手机端 .main：渐变底 + 深色字 + 柔和外发光 */
+button.primary{background:linear-gradient(140deg,var(--acc),var(--acc2));border:0;color:#04121f;
+  box-shadow:0 8px 20px rgba(56,189,248,.22)}
+button.primary:hover{filter:brightness(1.06)}
 button.ghost{background:transparent}
-button.ghost:hover{background:var(--card2)}
-button.icon{padding:7px 9px}
-button.danger:hover{border-color:var(--bad);color:var(--bad)}
-button.tiny{padding:3px 8px;font-size:11.5px;border-radius:7px}
+button.ghost:hover{background:rgba(255,255,255,.05)}
+button.icon{padding:8px 10px}
+button.danger:hover{border-color:var(--err);color:var(--err)}
+button.tiny{padding:4px 9px;font-size:11.5px;border-radius:9px}
 
 /* ---------- LAN banner ---------- */
 .banner{
   display:none; align-items:center; gap:14px; flex-wrap:wrap;
-  padding:13px 22px; border-bottom:1px solid rgba(74,222,128,.22);
-  background:linear-gradient(90deg,rgba(74,222,128,.09),rgba(96,165,250,.05) 55%,transparent);
+  padding:13px 22px; border-bottom:1px solid rgba(52,211,153,.22);
+  background:linear-gradient(90deg,rgba(52,211,153,.09),rgba(56,189,248,.05) 55%,transparent);
 }
 .banner.show{display:flex}
 .banner .k{font-size:12.5px;color:var(--dim)}
 .banner .v{
-  font-family:ui-monospace,Consolas,monospace;font-size:16.5px;font-weight:700;
-  color:var(--acc);letter-spacing:.2px;
-  background:rgba(4,18,10,.75);border:1px solid rgba(74,222,128,.3);
-  border-radius:var(--r2);padding:5px 12px;cursor:pointer;
+  font-family:ui-monospace,Menlo,Consolas,monospace;font-size:16.5px;font-weight:700;
+  color:var(--ok);letter-spacing:.2px;
+  background:rgba(52,211,153,.08);border:1px solid rgba(52,211,153,.3);
+  border-radius:12px;padding:5px 12px;cursor:pointer;
 }
 .banner .v:hover{border-color:var(--acc)}
 .banner .hint{font-size:12.5px;color:var(--dim);max-width:620px}
@@ -87,15 +100,15 @@ button.tiny{padding:3px 8px;font-size:11.5px;border-radius:7px}
 @media(max-width:1150px){.wrap{grid-template-columns:1fr;gap:18px}}
 .col{display:flex;flex-direction:column;gap:18px;min-width:0}
 
-.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden}
 .card>h2{
-  display:flex;align-items:center;gap:9px;
-  margin:0;padding:14px 18px;font-size:13.5px;font-weight:600;letter-spacing:.01em;
-  border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.022),transparent);
+  display:flex;align-items:center;gap:10px;
+  margin:0;padding:15px 18px;font-size:15px;font-weight:650;letter-spacing:.2px;
+  border-bottom:1px solid var(--line);background:transparent;
 }
 .card>h2 .n{
-  display:grid;place-items:center;width:20px;height:20px;border-radius:6px;flex:0 0 auto;
-  background:var(--card2);border:1px solid var(--line);color:var(--dim);
+  display:grid;place-items:center;width:24px;height:24px;border-radius:9px;flex:0 0 auto;
+  background:rgba(255,255,255,.05);border:1px solid var(--line);color:var(--dim);
   font-size:11.5px;font-weight:700;
 }
 .card>h2 .sub{font-weight:400;color:var(--dim);font-size:12.5px}
@@ -119,14 +132,14 @@ td.addr{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--d
 .btrow{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--line)}
 .btrow:last-child{border-bottom:0}
 .btrow .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.bthint{color:#ffcc66;font-size:12px;line-height:1.6;padding:2px 0 8px}
+.bthint{color:var(--warn);font-size:12px;line-height:1.6;padding:2px 0 8px}
 .chip{
-  display:inline-flex;align-items:center;gap:6px;padding:3px 9px 3px 7px;border-radius:7px;
-  background:var(--card2);border:1px solid var(--line);font-size:12px;
+  display:inline-flex;align-items:center;gap:6px;padding:3px 9px 3px 7px;border-radius:9px;
+  background:rgba(255,255,255,.03);border:1px solid var(--line);font-size:12px;
 }
 .chip .k{font-size:10.5px;padding:1px 5px;border-radius:4px;font-weight:600;letter-spacing:.02em}
-.chip.sys .k{background:rgba(74,222,128,.14);color:#7ee7a4}
-.chip.out .k{background:rgba(96,165,250,.15);color:#93c5fd}
+.chip.sys .k{background:rgba(52,211,153,.14);color:#7ee7bd}
+.chip.out .k{background:rgba(56,189,248,.15);color:#9cd8f8}
 .chip .x{color:var(--dim2);font-size:11px}
 
 .more{margin-top:7px;font-size:11.5px;color:var(--dim2)}
@@ -135,22 +148,22 @@ td.addr{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--d
 .more summary:hover{color:var(--fg)}
 .more[open] summary{margin-bottom:5px}
 .more .list{display:flex;flex-wrap:wrap;gap:5px;padding-top:2px}
-.more .list span{background:rgba(255,255,255,.035);border:1px solid var(--line);border-radius:6px;padding:2px 7px;font-size:11.5px}
+.more .list span{background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:9px;padding:3px 8px;font-size:11.5px}
 
 /* ---------- route list ---------- */
 .routes{display:flex;flex-direction:column;gap:9px}
 .route{
   display:flex;align-items:center;gap:12px;padding:12px 14px;
-  background:var(--card2);border:1px solid var(--line);border-radius:var(--r2);
+  background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:12px;
 }
 .route.mute{opacity:.55}
 .route .flow{display:flex;align-items:center;gap:9px;flex:1;min-width:0;flex-wrap:wrap}
 .route .node{
-  display:inline-flex;align-items:center;gap:7px;padding:4px 10px;border-radius:7px;
-  background:rgba(96,165,250,.1);border:1px solid rgba(96,165,250,.22);
+  display:inline-flex;align-items:center;gap:7px;padding:4px 10px;border-radius:9px;
+  background:rgba(56,189,248,.1);border:1px solid rgba(56,189,248,.22);
   font-size:12.5px;font-weight:600;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
-.route .node.dst{background:rgba(74,222,128,.1);border-color:rgba(74,222,128,.24)}
+.route .node.dst{background:rgba(52,211,153,.1);border-color:rgba(52,211,153,.24)}
 .route .arrow{color:var(--dim2);font-size:15px}
 .route .meta{font-size:11.5px;color:var(--dim2);white-space:nowrap}
 .route .acts{display:flex;gap:6px;flex:0 0 auto}
@@ -161,28 +174,33 @@ td.addr{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--d
    用户要"照手机端的样子、不要拖拽"。所以这里是设备为中心的卡片：
    名字 · 平台/IP · 状态标签 · 电平条 · 两个按钮（收听它的 / 送给它）。 */
 .dvtitle{font-size:12px;color:var(--dim);margin:14px 0 8px;padding-top:12px;border-top:1px solid var(--line)}
+/* 宽屏就把设备卡片排成两列（手机端是单列，但电脑是宽屏 —— 令牌照抄、排布用起宽度） */
+#deviceCards{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:12px}
 .dvcard{
-  background:var(--card2);border:1px solid var(--line);border-radius:var(--r2);
-  padding:12px 13px;margin-bottom:9px;transition:.14s;
+  background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:16px;
+  padding:14px 15px;transition:.16s;
 }
 .dvcard:hover{border-color:var(--line2)}
-.dvcard.self{border-color:rgba(96,165,250,.28);background:linear-gradient(180deg,rgba(96,165,250,.06),transparent)}
+.dvcard.self{border-color:rgba(56,189,248,.3);background:linear-gradient(180deg,rgba(56,189,248,.07),transparent)}
 .dvcard.off{opacity:.55}
 .dvhead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.dvname{font-weight:650;font-size:14px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dvtag{font-size:10.5px;padding:1px 7px;border-radius:999px;background:rgba(74,222,128,.13);color:#7ee7a4;white-space:nowrap}
-.dvtag.me{background:rgba(96,165,250,.14);color:#93c5fd}
-.dvmeta{font-size:11.5px;color:var(--dim2);margin-top:5px;font-family:ui-monospace,Consolas,monospace}
-.dvbar{height:6px;border-radius:999px;background:#0d1219;border:1px solid var(--line);margin-top:9px;overflow:hidden}
-.dvbar i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .3s}
-.dvflow{font-size:11.5px;color:var(--dim);margin-top:5px;font-variant-numeric:tabular-nums}
-.dvacts{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
-.dvself{font-size:11.5px;color:var(--dim2)}
+.dvname{font-weight:650;font-size:15.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dvtag{font-size:11px;padding:3px 9px;border-radius:999px;background:rgba(52,211,153,.12);
+  border:1px solid rgba(52,211,153,.3);color:#7ee7bd;white-space:nowrap}
+.dvtag.me{background:rgba(56,189,248,.12);border-color:rgba(56,189,248,.32);color:#9cd8f8}
+.dvmeta{font-size:12px;color:var(--dim);margin-top:6px;font-family:ui-monospace,Menlo,Consolas,monospace}
+/* 22 段电平条（和手机端 .bars 同一套做法：一段一段点亮） */
+.dvbar{display:flex;gap:3px;align-items:flex-end;height:22px;margin-top:10px}
+.dvbar i{flex:1;height:6px;border-radius:3px;background:rgba(255,255,255,.10);transition:height .1s linear}
+.dvbar i.hot{background:linear-gradient(180deg,var(--acc),var(--ok))}
+.dvflow{font-size:12px;color:var(--dim);margin-top:6px;font-variant-numeric:tabular-nums}
+.dvacts{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.dvself{font-size:12px;color:var(--dim)}
 @media(max-width:560px){.dvacts button{flex:1 1 auto}}
 
 .pick{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px}
 @media(max-width:760px){.pick{grid-template-columns:1fr}}
-.pickcol{background:var(--card2);border:1px solid var(--line);border-radius:var(--r2);padding:11px 12px}
+.pickcol{background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:12px;padding:12px 13px}
 .pickcol .head{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--dim);margin-bottom:8px}
 .pickcol .head b{color:var(--fg);font-size:13px;font-weight:600}
 .picklist{display:flex;flex-direction:column;gap:6px}
@@ -196,33 +214,35 @@ td.addr{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--d
 .f label{font-size:11.5px;color:var(--dim)}
 .f.grow{flex:1;min-width:150px}
 input[type=text],input[type=number],select{
-  font:inherit;font-size:13px;color:var(--fg);background:#0d1219;
-  border:1px solid var(--line);border-radius:8px;padding:7px 10px;width:100%;
+  font:inherit;font-size:13px;color:var(--fg);background:rgba(0,0,0,.28);
+  border:1px solid var(--line);border-radius:12px;padding:8px 11px;width:100%;
 }
-input:focus,select:focus{outline:none;border-color:var(--acc2);box-shadow:0 0 0 3px rgba(96,165,250,.13)}
+input[type=range]{accent-color:var(--acc)}
+input:focus,select:focus{outline:none;border-color:var(--acc);
+  box-shadow:0 0 0 3px rgba(56,189,248,.16)}
 
 .note{
-  margin-top:13px;padding:11px 13px;border-radius:var(--r2);font-size:12.5px;line-height:1.75;
-  background:rgba(96,165,250,.06);border:1px solid rgba(96,165,250,.16);color:#b9c6d8;
+  margin-top:13px;padding:12px 14px;border-radius:12px;font-size:12.5px;line-height:1.7;
+  background:rgba(56,189,248,.06);border:1px solid rgba(56,189,248,.16);color:#b9c9de;
 }
 .note b{color:var(--fg)}
 .note code{background:rgba(0,0,0,.35);padding:1px 5px;border-radius:4px;font-size:12px;color:#a7d8ff}
 
 /* ---------- stats ---------- */
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:10px}
-.stat{background:var(--card2);border:1px solid var(--line);border-radius:var(--r2);padding:11px 12px}
-.stat .k{font-size:11px;color:var(--dim2);margin-bottom:3px}
+.stat{background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:12px;padding:12px 13px}
+.stat .k{font-size:11.5px;color:var(--dim);margin-bottom:3px}
 .stat .v{font-size:17px;font-weight:700;font-variant-numeric:tabular-nums}
 .stat .v.sm{font-size:14px}
-.stat .v.ok{color:var(--acc)}
+.stat .v.ok{color:var(--ok)}
 .stat .v.warn{color:var(--warn)}
 
 .rows{display:flex;flex-direction:column;gap:7px;margin-top:3px}
-.row{display:flex;align-items:center;gap:9px;font-size:12.5px;padding:8px 11px;background:var(--card2);border:1px solid var(--line);border-radius:8px}
+.row{display:flex;align-items:center;gap:9px;font-size:12.5px;padding:9px 12px;background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:12px}
 .row .grow{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .row .num{font-variant-numeric:tabular-nums;color:var(--dim)}
 .row .num.bad{color:var(--bad)}
-.row .num.ok{color:var(--acc)}
+.row .num.ok{color:var(--ok)}
 
 pre{
   background:#080b11;border:1px solid var(--line);border-radius:var(--r2);
@@ -230,7 +250,8 @@ pre{
   font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all;
 }
 .msg{font-size:12.5px;color:var(--dim);min-height:1.2em}
-.warnbox{padding:10px 13px;border-radius:8px;font-size:12.5px;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.25);color:#fca5a5;margin-top:10px}
+.warnbox{padding:11px 14px;border-radius:12px;font-size:12.5px;line-height:1.65;
+  background:rgba(248,113,113,.09);border:1px solid rgba(248,113,113,.28);color:#fca5a5;margin-top:10px}
 /* 黄字版：用来报"能用但要当心"，红字版报"现在就是坏的"。
    两个都不带 .warn 类 —— 简洁视图会隐藏 .warn，而这两条正是用户必须看见的东西。 */
 .warnbox.amber{background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.28);color:#fcd34d}
@@ -244,19 +265,20 @@ pre{
 }
 #guideMask.show{display:block}
 #guideBox{
-  max-width:760px; margin:0 auto; background:var(--card); border:1px solid var(--line2);
-  border-radius:var(--r); padding:18px 20px 20px; box-shadow:0 24px 60px rgba(0,0,0,.55);
+  max-width:820px; margin:0 auto; background:#0b1220; border:1px solid var(--line2);
+  border-radius:16px; padding:18px 20px 20px; box-shadow:0 24px 60px rgba(0,0,0,.55);
 }
 #guideHead{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:12px}
 #guideHead .ghTitle{font-size:16px;font-weight:700}
 #guideHead .ghVer{font-size:11.5px;color:var(--dim2);font-family:ui-monospace,Consolas,monospace}
-.gsum{padding:10px 13px;border-radius:8px;font-size:13px;background:rgba(96,165,250,.08);
-  border:1px solid rgba(96,165,250,.2);color:#bcd2ec;margin-bottom:12px}
-.gsum.ok{background:rgba(74,222,128,.09);border-color:rgba(74,222,128,.28);color:#9ff0bd}
-.gstep{border:1px solid var(--line);border-radius:var(--r2);padding:12px 13px;margin-bottom:10px;background:var(--card2)}
-.gstep.ok{border-color:rgba(74,222,128,.3)}
-.gstep.bad{border-color:rgba(248,113,113,.34)}
-.gstep.warn,.gstep.manual{border-color:rgba(251,191,36,.3)}
+.gsum{padding:11px 14px;border-radius:12px;font-size:13px;background:rgba(56,189,248,.08);
+  border:1px solid rgba(56,189,248,.2);color:#bcd2ec;margin-bottom:12px}
+.gsum.ok{background:rgba(52,211,153,.09);border-color:rgba(52,211,153,.3);color:#9ff0bd}
+.gstep{border:1px solid var(--line);border-radius:12px;padding:13px 14px;margin-bottom:10px;
+  background:rgba(255,255,255,.03)}
+.gstep.ok{border-color:rgba(52,211,153,.32)}
+.gstep.bad{border-color:rgba(248,113,113,.36)}
+.gstep.warn,.gstep.manual{border-color:rgba(251,191,36,.32)}
 .gstep .gt{display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:600;margin-bottom:6px}
 .gstep .gt .n{font-size:11px;font-weight:700;padding:1px 7px;border-radius:999px;background:#0f141c;color:var(--dim)}
 .gstep .gx{font-size:13px;line-height:1.7;color:#dbe5f2}
@@ -268,11 +290,12 @@ pre{
 
 .toast{
   position:fixed;left:50%;bottom:28px;transform:translate(-50%,18px);opacity:0;pointer-events:none;
-  padding:11px 20px;border-radius:var(--r2);font-size:13px;z-index:100;transition:.22s ease;
-  background:#1c2431;border:1px solid var(--line2);box-shadow:0 10px 34px rgba(0,0,0,.5);max-width:80vw;
+  padding:12px 20px;border-radius:14px;font-size:13.5px;font-weight:600;z-index:100;
+  transition:.22s ease;background:#0b1220;border:1px solid var(--line2);
+  box-shadow:0 14px 38px rgba(0,0,0,.5);max-width:80vw;
 }
 .toast.show{opacity:1;transform:translate(-50%,0)}
-.toast.ok{border-color:rgba(74,222,128,.45)}
+.toast.ok{border-color:rgba(52,211,153,.45)}
 .toast.err{border-color:rgba(248,113,113,.5)}
 /* ---------------- display modes ----------------
    简洁 is the default: three things a person actually decides (谁在线 / 听什么 / 播到哪),
@@ -296,7 +319,7 @@ html.fullui .brief { display: none !important; }
 .peerline .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* Level sparkline: the one reading that tells a person "is sound flowing right now",
    which no counter does. Kept in 简洁 too, because that is where it matters most. */
-.spark { background: #111722; border: 1px solid var(--line); border-radius: 11px; padding: 6px 8px 2px; margin-bottom: 12px; }
+.spark { background: rgba(255,255,255,.03); border: 1px solid var(--line); border-radius: 12px; padding: 7px 9px 2px; margin-bottom: 12px; }
 .spark svg { display: block; width: 100%; height: 46px; }
 /* 简洁 is the default: the controls, and the state of things. Every explanation,
    table, counter, log and hint lives behind 详细. */
@@ -315,10 +338,10 @@ html:not(.fullui) .fullonly { display: none !important; }
    hiding that is how "the phone is sending but nothing plays it" stayed invisible. */
 html:not(.fullui) .action { display: block !important; }
 .action {
-  color: #ffcc66; font-size: 12.5px; line-height: 1.7;
-  border-left: 2px solid #ffcc66; padding: 4px 0 4px 8px; margin-top: 8px;
+  color: var(--warn); font-size: 12.5px; line-height: 1.7;
+  border-left: 2px solid var(--warn); padding: 4px 0 4px 8px; margin-top: 8px;
 }
-.meta { color: #6b7785; font-size: 12px; white-space: nowrap; }
+.meta { color: var(--dim); font-size: 12px; white-space: nowrap; }
 /* Per-path quality curves: the arrival/write interval over time, with a dashed line for
    the ideal. A volume meter showed that something was playing; this shows which link is
    misbehaving, which is the question that actually comes up. */
@@ -328,15 +351,15 @@ html:not(.fullui) .action { display: block !important; }
 .btrow .chip .k { white-space: nowrap; }
 .btrow input[type=range] { width: 84px; }
 .qbox { margin-top: 12px; }
-.qchart { width: 100%; height: 36px; display: block; background: #0e141d;
-          border: 1px solid var(--line); border-radius: 8px; }
+.qchart { width: 100%; height: 36px; display: block; background: rgba(0,0,0,.28);
+          border: 1px solid var(--line); border-radius: 12px; }
 .qchart.inline { width: 150px; height: 30px; display: inline-block; vertical-align: middle; }
-.qmeta { font-size: 11.5px; color: #8a96a3; margin-top: 5px; line-height: 1.5; }
-.qmeta b { color: #cfe0f5; }
+.qmeta { font-size: 12px; color: var(--dim); margin-top: 6px; line-height: 1.5; }
+.qmeta b { color: var(--fg); }
 .linkbtn {
-  display: inline-flex; align-items: center; padding: 7px 12px; border-radius: 10px;
-  border: 1px solid var(--line); background: #1d2634; color: var(--fg);
-  font-size: 12.5px; text-decoration: none; white-space: nowrap;
+  display: inline-flex; align-items: center; padding: 8px 14px; border-radius: 11px;
+  border: 1px solid var(--line); background: rgba(255,255,255,.03); color: var(--dim);
+  font-size: 13px; font-weight: 600; text-decoration: none; white-space: nowrap;
 }
 .linkbtn:hover { border-color: var(--acc); color: var(--acc); }
 /* Cards are arranged by hand: ⠿ moves one, ⤢ widens it to the full row. Free pixel
@@ -361,21 +384,53 @@ html.fullui .card { margin-bottom: 0; }
 html.fullui .body { padding: 11px 13px; }
 html.fullui .body.tight { padding: 9px 13px; }
 html.fullui table td, html.fullui table th { padding: 4px 7px; font-size: 12.5px; }
-.mini { color: #6b7785; font-size: 12px; line-height: 1.7; }
+.mini { color: var(--dim); font-size: 12.5px; line-height: 1.6; }
 
-.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
-.seg button {
-  border: 0; background: transparent; color: var(--dim); font: inherit; font-size: 12.5px;
-  padding: 4px 11px; cursor: pointer; line-height: 1.5;
+/* 分段控件＝手机端 .seg：带内边距的圆角容器，选中项是渐变底 + 深色字。
+   词也要和手机端一致：简洁 / 详细 / 监控（手机端这一轮定的三档浏览密度）。 */
+.seg{display:inline-flex;background:rgba(255,255,255,.03);border:1px solid var(--line);
+     border-radius:14px;padding:4px;gap:4px}
+.seg button{
+  border:0;background:transparent;color:var(--dim);font:inherit;font-weight:600;
+  font-size:13px;padding:8px 14px;border-radius:11px;cursor:pointer;transition:.18s;
 }
-.seg button + button { border-left: 1px solid var(--line); }
-.seg button.on { background: var(--acc); color: #06121f; font-weight: 600; }
-.seg button:not(.on):hover { color: var(--fg); background: #1d242f; }
+.seg button.on{background:linear-gradient(140deg,var(--acc),var(--acc2));color:#04121f}
+.seg button:not(.on):hover{color:var(--fg);background:rgba(255,255,255,.05)}
 
 /* A little air: the panel is mostly cards, so the spacing between them carries the
    hierarchy better than any border or colour does. */
-.card { border-radius: 14px; }
-.card > h2 { letter-spacing: .01em; }
+.card { border-radius: 16px; }
+.card > h2 { letter-spacing: .2px; }
+/* 折叠详情＝手机端那套：等宽小字 + ▸/▾ 前缀（前缀由 CSS 出，文案里不再手写） */
+details summary{list-style:none;cursor:pointer;color:var(--dim);font-size:12.5px}
+details summary::-webkit-details-marker{display:none}
+details summary .ar::before{content:"▸ "}
+details[open] > summary .ar::before{content:"▾ "}
+details summary:hover{color:var(--fg)}
+/* 宽屏用起宽度：设备卡片两列（见 #deviceCards）、传输行两列 */
+@media(min-width:1200px){
+  #streamsBox{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:9px}
+  #statusRows{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:9px}
+}
+/* ---------- ③ 大状态圆环 + 22 段电平条（照手机端 .ring / .bars） ---------- */
+.stage{display:flex;flex-direction:column;align-items:center;gap:6px;padding:6px 0 10px}
+.ring{position:relative;width:150px;height:150px;display:grid;place-items:center}
+.ring svg{position:absolute;inset:0;transform:rotate(-90deg)}
+.ring .track{fill:none;stroke:rgba(255,255,255,.07);stroke-width:8}
+.ring .prog{fill:none;stroke:url(#ringGrad);stroke-width:8;stroke-linecap:round;
+            transition:stroke-dashoffset .12s linear}
+.ring .core{text-align:center;z-index:1}
+.ring .core .big{font-size:34px;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
+.ring .core .unit{font-size:12.5px;color:var(--dim);margin-top:2px}
+.ring .core .st{font-size:12.5px;color:var(--dim);margin-top:6px}
+.ring.live .core .big{color:var(--ok)}
+.ring.busy .core .big{color:var(--warn)}
+.ring.bad .core .big{color:var(--err)}
+.bars{display:flex;gap:3px;height:26px;align-items:flex-end;justify-content:center;margin-top:2px;
+      width:150px}
+.bars i{flex:1;height:6px;border-radius:3px;background:rgba(255,255,255,.10);
+        transition:height .1s linear}
+.bars i.hot{background:linear-gradient(180deg,var(--acc),var(--ok))}
 .card > h2 .n {
   display: inline-flex; align-items: center; justify-content: center;
   width: 19px; height: 19px; border-radius: 6px; font-size: 11.5px;
@@ -448,7 +503,7 @@ html:not(.fullui) .card .body { padding-top: 6px; }
           <button onclick="addPeer()">添加设备</button>
         </div>
         <details class="more" style="margin-top:12px">
-          <summary>▸ 为什么手机上装着浏览器、却不能被添加成设备？</summary>
+          <summary><span class="ar"></span>为什么手机上装着浏览器、却不能被添加成设备？</summary>
           <div style="padding:10px 2px 2px;font-size:12.5px;line-height:1.85;color:#9aa7b8">
             WaveLink 要求<b>每台设备都运行一个节点程序</b>。手机上的浏览器只能<b>打开这个页面</b>
             （当遥控器），它本身不是一个节点，所以：<br>
@@ -488,7 +543,7 @@ html:not(.fullui) .card .body { padding-top: 6px; }
         <div class="routes" id="routesBox"></div>
 
         <details class="more" style="margin-top:12px">
-          <summary>▸ 高级：一次连多台 / 指定输出设备 / 音量 / 编码</summary>
+          <summary><span class="ar"></span>高级：一次连多台 / 指定输出设备 / 音量 / 编码</summary>
           <div style="padding:10px 2px 2px">
             <div class="pick">
               <div class="pickcol">
@@ -534,6 +589,28 @@ html:not(.fullui) .card .body { padding-top: 6px; }
     <section class="card">
       <h2><span class="n">③</span>本机状态<span class="sub" id="levelText">音量 —</span></h2>
       <div class="body">
+        <!-- 大状态圆环 + 22 段电平条：和手机端同一个做法（手机端才是这套视觉的样板）。
+             数字＝正在播放的电平百分比；没有本机播放时退回来显示链路评分。 -->
+        <div class="stage">
+          <div class="ring" id="ring">
+            <svg viewBox="0 0 120 120">
+              <defs>
+                <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0%" stop-color="#38bdf8"/><stop offset="100%" stop-color="#34d399"/>
+                </linearGradient>
+              </defs>
+              <circle class="track" cx="60" cy="60" r="52"></circle>
+              <circle class="prog" id="ringProg" cx="60" cy="60" r="52"
+                      stroke-dasharray="326.7" stroke-dashoffset="326.7"></circle>
+            </svg>
+            <div class="core">
+              <div class="big" id="ringMetric">—</div>
+              <div class="unit" id="ringUnit">播放电平 %</div>
+              <div class="st" id="ringState">空闲</div>
+            </div>
+          </div>
+          <div class="bars" id="levelBars"></div>
+        </div>
         <div class="rows" id="inputsBox" style="margin-top:12px"></div>
         <div class="qbox">
           <div class="qmeta" style="margin:0 0 5px">输出段（喂声卡）—— 与音频走蓝牙还是有线无关</div>
@@ -983,7 +1060,7 @@ function splitExtra(items){
 }
 function extraBox(title, extra){
   if(!extra.length) return '';
-  return `<details class="more"><summary>▸ ${title}（${extra.length}）</summary>
+  return `<details class="more"><summary><span class="ar"></span>${title}（${extra.length}）</summary>
     <div class="list">${extra.map(s=>`<span>${esc(s.name)}</span>`).join('')}</div></details>`;
 }
 
@@ -1121,13 +1198,19 @@ function deviceCard(n, routes){
          ${n.host ? `<button class="tiny ghost" onclick="pingPeer('${esc(n.host)}')">测连通</button>` : ''}
        </div>`;
 
+  // 22 段电平条（和手机端 .bars 同一套）：一段一段点亮，比一根连续的条更像"在跳动的电平"
+  const segs = Array.from({length: 22}, (_, i) => {
+    const t = i / 21;
+    const on = bar / 100 > t * 0.95;
+    return `<i class="${on ? 'hot' : ''}" style="height:${on ? Math.round(8 + t * 14) : 6}px"></i>`;
+  }).join('');
   return `<div class="dvcard${self ? ' self' : ''}${online ? '' : ' off'}">
     <div class="dvhead">
       <span class="dvname">${esc(n.name)}</span>
       ${tags.map(t => `<span class="dvtag${t === '本机' ? ' me' : ''}">${esc(t)}</span>`).join('')}
     </div>
     <div class="dvmeta">${esc(meta || '—')}</div>
-    <div class="dvbar"><i style="width:${bar.toFixed(0)}%"></i></div>
+    <div class="dvbar">${segs}</div>
     <div class="dvflow">${esc(barText)}${extra.length ? '　' + esc(extra.join('　')) : ''}</div>
     ${acts}
   </div>`;
@@ -1308,6 +1391,65 @@ function showTemplates(){
 }
 
 /* ---------------- ③ status ---------------- */
+/* 大圆环 + 22 段电平条：照手机端的做法（.ring / .bars 同一套取值）。
+   数字是本机播放电平的百分比；没有本机播放时退回来显示链路评分。 */
+const LEVEL_BARS = 22;
+const levelBarEls = [];
+let levelSmooth = 0;
+(function buildLevelMeter(){
+  const box = $('levelBars');
+  if(!box) return;
+  for(let i = 0; i < LEVEL_BARS; i++){
+    const el = document.createElement('i');
+    el.style.height = '6px';
+    box.appendChild(el);
+    levelBarEls.push(el);
+  }
+})();
+
+function pushLevel(v){                 // v: 0..1
+  levelSmooth = Math.max(v || 0, levelSmooth * 0.86);
+  const shown = Math.min(1, levelSmooth);
+  levelBarEls.forEach((el, i) => {
+    const t = i / (LEVEL_BARS - 1);
+    const on = shown > t * 0.95;
+    el.style.height = (on ? 8 + t * 14 : 6) + 'px';
+    el.classList.toggle('hot', on);
+  });
+  const prog = $('ringProg');
+  if(prog) prog.setAttribute('stroke-dashoffset', String(326.7 * (1 - shown * 0.92)));
+  const metric = $('ringMetric');
+  if(metric) metric.textContent = String(Math.round(shown * 100));
+  return Math.round(shown * 100);
+}
+
+function renderLevelMeter(s, l){
+  const ring = $('ring');
+  const unit = $('ringUnit'), state = $('ringState');
+  const recv = (s.receiver && s.receiver.streams) || [];
+  const wq = (s.quality && s.quality.wifi) || {};
+  const wl = wq.latest || null;
+  if(l && l.enabled && (l.frames || 0) > 0){
+    const pct = pushLevel(l.peak || 0);
+    if(unit) unit.textContent = '本机播放电平 %';
+    if(state) state.textContent = pct > 0 ? '本机正在出声' : '有数据，但现在是静音';
+    if(ring) ring.className = 'ring' + (pct > 0 ? ' live' : '');
+    return;
+  }
+  if(recv.length){
+    const score = Math.round(Number((wl && wl.score) || 0));
+    pushLevel(score / 100);
+    if(unit) unit.textContent = '链路评分';
+    if(state) state.textContent = '正在接收 ' + recv.length + ' 路声音';
+    if(ring) ring.className = 'ring' + (score >= 80 ? ' live' : (score ? ' busy' : ''));
+    return;
+  }
+  pushLevel(0);
+  if(unit) unit.textContent = '播放电平 %';
+  if(state) state.textContent = '空闲：没有声音在流';
+  if(ring) ring.className = 'ring';
+}
+
 /* Level history for the sparkline: one sample per refresh, so the window is a few
    minutes of "is anything actually flowing". */
 let levelHistory = new Array(90).fill(0);
@@ -1380,6 +1522,7 @@ function renderStatus(){
   const wq = (s.quality && s.quality.wifi) || {};
   const wl = wq.latest || null;
   const errs = (s.receiver && s.receiver.streams || []).reduce((a,b) => a + (b.lost||0), 0);
+  renderLevelMeter(s, l);
   $('statsBox').innerHTML = `
     <div class="stat"><div class="k">播放到</div><div class="v sm">${esc(l.sink || '—')}</div></div>
     <div class="stat"><div class="k">到达间隔</div><div class="v sm">${wl ? wl.v.toFixed(1) + ' ms' : '—'}</div></div>
@@ -1683,7 +1826,7 @@ function renderDeviceDetail(d){
   const extra = rows.filter(x => !['system','output'].includes(cls(x)));
   $('devicesBox').innerHTML = `
     <table><tbody>${main.map(line).join('')}</tbody></table>
-    ${extra.length ? `<details class="more" style="padding:0 12px 12px"><summary>▸ 麦克风 / 测试用设备（${extra.length}）</summary>
+    ${extra.length ? `<details class="more" style="padding:0 12px 12px"><summary><span class="ar"></span>麦克风 / 测试用设备（${extra.length}）</summary>
       <table style="margin-top:4px"><tbody>${extra.map(line).join('')}</tbody></table></details>` : ''}`;
 }
 
