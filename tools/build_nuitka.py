@@ -58,8 +58,8 @@ ARGS = [
     "--file-description=Audio Mixing - LAN audio casting",
     # 版本号跟着 audiomixing/__init__.py 的 __version__ 走（v1.8 时写的是 1.1.0.0，
     # 结果文件属性里显示的版本和面板上的版本对不上，用户没法靠右键属性确认自己拿的是哪一版）。
-    "--file-version=1.11.0.0",
-    "--product-version=1.11.0.0",
+    "--file-version=1.12.0.0",
+    "--product-version=1.12.0.0",
     "--copyright=MIT License",
     ENTRY,
 ]

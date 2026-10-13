@@ -1161,6 +1161,10 @@ class WaveLinkApi:
             raise ApiError("body must contain a 'routes' list")
         if len(routes) > 200:
             raise ApiError("too many routes (max 200)")
+        if "gain" in payload:
+            # 本机用户刚动了这条路由的音量：记下时刻。共享增益判"谁最后动"要用它，
+            # 否则对端一个在途的旧值会把用户刚拖到的位置抢回去。
+            self.node.note_local_gain_change(route_id)
         applied = self.node.set_routes(routes)
         if self.on_routes_changed is not None:
             self.on_routes_changed(applied)
@@ -1321,6 +1325,17 @@ class WaveLinkApi:
                 raise ApiError("open_panel_on_start 只能是 none、simple 或 full", 400)
             node.config.open_panel_on_start = want
             changed.append("open_panel_on_start")
+        if "auto_accept_listen" in payload:
+            node.config.auto_accept_listen = bool(payload["auto_accept_listen"])
+            changed.append("auto_accept_listen")
+        if "listen_optout" in payload:
+            raw = payload["listen_optout"]
+            if isinstance(raw, str):
+                raw = [raw]
+            if not isinstance(raw, list):
+                raise ApiError("listen_optout must be a list")
+            node.config.listen_optout = [str(x).strip() for x in raw if str(x).strip()][:16]
+            changed.append("listen_optout")
         if "channel_gain" in payload:
             node.config.channel_gain = max(0.0, min(4.0, float(payload["channel_gain"])))
             changed.append("channel_gain")
@@ -2294,6 +2309,21 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, self.api.remove_peer(body))
             elif path == "/api/settings":
                 self._json(200, self.api.set_settings(body))
+            elif path == "/api/listen/optout":
+                # ① 自动收听：撤销时把设备记进"永不再自动"名单；"这次打开"时移出去。
+                node = self.api.node
+                on = bool(body.get("on", True))
+                node_id = str(body.get("node_id") or "").strip()
+                name = str(body.get("name") or "").strip()
+                if not node_id and not name:
+                    raise ApiError("missing node_id or name")
+                node.set_listen_optout(node_id, name, on=on)
+                if not on:
+                    # 这次打开：立刻按请求把它加回来（等同再收到一次 want_listen）
+                    node._grant_listen_request(node_id, name, str(body.get("host") or ""))
+                self._json(200, {"ok": True, "on": on,
+                                 "note": ("已加入「不再自动收听」名单：" + (name or node_id)) if on
+                                         else ("已允许自动收听：" + (name or node_id))})
             elif path == "/api/guide/fix":
                 # 「快速上手」里的"一键修"：换设备 / 试采 / 修广播。一次只做用户点的那一件。
                 self._json(200, self.api.guide_fix(body))
