@@ -899,7 +899,6 @@ class SenderSession:
         remote-controllable and the link always carries real-time audio.
         """
         pending = array.array("f")
-        frames_sent = 0
         step_ns = 1_000_000_000 * self.frames_per_packet // SAMPLE_RATE
         next_deadline = time.monotonic_ns()
         while not self._stop.is_set():
@@ -924,8 +923,7 @@ class SenderSession:
                 now = time.monotonic_ns()
                 if next_deadline > now:
                     time.sleep((next_deadline - now) / 1e9)
-                self._send_chunk(chunk, frames_sent)
-                frames_sent += self.frames_per_packet
+                self._send_chunk(chunk)
                 self.frames_sent += self.frames_per_packet
                 next_deadline += step_ns
                 if next_deadline < time.monotonic_ns() - 200_000_000:
@@ -935,9 +933,18 @@ class SenderSession:
         # Flush whatever is left.
         if len(pending) >= CHANNELS:
             frames = len(pending) // CHANNELS
-            self._send_chunk(pending[: frames * CHANNELS], frames_sent)
+            self._send_chunk(pending[: frames * CHANNELS])
 
-    def _send_chunk(self, chunk, frame_offset: int) -> None:
+    def _send_chunk(self, chunk) -> None:
+        """Send one audio packet.
+
+        ★ samples 字段填的是【本包帧数】，不是累计帧偏移 ★
+        这一条曾经填错（`samples=frame_offset`，即 480 × seq）：Python 接收端压根不读
+        `pkt.samples`（它按解码后的负载长度算帧数），所以电脑↔电脑之间完全没有症状；
+        而手机端把 samples 当准入判据（`samples > 每包帧数` 直接判坏包），于是电脑发出的
+        **每一个音频包都被手机拒收** —— 用户"手机听不到电脑的声音"的根因就在这里。
+        时间信息由 ts_ns 承担，累计偏移没有任何接收方需要。
+        """
         if self._sock is None:
             return
         payload = self._encoder(chunk)
@@ -948,13 +955,14 @@ class SenderSession:
             payload = self._encoder(scaled)
         ts = now_ns()
         seq = self.sequence & 0xFFFF
+        frames_here = len(chunk) // CHANNELS
         pkt = Packet(
             type=proto.T_AUDIO,
             payload=payload,
             codec=self.codec,
             seq=seq,
             ssrc=self.ssrc,
-            samples=frame_offset & 0xFFFFFFFF,
+            samples=frames_here & 0xFFFFFFFF,
             ts_ns=ts,
             gain_q14=int(self.gain * 10000),
         )

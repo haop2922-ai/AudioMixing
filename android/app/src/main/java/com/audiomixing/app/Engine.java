@@ -585,6 +585,73 @@ public final class Engine {
         return peers().size() + 1;
     }
 
+    // ────────────────── ★ 每台设备自己的可调音量（"我听它的 / 我送它的"） ──────────────────
+    //
+    // 用户原话：「我要求的是各设备【可调节】的音量条。当然现在有的显示实际音量条也不错」
+    // —— 所以电平条（实时显示）保留，旁边再加一条可调滑杆。
+    // 两条滑杆控制的都是【我们这一层】的增益（绝不碰手机系统音量，这条口径和回归测试都在）：
+    //   · 我听它的 → AudioRecv 里只乘这一路的样本
+    //   · 我送它的 → SendFanout 里只缩放发给这一台的那份包
+    // 主音量滑杆（"我们这一层的音量"）是总增益，叠在这些单台增益之上，互不冲突。
+
+    /** 设定"我听它的"增益（0~1.5，1.0 = 原样）。立刻生效。 */
+    public void setPeerRecvGain(String host, float g) {
+        AudioRecv r = receiver;
+        if (r != null) {
+            try {
+                r.setHostGain(host, g);
+            } catch (Throwable t) {
+                Log.w(TAG, "设置接收增益失败", t);
+            }
+        }
+    }
+
+    /** 某一台现在的"我听它的"增益。接收器没跑时返回 1.00（还没法记）。 */
+    public float peerRecvGain(String host) {
+        AudioRecv r = receiver;
+        if (r == null || host == null) {
+            return 1f;
+        }
+        try {
+            return r.hostGain(host);
+        } catch (Throwable t) {
+            return 1f;
+        }
+    }
+
+    /** 设定"我送它的"增益（0~1.5，1.0 = 原样）。立刻生效；目标没上线也会记住。 */
+    public void setPeerSendGain(String host, float g) {
+        AudioSend s = sender;
+        if (s != null) {
+            try {
+                s.setTargetGain(host, g);
+            } catch (Throwable t) {
+                Log.w(TAG, "设置发送增益失败", t);
+            }
+        }
+        peerSendGain.put(host, g);
+    }
+
+    /** 某一台现在的"我送它的"增益（发送器不在时用记下来的值）。 */
+    public float peerSendGain(String host) {
+        AudioSend s = sender;
+        if (s != null && host != null) {
+            try {
+                float v = s.targetGain(host);
+                if (v != 1f || s.targetCount() > 0) {
+                    return v;
+                }
+            } catch (Throwable ignored) {
+                // 落到下面记着的值
+            }
+        }
+        Float v = peerSendGain.get(host);
+        return v == null ? 1f : v;
+    }
+
+    /** 用户设过的"我送它的"增益（发送器重建/目标重新上线时补回去）。 */
+    private final Map<String, Float> peerSendGain = new java.util.HashMap<String, Float>();
+
     public boolean isListening(Discovery.Peer p) {
         synchronized (lock) {
             return p != null && listenIds.contains(idOf(p));
@@ -1888,6 +1955,12 @@ public final class Engine {
             sb.append("坏包分类 magic ").append(st.badMagic).append(" / 版本 ").append(st.badVersion)
                     .append(" / 太短 ").append(st.badShort).append(" / 编码 ").append(st.badCodec)
                     .append(" / 帧长 ").append(st.badFrames).append('\n');
+            if (st.samplesMismatch > 0) {
+                // ★ 不是坏包：是对方 samples 字段语义不同（电脑端历史版本填累计值）。
+                //   单独一行写出来，免得又被当成"包全坏了"。
+                sb.append("samples 字段异常 ").append(st.samplesMismatch)
+                        .append(" 次（已按负载长度接收）\n");
+            }
             sb.append("缓冲 ").append(st.bufferedMs).append("ms（目标 ").append(st.targetMs)
                     .append("）· 流 ").append(st.streamCount)
                     .append(" · 混音 ").append(pctText(st.peak)).append('\n');
@@ -1919,7 +1992,8 @@ public final class Engine {
             for (SendFanout.TargetStats ts : snd.targetStats()) {
                 sb.append("  · ").append(ts.host).append(':').append(ts.port)
                         .append(" 发 ").append(ts.packetsSent).append(" 包")
-                        .append(" · ").append(pctText(ts.peak));
+                        .append(" · ").append(pctText(ts.peak))
+                        .append(" · 音量 ").append(String.format(java.util.Locale.US, "%.2f", ts.gain));
                 if (ts.sendErrors > 0) {
                     sb.append(" · 失败 ").append(ts.sendErrors);
                 }

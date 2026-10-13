@@ -194,6 +194,19 @@ td.addr{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--d
 .dvbar i{flex:1;height:6px;border-radius:3px;background:rgba(255,255,255,.10);transition:height .1s linear}
 .dvbar i.hot{background:linear-gradient(180deg,var(--acc),var(--ok))}
 .dvflow{font-size:12px;color:var(--dim);margin-top:6px;font-variant-numeric:tabular-nums}
+/* 收 / 送 两条实时电平（左边一个字的标签 + 22 段条 + 数字） */
+.dvlevel{display:flex;align-items:center;gap:9px;margin-top:9px}
+.dvlevel .lbl{width:16px;flex:0 0 auto;color:var(--dim);font-size:12px}
+.dvlevel .dvbar{flex:1;margin-top:0}
+.dvlevel .num{flex:0 0 auto;min-width:74px;text-align:right;font-size:11.5px;color:var(--dim);
+  font-variant-numeric:tabular-nums}
+/* ★ 用户要的"各设备可调节的音量条"：滑块和电平条并排，滑的是我们这一层的增益 */
+.dvslide{display:flex;align-items:center;gap:9px;margin-top:8px}
+.dvslide .lbl{width:58px;flex:0 0 auto;color:var(--dim);font-size:12px}
+.dvslide input[type=range]{flex:1;min-width:80px;accent-color:var(--acc)}
+.dvslide .val{flex:0 0 auto;min-width:34px;text-align:right;font-size:11.5px;color:var(--dim);
+  font-family:ui-monospace,Menlo,Consolas,monospace}
+.dvslide input[type=range]:disabled{opacity:.45}
 .dvacts{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
 .dvself{font-size:12px;color:var(--dim)}
 @media(max-width:560px){.dvacts button{flex:1 1 auto}}
@@ -1078,7 +1091,9 @@ function renderPeers(){
            title="从列表移除这台设备">移除</button>`;
     return `<tr>
       <td class="name"><span class="dot ${cls}"></span>${esc(n.name)}${n.manual?' <span class="chip"><span class="k">手动</span></span>':''}</td>
-      <td class="addr">${esc(n.host||'—')}${n.host ? `<br><button class="tiny ghost" onclick="pingPeer('${esc(n.host)}')">测连通</button>` : ''}</td>
+      <td class="addr">${esc(n.host||'—')}${n.host ? `<br><button class="tiny ghost"
+        title="发一个 UDP 探测包；手机端不回 PING/PONG，所以『没回应』不等于不通"
+        onclick="pingPeer('${esc(n.host)}', ${Number(n.audio_port) || 0})">测连通</button>` : ''}</td>
       <td><div class="chips">${ms.map(s=>chip(s,'system')).join('') || '<span class="x">—</span>'}</div>
           ${extraBox('其它可采集', es)}</td>
       <td><div class="chips">${mk.map(s=>chip(s,'output')).join('') || '<span class="x">—</span>'}</div>
@@ -1096,7 +1111,8 @@ function renderPeers(){
       <span class="dot ${cls}"></span>
       <span class="nm">${esc(n.name)}${n.manual?' <span class="chip"><span class="k">手动</span></span>':''}</span>
       <span class="tag ${n.local||n.online?'':'off'}">${state}</span>
-      ${n.host ? `<button class="tiny ghost" onclick="pingPeer('${esc(n.host)}')" title="测连通">测连通</button>` : ''}
+      ${n.host ? `<button class="tiny ghost" title="发一个 UDP 探测包；手机端不回 PING/PONG，所以『没回应』不等于不通"
+        onclick="pingPeer('${esc(n.host)}', ${Number(n.audio_port) || 0})">测连通</button>` : ''}
       ${del}
     </div>`;
   }).join('');
@@ -1138,6 +1154,18 @@ function sameEnds(ids, wanted){
   return JSON.stringify(normEnds(ids)) === JSON.stringify(normEnds(wanted));
 }
 
+/* 下行码率只能在浏览器这边算：接收端统计里只有累计字节数，
+   两张快照一减就是"这段时间里它给我们发了多少"。 */
+const flowPrev = {};
+function inboundKbps(key, bytes){
+  const now = Date.now();
+  const prev = flowPrev[key];
+  flowPrev[key] = {bytes, t: now};
+  if(!prev || now <= prev.t || bytes < prev.bytes) return 0;
+  const dt = (now - prev.t) / 1000;
+  return dt > 0 ? (bytes - prev.bytes) * 8 / dt / 1000 : 0;
+}
+
 /* 这台设备现在有没有数据在流：上行取发送端统计，下行取接收端统计。 */
 function deviceFlow(nodeId, host){
   const st = state.status || {};
@@ -1146,16 +1174,45 @@ function deviceFlow(nodeId, host){
     if(host && s.host === host) flows.up_kbps += Number(s.kbps || 0);
   }
   const recv = (st.receiver && st.receiver.streams) || [];
+  let in_bytes = 0, matched = false;
   for(const r of recv){
     const match = (r.node_id && r.node_id === nodeId) ||
                   (r.node_name && state.peers && state.peers.some(p => p.node_id === nodeId && p.name === r.node_name));
     if(!match) continue;
+    matched = true;
+    in_bytes += Number(r.bytes || 0);
     flows.down_packets += Number(r.packets || 0);
     flows.down_mb += Number(r.bytes || 0) / 1048576;
     if(r.buffered_ms != null) flows.buf_ms = Number(r.buffered_ms);
     if(r.target_ms != null) flows.target_ms = Number(r.target_ms);
   }
+  flows.in_kbps = matched ? inboundKbps('in:' + nodeId, in_bytes) : 0;
   return flows;
+}
+
+/* 22 段电平条的小工厂：bar 是 0..100 的百分比，返回 22 个 <i>。 */
+function levelSegs(pct){
+  return Array.from({length: 22}, (_, i) => {
+    const t = i / 21;
+    const on = pct / 100 > t * 0.95;
+    return `<i class="${on ? 'hot' : ''}" style="height:${on ? Math.round(8 + t * 14) : 6}px"></i>`;
+  }).join('');
+}
+
+/* ★ 卡片上的音量滑块 ★ 控制的是【我们这一层】的增益（不动 Windows 系统音量）：
+   把这条路由的 gain 直接改掉，立刻生效（update_route → set_routes → apply_routes）。
+   拖动时只更新数字、不整页刷新，否则滑块会被重画打断。 */
+let cardGainTimer = {};
+function setCardGain(routeId, slot, uid, value, el){
+  const val = Math.max(0, Math.min(2, parseFloat(value) || 0));
+  // 数字标签带上设备 id：多张卡片同时存在，不带就会互相覆盖（同名 id 只认第一个）
+  const label = $('cg_' + slot + '_' + uid);
+  if(label) label.textContent = val.toFixed(2);
+  clearTimeout(cardGainTimer[slot]);
+  cardGainTimer[slot] = setTimeout(async () => {
+    try{ await api('/api/routes/update', {id: routeId, gain: val}); }
+    catch(e){ toast('音量设置失败：' + e.message, 'err'); }
+  }, 350);
 }
 
 function deviceCard(n, routes){
@@ -1182,11 +1239,31 @@ function deviceCard(n, routes){
 
   const meta = [n.platform || '', n.host || '', n.version ? ('v' + n.version) : '']
     .filter(Boolean).join(' · ');
-  // 第二行只放"上面那条没说到的"事实，不重复同一个数字。
-  const extra = [];
-  if(flows.down_packets) extra.push(`↓ 已收 ${flows.down_packets} 包 / ${flows.down_mb.toFixed(1)} MB`);
-  if(flows.buf_ms != null && !/缓冲/.test(barText)) extra.push(`缓冲 ${flows.buf_ms.toFixed(0)} ms`);
-  if(flows.up_kbps > 0 && !/上行/.test(barText)) extra.push(`↑ ${flows.up_kbps.toFixed(0)} kbps`);
+  // 收 / 送 两条实时电平：收＝它给我们的码率（或缓冲深度），送＝我们给它的码率。
+  // 本机这张卡片没有"收"，只看播放电平。
+  const inPct = self ? 0 : Math.min(100, (flows.in_kbps || 0) / 16);
+  const outPct = self ? bar : Math.min(100, (flows.up_kbps || 0) / 16);
+  const inNum = self ? '' : ((flows.in_kbps || 0) > 0 ? `${flows.in_kbps.toFixed(0)} kbps`
+      : (flows.buf_ms != null ? `缓冲 ${flows.buf_ms.toFixed(0)}ms`
+      : (flows.down_packets ? `已收 ${flows.down_packets} 包` : '没有在收')));
+  const outNum = self ? barText
+      : ((flows.up_kbps || 0) > 0 ? `${flows.up_kbps.toFixed(0)} kbps` : '没有在送');
+  // ★ 用户要的"各设备可调节的音量条"：我听它的 / 我送它的。
+  //   没有对应的那条路由时滑块禁用（先点下面的按钮连上），避免调了个不存在的音量。
+  // DOM id 只留安全字符（设备 id 里可能有 ':' 之类）
+  const uid = String(n.value || n.node_id || 'x').replace(/[^A-Za-z0-9_-]/g, '_');
+  const gainRow = (slot, route, label) => {
+    const on = !!route;
+    const val = on ? Number(route.gain || 1) : 1;
+    return `<div class="dvslide">
+      <span class="lbl" title="我们这一层的增益，不动 Windows 系统音量">${label}</span>
+      <input type="range" min="0" max="2" step="0.05" value="${val.toFixed(2)}"
+             ${on ? '' : 'disabled'}
+             title="${on ? '我们这一层的增益，不动 Windows 系统音量' : '先点下面的按钮连上，才能调这一路的音量'}"
+             oninput="setCardGain('${esc(on ? route.id : '')}','${slot}','${esc(uid)}',this.value,this)">
+      <span class="val" id="cg_${slot}_${esc(uid)}">${on ? val.toFixed(2) : '—'}</span>
+    </div>`;
+  };
 
   const acts = self
     ? `<div class="dvacts"><span class="dvself">这台电脑：用下面的 ⑥ 频道开关决定它广播什么、听什么</span></div>`
@@ -1195,23 +1272,22 @@ function deviceCard(n, routes){
            ${inRoute ? '✓ 正在收听它的（点一下断开）' : '🎧 收听它的'}</button>
          <button class="${outRoute ? 'primary' : ''}" onclick="quickRoute('${esc(n.value)}','out')">
            ${outRoute ? '✓ 正在送给它（点一下断开）' : '🎤 送给它'}</button>
-         ${n.host ? `<button class="tiny ghost" onclick="pingPeer('${esc(n.host)}')">测连通</button>` : ''}
+         ${n.host ? `<button class="tiny ghost" title="发一个 UDP 探测包；手机端不回 PING/PONG，所以『没回应』不等于不通"
+            onclick="pingPeer('${esc(n.host)}', ${Number(n.audio_port) || 0})">测连通</button>` : ''}
        </div>`;
 
-  // 22 段电平条（和手机端 .bars 同一套）：一段一段点亮，比一根连续的条更像"在跳动的电平"
-  const segs = Array.from({length: 22}, (_, i) => {
-    const t = i / 21;
-    const on = bar / 100 > t * 0.95;
-    return `<i class="${on ? 'hot' : ''}" style="height:${on ? Math.round(8 + t * 14) : 6}px"></i>`;
-  }).join('');
   return `<div class="dvcard${self ? ' self' : ''}${online ? '' : ' off'}">
     <div class="dvhead">
       <span class="dvname">${esc(n.name)}</span>
       ${tags.map(t => `<span class="dvtag${t === '本机' ? ' me' : ''}">${esc(t)}</span>`).join('')}
     </div>
     <div class="dvmeta">${esc(meta || '—')}</div>
-    <div class="dvbar">${segs}</div>
-    <div class="dvflow">${esc(barText)}${extra.length ? '　' + esc(extra.join('　')) : ''}</div>
+    ${self ? '' : `<div class="dvlevel"><span class="lbl">收</span>
+      <span class="dvbar">${levelSegs(inPct)}</span><span class="num">${esc(inNum)}</span></div>`}
+    <div class="dvlevel"><span class="lbl">送</span>
+      <span class="dvbar">${levelSegs(outPct)}</span><span class="num">${esc(outNum)}</span></div>
+    ${self ? '' : gainRow('in', inRoute, '我听它的')}
+    ${self ? '' : gainRow('out', outRoute, '我送它的')}
     ${acts}
   </div>`;
 }
@@ -1366,10 +1442,12 @@ async function addPeer(){
   catch(e){ toast('添加失败：' + e.message, 'err'); }
 }
 
-async function pingPeer(host){
+/* 测连通：对端端口用它自己广播里报的那个（以前只传 host，服务端会拿【本机】端口去探）。
+   还要注意：手机/安卓端不回 PING/PONG，所以"没回应"读起来不能像"不通"。 */
+async function pingPeer(host, port){
   try{
-    const r = await api('/api/ping', {host});
-    toast(r.ok ? `${r.host} 连通，往返 ${r.rtt_ms} ms` : `${host} 不通：${r.error}`, r.ok ? 'ok' : 'err');
+    const r = await api('/api/ping', port ? {host, port} : {host});
+    toast(r.note || (r.ok ? (host + ' 连通') : (host + ' 没回应')), r.ok ? 'ok' : 'err');
   }catch(e){ toast('探测失败：' + e.message, 'err'); }
 }
 

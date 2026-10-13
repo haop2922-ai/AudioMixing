@@ -383,6 +383,16 @@ public final class AudioSend {
         return fanout.peakFor(host);
     }
 
+    /** ★ 设定"我送它的"增益（0~1.5，1.0 = 原样）。逐目标，各台互不影响。 */
+    public void setTargetGain(String host, float g) {
+        fanout.setTargetGain(host, g);
+    }
+
+    /** 某一台现在的发送增益。 */
+    public float targetGain(String host) {
+        return fanout.targetGain(host);
+    }
+
     public String host() {
         return host;
     }

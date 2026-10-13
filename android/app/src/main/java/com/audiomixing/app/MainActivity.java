@@ -1422,6 +1422,67 @@ public class MainActivity extends Activity {
         return row;
     }
 
+    /**
+     * 一条「标签 + 可调滑杆 + 数值」的行（设备卡片上的「我听它的」/「我送它的」）。
+     *
+     * <p>为什么和电平条分开两条：用户原话「我要求的是各设备<b>可调节</b>的音量条。
+     * 当然现在有的显示实际音量条也不错」—— 电平条看实时、滑杆动手调，两件事不合并。
+     *
+     * @param recv true = 收侧增益（只乘这一路的样本）；false = 送侧增益（只缩放发给这一台的包）
+     */
+    private LinearLayout gainRow(final Discovery.Peer peer, String tag, final SeekBar bar,
+                                 final boolean recv) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView k = text(tag, 11f, DIM, false);
+        row.addView(k, new LinearLayout.LayoutParams(dpi(52), WRAP));
+
+        bar.setMax(150);              // 0.00 ~ 1.50，和「我们这一层的音量」滑杆同一口径
+        bar.setProgress(100);
+        bar.setProgressTintList(ColorStateList.valueOf(ACC));
+        bar.setThumbTintList(ColorStateList.valueOf(ACC));
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(0, WRAP);
+        blp.weight = 1f;
+        row.addView(bar, blp);
+
+        final TextView val = text("1.00", 11f, DIM, false);
+        val.setGravity(Gravity.END);
+        val.setTypeface(Typeface.MONOSPACE);
+        val.setTag("gainVal");                 // 只是标识：这行显示的是数值
+        row.addView(val, new LinearLayout.LayoutParams(dpi(38), WRAP));
+        bar.setTag(val);                       // 监听器里要更新它
+
+        bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
+                float g = progress / 100f;
+                Object t = sb.getTag();
+                if (t instanceof TextView) {
+                    setTextIfChanged((TextView) t, String.format(Locale.US, "%.2f", g));
+                }
+                if (fromUser && peer != null && peer.host != null && !peer.host.isEmpty()) {
+                    // 立刻生效：收侧改这一路的样本增益，送侧改发给这一台的包
+                    if (recv) {
+                        engine.setPeerRecvGain(peer.host, g);
+                    } else {
+                        engine.setPeerSendGain(peer.host, g);
+                    }
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar sb) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar sb) {
+            }
+        });
+        return row;
+    }
+
     /** 「送声音」按钮上的字：图标直接表达当前音源（🔊 本机声音 / 🎤 麦克风）。 */
     private static String sendChipLabel(int kind) {
         return kind == AudioSend.SRC_PLAYBACK ? "🔊 送声音" : "🎤 送声音";
@@ -1576,6 +1637,10 @@ public class MainActivity extends Activity {
         final LevelBar recvLevel;
         /** 「送」电平条：我送给它多少（逐目标统计，见 SendFanout）。 */
         final LevelBar sendLevel;
+        /** ★ 「我听它的」可调滑杆（收侧增益，只影响这一路）。 */
+        final SeekBar recvGainBar;
+        /** ★ 「我送它的」可调滑杆（送侧逐目标增益）。 */
+        final SeekBar sendGainBar;
         /** ★ 「对方：…」那一行（两台设备互报的统计）。 */
         final TextView peerLine;
         private boolean styledOnce;
@@ -1616,6 +1681,19 @@ public class MainActivity extends Activity {
             sendLevel = new LevelBar(MainActivity.this, Math.max(2, dpi(3)));
             card.addView(levelRow("送", sendLevel, "我送给它多少"),
                     margins(MATCH, WRAP, 0, dpi(5), 0, 0));
+
+            // ★★ 可调音量条（用户原话：「我要求的是各设备【可调节】的音量条。
+            //    当然现在有的显示实际音量条也不错」）—— 电平条保留，旁边再加一条可调滑杆。
+            //    两条滑杆控制的都是【我们这一层】的增益：
+            //      · 我听它的 → 只乘这一路的样本（AudioRecv.Stream.gain）
+            //      · 我送它的 → 只缩放发给这一台的那份包（SendFanout.Target.gain）
+            //    都不碰手机系统音量。
+            recvGainBar = new SeekBar(MainActivity.this);
+            card.addView(gainRow(p, "我听它的", recvGainBar, true),
+                    margins(MATCH, WRAP, 0, dpi(9), 0, 0));
+            sendGainBar = new SeekBar(MainActivity.this);
+            card.addView(gainRow(p, "我送它的", sendGainBar, false),
+                    margins(MATCH, WRAP, 0, dpi(4), 0, 0));
 
             // ★ 「对方」那一行：两台设备互报的结果。用户原话是"不知道是哪一端没在发"，
             //   这一行就是答案 —— 对方自己说它有没有在发、它收了我多少。
@@ -1683,6 +1761,21 @@ public class MainActivity extends Activity {
             //   「送」= 我送给它多少（SendFanout 逐目标统计，这一路发不出去它会自己塌下去）。
             recvLevel.setLevel(listen ? engine.recvPeakFor(peer.host) : 0f);
             sendLevel.setLevel(send ? engine.sendPeakFor(peer.host) : 0f);
+
+            // ★ 两条可调滑杆跟着引擎里的真实值走（对方重新上线、接收器重建之后不会"跳回 1.00"）；
+            //   正在被用户拖的那条不动（否则会跟手指打架）。
+            if (recvGainBar != null && !recvGainBar.isPressed()) {
+                int want = Math.round(engine.peerRecvGain(peer.host) * 100);
+                if (recvGainBar.getProgress() != want) {
+                    recvGainBar.setProgress(want);
+                }
+            }
+            if (sendGainBar != null && !sendGainBar.isPressed()) {
+                int want = Math.round(engine.peerSendGain(peer.host) * 100);
+                if (sendGainBar.getProgress() != want) {
+                    sendGainBar.setProgress(want);
+                }
+            }
 
             String st;
             int color;
