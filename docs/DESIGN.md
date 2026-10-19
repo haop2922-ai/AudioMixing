@@ -1,4 +1,4 @@
-# WaveLink 设计文档（局域网声音投射）
+# Audio Mixing 设计文档（局域网声音投射）
 
 ## 1. 要解决的问题
 
@@ -17,7 +17,7 @@
 | 接受公网地址作为源或目标 | `is_lan_address()` 会拒绝，`send --allow-wan` 才可显式绕过（默认关闭） |
 | 互联网发现服务 | 发现只靠局域网组播/广播 + 手动填同网段 IP |
 
-判定标准：目标地址必须是私有地址、链路本地地址或 `.local` 名字。用 `wavelink net` 查看本机
+判定标准：目标地址必须是私有地址、链路本地地址或 `.local` 名字。用 `audiomixing net` 查看本机
 可被哪些局域网地址访问。这样做的额外好处是攻击面极小——数据包根本出不去这个子网。
 
 结论：需要一个「源（Source）— 路由（Route）— 目标（Sink）」模型，并把
@@ -32,13 +32,13 @@
 
 ## 2. 角色与拓扑
 
-一台设备上跑一个 **WaveLink 节点进程**（node）。节点同时具备两种能力：
+一台设备上跑一个 **Audio Mixing 节点进程**（node）。节点同时具备两种能力：
 
 | 能力 | 说明 | 对应代码 |
 | --- | --- | --- |
-| Source（采集端） | 抓本机系统声音 / 麦克风 / 指定进程，编码后经 UDP 发出 | `wavelink/audio/backends/*` 的 `open_source()` |
+| Source（采集端） | 抓本机系统声音 / 麦克风 / 指定进程，编码后经 UDP 发出 | `audiomixing/audio/backends/*` 的 `open_source()` |
 | Sink（播放端） | 收包、抖动缓冲、解复用、混音、重采样，输出到指定输出设备 | `open_sink()` |
-| Control（控制面） | 发现、路由下发、音量/静音、状态上报；Web UI | `wavelink/net/*`, `wavelink/webui.py` |
+| Control（控制面） | 发现、路由下发、音量/静音、状态上报；Web UI | `audiomixing/net/*`, `audiomixing/webui.py` |
 
 **默认是去中心化的**：没有服务器也能用。任一台设备都可以打开 Web UI 当“总控台”，
 它只是向各节点下发同一份路由表（幂等、可重复下发），节点之间仍然直连传输音频。
@@ -79,7 +79,7 @@
    内含 `node_id / name / platform / 输入设备列表 / 输出设备列表 / 正在监听的端口`。
    收到即加入“在线设备表”，15 秒没收到标记离线。同时向子网扫描一次 `/24`，兼容
    屏蔽组播的路由器。
-2. **mDNS/DNS-SD（兼容层）**：注册 `_wavelink._udp.local`（PTR/SRV/TXT），
+2. **mDNS/DNS-SD（兼容层）**：注册 `_audiomixing._udp.local`（PTR/SRV/TXT），
    方便将来的原生客户端和 `dns-sd -B` 调试。（本仓库先实现信标；mDNS 解析器可选实现。）
 3. **手动添加**：`audiomixing peer add 192.168.1.23`，用于 AP 隔离 / 跨网段场景。
 
@@ -115,12 +115,12 @@
 
 | 平台 | 系统声音采集 | 单进程采集 | 播放 | 实现 |
 | --- | --- | --- | --- | --- |
-| Windows 10/11 | ✅ WASAPI Loopback | ✅ (Process Loopback, 19041+) | ✅ WASAPI Shared | 本仓库 `wavelink/audio/backends/wasapi.py`（纯 ctypes，零依赖） |
+| Windows 10/11 | ✅ WASAPI Loopback | ✅ (Process Loopback, 19041+) | ✅ WASAPI Shared | 本仓库 `audiomixing/audio/backends/wasapi.py`（纯 ctypes，零依赖） |
 | Windows (备用) | ✅ 虚拟声卡 (VB-CABLE) | ✅ | ✅ | 同上 + `--capture device:` |
-| Linux | ✅ PulseAudio `*.monitor` | ✅ `pactl` 模块/pipewire | ✅ | `wavelink/audio/backends/pipewire.py`（`pactl`/`pw-record` 子进程） |
+| Linux | ✅ PulseAudio `*.monitor` | ✅ `pactl` 模块/pipewire | ✅ | `audiomixing/audio/backends/pipewire.py`（`pactl`/`pw-record` 子进程） |
 | macOS | ⚠️ 需 BlackHole/Loopback 虚拟声卡（系统限制） | ✅ ScreenCaptureKit(13+) | ✅ CoreAudio | 计划中，先走虚拟声卡方案 |
 | Android | ⚠️ 需 MediaProjection 授权（系统限制） | ✅ per-app(10+) | ✅ AudioTrack | 见 `docs/PLATFORM-NOTES.md` 的 Android 端计划 |
-| 无音频设备（测试） | ✅ WAV 文件 / 合成音 | – | ✅ WAV 文件 / null | `wavelink/audio/backends/file.py` |
+| 无音频设备（测试） | ✅ WAV 文件 / 合成音 | – | ✅ WAV 文件 / null | `audiomixing/audio/backends/file.py` |
 
 **关键平台事实**（避免踩坑）：
 * Windows 采集系统声音**不需要**装虚拟声卡，WASAPI Loopback 直接抓默认渲染端点。
@@ -146,8 +146,8 @@
 ## 9. 目录结构
 
 ```
-wavelink/
-  wavelink/
+audiomixing/
+  audiomixing/
     proto.py          报文编解码
     rtpaudio.py       发送/接收会话、抖动缓冲、时钟同步
     net/discovery.py  信标发现 + 手动 peer
@@ -156,7 +156,7 @@ wavelink/
     audio/format.py   采样格式、重采样、混音
     audio/backends/   wasapi.py / pipewire.py / file.py / null.py
     engine.py         节点引擎：把配置变成线程与流
-    config.py         ~/.wavelink/config.json
+    config.py         ~/.audiomixing/config.json
     webui.py          控制台 HTTP 服务 + 单页 UI
     cli.py            audiomixing devices|serve|send|play|route|doctor
   tools/              真机验证脚本

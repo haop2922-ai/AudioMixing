@@ -1,15 +1,27 @@
 import android.content.Context;
 import com.audiomixing.app.Discovery;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.MulticastSocket;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+
 /**
- * 信标 / 节点身份离线探针（task-11 第 ① 条：手机重启后电脑多出一台重名设备）。
+ * 信标 / 节点身份 / 控制面离线探针。
  *
  * <p>被测的是 {@code Discovery.java} 本体（run_beacon_test.sh 原样编译，配 android.* 与
- * org.json 的桩类），断言的是两件真机上看不见、但一看代码就能定死的事：
+ * org.json 的桩类），断言的是真机上看不见、但一看代码就能定死的事：
  * <ol>
  *   <li><b>节点 ID 持久化</b>：同一个 Context（同一份 SharedPreferences）建两个 Discovery，
  *       拿到的 id 必须完全一样 —— 这是"重启不再多出一台设备"的唯一根据；</li>
- *   <li><b>信标里的 id 不能是空的</b>：把真正要发出去的 JSON 组出来看。</li>
+ *   <li><b>信标里的 id 不能是空的</b>：把真正要发出去的 JSON 组出来看；</li>
+ *   <li><b>★ 控制面（2026-10-15）</b>：控制消息和信标<b>同一条 socket</b>，靠 {@code "ctl"}
+ *       是对象还是数字区分。这一条判错就会变成"一边收得到、一边收不到"，
+ *       是上一版把控制消息挂在按需启停的音频接收器上时最难查的一类故障。</li>
  * </ol>
  * 全部通过返回 0。
  */
@@ -18,7 +30,7 @@ public final class BeaconProbe {
     private static int checks;
     private static int failures;
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
         System.out.println("== 1. 节点 ID 持久化（重启不变 —— 电脑端才不会记成好几台）==");
         Context ctx = new Context();                       // 模拟"同一台手机、同一份存储"
         Discovery d1 = new Discovery(ctx);
@@ -44,16 +56,116 @@ public final class BeaconProbe {
         check("信标里有 wl=1（协议版本）", beacon.contains("\"wl\":1"));
         check("信标里有 audio_port=47831", beacon.contains("\"audio_port\":47831"));
         check("信标里有名字和平台", beacon.contains("\"name\":\"") && beacon.contains("\"platform\":\""));
+        // ★ 用户反馈：手机装的是新版，电脑端卡片上却写着 1.0.0 —— 因为 "version" 原来写死成协议版本。
+        //   现在它读 BuildConfig.VERSION_NAME（本测试的桩把它定成 "2.1"，对齐 build.gradle）。
+        check("★ 信标里的 version 报的是 App 版本，不再是写死的 1.0.0",
+                beacon.contains("\"version\":\"2.1\"") && !beacon.contains("\"version\":\"1.0.0\""));
         check("信标里有 sources / sinks（电脑端据此判断对端能力）",
                 beacon.contains("\"sources\":[") && beacon.contains("\"sinks\":["));
+        check("信标里有 ctl=1（对端据此把控制消息发到这一层）", beacon.contains("\"ctl\":1"));
+        check("信标里有 disc_port=47830（对端按它发控制消息）",
+                beacon.contains("\"disc_port\":47830"));
         int bytes = reportedBytes(beacon);
         check("信标不超过协议上限 1200 字节（实测 " + bytes + "）", bytes > 0 && bytes < 1200);
+
+        System.out.println();
+        System.out.println("== 3. ★ 控制面：控制消息和信标同一条 socket（2026-10-15）==");
+        System.out.println("   背景：这一层每 2 秒一发一收、一直活着；音频接收端是按需启停的。");
+        System.out.println("   控制消息（请自动收听 / 共享音量 / 请连蓝牙）原来挂音频端口，"
+                + "对端接收器一停就收不到。");
+        controlPlane();
 
         System.out.println();
         System.out.println("RESULT: " + (failures == 0 ? "PASS" : "FAIL")
                 + "  （" + checks + " 项断言"
                 + (failures == 0 ? "全部通过）" : "，失败 " + failures + " 项）"));
         System.exit(failures == 0 ? 0 : 1);
+    }
+
+    /**
+     * ★ 控制面（2026-10-15）：同一个 socket 上两种包 —— 信标和"请对端自动收听我"这类控制消息。
+     *
+     * <p>验四件事：① 信标（{@code ctl} 是数字）不会被误判成控制消息；② 外衣里抠出来的正文
+     * 一字不差；③ 真起一个 UDP socket 跑一遍：发出去 → 对端收到 → 对端抠出来；
+     * ④ 收到的控制消息走 {@code onControl}，而且【绝不会】变成设备列表里的一台假设备。
+     */
+    private static void controlPlane() throws Exception {
+        String beacon = "{\"wl\":1,\"id\":\"abc\",\"name\":\"手机\",\"ctl\":1,\"disc_port\":47830}";
+        check("信标（ctl 是数字）不被判成控制消息", Discovery.controlBodyOf(beacon) == null);
+
+        String body = "{\"t\":\"stats\",\"name\":\"电脑\",\"want_listen\":true,\"gain\":0.75}";
+        String envelope = "{\"wl\":1,\"ctl\":" + body + "}";
+        check("外衣里抠出来的就是 ctl 正文，一字不多不少",
+                body.equals(Discovery.controlBodyOf(envelope)));
+
+        // 设备名里可能有花括号：抠取必须认得"字符串里的括号不算括号"。
+        String tricky = "{\"wl\":1,\"ctl\":{\"t\":\"stats\",\"name\":\"客厅{电脑}\"}}";
+        check("正文里字符串内的花括号不会把抠取截断",
+                "{\"t\":\"stats\",\"name\":\"客厅{电脑}\"}".equals(
+                        Discovery.controlBodyOf(tricky)));
+
+        check("没有 ctl 键的包不是控制消息",
+                Discovery.controlBodyOf("{\"wl\":1,\"id\":\"a\"}") == null);
+        check("被截断的外衣（括号不配对）当垃圾丢掉，绝不猜",
+                Discovery.controlBodyOf("{\"wl\":1,\"ctl\":{\"t\":\"stats\"") == null);
+
+        // ── 真跑一遍：发出去 → 对端收到 → 对端抠出来 ──
+        DatagramSocket lis = new DatagramSocket(0);
+        lis.setSoTimeout(2000);
+        Discovery sender = new Discovery(new Context());
+        MulticastSocket ms = new MulticastSocket();
+        setField(sender, "sock", ms);
+        String received = null;
+        try {
+            boolean ok = sender.sendControl(body, "127.0.0.1", lis.getLocalPort());
+            check("sendControl 报告发送成功（对端不支持时靠这个返回值决定退回音频端口）", ok);
+            check("控制消息计数 +1", sender.controlsSent() == 1);
+            byte[] buf = new byte[4096];
+            DatagramPacket p = new DatagramPacket(buf, buf.length);
+            lis.receive(p);
+            received = new String(buf, 0, p.getLength(), StandardCharsets.UTF_8);
+        } catch (Throwable t) {
+            received = null;
+        } finally {
+            lis.close();
+            ms.close();
+        }
+        check("对端真的收到了这条 UDP 包", received != null);
+        check("外衣形状是 {\"wl\":1,\"ctl\":{…}}",
+                received != null && received.startsWith("{\"wl\":1,\"ctl\":{"));
+        check("对端抠出来的正文和发出去的完全一样",
+                body.equals(Discovery.controlBodyOf(received)));
+
+        // ── 收到控制消息：走 onControl，绝不进设备列表 ──
+        Discovery recv = new Discovery(new Context());
+        final String[] seen = new String[]{null, null};
+        recv.setListener(new Discovery.Listener() {
+            @Override
+            public void onPeersChanged(List<Discovery.Peer> p) {
+            }
+
+            @Override
+            public void onControl(String host, String json) {
+                seen[0] = host;
+                seen[1] = json;
+            }
+        });
+        Method hb = Discovery.class.getDeclaredMethod("handleBeacon", byte[].class, int.class,
+                InetAddress.class);
+        hb.setAccessible(true);
+        byte[] raw = envelope.getBytes(StandardCharsets.UTF_8);
+        hb.invoke(recv, raw, raw.length,
+                InetAddress.getByAddress(new byte[]{(byte) 192, (byte) 168, 0, 9}));
+        check("onControl 被叫到，来源就是发信那台", "192.168.0.9".equals(seen[0]));
+        check("正文原样传下来（和音频层那份走同一段解析）", body.equals(seen[1]));
+        check("控制消息计数 +1", recv.controlsReceived() == 1);
+        check("控制消息【绝不能】变成一台设备", recv.peers().isEmpty());
+    }
+
+    private static void setField(Discovery d, String name, Object value) throws Exception {
+        Field f = Discovery.class.getDeclaredField(name);
+        f.setAccessible(true);
+        f.set(d, value);
     }
 
     /** 从"…（共 N 字节）"里把 N 抠出来。 */

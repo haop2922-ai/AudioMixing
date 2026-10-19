@@ -31,8 +31,9 @@ import java.util.Arrays;
  *       Android 10（API 29）起才有这个能力；</li>
  *   <li>{@link #SRC_MIC} 🎤 <b>麦克风</b> —— 对讲场景仍然有用，所以保留。</li>
  * </ul>
- * <b>采不到就如实退回麦克风，并把原因记在 {@link #lastError()} 里</b>，
- * 让界面和诊断报告能写清"实际在采的是哪一个"。绝不假装成功 —— 用户已经被误导过一次了。
+ * <b>采不到就如实停下、不假装成功</b>：原因记在 {@link #lastError()} / {@link #captureProblem} 里，
+ * 让界面和诊断报告能写清"到底怎么了"。★ 2026-10-19 用户隐私硬约束：<b>绝不自动改用麦克风</b>
+ * （停止本机声音采集时自动开麦是严重危害用户安全的行为），麦克风只由用户主动点击才开。
  *
  * <p><b>参数固定</b> 48000Hz / 立体声 / PCM16，一次读 480 帧（10 毫秒）打一个包。
  * <b>为什么不用 Opus</b>：PCM16 立体声 48k 是 1536 KB/s，Wi-Fi 上几台设备完全吃得下；
@@ -59,10 +60,10 @@ public final class AudioSend {
 
     // ══════════════════════════ ★ 送什么声音（音源） ══════════════════════════
 
-    /** 音源：麦克风（对讲用，最早的实现）。 */
-    public static final int SRC_MIC = 0;
+    /** 音源：麦克风（对讲用，最早的实现）。★ 值和 {@link SourcePolicy} 同源，不再各写一份。 */
+    public static final int SRC_MIC = SourcePolicy.SRC_MIC;
     /** 音源：本机正在播放的声音（音乐/视频/游戏），Android 10+ 才有。 */
-    public static final int SRC_PLAYBACK = 1;
+    public static final int SRC_PLAYBACK = SourcePolicy.SRC_PLAYBACK;
 
     /**
      * 这台机器支不支持采"本机正在播放的声音"。
@@ -225,8 +226,7 @@ public final class AudioSend {
      * 请求换音源。真正的重建在采集线程里做（先关旧的再开新的，不会有两路叠着发）。
      *
      * <p>如果请求的是本机声音但采不到（没授权 / 低于 Android 10 / ROM 阉割），
-     * 采集线程会<b>退回麦克风</b>并把原因写进 {@link #lastError()}，
-     * 此时 {@link #activeSourceKind()} 会如实返回 {@link #SRC_MIC}。
+     * 采集线程会<b>停下并把原因写进 {@link #lastError()}</b>（<b>绝不自动改用麦克风</b>）。
      */
     public void setSourceKind(int kind) {
         if (kind == SRC_PLAYBACK && !playbackSupported()) {
@@ -547,8 +547,8 @@ public final class AudioSend {
     /**
      * 按 wantSource 打开采集。打不开就返回 false（调用方负责收尾）。
      *
-     * <p>本机声音打不开时会<b>退回麦克风</b>：用户至少还能对讲，而界面上会如实写
-     * "你要的是本机声音，但采不到，现在实际送的是麦克风 + 原因"。
+     * <p>本机声音打不开时<b>返回 false 停下</b>（绝不自动改用麦克风）：界面据此显示
+     * "已停止 + 原因"（见 Engine.sourceStateText）。
      */
     private boolean openCapture() {
         closeRecord();                  // 保险：任何情况下都不允许两份采集并存
@@ -564,7 +564,8 @@ public final class AudioSend {
             }
             if (c == null) {
                 String why = captureProblem.length() > 0 ? captureProblem : "未知原因";
-                note("本机声音采不到：" + why + " → 已改用麦克风，界面会如实显示");
+                // ★ 绝不自动改用麦克风：只如实记下原因（界面据此显示"已停止 + 原因"）。
+                note("本机声音采不到：" + why + "（不会自动改用麦克风）");
                 captureProblem = why;
             }
         } else {

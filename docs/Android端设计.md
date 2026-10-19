@@ -25,15 +25,42 @@
  "version":"1.0.0","audio_port":47831,"web_port":0,
  "sources":[{"id":"mic","name":"麦克风","detail":"mic"}],
  "sinks":[{"id":"speaker","name":"本机扬声器","detail":"render"}],
- "busy":false}
+ "busy":false,"ctl":1,"disc_port":47830}
 ```
 
 - `wl` 协议版本（固定 1）、`id` 节点 UUID、`name` 给人看的名字
 - `audio_port` 音频端口（手机固定 47831，被占则换一个并在信标里如实写）
 - `web_port` 手机没有网页面板，写 0
 - `sources` / `sinks` 本机可提供的音源与播放端（手机只要 mic / speaker 两项即可）
+- `ctl` 控制面能力位（固定 1）、`disc_port` 本机发现端口的实际端口 —— 见下面「二·补」
 
 **收到信标就更新列表，不需要任何握手、不需要配对、不需要电脑。**
+
+### 二·补、控制消息走发现层（2026-10-15，协议 1.0.0 不变）
+
+控制消息（"我在把声音送给你，请自动打开收听"、共享音量、"请电脑去连我的蓝牙"）
+**不再发音频端口**，改发**发现端口** —— 也就是这一层：
+
+```
+{"wl":1,"ctl":<原来 T_STATS 那份 JSON 正文，字段名一字不改>}
+```
+
+为什么必须搬：这一层每 2 秒一发一收、**设计上一直活着**；而音频接收端（`AudioRecv`）
+是**按需启停**的（没在收听 / 没在听广播 / 没在送声音时它是停的）。控制消息原来挂在
+音频端口上，对端接收器一停就永远收不到 —— 现场表现是
+"电脑送声音打开了，手机的收听不会自己打开"。
+
+判定很简单：`ctl` 是**对象**就是控制消息，是**数字**就是上面那个能力位。
+
+- 只发给信标里报了 `ctl:1` 的对端（它自己公布的 `disc_port`）；老版本对端不认这层外衣，
+  **照旧发音频端口**的二进制 `T_STATS` —— 所以新旧混跑不会互相打哑。
+- 老版本收到这份外衣会当成"没有 id 的信标"直接丢掉，**不会多出一台假设备**。
+- 电脑端在这一层还会**单播信标给每个已知对端**（见 `BeaconService._unicast_targets`）：
+  安卓省电会成批丢组播/广播帧，手机端 15 秒收不到信标就把设备摘掉 ——
+  只发组播就会出现"电脑一直看得见手机、手机却经常丢掉电脑"这种不对称。
+
+代码落点：手机 `Discovery.controlBodyOf / sendControl / onControl`，电脑
+`net/discovery.py` 的 `send_control / _queue_control / _unicast_targets`。
 
 ## 三、音频协议（同一个 28 字节包头，小端）
 
@@ -113,7 +140,7 @@ Gradle: E:\Android\gradle\gradle-8.7
 ### 实际可用的构建命令（2026-10-12 验证过）
 
 ```powershell
-cd "E:\AI\deep blue\AudioMixing\android"
+cd "E:\AI\Audio\AudioMixing\android"
 $env:JAVA_HOME = "C:\Program Files\Java\jdk-17"      # 必须是 JDK 而不是 JRE，gradle 要 javac
 $env:ANDROID_HOME = "E:\Android\sdk"
 $env:ANDROID_SDK_ROOT = "E:\Android\sdk"

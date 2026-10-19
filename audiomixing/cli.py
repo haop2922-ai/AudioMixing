@@ -1,4 +1,4 @@
-"""WaveLink command line interface.
+"""Audio Mixing command line interface.
 
     audiomixing devices                 list capture/playback devices
     audiomixing serve                   run the node + web control panel
@@ -6,7 +6,7 @@
     audiomixing route add|list|rm|set   manage the route table (pushes to the LAN)
     audiomixing send / play             direct one-shot streaming without the daemon
     audiomixing peer add|list           manual peers for AP-isolated networks
-    wavelink doctor                  end-to-end self test on this machine
+    audiomixing doctor                  end-to-end self test on this machine
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from typing import Any
 from . import __version__, proto
 from .audio import base as audio_base
 from .config import Config, config_path
-from .engine import WaveLinkNode
+from .engine import AudioMixingNode
 from .net import discovery as disc
 from .net.rtpaudio import JitterBuffer, Receiver, SenderSession
 
@@ -37,7 +37,7 @@ def _short(text: str, width: int = 46) -> str:
 
 
 def _existing_instance(port: int) -> dict[str, Any] | None:
-    """Talk to an already-running WaveLink control panel on `port`, if any.
+    """Talk to an already-running Audio Mixing control panel on `port`, if any.
 
     Double-clicking the exe twice is the single most confusing thing a user can do
     here: the second process cannot bind the ports, looks alive in Task Manager, and
@@ -92,21 +92,21 @@ def _isolate_config() -> str | None:
     """
     import tempfile
 
-    previous = os.environ.get("WAVELINK_HOME")
-    os.environ["WAVELINK_HOME"] = tempfile.mkdtemp(prefix="wavelink-diag-")
+    previous = os.environ.get("AUDIOMIXING_HOME")
+    os.environ["AUDIOMIXING_HOME"] = tempfile.mkdtemp(prefix="audiomixing-diag-")
     return previous
 
 
 def _restore_config(previous: str | None) -> None:
     import shutil
 
-    current = os.environ.get("WAVELINK_HOME")
-    if current and "wavelink-diag-" in current:
+    current = os.environ.get("AUDIOMIXING_HOME")
+    if current and "audiomixing-diag-" in current:
         shutil.rmtree(current, ignore_errors=True)
     if previous is None:
-        os.environ.pop("WAVELINK_HOME", None)
+        os.environ.pop("AUDIOMIXING_HOME", None)
     else:
-        os.environ["WAVELINK_HOME"] = previous
+        os.environ["AUDIOMIXING_HOME"] = previous
 
 
 # --------------------------------------------------------------------------
@@ -114,7 +114,7 @@ def _restore_config(previous: str | None) -> None:
 # --------------------------------------------------------------------------
 
 def cmd_net(args: argparse.Namespace) -> int:
-    """Show this machine's LAN interfaces and what WaveLink can reach."""
+    """Show this machine's LAN interfaces and what Audio Mixing can reach."""
     report = disc.lan_report()
     cfg = Config.load()
     if args.json:
@@ -122,7 +122,7 @@ def cmd_net(args: argparse.Namespace) -> int:
         return 0
     local = [i for i in report["interfaces"] if i["kind"] == "private"]
     public = [i for i in report["interfaces"] if i["kind"] != "private"]
-    print("WaveLink 只在局域网内工作（没有服务器、没有穿透、没有中继）")
+    print("Audio Mixing 只在局域网内工作（没有服务器、没有穿透、没有中继）")
     print("=" * 62)
     if not local:
         print("没有找到局域网接口：请确认已连接 Wi-Fi / 网线。")
@@ -136,7 +136,7 @@ def cmd_net(args: argparse.Namespace) -> int:
     if public:
         print()
         print("  注意：以下地址看起来不在局域网内（可能是 VPN / 虚拟网卡 / 公网），")
-        print("        WaveLink 不会向它们投射，也不会被它们投射：")
+        print("        Audio Mixing 不会向它们投射，也不会被它们投射：")
         for iface in public:
             print("       %s (%s)" % (iface["address"], iface["subnet"] or "未知网段"))
     print()
@@ -201,7 +201,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         cfg.web_port = args.web_port
     cfg.save()
 
-    node = WaveLinkNode(cfg, audio_port=args.audio_port or cfg.audio_port, discovery_port=args.discovery_port or cfg.discovery_port,
+    node = AudioMixingNode(cfg, audio_port=args.audio_port or cfg.audio_port, discovery_port=args.discovery_port or cfg.discovery_port,
                         simulate=args.simulate)
     from .webui import WebUI
 
@@ -214,7 +214,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     running = _existing_instance(requested_web)
     if running is not None:
         node_info = running.get("node", {})
-        print("WaveLink 已经在这台电脑上运行了 —— 不需要再启动一个。")
+        print("Audio Mixing 已经在这台电脑上运行了 —— 不需要再启动一个。")
         print("  节点名称 : %s" % node_info.get("name"))
         print("  已运行   : %.0f 秒" % float(node_info.get("uptime_s") or 0))
         print("  发送/播放: %s / %s" % (running.get("totals", {}).get("active_senders", 0),
@@ -238,15 +238,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
         return 0
 
     if _port_in_use(requested_web, "tcp"):
-        print("⚠ 端口 %d 被其它程序占用（不是 WaveLink）。改用其它端口启动。" % requested_web)
+        print("⚠ 端口 %d 被其它程序占用（不是 Audio Mixing）。改用其它端口启动。" % requested_web)
         print()
     if _port_in_use(requested_audio, "udp"):
         print("⚠ 音频端口 udp/%d 被其它程序占用 —— 这台机器将无法接收音频。" % requested_audio)
-        print("  请关闭占用它的程序后重启 WaveLink。")
+        print("  请关闭占用它的程序后重启 Audio Mixing。")
         print()
 
     ui = WebUI(node, host=args.host, port=cfg.web_port)
     node.start()
+    # 面板上"声音大小"那根条 / 圆心那个百分比来自**直读当前输出设备**的电平表。
+    # 只在这里（真正的服务进程）打开；单元测试不会去碰真实声卡。
+    node.enable_output_meter()
     port = ui.start()
     node.config.web_port = port
     # Persist the port actually in use so `status` and the next launch agree.
@@ -265,7 +268,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     local_url = "http://127.0.0.1:%d" % port
     lan_urls = ["http://%s:%d" % (ip, port) for ip in lan_ips]
     print("=" * 70)
-    print(" WaveLink %s 已启动" % __version__)
+    print(" Audio Mixing %s 已启动" % __version__)
     print("=" * 70)
     if lan_urls:
         print("  给『别的电脑/手机』用这个网址（复制到它的浏览器里打开）:")
@@ -287,7 +290,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if args.simulate:
         print("  [模拟模式] 不打开真实声卡，使用内置测试音。")
     print()
-    print("  下一步: 在页面上「② 路由」里选择'声音来自'和'播放在'，点添加路由。")
+    print("  下一步: 在页面上「设备与路由」里选择'声音来自'和'播放在'，点添加路由。")
     print("  关闭本窗口即停止服务（或按 Ctrl+C）。")
     print()
     _flush()
@@ -309,7 +312,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     try:
         log_path = config_path().with_name("last-run.txt")
         log_path.write_text(
-            "WaveLink %s\n启动时间: %s\n给别的设备用: %s\n本机用: %s\n"
+            "Audio Mixing %s\n启动时间: %s\n给别的设备用: %s\n本机用: %s\n"
             % (
                 __version__,
                 time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -329,6 +332,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
     finally:
         ui.stop()
         node.stop()
+        # 蓝牙连接握在助手子进程里，进程退掉不会自动挂断 —— 退出前必须显式放掉，
+        # 否则"关闭服务后手机声音还在往电脑里送"（用户真机反馈）。
+        try:
+            from . import bluetooth as _bt
+
+            _bt.disconnect_all()
+        except Exception:
+            pass
     return 0
 
 
@@ -475,7 +486,7 @@ def cmd_peer(args: argparse.Namespace) -> int:
             print("需要 host")
             return 2
         if not disc.is_lan_address(args.host):
-            print("拒绝添加 %s：不是局域网地址（WaveLink 不做跨网穿透）。" % args.host)
+            print("拒绝添加 %s：不是局域网地址（Audio Mixing 不做跨网穿透）。" % args.host)
             return 2
         cfg.manual_peers = [p for p in cfg.manual_peers if p.get("host") != args.host]
         cfg.manual_peers.append({"host": args.host, "port": cfg.discovery_port, "audio_port": cfg.audio_port, "name": args.name or ""})
@@ -495,10 +506,10 @@ def cmd_peer(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 def cmd_send(args: argparse.Namespace) -> int:
-    """Capture this machine's audio and stream it to a remote WaveLink node."""
+    """Capture this machine's audio and stream it to a remote Audio Mixing node."""
     if not disc.is_lan_address(args.host) and not args.allow_wan:
         print("拒绝发送到 %s：这不是局域网地址。" % args.host)
-        print("WaveLink 是局域网内工具（不做穿透/中继）。想强制发送请加 --allow-wan，")
+        print("Audio Mixing 是局域网内工具（不做穿透/中继）。想强制发送请加 --allow-wan，")
         print("但请确认这是你自己的网络，跨公网传输未加密。")
         return 2
     spec: dict[str, Any] = {"backend": args.backend or audio_base.default_backend_name()}
@@ -539,7 +550,7 @@ def cmd_send(args: argparse.Namespace) -> int:
 
 
 def cmd_play(args: argparse.Namespace) -> int:
-    """Receive WaveLink audio on this machine and play it to a chosen device."""
+    """Receive Audio Mixing audio on this machine and play it to a chosen device."""
     import numpy as np  # noqa: F401  (only to fail fast if numpy is missing)
 
     from .audio.format import CHANNELS, SAMPLE_RATE
@@ -613,7 +624,7 @@ def _doctor_body(args: argparse.Namespace) -> int:
 
     failures: list[str] = []
     notes: list[str] = []
-    print("WaveLink %s 自检" % __version__)
+    print("Audio Mixing %s 自检" % __version__)
     print("=" * 62)
 
     # 1. backends ---------------------------------------------------------
@@ -841,7 +852,7 @@ def _doctor_body(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="audiomixing", description="把多台设备的声音投射到指定的音响设备（局域网）")
-    p.add_argument("--version", action="version", version="wavelink %s" % __version__)
+    p.add_argument("--version", action="version", version="audiomixing %s" % __version__)
     sub = p.add_subparsers(dest="cmd")
 
     d = sub.add_parser("devices", help="列出本机可采集/可播放的音频设备")
@@ -967,7 +978,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 130
     except Exception as exc:  # a packaged exe must not vanish without a trace
-        print("\n[WaveLink] 出错了: %s: %s" % (type(exc).__name__, exc))
+        print("\n[Audio Mixing] 出错了: %s: %s" % (type(exc).__name__, exc))
         import traceback
 
         traceback.print_exc()

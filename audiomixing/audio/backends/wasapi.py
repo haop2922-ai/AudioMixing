@@ -6,10 +6,10 @@ Two things matter here and both are easy to get wrong:
   capture client on a *render* endpoint and pass ``AUDCLNT_STREAMFLAGS_LOOPBACK``.
   No virtual cable and no elevation are required. This is exactly what the office
   scenario needs: every notification, call and video on the laptop becomes a
-  WaveLink source.
+  Audio Mixing source.
 * **Shared-mode formats.** The device's mix format is whatever the user configured
   in Windows (often 48 kHz float32, sometimes 44.1 kHz or 16-bit). We always
-  convert to/from interleaved float32 @ 48 kHz here so the rest of WaveLink never
+  convert to/from interleaved float32 @ 48 kHz here so the rest of Audio Mixing never
   sees a platform detail.
 """
 
@@ -463,7 +463,7 @@ class WasapiSink:
         )
         import os as _os
 
-        if _os.environ.get("WAVELINK_DEBUG"):
+        if _os.environ.get("AUDIOMIXING_DEBUG") or _os.environ.get("WAVELINK_DEBUG"):
             print("[wasapi] Initialize hr=%s fmt_ptr=0x%X info=%s" % (wc.hresult_name(hr), self._fmt_ptr, self._info))
         if wc.failed(hr):
             raise wc.win_error("IAudioClient::Initialize", hr)
@@ -578,6 +578,72 @@ class WasapiSink:
             "resampled": self._resampler is not None and self._resampler.enabled,
             "buffer_ms": round(self.buffered_frames() * 1000.0 / SAMPLE_RATE, 2),
         }
+
+
+class WasapiMeter:
+    """当前输出设备"在出声多大声"的直读表：不采集、不播放、不动系统音量。
+
+    为什么要有它：手机经蓝牙把声音送进来时，播放是 **Windows 直接做的**，本工具那一路
+    （本机直通 / 我们自己的播放端）根本没有数据，面板上的"本机播放电平"就永远是 0
+    （用户真机反馈「手机播放声音这个电平没有反应」，实机 /api/status 里
+    ``local.note`` 正是"音源就是输出设备本身，这里不再重复处理"）。
+    回环采集也能测到，但用户反馈过"同一块设备多开一路采集会越听越卡"。
+    IAudioMeterInformation 是音频引擎自带的峰值表：读一次 float 就有数，不占设备、
+    也不打扰正在播放的声音 —— 这正是用户要的"直接显示当前设备的音量大小"。
+    """
+
+    def __init__(self, spec: dict[str, Any] | None = None) -> None:
+        self.spec = dict(spec or {})
+        self.device_name = str(self.spec.get("device") or "@default")
+        self._dev: wc.IMMDevice | None = None
+        self._meter: wc.IAudioMeterInformation | None = None
+        self.name = ""
+        self.error = ""
+
+    def open(self) -> bool:
+        """打开（或重新打开）这块端点的峰值表。失败不抛，调用方看 error。"""
+        self.close()
+        try:
+            _ensure_com()
+            self._dev = _find_endpoint(self.device_name, eRender, KIND_SINK)
+            self.name = wc.device_friendly_name(self._dev) or self.device_name
+            self._meter = wc.IAudioMeterInformation.from_ptr(
+                self._dev.activate(wc.IID_IAudioMeterInformation)
+            )
+            # 立刻读一次：有的端点上 Activate 成功、读值却失败，那样必须当场认出来。
+            self._meter.get_peak_value()
+            self.error = ""
+            return True
+        except Exception as exc:
+            self.error = "%s: %s" % (type(exc).__name__, exc)
+            self.close()
+            return False
+
+    def peak(self) -> float | None:
+        """0..1 的峰值；接口没了返回 None（调用方据此重开）。"""
+        if self._meter is None:
+            return None
+        try:
+            return float(self._meter.get_peak_value())
+        except Exception as exc:
+            self.error = "%s: %s" % (type(exc).__name__, exc)
+            self.close()
+            return None
+
+    def device(self) -> str:
+        return self.name or self.device_name
+
+    def describe(self) -> dict[str, Any]:
+        return {"backend": "wasapi", "kind": "meter", "device": self.device_name,
+                "name": self.name, "error": self.error, "open": self._meter is not None}
+
+    def close(self) -> None:
+        if self._meter is not None:
+            self._meter.release()
+            self._meter = None
+        if self._dev is not None:
+            self._dev.release()
+            self._dev = None
 
 
 @register

@@ -15,19 +15,23 @@ import sys
 import threading
 import time
 
-sys.path.insert(0, r"E:\AI\deep blue\wavelink")
-
 import atexit as _atexit
 import os as _os
 import shutil as _shutil
 import tempfile as _tempfile
 
+# ★ 2026-10-15 自查：这里原来写死的是**另一个目录**的绝对路径（旧副本那一条），
+#   而那个目录早就不存在了 —— 这个探针在文档里怎么写都跑不起来。改成从本文件反推仓库根
+#   （脚本在 tools/ 下，根就是它的上一层）。写死绝对路径一旦留下，换台机器/换个目录
+#   就静默失效，而报错（ModuleNotFoundError）完全指不到真凶。
+sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 # Verification scripts must never read or write the user's real config: they start
-# real nodes, and a stray run once saved test ports into %APPDATA%\WaveLink.
+# real nodes, and a stray run once saved test ports into %APPDATA%\AudioMixing.
 # The sandbox is removed again on exit so a test run leaves nothing behind.
-if "WAVELINK_HOME" not in _os.environ:
-    _sandbox = _tempfile.mkdtemp(prefix="wavelink-check-")
-    _os.environ["WAVELINK_HOME"] = _sandbox
+if "AUDIOMIXING_HOME" not in _os.environ:
+    _sandbox = _tempfile.mkdtemp(prefix="audiomixing-check-")
+    _os.environ["AUDIOMIXING_HOME"] = _sandbox
     _atexit.register(lambda: _shutil.rmtree(_sandbox, ignore_errors=True))
 from audiomixing.audio.base import open_sink, open_source, write_paced
 from audiomixing.audio.format import CHANNELS, SAMPLE_RATE, make_tone, measure_frequency, peak, rms, signal_report
@@ -128,7 +132,7 @@ def scan(seconds: float) -> int:
     except Exception:
         pass
 
-    print("WaveLink 声卡活动扫描（每个设备 %.1f 秒）" % seconds)
+    print("Audio Mixing 声卡活动扫描（每个设备 %.1f 秒）" % seconds)
     _print_role_defaults()
     print("")
     print("  %-4s %-6s %8s %8s  设备" % ("默认", "虚拟", "峰值", "有效值"))
@@ -139,9 +143,9 @@ def scan(seconds: float) -> int:
         print("  没有找到可环回采集的播放设备")
         return 1
 
-    from audiomixing.engine import WaveLinkNode
+    from audiomixing.engine import AudioMixingNode
 
-    virtual_hints = WaveLinkNode._VIRTUAL_HINTS
+    virtual_hints = AudioMixingNode._VIRTUAL_HINTS
     live = []
     for dev in loopbacks:
         try:

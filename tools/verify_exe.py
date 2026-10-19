@@ -26,7 +26,12 @@ import time
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-EXE = ROOT / "dist" / "AudioMixing.exe"
+# ★ 2026-10-15：打包早就只剩 Nuitka 这一条了（tools/build_nuitka.py → dist_nuitka/），
+#   这里却一直只看 PyInstaller 时代的 dist/ —— 于是这个工具在现在这台机器上永远
+#   跑不起来（"找不到 dist/AudioMixing.exe"），等于没有。两个位置都认。
+EXE = next((p for p in (ROOT / "dist_nuitka" / "AudioMixing.exe",
+                        ROOT / "dist" / "AudioMixing.exe") if p.is_file()),
+           ROOT / "dist_nuitka" / "AudioMixing.exe")
 QUICK = "--quick" in sys.argv
 
 WEB_PORT = 17991
@@ -34,18 +39,18 @@ AUDIO_PORT = 48721
 DISC_PORT = 48722
 
 # Run the bundle against a throwaway config directory. Without this, starting the
-# exe rewrites the *user's* %APPDATA%\WaveLink\config.json (node name, routes from
+# exe rewrites the *user's* %APPDATA%\AudioMixing\config.json (node name, routes from
 # the API calls below) and leaves test nodes broadcasting on their LAN -- which is
 # exactly what happened during development and is not acceptable behaviour for a
 # verification script.
-SANDBOX = pathlib.Path(tempfile.mkdtemp(prefix="wavelink-verify-"))
+SANDBOX = pathlib.Path(tempfile.mkdtemp(prefix="audiomixing-verify-"))
 
 results: list[tuple[str, bool, str]] = []
 
 
 def exe_env() -> dict[str, str]:
     env = dict(os.environ)
-    env["WAVELINK_HOME"] = str(SANDBOX)
+    env["AUDIOMIXING_HOME"] = str(SANDBOX)
     return env
 
 
@@ -148,7 +153,7 @@ def user_config_fingerprint() -> str:
 
 def main() -> int:
     if not EXE.is_file():
-        print("找不到 %s，先运行 python tools/build_exe.py" % EXE)
+        print("找不到 %s，先运行 python tools/build_nuitka.py" % EXE)
         return 1
     real_config = pathlib.Path(os.environ.get("APPDATA", "")) / "AudioMixing" / "config.json"
     before = user_config_fingerprint()
@@ -196,7 +201,10 @@ def main() -> int:
         if healthy:
             with urllib.request.urlopen(base + "/", timeout=5) as resp:
                 html = resp.read().decode("utf-8")
-            check("控制台页面可打开", all(m in html for m in ('id="peersBox"', 'id="routesBox"', 'id="lanUrl"')),
+            # 2026-10-16：原来这里钉的是 id="routesBox" —— 用户（图5）把「已经连上的」那一段
+            # 整块删掉了，那一项再查下去只会永远红。改钉仍在的三处骨架：对端表 / 局域网地址 /
+            # 设备方块（每个设备的状态现在由方块上的三根条承担，取代了被删掉的路由列表）。
+            check("控制台页面可打开", all(m in html for m in ('id="peersBox"', 'id="deviceCards"', 'id="lanUrl"')),
                   "%d 字节" % len(html))
 
             with urllib.request.urlopen(base + "/api/status", timeout=5) as resp:

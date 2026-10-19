@@ -27,7 +27,7 @@ def check_url(url: str) -> list[str]:
     for index, js in enumerate(scripts_in(html)):
         if not js.strip():
             continue
-        path = os.path.join(tempfile.gettempdir(), "wavelink-page-%d.js" % index)
+        path = os.path.join(tempfile.gettempdir(), "audiomixing-page-%d.js" % index)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(js)
         try:

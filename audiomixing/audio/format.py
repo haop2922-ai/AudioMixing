@@ -1,10 +1,10 @@
 """Sample-format helpers: interleaved float32 buffers, resampling, mixing.
 
-All internal audio in WaveLink is **interleaved float32 at 48 kHz**. This module
+All internal audio in Audio Mixing is **interleaved float32 at 48 kHz**. This module
 has no I/O and no third-party dependencies, so it is fully unit-testable.
 
 Recovered and rewritten after an editing accident removed several functions; the
-tests in tests/test_wavelink.py (resampler vs an exact sinc reference, format
+tests in tests/test_audiomixing.py (resampler vs an exact sinc reference, format
 round-trips, tone/chirp generation, best_lag) are what keep this file honest.
 """
 
@@ -138,7 +138,7 @@ def best_lag(reference: Sequence[float], signal: Sequence[float], max_lag: int) 
     IMPORTANT: this only gives a unique answer for a **broadband** signal (a chirp,
     noise, speech). A pure sine repeats every ``sample_rate / freq`` samples, so many
     different lags correlate equally well - with a 1 kHz tone at 48 kHz every 48th
-    lag scores 1.0. Use a chirp when measuring latency; `wavelink doctor` does.
+    lag scores 1.0. Use a chirp when measuring latency; `audiomixing doctor` does.
     """
     best = (0, -2.0)
     if len(reference) > len(signal):
@@ -161,7 +161,7 @@ def measure_frequency(samples: Sequence[float], channels: int = CHANNELS) -> flo
     """Estimate the dominant frequency of a (roughly sinusoidal) tone by counting
     rising zero crossings, after trimming leading and trailing silence.
 
-    Used by `wavelink doctor` and the hardware probe tools: it is deliberately
+    Used by `audiomixing doctor` and the hardware probe tools: it is deliberately
     simple and dependency-free, and it measures end-to-end correctness (if any
     part of the chain drops or duplicates samples, the number moves). Accepts plain
     lists or numpy arrays (the mixer hands us numpy).
@@ -398,7 +398,7 @@ class Resampler:
     Keeps a history buffer so it can be fed arbitrary block sizes, which is what a
     device callback does. Quality is far beyond what is audible for speech and
     music at 44.1<->48 kHz; accuracy is asserted against an exact sinc reference in
-    tests/test_wavelink.py.
+    tests/test_audiomixing.py.
     """
 
     def __init__(self, src_rate: int, dst_rate: int, channels: int = CHANNELS) -> None:

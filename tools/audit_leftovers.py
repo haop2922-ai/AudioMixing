@@ -1,4 +1,4 @@
-"""WaveLink self-audit: find leftovers this project may have left behind.
+"""Audio Mixing self-audit: find leftovers this project may have left behind.
 
 Run before shipping anything:
 
@@ -7,9 +7,9 @@ Run before shipping anything:
 
 It checks, in two groups:
 
-  ENVIRONMENT - things on the machine that WaveLink may have created and forgotten
-      * running WaveLink processes (a double-launch leaves a zombie)
-      * %APPDATA%\\WaveLink config carrying non-default ports from a test run
+  ENVIRONMENT - things on the machine that Audio Mixing may have created and forgotten
+      * running Audio Mixing processes (a double-launch leaves a zombie)
+      * %APPDATA%\\AudioMixing config carrying non-default ports from a test run
       * manual_peers entries that are obviously test data
       * routes left over from automated tests
       * firewall rules pointing at an exe path that no longer exists
@@ -139,7 +139,7 @@ def audit_environment() -> None:
 
     # 3. firewall rules pointing at a stale path
     if sys.platform == "win32":
-        ps = ("Get-NetFirewallRule -DisplayName 'WaveLink*','wavelink*' -ErrorAction SilentlyContinue | "
+        ps = ("Get-NetFirewallRule -DisplayName 'Audio Mixing*','WaveLink*','wavelink*' -ErrorAction SilentlyContinue | "
               "ForEach-Object { $af = $_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue; "
               "Write-Output ($_.DisplayName + '|' + $_.Enabled + '|' + $af.Program) }")
         try:
@@ -157,16 +157,19 @@ def audit_environment() -> None:
         if stale:
             report("WARN", "firewall", "rules reference an exe that no longer exists: %s" % stale)
         elif lines:
-            print("[ok] firewall   %d WaveLink rule(s), all program paths valid" % len(lines))
+            print("[ok] firewall   %d Audio Mixing rule(s), all program paths valid" % len(lines))
         else:
-            print("[i ] firewall   no WaveLink rules (run fix-phone-connection.bat if the phone must connect)")
+            print("[i ] firewall   no Audio Mixing rules (if the phone must connect, use the tray menu's 放行防火墙)")
 
     # 4. temp sandboxes from the verification scripts
     tmp = pathlib.Path(tempfile.gettempdir())
-    leftovers = [p for p in tmp.glob("wavelink-verify-*")]
-    leftovers += [p for p in tmp.glob("wavelink-check-*")]
-    leftovers += [p for p in tmp.glob("wavelink-selftest-*")]
-    leftovers += [p for p in tmp.glob("wavelink-diag-*")]
+    # 新名 + 旧名都扫：v1.22 及更早版本建的临时目录叫 wavelink-*，
+    # 它们可能还躺在 %TEMP% 里，顺手一起清掉。
+    leftovers = []
+    for _prefix in ("audiomixing-verify-", "audiomixing-check-", "audiomixing-selftest-",
+                    "audiomixing-diag-", "wavelink-verify-", "wavelink-check-",
+                    "wavelink-selftest-", "wavelink-diag-"):
+        leftovers += [p for p in tmp.glob(_prefix + "*")]
     if leftovers:
         report("INFO", "temp", "%d verification sandbox dirs in %s" % (len(leftovers), tmp),
                fixable=True, fix=lambda: [shutil.rmtree(p, ignore_errors=True) for p in leftovers])
@@ -184,7 +187,7 @@ def audit_environment() -> None:
 
     # 6. a log the fix script may have written
     if sys.platform == "win32":
-        log = tmp / "wavelink-fix.log"
+        log = tmp / "audiomixing-fix.log"
         if log.is_file():
             age_h = (time.time() - log.stat().st_mtime) / 3600.0
             if age_h > 24:
@@ -296,19 +299,24 @@ def audit_project() -> None:
         print("[ok] dead-code  no orphaned functions (%d documented exceptions)" % len(ALLOWED_UNUSED))
 
     # 5. is the packaged exe stale?
-    exe = ROOT / "dist" / "AudioMixing.exe"
+    #    ★ 2026-10-15：交付流程早就只剩 Nuitka 这一条了（tools/build_nuitka.py → dist_nuitka/），
+    #      这里却一直只看 PyInstaller 时代的 dist/ —— 于是每轮自查都挂着一条
+    #      "dist/AudioMixing.exe does not exist" 的假警告。假警告多了，这一项就没人看了。
+    exe = next((p for p in (ROOT / "dist_nuitka" / "AudioMixing.exe",
+                            ROOT / "dist" / "AudioMixing.exe") if p.is_file()), None)
     newest_src = max((p.stat().st_mtime for p in PKG.rglob("*.py")), default=0)
     ui = PKG / "ui" / "index.html"
     if ui.is_file():
         newest_src = max(newest_src, ui.stat().st_mtime)
-    if exe.is_file():
+    if exe is not None:
+        shown = exe.relative_to(ROOT)
         if exe.stat().st_mtime < newest_src:
-            report("ERROR", "package", "dist/AudioMixing.exe is OLDER than the newest source file - rebuild it (python tools/build_exe.py)")
+            report("ERROR", "package", "%s is OLDER than the newest source file - rebuild it (python tools/build_nuitka.py)" % shown)
         else:
             age_min = (time.time() - exe.stat().st_mtime) / 60.0
-            print("[ok] package    dist/AudioMixing.exe is newer than all sources (built %.0f min ago)" % age_min)
+            print("[ok] package    %s is newer than all sources (built %.0f min ago)" % (shown, age_min))
     else:
-        report("WARN", "package", "dist/AudioMixing.exe does not exist")
+        report("WARN", "package", "还没有打包好的 exe（跑 python tools/build_nuitka.py）")
 
     # 7. critical API surface: an editing accident once removed a dozen functions
     #    from audio/format.py (sine/chirp generators, Resampler, the device format
@@ -329,7 +337,7 @@ def audit_project() -> None:
         ],
         "audiomixing/net/rtpaudio.py": ["Receiver", "SenderSession", "Sender", "JitterBuffer"],
         "audiomixing/audio/capture.py": ["CaptureHub", "TapReader"],
-        "audiomixing/engine.py": ["WaveLinkNode"],
+        "audiomixing/engine.py": ["AudioMixingNode"],
         "audiomixing/webui.py": ["WebUI", "index_html"],
     }
     missing_api: list[str] = []
@@ -359,7 +367,7 @@ def audit_project() -> None:
         for m in set(re.findall(r"([A-Za-z0-9_\-]+\.(?:bat|ps1))", text)):
             if not (ROOT / m).exists():
                 report("ERROR", "docs", "README references %s which does not exist" % m)
-        for m in set(re.findall(r"`(wavelink [a-z]+)", text)):
+        for m in set(re.findall(r"`(audiomixing [a-z]+)", text)):
             pass
         if not any(f[1] == "docs" for f in findings):
             print("[ok] docs       README script references all exist")
@@ -369,7 +377,7 @@ def audit_project() -> None:
     implemented = set(re.findall(r'sub\.add_parser\("([a-z]+)"', cli)) | set(re.findall(r'\w+ = sub\.add_parser\("([a-z]+)"', cli))
     implemented |= set(re.findall(r'add_parser\("([a-z]+)"', cli))
     readme_text = readme.read_text(encoding="utf-8", errors="replace") if readme.is_file() else ""
-    advertised = set(re.findall(r"wavelink ([a-z]+)", readme_text))
+    advertised = set(re.findall(r"audiomixing ([a-z]+)", readme_text))
     missing = sorted(a for a in advertised if a not in implemented and a not in ("ack",))
     if missing:
         report("WARN", "docs", "README mentions commands that are not implemented: %s" % missing)
@@ -379,12 +387,12 @@ def audit_project() -> None:
 
 def main() -> int:
     global FIX
-    ap = argparse.ArgumentParser(description="audit WaveLink for leftovers")
+    ap = argparse.ArgumentParser(description="audit Audio Mixing for leftovers")
     ap.add_argument("--fix", action="store_true", help="clean what is safe to clean")
     args = ap.parse_args()
     FIX = args.fix
 
-    print("WaveLink self-audit   repo=%s" % ROOT)
+    print("Audio Mixing self-audit   repo=%s" % ROOT)
     print("mode: %s" % ("FIX (will clean safe items)" if FIX else "report only (use --fix to clean)"))
     print()
     audit_environment()

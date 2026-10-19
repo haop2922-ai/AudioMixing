@@ -69,6 +69,8 @@ public final class AudioRecv {
     /** 收包缓冲区：一包 28 + 1920 = 1948 字节，4096 留足余量。 */
     private static final int RECV_BUF = 4096;
     private static final float PEAK_DECAY = 0.82f;
+    /** PONG 包的 ssrc：固定一个，对端的日志/诊断里好认。 */
+    private static final int PONG_SSRC = 0x506F6E67;   // "Pong"
 
     /**
      * 对端发来的统计包（{@code ptype=7 T_STATS}）回调：两台设备"自己交流"的入口。
@@ -587,7 +589,7 @@ public final class AudioRecv {
                 try {
                     p.setLength(buf.length);
                     s.receive(p);
-                    onPacket(buf, p.getLength(), p.getAddress());
+                    onPacket(buf, p.getLength(), p.getAddress(), p.getPort());
                 } catch (SocketTimeoutException te) {
                     // 正常：用超时让循环有机会看到 running 变 false
                 } catch (IOException e) {
@@ -613,7 +615,7 @@ public final class AudioRecv {
         }
     }
 
-    private void onPacket(byte[] buf, int len, InetAddress from) {
+    private void onPacket(byte[] buf, int len, InetAddress from, int fromPort) {
         // 来源地址先解析出来：下面每个分支（包括坏包分类）都要用它，只算一次。
         String host = normalizeHost(from);
         // ★ 坏包原因分类（2026-10-12 真机反馈）：只有一个"坏包 3220"的总数查不出任何东西，
@@ -646,6 +648,13 @@ public final class AudioRecv {
         }
         if (pkt.type != Proto.T_AUDIO) {
             bump(6);   // PING/PONG/BYE 之类的控制包，先计数
+            // ★ 回 PONG：电脑端「测连通」发的是 UDP PING。这里原来只把它记一笔就返回，
+            //   于是对手机测连通【必然】超时 —— 用户看到的永远是「没有回应 UDP 探测包」。
+            //   协议里 T_PONG 早就定义了，电脑↔电脑那条路也一直在互回（见 rtpaudio 的
+            //   _handle），只有手机缺这一段。
+            if (pkt.type == Proto.T_PING) {
+                replyPong(from, fromPort, pkt.payload);
+            }
             // ★ 对端统计（T_STATS=7）：两台设备"自己交流"的唯一入口。对方每 2 秒说一次
             //   "我发了多少、是不是正在发、我收了你多少"，界面据此直接显示是哪一端的问题。
             //
@@ -900,6 +909,67 @@ public final class AudioRecv {
                 if (lastMagicSample.length() == 0) {
                     lastMagicSample = s;
                 }
+        }
+    }
+
+    /**
+     * 回一个 PONG 给发 PING 的那台设备。
+     *
+     * <p>为什么必须有：电脑端「测连通」发的是 UDP PING，而安卓这边原来只把它记一笔
+     * （{@code bump(6)}）就返回 —— 于是对手机测连通【必然】超时，用户看到的永远是
+     * 「没有回应 UDP 探测包」。协议里 {@code T_PONG} 早就定义好了，电脑↔电脑那条路也一直
+     * 在互回（见 rtpaudio 的 _handle），只有手机缺这一段。回包里带上收到的 t0，
+     * 对端将来可以直接用它算时钟偏差。
+     *
+     * <p>回给 {@code fromPort} 而不是某个固定端口：电脑端是用一个临时 socket 发的 PING，
+     * 来源端口每次都不一样。
+     */
+    private void replyPong(InetAddress from, int fromPort, byte[] pingPayload) {
+        DatagramSocket s = socket;
+        if (s == null || from == null) {
+            return;
+        }
+        long now = System.currentTimeMillis() * 1_000_000L;
+        long t0 = jsonLong(pingPayload, "t0", 0L);
+        Proto.Pkt pong = new Proto.Pkt(Proto.T_PONG);
+        pong.ssrc = PONG_SSRC;
+        pong.tsNs = now;
+        pong.payload = ("{\"t0\":" + t0 + ",\"t1\":" + now + ",\"t2\":" + now + "}")
+                .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] raw = Proto.encode(pong);
+        try {
+            s.send(new DatagramPacket(raw, raw.length, from, fromPort));
+        } catch (Throwable t) {
+            note("回 PONG 失败（" + from + ":" + fromPort + "）：" + t);
+        }
+    }
+
+    /** 从控制包的 JSON 负载里取一个整数字段。只认最简单的那种，不引 JSON 库。 */
+    private static long jsonLong(byte[] payload, String key, long fallback) {
+        if (payload == null || payload.length == 0) {
+            return fallback;
+        }
+        String s = new String(payload, java.nio.charset.StandardCharsets.UTF_8);
+        int i = s.indexOf("\"" + key + "\"");
+        int c = i < 0 ? -1 : s.indexOf(':', i);
+        if (c < 0) {
+            return fallback;
+        }
+        int j = c + 1;
+        while (j < s.length() && (s.charAt(j) == ' ' || s.charAt(j) == '\t')) {
+            j++;
+        }
+        int k = j;
+        while (k < s.length() && (s.charAt(k) == '-' || Character.isDigit(s.charAt(k)))) {
+            k++;
+        }
+        if (k == j) {
+            return fallback;
+        }
+        try {
+            return Long.parseLong(s.substring(j, k));
+        } catch (Throwable t) {
+            return fallback;
         }
     }
 
@@ -1348,7 +1418,7 @@ public final class AudioRecv {
         if (host == null || host.isEmpty()) {
             return;
         }
-        float v = Math.max(0f, Math.min(1.5f, g));
+        float v = Math.max(0f, Math.min(2f, g));
         Map<String, Float> next = new HashMap<>(hostGain);
         next.put(host, v);
         hostGain = Collections.unmodifiableMap(next);   // 一次替换，收包线程永远读到完整的一份

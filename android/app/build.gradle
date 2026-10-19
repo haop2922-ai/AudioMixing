@@ -7,13 +7,20 @@ android {
         applicationId "com.audiomixing.app"
         minSdk 24
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        // ★ UI 版本（用户要求手机和电脑这次都输出 v2.1）。
+        //   用户抱怨过"装完的 APK 对不上货"，而诊断报告里的"程序版本"读的就是 versionName ——
+        //   升它，用户才能在手机上确认自己装的确实是新包。
+        //   （信标/设备卡片里自报的版本也读它，见 Discovery.java 的 APP_VERSION = BuildConfig.VERSION_NAME。）
+        versionCode 15
+        versionName "2.1"
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+    // ★ 需要 BuildConfig：AGP 8 默认不生成它，而信标自报版本要读 BuildConfig.VERSION_NAME
+    //   （见 Discovery.java 的 APP_VERSION）——否则电脑端设备卡片上永远是写死的旧版本号。
+    buildFeatures { buildConfig true }
     buildTypes { release { minifyEnabled false } }
 }
 

@@ -117,7 +117,7 @@ class WavSink:
     """Writes everything it receives to a WAV file (float32), optionally in real time."""
 
     def __init__(self, spec: dict[str, Any]) -> None:
-        self.path = spec.get("path") or spec.get("device") or "wavelink-out.wav"
+        self.path = spec.get("path") or spec.get("device") or "audiomixing-out.wav"
         self.sample_rate = SAMPLE_RATE
         self.channels = CHANNELS
         self.name = os.path.basename(self.path)

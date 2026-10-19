@@ -55,6 +55,11 @@ JITTER_START_MS = 55.0
 # without this a single burst of arrivals leaves the stream permanently deep.
 JITTER_TRIM_SLACK_MS = 60.0
 JITTER_TRIM_STEP_MS = 20.0
+# ★ 2026-10-19 用户：「音频质量出现了下降，存在短小杂音」。
+#   一个块只差**几个采样**（网络抖动让这一包晚到几毫秒）时，原来直接补静音 ——
+#   波形被硬切到 0 再跳回来，那就是一声"咔"。缺口不超过这个宽度就改成**保持最后一个采样**
+#   （≤2 毫秒的直流保持，听不出来），更大的缺口才是真的断流、保持静音。
+JITTER_HOLD_MS = 2.0
 # No packet for this long means the peer paused; the resulting silence is not an
 # underrun and must not be allowed to inflate the target.
 JITTER_IDLE_NS = 120_000_000
@@ -65,7 +70,28 @@ PCM_FRAMES_PER_PACKET = 480  # 10 ms @48k
 
 import os as _os
 
-DEBUG_JITTER = bool(_os.environ.get("WAVELINK_DEBUG_JITTER"))
+
+def _chunk_peak(samples) -> float:
+    """一块音频的峰值（0..1）。
+
+    面板上每台设备的「送 / 收」现在是**音量显示条**，不是码率条：码率跟"声音大小"完全
+    没关系（静音也照样在按 1536kbps 出数据），所以亮度必须从这里来。
+    """
+    if samples is None:
+        return 0.0
+    try:
+        if _np is not None:
+            # 不能写 `if not samples`：这里传进来的可能是 numpy 数组，
+            # 对多元素数组取真假会直接抛"truth value is ambiguous"。
+            block = _np.asarray(samples, dtype=_np.float32)
+            return 0.0 if block.size == 0 else float(_np.max(_np.abs(block)))
+        if len(samples) == 0:
+            return 0.0
+        return max(abs(float(s)) for s in samples)
+    except (TypeError, ValueError):
+        return 0.0
+
+DEBUG_JITTER = bool(_os.environ.get("AUDIOMIXING_DEBUG_JITTER") or _os.environ.get("WAVELINK_DEBUG_JITTER"))
 
 
 # HWHHYN 用 DEEPSEEK 制作
@@ -128,9 +154,14 @@ class JitterBuffer:
         self.trimmed = 0
         self.underruns = 0
         self.resyncs = 0
+        # ★ 2026-10-19：块里只差几个采样时"保持最后一个采样"（而不是补静音）的次数 ——
+        #   它和 underruns 分开计数：这些缺口是听不出来的，不该被算成"断流"（也就不会去撑大缓冲）。
+        self.held_gaps = 0
         self.last_packet_ns = 0
         self.started_ns = now_ns()
         self._last_adjust_ns = now_ns()
+        # 这一路**收到**的声音有多大声（面板「收」那根音量条用它）。
+        self.peak = 0.0
         self._peak_buffered = 0
         self.max_depth_ms = 0.0
         self._dbg_last_bucket = -1
@@ -213,6 +244,8 @@ class JitterBuffer:
                 )
         self._count += n
         self.samples_written += n
+        # 收到多大声：这里拿到的是**解码后**的采样，正好是"对面送过来多大声"。
+        self.peak = max(_chunk_peak(samples), self.peak * 0.8)
         self._peak_buffered = max(self._peak_buffered, self._count)
 
     # -- read side ---------------------------------------------------------
@@ -290,7 +323,15 @@ class JitterBuffer:
             self._count -= take
             self.samples_played += take
         if take < frames and now - self.last_packet_ns < JITTER_IDLE_NS:
-            self.underruns += 1
+            # ★ 2026-10-19：小缺口保持最后一个采样（不补静音）——见文件上面 JITTER_HOLD_MS 那段。
+            #   只有"这一包真的到了、只是晚了几毫秒"（last_packet_ns 在 idle 窗口内）才这么做；
+            #   真断流（take==0 或者缺口很大）仍然保持静音，那时本来就没有内容。
+            hold = frames - take
+            if take > 0 and hold <= _ms_to_frames(JITTER_HOLD_MS):
+                out[take:] = out[take - 1]
+                self.held_gaps += 1
+            else:
+                self.underruns += 1
         self._play_at = max(self._play_at + take * step_ns, now - target_ns)
         self.max_depth_ms = max(self.max_depth_ms, self.depth_ms())
         self._adapt(now)
@@ -368,6 +409,8 @@ class JitterBuffer:
 
     def stats(self) -> dict[str, Any]:
         return {
+            # 「收」音量条：这一路收到多大声（0..1）。
+            "peak": round(float(self.peak), 4),
             "buffered_ms": round(self.buffered_ms, 1),
             "depth_ms": round(self.depth_ms(), 1),
             "target_ms": round(_frames_to_ms(self.target_frames), 1),
@@ -375,6 +418,8 @@ class JitterBuffer:
             "written": self.samples_written,
             "played": self.samples_played,
             "underruns": self.underruns,
+            # ★ 2026-10-19：块里只差几个采样、用"保持上一个采样"补上的次数（听不出来，不算断流）。
+            "held_gaps": self.held_gaps,
             "late": self.dropped_late,
             "overflow": self.dropped_overflow,
             "trimmed": self.trimmed,
@@ -484,7 +529,7 @@ class Receiver:
         sock.bind((self.bind_host, self.port))
         sock.settimeout(0.5)
         self._sock = sock
-        self._thread = threading.Thread(target=self._recv_loop, name="wavelink-audio-rx", daemon=True)
+        self._thread = threading.Thread(target=self._recv_loop, name="audiomixing-audio-rx", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -865,6 +910,8 @@ class SenderSession:
         self.bytes_sent = 0
         self.frames_sent = 0
         self.sequence = 0
+        # 这一路**送出去**的声音有多大声（面板「送」那根音量条用它）。
+        self.peak = 0.0
         self.error = ""
         self.started_ns = 0
         self.last_send_ns = 0
@@ -882,7 +929,7 @@ class SenderSession:
         self._sock.connect((self.host, self.port))
         self.source.start()
         self.started_ns = time.monotonic_ns()
-        self._thread = threading.Thread(target=self._run, name="wavelink-tx-%08x" % self.ssrc, daemon=True)
+        self._thread = threading.Thread(target=self._run, name="audiomixing-tx-%08x" % self.ssrc, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -961,9 +1008,13 @@ class SenderSession:
         payload = self._encoder(chunk)
         if payload is None:
             return
+        level_source = chunk
         if self.gain != 1.0:
             scaled = array.array("f", (s * self.gain for s in chunk))
             payload = self._encoder(scaled)
+            level_source = scaled
+        # ★「送」音量条：这是我们**实际发出去**的那份声音有多大声（含我们这一层的增益）。
+        self.peak = max(_chunk_peak(level_source), self.peak * 0.85)
         ts = now_ns()
         seq = self.sequence & 0xFFFF
         frames_here = len(chunk) // CHANNELS
@@ -1000,6 +1051,8 @@ class SenderSession:
             "packets": self.packets_sent,
             "bytes": self.bytes_sent,
             "frames": self.frames_sent,
+            # 「送」音量条：我们送出去的那份声音多大声（0..1）。
+            "peak": round(float(self.peak), 4),
             "kbps": round(kbps, 1),
             "gain": self.gain,
             "running": self._thread is not None and self._thread.is_alive(),

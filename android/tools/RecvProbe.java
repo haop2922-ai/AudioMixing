@@ -166,7 +166,7 @@ public final class RecvProbe {
     public static void main(String[] args) throws Exception {
         recv = new AudioRecv((Context) null, 47831);
         onPacket = AudioRecv.class.getDeclaredMethod(
-                "onPacket", byte[].class, int.class, InetAddress.class);
+                "onPacket", byte[].class, int.class, InetAddress.class, int.class);
         onPacket.setAccessible(true);
 
         InetAddress pc = InetAddress.getByName("192.168.0.109");       // "电脑"
@@ -370,7 +370,7 @@ public final class RecvProbe {
 
     private static void feed(byte[] raw, InetAddress from) throws Exception {
         SystemClock.now += 10;      // 让"最近样本"的节流（500ms）每次都放行
-        onPacket.invoke(recv, raw, raw.length, from);
+        onPacket.invoke(recv, raw, raw.length, from, 40000);   // 对端的来源端口（PONG 要回给它）
     }
 
     private static byte[] hex(String s) {

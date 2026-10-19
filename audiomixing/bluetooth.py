@@ -220,6 +220,7 @@ def list_devices() -> list[dict[str, Any]]:
             link = "off"
         out.append({
             "id": device_id,
+            "address": device_address(device_id),
             "name": str(item.get("name") or "未知设备"),
             "state": state,
             "held": held,
@@ -228,6 +229,27 @@ def list_devices() -> list[dict[str, Any]]:
             "link": link,
         })
     return out
+
+
+def device_address(instance_id: str) -> str:
+    """从 Windows 的设备实例 ID 里取出蓝牙地址，形如 5C:A0:6C:CA:0A:6E。
+
+    实例 ID 长这样，中间那 12 位十六进制**就是地址本身**：
+        \\?\BTHENUM#{...}_VID&..._PID&...#b&62612bf&0&5CA06CCA0A6E_C00000000#{...}\SNK
+
+    2026-10-16 实机核对过：这 12 位与 Windows 自己的
+    DEVPKEY_Bluetooth_DeviceAddress、以及
+    HKLM\\SYSTEM\\CurrentControlSet\\Services\\BTHPORT\\Parameters\\Devices 下的子键
+    **完全一致**，所以按两位一组分开、大写显示就是 Windows 上那个地址。
+    取不到就返回空串 —— 面板会写「—」，绝不编造。
+    """
+    import re
+
+    m = re.search(r"&0&([0-9A-Fa-f]{12})_", instance_id or "")
+    hexs = m.group(1) if m else ""
+    if len(hexs) != 12:
+        return ""
+    return ":".join(hexs[i:i + 2] for i in range(0, 12, 2)).upper()
 
 
 def _key(device_id: str) -> str:
@@ -329,6 +351,47 @@ def status(device_id: str) -> str:
         time.sleep(0.08)
         text = read()
     return text
+
+
+def connect_by_name(name: str) -> dict[str, Any]:
+    """按名字在一堆"已配对的设备"里找到一台，并打开 A2DP sink。
+
+    为什么要这个入口（2026-10-15 用户真机反馈④）：「手机确认走蓝牙后应当由电脑发送
+    蓝牙请求并配对互相连接」—— 也就是这一步该由**电脑**发起，而不是把用户丢进
+    系统蓝牙设置里自己点。
+
+    能做到什么、不能做到什么，说清楚：
+      · **连接**（打开 sink、等手机把媒体音频发过来）能做到 —— 就是面板 ⑦ 里
+        「连接」按钮做的事；
+      · **配对**做不到：Windows 不给普通程序配对 API。所以这里只在"已经配对过"的
+        设备里找；没找到就如实回报 {"state": "no_device"}，由手机端提示用户
+        先去 Windows 蓝牙设置里配对一次（配一次就够，以后都由电脑这边连）。
+    名字用"包含即算"匹配：电脑看到的蓝牙设备名和手机自己报的名字常常差一截后缀。
+    """
+    wanted = str(name or "").strip().lower()
+    if not wanted:
+        return {"ok": False, "state": "no_name", "error": "对端没报名字"}
+    try:
+        devices = list_devices_cached()
+    except Exception as exc:
+        return {"ok": False, "state": "error", "error": "读蓝牙设备列表失败: %s" % exc}
+    for device in devices:
+        dev_name = str((device or {}).get("name") or "").strip()
+        key = dev_name.lower()
+        if not key:
+            continue
+        if key == wanted or wanted in key or key in wanted:
+            if str(device.get("link") or "") in ("connected", "waiting"):
+                return {"ok": True, "state": "already", "device": dev_name,
+                        "note": "已经连着或电脑这边已就绪，没有重复连接"}
+            try:
+                result = connect(str(device.get("id") or ""))
+            except Exception as exc:
+                return {"ok": False, "state": "error", "device": dev_name, "error": str(exc)}
+            return {"ok": bool(result.get("ok")), "state": str(result.get("state") or ""),
+                    "device": dev_name, "error": str(result.get("error") or "")}
+    return {"ok": False, "state": "no_device",
+            "error": "「%s」不在蓝牙列表里 —— 要先在 Windows 蓝牙设置里配对一次" % name}
 
 
 def connect(device_id: str) -> dict[str, Any]:
@@ -443,6 +506,51 @@ def disconnect(device_id: str) -> dict[str, Any]:
     _forget(device_id)
     return {"ok": True, "state": "closed"}
 
+
+def disconnect_all() -> dict[str, Any]:
+    """把**所有**还握着的蓝牙连接一次挂断 —— 退出程序时必须调这个。
+
+    为什么必须做（用户真机反馈）：「关闭服务后，手机声音依旧通过蓝牙传入电脑」。
+    根因是连接的寿命绑在**助手子进程**上：主进程一退，那个助手的哨兵文件还在，
+    它就一直握着 A2DP 链路，手机也还以为连着、继续把声音往里送。这里逐个删哨兵，
+    助手发现哨兵没了就自己 Close 并退出；卡住的再 taskkill。
+
+    顺序上先把所有哨兵一次删光、再逐个等：那样所有助手会在同一个 0.7 秒周期里
+    一起发现，握着两台手机也不用等两倍时间。
+
+    说清楚能覆盖到什么：**正常退出**（托盘「停止服务并退出」/ Ctrl+C）都会走到这里；
+    被强杀（任务管理器结束进程、断电、蓝屏）根本来不及跑，那就清不掉 —— 只能等
+    Windows 自己回收，这里不假装能覆盖。
+    """
+    try:
+        keys = [keep.stem for keep in _STATE_DIR.glob("*.keep")]
+    except OSError:
+        return {"ok": True, "closed": [], "failed": [], "count": 0}
+    for key in keys:
+        try:
+            (_STATE_DIR / ("%s.keep" % key)).unlink(missing_ok=True)
+        except OSError:
+            pass
+    closed: list[str] = []
+    failed: list[str] = []
+    for key in keys:
+        try:
+            _stop_helper(_STATE_DIR / ("%s.pid" % key))
+            _forget_key(key)
+            closed.append(key)
+        except Exception as exc:            # 一个失败不能拖住其余的
+            failed.append("%s: %s" % (key, exc))
+    return {"ok": not failed, "closed": closed, "failed": failed, "count": len(closed)}
+
+
+def _forget_key(key: str) -> None:
+    """按内部 key（文件名前缀）删掉一个助手留下的全部文件。"""
+    for suffix in ("keep", "pid", "status", "log"):
+        try:
+            (_STATE_DIR / ("%s.%s" % (key, suffix))).unlink(missing_ok=True)
+        except OSError:
+            pass
+
 _CACHE_LOCK = threading.Lock()
 _CACHE: dict = {"at": 0.0, "devices": []}
 
@@ -453,17 +561,47 @@ def list_devices_cached(max_age: float = 10.0, force: bool = False) -> list[dict
     Listing costs about three seconds - it starts a PowerShell helper - so it must never
     happen on a request the panel polls. Only the background refresh and the explicit
     刷新 button come through here.
+
+    ★ 2026-10-16 修一个**真缺陷**（打包成 v1.29 后实测抓到的性能故障）：这里原来要求
+    ``_CACHE["devices"]`` **非空**才算命中缓存 —— 于是"这台机器现在一台配对的蓝牙设备都没有"
+    时，每一次调用都会重跑那个约 2.6 秒的 PowerShell。而引擎的 ``apply_routes()`` 每轮
+    （维护循环 0.5 秒一轮）都要问一次蓝牙名单，结果就是**整台机器的音频路径被一个 2.6 秒的
+    子进程反复拖住**：实测 ``tick()`` 单次 2.7 秒，两个节点的音频流直接超时（unittest 里
+    test_audio_flows_between_two_nodes 等三条就是这么红的），用户侧的表现是"越用越卡"。
+    现在**空结果同样算"刚查过"**：把查询时刻记下来，空表也在 max_age 内照常命中缓存。
     """
     now = time.monotonic()
+    cached: list[dict] | None = None
     with _CACHE_LOCK:
-        if not force and _CACHE["devices"] and now - _CACHE["at"] < max_age:
-            return _apply_live_states(_CACHE["devices"])
+        # at 为 0 = 从来没查过；查过之后（哪怕结果是空表）就在 max_age 内都算新鲜。
+        if not force and _CACHE["at"] and now - _CACHE["at"] < max_age:
+            cached = list(_CACHE["devices"])
+    if cached is not None:
+        # 出口也必须合并实时状态，否则面板读到的还是枚举那一刻的旧结论
+        return _apply_live_states(cached)
     devices = list_devices()
     with _CACHE_LOCK:
         _CACHE["at"] = time.monotonic()
         _CACHE["devices"] = list(devices)
-    # 出口也必须合并实时状态，否则面板读到的还是枚举那一刻的旧结论
     return _apply_live_states(devices)
+
+
+def cached_names() -> list[str]:
+    """设备名列表，**只读缓存、绝不刷新**（给每 2 秒一次的发现信标用）。
+
+    为什么要单独开一个口子：`list_devices_cached()` 在缓存过期时会去跑一次
+    PowerShell（约 3 秒）。信标是每 2 秒发一次的，一旦那里触发刷新，广播会被
+    整整卡住 3 秒 —— 对端就可能判我们离线。这里只回上次后台刷新的结果：
+    名单晚个几十秒无所谓，它只是用来决定"要不要问用户走蓝牙还是 WiFi"。
+    """
+    with _CACHE_LOCK:
+        devices = list(_CACHE["devices"] or [])
+    names: list[str] = []
+    for item in devices:
+        name = str((item or {}).get("name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
 def held_count() -> int:

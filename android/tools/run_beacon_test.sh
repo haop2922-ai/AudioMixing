@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 #
-# 信标 / 节点身份离线测试 —— 一条命令复跑，不需要安卓设备、不需要 Gradle、不需要联网。
+# 信标 / 节点身份 / 控制面离线测试 —— 一条命令复跑，不需要安卓设备、不需要 Gradle、不需要联网。
 #
 #     bash android/tools/run_beacon_test.sh
+#
+# 第 ③ 段是 ★ 控制面（2026-10-15）：控制消息（"我在把声音送给你，请自动打开收听"、
+# 共享音量、"请电脑去连我的蓝牙"）和信标走同一条 socket，靠 `"ctl"` 是对象还是数字区分。
+# 为什么值得钉在这里：这一层每 2 秒一发一收、一直活着，而音频接收端是按需启停的 ——
+# 控制消息原来挂音频端口，对端接收器一停就永远收不到，现场就是
+# "电脑送声音打开了，手机的收听不会自己打开"。这条判定判错了，表现就是
+# "一边收得到、一边收不到"，在真机上几乎查不出来。
 #
 # 为什么值得存在（task-11 第 ① 条真机反馈）："手机重启一次，电脑的路由里就多一个重名设备"。
 # 现场证据（电脑端 /api/status）：同一台手机、同一个 192.168.0.101:47831，挂了三条记录，
@@ -180,6 +187,17 @@ public class Log {
 }
 EOF
 
+# ─── 桩：BuildConfig（AGC 构建时自动生成；这里补一个，值对齐 build.gradle 的 versionName）───
+#   为什么需要它：Discovery 现在把信标里的 "version" 报成 App 的实际版本
+#   （Discovery.APP_VERSION = BuildConfig.VERSION_NAME），不再写死协议版本 "1.0.0" ——
+#   否则电脑端设备卡片上永远显示 1.0.0，明明手机装的是新版。
+cat > "$S/com/audiomixing/app/BuildConfig.java" <<'EOF'
+package com.audiomixing.app;
+public final class BuildConfig {
+    public static final String VERSION_NAME = "2.1";
+}
+EOF
+
 # ─── 桩：org.json（只实现 Discovery 用到的那几个方法 + 真的序列化）───
 cat > "$S/org/json/JSONArray.java" <<'EOF'
 package org.json;
@@ -191,6 +209,11 @@ public class JSONArray {
     public JSONObject optJSONObject(int i) {
         Object v = i >= 0 && i < list.size() ? list.get(i) : null;
         return (v instanceof JSONObject) ? (JSONObject) v : null;
+    }
+    /** 纯字符串数组要用的那个读法（Discovery.readNames 读电脑端信标的 "bt" 就走这里）。 */
+    public String optString(int i, String fallback) {
+        Object v = i >= 0 && i < list.size() ? list.get(i) : null;
+        return v == null ? fallback : String.valueOf(v);
     }
     @Override public String toString() {
         StringBuilder sb = new StringBuilder("[");

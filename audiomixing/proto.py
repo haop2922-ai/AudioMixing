@@ -1,4 +1,4 @@
-"""WaveLink wire protocol.
+"""Audio Mixing wire protocol.
 
 Data plane: 28-byte header + payload over UDP (unicast).
 Control plane packets (HELLO/PING/ROUTE/...) reuse the same header with a JSON
@@ -92,7 +92,9 @@ PORT_WEB = 17800
 DISCOVERY_GROUP = "239.255.77.120"
 MDNS_GROUP = "224.0.0.251"
 MDNS_PORT = 5353
-SERVICE_TYPE = "_wavelink._udp.local."
+# mDNS/DNS-SD 服务类型。真正的设备互发现走 UDP 信标（见 net/discovery.py），
+# 这一条只服务于可选的 mDNS 桥和 `dns-sd -B` 调试 —— 改名不影响发现功能。
+SERVICE_TYPE = "_audiomixing._udp.local."
 
 
 def now_ns() -> int:
@@ -172,7 +174,7 @@ class Packet:
 
 
 def decode(buf: bytes) -> Packet | None:
-    """Decode one datagram; returns None when it is not a valid WaveLink packet."""
+    """Decode one datagram; returns None when it is not a valid Audio Mixing packet."""
     if len(buf) < HEADER_SIZE:
         return None
     magic, version, ptype, flags, codec, seq, ssrc, samples, ts_ns, gain, plen = HEADER.unpack_from(buf, 0)

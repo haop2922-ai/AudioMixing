@@ -184,7 +184,7 @@ public final class SendFanout {
         if (host == null || host.isEmpty()) {
             return;
         }
-        float v = Math.max(0f, Math.min(1.5f, g));
+        float v = Math.max(0f, Math.min(2f, g));
         synchronized (lock) {
             for (Target t : targets.values()) {
                 if (host.equals(t.host)) {
