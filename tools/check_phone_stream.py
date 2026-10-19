@@ -22,9 +22,18 @@ import time
 import urllib.request
 
 HOST = "127.0.0.1"
-PORT = int(os.environ.get("WAVELINK_PORT", "17800"))
+PORT = int(os.environ.get("AUDIOMIXING_PORT") or os.environ.get("WAVELINK_PORT") or "17800")
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-BLOCK_BYTES = 480 * 2 * 2  # 480 frames, stereo, PCM16
+# ★ 一个 WebSocket 帧 = 10 毫秒的声音。这里必须写**真正发出去的那个格式**：
+#   原来写的是 480 帧 × 立体声 × PCM16 = 1920 字节，但 /ws/audio 早就改成
+#   "往下混成 24kHz 单声道再重切"（见 webui.py 的 _to_24k_mono + BLOCK_BYTES_MONO，
+#   也见那条 chunked 路径自己发的 X-Sample-Rate: 24000 / X-Channels: 1）。
+#   于是这个断言从那次改动起就一直误报 —— 每帧 1920 字节的期望 vs 实测 480 字节。
+#   ★ 2026-10-15 核对：同一个工具打在 v1.19（改动之前那一版）上**报一模一样的结果**，
+#     所以它不是哪一版引入的回归，是这个期望值没跟着实现更新。
+#   24000 帧/秒 × 单声道 2 字节 × 0.01 秒 = 480 字节。
+BLOCK_MS = 10.0
+BLOCK_BYTES = int(24000 * 2 * (BLOCK_MS / 1000.0))
 
 
 def api(path: str, body: dict | None = None) -> dict:
@@ -64,7 +73,7 @@ def main() -> int:
         print("FAIL: 控制台 %d 端口没有响应 (%s)" % (PORT, exc))
         return 1
 
-    print("WaveLink 手机收听链路自检")
+    print("Audio Mixing 手机收听链路自检")
     print("  1) 播放测试音到「空输出」并同时喂给监听 tap（完全无声，也不需要其它设备在线）")
     api("/api/test-tone", {"device": "null", "seconds": seconds, "freq": 1000})
     try:
@@ -96,6 +105,8 @@ def main() -> int:
         bad_sizes = 0
         nonzero = 0
         deadline = time.time() + seconds
+        first_at = 0.0
+        last_at = 0.0
         while time.time() < deadline:
             try:
                 payload = read_frame(sock)
@@ -103,16 +114,30 @@ def main() -> int:
                 break
             if not payload:
                 break
+            now = time.time()
+            if frames == 0:
+                first_at = now
+            last_at = now
             frames += 1
             payload_bytes += len(payload)
-            if len(payload) % BLOCK_BYTES:
+            if len(payload) != BLOCK_BYTES:
                 bad_sizes += 1
             if any(payload):
                 nonzero += 1
         sock.close()
-        print("     收到 %d 帧 / %d 字节" % (frames, payload_bytes))
-        print("     非 10ms 整块的帧: %d（应为 0）；含音频的帧: %d（测试音期间应 > 0）" % (bad_sizes, nonzero))
-        ok = ok_status and ok_accept and frames > 10 and bad_sizes == 0 and nonzero > 0
+        # ★ 实时性：从**第一帧到最后一帧**这一段里，声音有没有按实时速度来。
+        #   为什么不用"总时长"：测试音只有 2 秒，读完它之后 socket 还会空等到超时，
+        #   那个等待会把比值压到 0.35 —— 量的是"窗口"，不是"送得多快"（我第一版就是这么
+        #   写错的）。改用帧间隔：100 帧/秒才是实时，慢一大截就是手机听着断续。
+        gap = max(0.0, last_at - first_at)
+        rate = ((frames - 1) / gap) if (frames > 1 and gap > 0.05) else 0.0
+        print("     收到 %d 帧 / %d 字节（每帧 %d 字节 = %.0fms 的 24kHz 单声道）"
+              % (frames, payload_bytes, BLOCK_BYTES, BLOCK_MS))
+        print("     长度不对的帧: %d（应为 0）；含音频的帧: %d（测试音期间应 > 0）" % (bad_sizes, nonzero))
+        print("     实时性: %d 帧用了 %.2fs → %.0f 帧/秒（实时是 100）" % (frames, gap, rate))
+        ok = (ok_status and ok_accept and frames > 10 and bad_sizes == 0 and nonzero > 0
+              # 只在这段里真的量到了帧间隔时才断言（帧太少/时间戳太挤就不硬判）。
+              and (rate == 0.0 or 80.0 <= rate <= 125.0))
         print("")
         print("RESULT: %s" % ("PASS" if ok else "FAIL"))
         return 0 if ok else 1

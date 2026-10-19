@@ -1,6 +1,6 @@
 """Minimal COM plumbing for the WASAPI backend (ctypes only, no dependencies).
 
-Only what WaveLink needs: IUnknown reference counting, vtable slot lookup,
+Only what Audio Mixing needs: IUnknown reference counting, vtable slot lookup,
 interface pointers, and the handful of GUID helpers WASAPI requires.
 """
 
@@ -459,6 +459,38 @@ class IAudioRenderClient(ComPtr):
             raise win_error("IAudioRenderClient::ReleaseBuffer", hr)
 
 
+class IAudioMeterInformation(ComPtr):
+    """某个音频端点**当前在出声多大声**的峰值表。
+
+    为什么要它，而不是再开一路回环采集去量电平：真机反馈过"同一块设备多开一路采集
+    会越听越卡"（尤其是蓝牙耳机）。这个接口是音频引擎自己维护的峰值表 —— 读一次
+    float 就有数，**不占用设备、不影响正在播放的声音**，所以它是"直接显示当前设备的
+    音量大小"最省事也最不打扰的做法。
+
+    槽位顺序必须是 GetPeakValue → GetMeteringChannelCount → GetChannelsPeakValues
+    → QueryHardwareSupport：少写一个名字会让后面所有槽位整体错位。这里用不到后两个，
+    但仍然按声明顺序列全，保证索引正确。
+    """
+
+    _method_names = (
+        "GetPeakValue",
+        "GetMeteringChannelCount",
+        "GetChannelsPeakValues",
+        "QueryHardwareSupport",
+    )
+    _proto_GetPeakValue = ctypes.WINFUNCTYPE(HRESULT, c_void_p, POINTER(ctypes.c_float))
+    _proto_GetMeteringChannelCount = ctypes.WINFUNCTYPE(HRESULT, c_void_p, POINTER(UINT32))
+    _proto_GetChannelsPeakValues = ctypes.WINFUNCTYPE(HRESULT, c_void_p, UINT32, c_void_p)
+    _proto_QueryHardwareSupport = ctypes.WINFUNCTYPE(HRESULT, c_void_p, POINTER(DWORD))
+
+    def get_peak_value(self) -> float:
+        value = ctypes.c_float()
+        hr = self.call("GetPeakValue", byref(value))
+        if failed(hr):
+            raise win_error("IAudioMeterInformation::GetPeakValue", hr)
+        return float(value.value)
+
+
 # --------------------------------------------------------------------------
 # Audio format structures
 # --------------------------------------------------------------------------
@@ -594,6 +626,7 @@ IID_IMMDeviceEnumerator = "{A95664D2-9614-4F35-A746-DE8DB63617E6}"
 IID_IAudioClient = "{1CB9AD4C-DBFA-4c32-B178-C2F568A703B2}"
 IID_IAudioCaptureClient = "{C8ADBD64-E71E-48a0-A4DE-185C395CD317}"
 IID_IAudioRenderClient = "{F294ACFC-3146-4483-A7BF-ADDCA7C260E2}"
+IID_IAudioMeterInformation = "{C02216F6-8C67-4B5B-9D00-D008E73E0064}"
 PKEY_Device_FriendlyName = "{A45C254E-DF1C-4EFD-8020-67D146A850E0},14"
 PKEY_Device_DeviceDesc = "{A45C254E-DF1C-4EFD-8020-67D146A850E0},2"
 

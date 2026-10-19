@@ -44,11 +44,30 @@ import java.util.Map;
  * 这样手机能看见电脑、电脑也能看见手机：
  * <pre>
  * {"wl":1,"id":"&lt;uuid&gt;","name":"小红的手机","platform":"Android-14",
- *  "version":"1.0.0","audio_port":47831,"web_port":0,
+ *  "version":"2.1","audio_port":47831,"web_port":0,
  *  "sources":[{"id":"mic","name":"麦克风","detail":"mic"}],
  *  "sinks":[{"id":"speaker","name":"本机扬声器","detail":"render"}],
- *  "busy":false,"scope":"lan","ts":1700000000}
+ *  "busy":false,"scope":"lan","ts":1700000000,"ctl":1,"disc_port":47830}
  * </pre>
+ *
+ * <p><b>★ 同一个 socket 上还跑第二种包：控制消息（2026-10-15）★</b>
+ * 这一层每 2 秒一发一收、<b>设计上一直活着</b>；而音频接收端（{@link AudioRecv}）是按需
+ * 启停的 —— 用户没在收听、没在听广播、没在送声音时它是停的。控制消息（"我在把声音送给你，
+ * 请自动打开收听"、共享音量、"请电脑去连我的蓝牙"）原来发到音频端口，接收器一停对端就
+ * 永远收不到，现场表现就是"电脑送声音打开了，手机的收听不会自己打开"。
+ *
+ * <p>所以控制消息也走这个 socket，外衣是：
+ * <pre>
+ * {"wl":1,"ctl":&lt;原来 T_STATS 那份 JSON 正文，一字不改&gt;}
+ * </pre>
+ * 判定很简单：{@code ctl} 是<b>对象</b>就是控制消息，是<b>数字</b>就是信标的能力位。
+ * 老版本收到这份外衣会当成"没有 id 的信标"直接丢掉（不会多出一台假设备），
+ * 我们对外发包前也先看对端信标里有没有 {@code ctl:1} —— 没有就照旧走音频端口，
+ * 所以新旧混跑不会互相打哑。
+ *
+ * <p>电脑端的信标还可能多一个 {@code "bt":["小红的手机","平板"]}（<b>纯字符串数组</b>，只有名字
+ * 没有 id）：那是"它这台电脑能用蓝牙收谁的音"。手机点「送声音」时拿它判断要不要先问用户
+ * 走蓝牙还是 WiFi（老版本电脑没有这个键 → 按空表处理，见 {@link Peer#btNames}）。
  *
  * <p><b>线程约定</b>：所有网络 IO（建 socket、加入组播组、收发）都在自己的线程里，
  * 主线程只调用 {@link #start()} / {@link #stop()} / {@link #peers()}（纯内存操作）。
@@ -66,8 +85,15 @@ public final class Discovery {
     private static final int MAX_BEACON_BYTES = 1200;
     /** 收包缓冲区：信标很小，4096 足够，也顺手挡掉别人的大包。 */
     private static final int RECV_BUF = 4096;
-    /** 版本号写死：这属于协议字段，跟 build.gradle 的 versionName 解耦，免得改 UI 版本把协议也改了。 */
-    private static final String PROTOCOL_VERSION = "1.0.0";
+    /**
+     * ★ 信标里自报的版本 = <b>App 的实际版本</b>（{@code build.gradle} 的 versionName）。
+     *
+     * <p>用户反馈：手机上明明装着 v3.7，电脑端设备卡片上却写着 1.0.0 —— 因为这里原来把版本
+     * 写死成协议版本 {@code "1.0.0"}（和 build.gradle 解耦）。协议本身是靠信标里的 {@code wl}
+     * 字段判定的，跟这个展示字段无关；所以这里改成读 {@link BuildConfig#VERSION_NAME}，
+     * 电脑端才能看到手机真实的版本号。
+     */
+    private static final String APP_VERSION = BuildConfig.VERSION_NAME;
 
     /** 设备列表变化回调（后台线程）。 */
     public interface Listener {
@@ -76,6 +102,16 @@ public final class Discovery {
 
         /** 出错但不致命（组播加不进去、锁拿不到…），给界面拿去显示"详情"。 */
         default void onDiscoveryError(String message) {
+        }
+
+        /**
+         * ★ 收到一条控制消息（2026-10-15）：{@code json} 是 ctl 对象的原文。
+         *
+         * <p>和音频层那份"对端统计"是<b>同一份正文</b>（字段名一字不差），收端直接交给
+         * {@code Diagnosis.parse} 就行 —— 两处走同一段解析、同一段处理逻辑。
+         * 回调在发现线程上（和 {@link #onPeersChanged} 一样），界面/引擎自己切线程。
+         */
+        default void onControl(String host, String json) {
         }
     }
 
@@ -99,6 +135,25 @@ public final class Discovery {
         public volatile List<String> sources = Collections.emptyList();
         /** 对端能播放的名字（手机就是"本机扬声器"）。 */
         public volatile List<String> sinks = Collections.emptyList();
+        /**
+         * 对端（电脑）说它能用<b>蓝牙</b>收谁的音（名字列表，只有名字没有 id）。
+         *
+         * <p>用来判断要不要在「送声音」时先问用户走蓝牙还是 WiFi —— 用户原话：
+         * 「手机界面点击送声音后，应当判断手机是否在电脑的蓝牙设备列表里。如果是就让用户判断
+         * 到底用蓝牙还是WiFi。如果否就直接走WiFi路径。」判错也只是多问/少问一句。
+         */
+        public volatile List<String> btNames = Collections.emptyList();
+        /**
+         * ★ 控制面协商位（2026-10-15）：对端信标里 {@code "ctl":1} = 它能把控制消息收在
+         * <b>发现层</b>（这一层一直活着）。只有它支持，我们才把统计包改发到它的发现端口；
+         * 老版本对端没有这个键 → false，照旧发音频端口。
+         */
+        public volatile boolean ctl;
+        /**
+         * 对端发现端口的实际端口（信标里的 {@code disc_port}，端口被占时可能不是 47830）。
+         * 缺失/为 0 时按默认处理。
+         */
+        public volatile int discPort = Proto.DEFAULT_DISCOVERY_PORT;
         /** 最后一次收到信标的墙钟毫秒（给人看的）。 */
         public volatile long lastSeen;
         /** 单调时钟（开机毫秒）：判断超时只能用这个，系统改时间不能把设备"改没了"。 */
@@ -196,6 +251,13 @@ public final class Discovery {
     private volatile int unicastTargets;
     /** 成功加入组播组的网卡名（空 = 一个都没加进去，只能靠广播）。 */
     private volatile String mcastIfaces = "";
+
+    // ── ★ 控制面（2026-10-15）：这一层收发了多少条控制消息 ──
+    // 诊断报告要如实写出这两个数：用户判断"控制消息到底走到没走到"就靠它，
+    // 不用再靠猜（这正是上一版"收音器常驻"那种绕法最难自证的地方）。
+    private volatile long ctrlSent;
+    private volatile long ctrlReceived;
+    private volatile String ctrlLastError = "";
 
     private WifiManager.MulticastLock mcastLock;
     private Thread txThread;
@@ -549,6 +611,14 @@ public final class Discovery {
                 .append(" · 自己绕回来 ").append(beaconsSelf)
                 .append(" · 不是我们的 ").append(beaconsBad)
                 .append(" · 版本不对 ").append(beaconsWrongVersion).append('\n');
+        // ★ 控制消息走的就是这一层（见类注释）：这条数一直不动就说明"请求收听/共享音量"
+        //   根本没在路上 —— 上一版把控制消息挂在音频接收器上时，这一点完全看不出来。
+        sb.append("控制消息：发 ").append(ctrlSent).append(" · 收 ").append(ctrlReceived)
+                .append("（和信标同一条 socket，接收器停着也收得到）");
+        if (ctrlLastError != null && ctrlLastError.length() > 0) {
+            sb.append("　最后错误：").append(ctrlLastError);
+        }
+        sb.append('\n');
         sb.append("组播锁  ：").append(multicastLockHeld()
                 ? "已持有 ✓" : "没有 ✗（安卓会把组播/广播帧丢掉）").append('\n');
         sb.append("加入组播：").append(mcastIfaces.isEmpty()
@@ -731,10 +801,10 @@ public final class Discovery {
         // 在线节点），于是变成"电脑明明在广播，手机一个包都收不到"。
         // 单播帧不会被 AP 的组播过滤丢掉，只要互相见过一次面，这条路就一直通。
         int uni = 0;
-        for (String host : knownPeerHosts()) {
+        for (String[] target : knownPeerTargets()) {
             try {
                 s.send(new DatagramPacket(data, data.length,
-                        InetAddress.getByName(host), Proto.DEFAULT_DISCOVERY_PORT));
+                        InetAddress.getByName(target[0]), Integer.parseInt(target[1])));
                 uni++;
                 beaconsSentUni++;
             } catch (IOException | RuntimeException e) {
@@ -749,17 +819,36 @@ public final class Discovery {
         }
     }
 
-    /** 已经见过面的设备 IP（单播信标用）。有上限：局域网里不会有这么多，防的是被人乱刷撑爆。 */
-    private List<String> knownPeerHosts() {
-        List<String> out = new ArrayList<>(8);
+    /**
+     * 已经见过面的设备地址（单播信标用）：{地址, 端口}。有上限 16 台（局域网里不会有这么多，
+     * 防的是被人乱刷撑爆）。
+     *
+     * <p>端口用对端信标里公布的 {@code disc_port}（端口被占时它可能不是 47830）。
+     * 写死默认端口的话，换过端口的那一台就永远收不到我们的单播信标 ——
+     * 而那正是"经常丢设备"最容易藏起来的一种原因。
+     */
+    private List<String[]> knownPeerTargets() {
+        List<String[]> out = new ArrayList<>(8);
         synchronized (lock) {
             for (Peer p : peers.values()) {
                 String h = p.host;
-                if (h != null && !h.isEmpty() && !out.contains(h)) {
-                    out.add(h);
-                    if (out.size() >= 16) {
+                if (h == null || h.isEmpty()) {
+                    continue;
+                }
+                boolean seen = false;
+                for (String[] t : out) {
+                    if (h.equals(t[0])) {
+                        seen = true;
                         break;
                     }
+                }
+                if (seen) {
+                    continue;
+                }
+                out.add(new String[]{h, String.valueOf(p.discPort > 0
+                        ? p.discPort : Proto.DEFAULT_DISCOVERY_PORT)});
+                if (out.size() >= 16) {
+                    break;
                 }
             }
         }
@@ -809,7 +898,7 @@ public final class Discovery {
             o.put("id", nodeId);
             o.put("name", nodeName);
             o.put("platform", defaultPlatform());
-            o.put("version", PROTOCOL_VERSION);
+            o.put("version", APP_VERSION);
             o.put("audio_port", audioPort);
             o.put("web_port", webPort);
             JSONArray sources = new JSONArray();
@@ -819,6 +908,13 @@ public final class Discovery {
             sinks.put(item("speaker", "本机扬声器", "render"));
             o.put("sinks", sinks);
             o.put("busy", busy);
+            // ★ 控制面能力位（2026-10-15）：1 = "请把控制消息发到我的发现端口"。
+            //   恒为 1 —— 这一层的收发本来就是每台节点一直在做的事，没有"有时支持"的中间态。
+            //   电脑端的信标里是同一个键（见 audiomixing/net/discovery.py），两边对称。
+            o.put("ctl", 1);
+            // 我实际绑定的发现端口（被占时可能不是 47830）：对端按它发控制消息，
+            // 写死默认端口的话换过端口的那一台就再也收不到。
+            o.put("disc_port", boundPort);
             // scope/ts 是电脑端就有的字段，手机也带上，双方解析逻辑就完全对称了。
             o.put("scope", "lan");
             o.put("ts", System.currentTimeMillis() / 1000L);
@@ -850,26 +946,29 @@ public final class Discovery {
             if (s == null) {
                 ensureSocket();
                 s = sock;
-                if (s == null) {
-                    sleepQuiet(300);
-                    continue;
-                }
             }
-            try {
-                pkt.setLength(buf.length);
-                s.receive(pkt);
-                handleBeacon(buf, pkt.getLength(), pkt.getAddress());
-            } catch (SocketTimeoutException te) {
-                // 超时是正常的：用它当心跳顺便做过期清理，省一个专用线程。
-            } catch (IOException e) {
-                if (!running) {
-                    return;
+            if (s == null) {
+                // ★ 没有 socket 时【也要】走到下面的 sweep：过期清理不能因为"这一下没网"就整段跳过 ——
+                //   否则 socket 短暂不可用期间，早就断联的对端会一直留在列表里（用户真机截图：
+                //   卡片断联 128 秒还挂在界面上）。睡一下再取新的 socket，线程不能退出。
+                sleepQuiet(300);
+            } else {
+                try {
+                    pkt.setLength(buf.length);
+                    s.receive(pkt);
+                    handleBeacon(buf, pkt.getLength(), pkt.getAddress());
+                } catch (SocketTimeoutException te) {
+                    // 超时是正常的：用它当心跳顺便做过期清理，省一个专用线程。
+                } catch (IOException e) {
+                    if (!running) {
+                        return;
+                    }
+                    // socket 被换掉（切网）时会走到这里；睡一下再取新的 socket，线程不能退出。
+                    sleepQuiet(100);
+                } catch (Throwable t) {
+                    note("信标接收出错：" + t);
+                    sleepQuiet(100);
                 }
-                // socket 被换掉（切网）时会走到这里；睡一下再取新的 socket，线程不能退出。
-                sleepQuiet(100);
-            } catch (Throwable t) {
-                note("信标接收出错：" + t);
-                sleepQuiet(100);
             }
             long now = SystemClock.elapsedRealtime();
             if (now - lastSweep >= 1000) {
@@ -884,9 +983,26 @@ public final class Discovery {
         if (len <= 0 || len > RECV_BUF) {
             return;
         }
+        String text = new String(buf, 0, len, StandardCharsets.UTF_8);
+        // ★ 同一个 socket 上跑两种包：`"ctl":{…}` = 控制消息（见类注释）。
+        //   这一条必须走在信标处理【之前】—— 控制消息没有 id，后面按 id 的那段会直接把它丢掉。
+        String ctl = controlBodyOf(text);
+        if (ctl != null) {
+            String ctlHost = normalizeHost(from);
+            if (!ctlHost.isEmpty() && listener != null) {
+                ctrlReceived++;
+                try {
+                    listener.onControl(ctlHost, ctl);
+                } catch (Throwable t) {
+                    // 回调出问题绝不能连累发现线程：信标那条路还得继续跑。
+                    note("控制消息回调出错：" + t);
+                }
+            }
+            return;
+        }
         JSONObject o;
         try {
-            o = new JSONObject(new String(buf, 0, len, StandardCharsets.UTF_8));
+            o = new JSONObject(text);
         } catch (Exception e) {
             // ★ 不是我们的信标（或者是别人家的 UDP 包）。计数 + 留一个样本：
             //   "一个都没收到"和"收到了但都不是我们的"是完全不同的两个问题。
@@ -962,12 +1078,127 @@ public final class Discovery {
             peer.busy = o.optBoolean("busy", false);
             peer.sources = readItems(o.optJSONArray("sources"));
             peer.sinks = readItems(o.optJSONArray("sinks"));
+            peer.btNames = readNames(o.optJSONArray("bt"));
+            // ★ 控制面协商位：老版本没有这个键 → optInt 给 0 → false，照旧发音频端口。
+            //   只认"真的是 1"，对端把 ctl 写成别的东西时一律当不支持（宁可多发一份到
+            //   音频端口，也不能因为一个看不懂的字段把控制消息整条丢掉）。
+            peer.ctl = o.optInt("ctl", 0) == 1;
+            int discPort = o.optInt("disc_port", 0);
+            if (discPort > 0) {
+                peer.discPort = discPort;
+            }
             peer.lastSeen = System.currentTimeMillis();
             peer.seenTick = SystemClock.elapsedRealtime();
             if (fresh) {
                 dirty = true;
             }
         }
+    }
+
+    /**
+     * 这一帧是不是「控制消息的外衣」（{@code {"wl":1,"ctl":{…正文…}}}）？
+     * 是就返回 ctl 对象的原文，不是就返回 null。
+     *
+     * <p><b>为什么用抠字符串、不再解析一遍 JSON</b>：① 这套收发是每 2 秒一轮的热路径，
+     * 信标本来就要解析一次，多解析一次纯属浪费；② 解析成对象再序列化回去，等于让
+     * JSON 库决定那几个字段写成什么样 —— 而这段正文的读者是 {@code Diagnosis.parse}
+     * （手写扫描，按字段名逐个找），写法必须原样保持，不能让库去做归一化。
+     *
+     * <p>判定规则只有一条：{@code ctl} 后面跟着 <b>对象</b>是控制消息，
+     * 跟着<b>数字</b>就是信标的能力位（我们的信标写的就是 {@code "ctl":1}）。
+     *
+     * <p>单独开成 {@code public static} 是为了让离线门禁能直接断言它（
+     * {@code android/tools/BeaconProbe.java}）—— 这条判定错了就是"一边收得到、一边收不到"，
+     * 是最难在真机上定位的那类故障。
+     */
+    public static String controlBodyOf(String text) {
+        if (text == null) {
+            return null;
+        }
+        int at = text.indexOf("\"ctl\"");
+        if (at < 0) {
+            return null;
+        }
+        int colon = text.indexOf(':', at + 5);
+        if (colon < 0) {
+            return null;
+        }
+        int i = colon + 1;
+        while (i < text.length() && Character.isWhitespace(text.charAt(i))) {
+            i++;
+        }
+        if (i >= text.length() || text.charAt(i) != '{') {
+            return null;      // 是数字（能力位）/ 是别的类型 → 不是控制消息
+        }
+        int depth = 0;
+        boolean inString = false;
+        for (int j = i; j < text.length(); j++) {
+            char c = text.charAt(j);
+            if (inString) {
+                if (c == '\\') {
+                    j++;                  // 跳过被转义的字符：名字里可能有引号或花括号
+                } else if (c == '"') {
+                    inString = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                inString = true;
+            } else if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    return text.substring(i, j + 1);
+                }
+            }
+        }
+        return null;          // 括号不配对（被截断）：当垃圾丢掉，绝不猜
+    }
+
+    /**
+     * ★ 往某台对端的发现端口发一条控制消息（外衣见类注释）。
+     *
+     * <p>用户原话（2026-10-15）：「我们设计了同一局域网设备能互相发现。那它本身就是
+     * 多个设备都在互相同步数据啊」—— 控制消息就该走这条一直活着的路，
+     * 而不是挂在按需启停的音频接收器上。
+     *
+     * @param bodyJson 原来 T_STATS 那份 JSON 正文（{@code Diagnosis.json(...)} 出来的字节）
+     * @return 是否真的发出去了。调用方靠它决定"要不要退回音频端口再发一份" ——
+     *         报成功却其实没出去，就等于把消息静默丢掉。
+     */
+    public boolean sendControl(String bodyJson, String host, int port) {
+        if (bodyJson == null || bodyJson.isEmpty() || host == null || host.isEmpty()) {
+            return false;
+        }
+        MulticastSocket s = sock;
+        if (s == null) {
+            ctrlLastError = "发现层 socket 还没起来，控制消息发不出去";
+            return false;
+        }
+        byte[] data = ("{\"wl\":1,\"ctl\":" + bodyJson + "}").getBytes(StandardCharsets.UTF_8);
+        try {
+            s.send(new DatagramPacket(data, data.length, InetAddress.getByName(host),
+                    port > 0 ? port : Proto.DEFAULT_DISCOVERY_PORT));
+        } catch (IOException | RuntimeException e) {
+            ctrlLastError = host + ":" + port + " 发不出去：" + e;
+            return false;
+        }
+        ctrlSent++;
+        return true;
+    }
+
+    /** 这一层收发了多少条控制消息（诊断报告用）。 */
+    public long controlsSent() {
+        return ctrlSent;
+    }
+
+    public long controlsReceived() {
+        return ctrlReceived;
+    }
+
+    public String controlLastError() {
+        return ctrlLastError;
     }
 
     private static List<String> readItems(JSONArray arr) {
@@ -982,6 +1213,27 @@ public final class Discovery {
             }
             String n = it.optString("name", "");
             out.add(n.isEmpty() ? it.optString("id", "") : n);
+        }
+        return out;
+    }
+
+    /**
+     * 读一个<b>纯字符串数组</b>（电脑端信标里的 {@code "bt"}：它的蓝牙设备名列表）。
+     *
+     * <p>为什么不能复用 {@link #readItems}：那个只认"对象数组"（每条读 {@code name}/{@code id}），
+     * 而 {@code bt} 跟 {@code sources}/{@code sinks} 不一样，它是纯字符串 —— 硬套会把每条都读成空。
+     * 读不到就当空表（老版本电脑没有这个键）—— 空表含义就是"没名单"，界面直接走 WiFi。
+     */
+    private static List<String> readNames(JSONArray arr) {
+        if (arr == null || arr.length() == 0) {
+            return Collections.emptyList();
+        }
+        List<String> out = new ArrayList<>(arr.length());
+        for (int i = 0; i < arr.length(); i++) {
+            String n = arr.optString(i, "").trim();
+            if (!n.isEmpty()) {
+                out.add(n);
+            }
         }
         return out;
     }

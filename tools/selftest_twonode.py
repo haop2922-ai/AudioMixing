@@ -26,21 +26,27 @@ import threading
 import time
 import urllib.request
 
-sys.path.insert(0, r"E:\AI\deep blue\wavelink")
+# ★ 2026-10-15 自查发现的真 bug：这里原来写死的是**另一台机器/另一个目录**的绝对路径
+#   （旧副本那一条），而那个目录早就不存在了 —— 于是这个自检在文档里怎么写都跑不起来
+#   （ModuleNotFoundError: No module named 'audiomixing'）。自查时是加
+#   PYTHONPATH=. 才勉强跑通的。
+#   正确做法是从本文件反推仓库根：脚本在 tools/ 下，根就是它的上一层。
+#   写死绝对路径这种东西一旦留下，换台机器/换个目录就静默失效，而且报错完全指不到真凶。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # This script starts two real nodes, which write config files. Point that at a
 # throwaway directory: a verification run must never touch the user's
-# %APPDATA%\WaveLink (it once saved test ports 17902/48402 into the real config,
+# %APPDATA%\AudioMixing (it once saved test ports 17902/48402 into the real config,
 # which then made the control panel listen somewhere the user did not expect).
 # The sandbox is removed again on exit so a test run leaves nothing behind.
-_SANDBOX = tempfile.mkdtemp(prefix="wavelink-selftest-")
-os.environ["WAVELINK_HOME"] = _SANDBOX
+_SANDBOX = tempfile.mkdtemp(prefix="audiomixing-selftest-")
+os.environ["AUDIOMIXING_HOME"] = _SANDBOX
 atexit.register(lambda: shutil.rmtree(_SANDBOX, ignore_errors=True))
 
 from audiomixing.audio import base as audio_base  # noqa: E402
 from audiomixing.audio.format import CHANNELS, SAMPLE_RATE, make_tone, signal_report  # noqa: E402
 from audiomixing.config import Config  # noqa: E402
-from audiomixing.engine import WaveLinkNode  # noqa: E402
+from audiomixing.engine import AudioMixingNode  # noqa: E402
 from audiomixing.webui import WebUI  # noqa: E402
 
 PASS = "PASS"
@@ -114,8 +120,8 @@ def main() -> int:
     cfg_b.routes = []
     cfg_b.manual_peers = []
 
-    node_a = WaveLinkNode(cfg_a, audio_port=audio_port_a, discovery_port=disc_port_a)
-    node_b = WaveLinkNode(cfg_b, audio_port=audio_port_b, discovery_port=disc_port_b)
+    node_a = AudioMixingNode(cfg_a, audio_port=audio_port_a, discovery_port=disc_port_a)
+    node_b = AudioMixingNode(cfg_b, audio_port=audio_port_b, discovery_port=disc_port_b)
     ui_a = WebUI(node_a, host="127.0.0.1", port=web_a)
     ui_b = WebUI(node_b, host="127.0.0.1", port=web_b)
 

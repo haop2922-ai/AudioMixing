@@ -24,15 +24,15 @@ import shutil as _shutil
 import tempfile as _tempfile
 
 # Verification scripts must never read or write the user's real config: they start
-# real nodes, and a stray run once saved test ports into %APPDATA%\WaveLink.
+# real nodes, and a stray run once saved test ports into %APPDATA%\AudioMixing.
 # The sandbox is removed again on exit so a test run leaves nothing behind.
-if "WAVELINK_HOME" not in _os.environ:
-    _sandbox = _tempfile.mkdtemp(prefix="wavelink-check-")
-    _os.environ["WAVELINK_HOME"] = _sandbox
+if "AUDIOMIXING_HOME" not in _os.environ:
+    _sandbox = _tempfile.mkdtemp(prefix="audiomixing-check-")
+    _os.environ["AUDIOMIXING_HOME"] = _sandbox
     _atexit.register(lambda: _shutil.rmtree(_sandbox, ignore_errors=True))
 
 from audiomixing.config import Config
-from audiomixing.engine import WaveLinkNode
+from audiomixing.engine import AudioMixingNode
 
 failures: list[str] = []
 
@@ -43,16 +43,16 @@ def check(name: str, ok: bool, detail: str = "") -> None:
         failures.append(name)
 
 
-def make_node(name: str, node_id: str) -> WaveLinkNode:
+def make_node(name: str, node_id: str) -> AudioMixingNode:
     cfg = Config()
     cfg.node_id = node_id
     cfg.name = name
     cfg.routes = []
     cfg.manual_peers = []
-    return WaveLinkNode(cfg, audio_port=0, discovery_port=0, simulate=True)
+    return AudioMixingNode(cfg, audio_port=0, discovery_port=0, simulate=True)
 
 
-def add_peer(node: WaveLinkNode, node_id: str, name: str, host: str, port: int) -> None:
+def add_peer(node: AudioMixingNode, node_id: str, name: str, host: str, port: int) -> None:
     node.registry.update(
         {"wl": 1, "id": node_id, "name": name, "audio_port": port, "web_port": 1,
          "sources": [{"id": "s", "name": "扬声器 [loopback]", "detail": "loopback"}],

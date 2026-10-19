@@ -117,7 +117,7 @@ async function start(){
   running = true;
   $('btn').textContent = '停止发送';
   $('btn').classList.add('stop');
-  setState('正在发送（电脑面板 ⑥ 频道的音源里会出现这台手机）', 'on');
+  setState('正在发送（电脑面板「频道」的音源里会出现这台手机）', 'on');
   pump();
   setInterval(() => {
     $('sent').textContent = (sent / 10).toFixed(1);

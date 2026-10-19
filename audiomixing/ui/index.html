@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Audio Mixing · 局域网声音投射</title>
+<!-- ★ favicon：2026-10-17 用户（图1 左上角 / 图2）反馈「logo 不显示」——浏览器标签页上
+     只有一个默认的白纸图标。这里用内联 data-URI 的 SVG 画同一套「蓝色渐变圆角方块 + 白 A」，
+     刻意不引外部文件：这台电脑/手机在局域网里打开，外链图片根本加载不出来，
+     tools/check_ui_syntax.py 也会把任何 http(s) 外链判为不合格。 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%2338bdf8'/%3E%3Cstop offset='1' stop-color='%236366f1'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='url(%23g)'/%3E%3Cpath fill='%23fff' fill-rule='evenodd' d='M32 13L50 51L41.4 51L38.3 44L25.7 44L22.6 51L14 51Z M32 25.5L27.4 36L36.6 36Z'/%3E%3C/svg%3E">
 <style>
 :root{
   /* ★ 这一套令牌【直接抄】audiomixing/ui/phone.html 的 :root —— 手机端才是这套主题的
@@ -29,21 +34,97 @@ body{
 }
 code,.mono{font-family:ui-monospace,"Cascadia Code",Consolas,monospace;font-variant-numeric:tabular-nums}
 
-/* ---------- top bar ---------- */
-.top{
-  position:sticky; top:0; z-index:30; display:flex; align-items:center; gap:12px;
-  padding:12px 22px; background:rgba(7,11,18,.82); backdrop-filter:blur(12px);
-  border-bottom:1px solid var(--line);
+/* ---------- ★ 外壳：一级菜单（左）+ 二级菜单（上）+ 内容 ----------
+   ★ 2026-10-16 用户（图2）：「UI问题，学习localsend。按我的图2排版」——
+   照他画的图重做：左边一竖条**一级菜单**（LOGO / 监控 / 简洁 / 详细 / 二维码 / 版本号），
+   上面一行**二级菜单**（本机状态 / 设备与路由 / 广播 / 多耳机），右边是**对应内容显示**。
+   括号里的字是他写给我看的**标注**（比如他在「设备与路由」旁边括注的「蓝牙 + WiFi」），按他明确要求
+   **不进按钮文案** —— 按钮上只有「设备与路由」四个字。
+   为什么这次顺手把多列装箱整个删掉：他原话「这次直接改ui设计免得你对不齐」——
+   单列 + 标签页，两列不齐这个类别的问题从此不存在。 */
+/* ★ 2026-10-16（图5）：原来 `.app` 是 align-items:flex-start —— 左栏不会被拉伸到视口高度，
+   于是 `.verline{margin-top:auto}` 根本推不到底，内容不多的时候版本号就浮在半空而不是
+   窗口左下角。改成 stretch（左栏本来就 sticky，不影响滚动行为）+ 给左栏一个最小高度。 */
+.app{display:flex;align-items:stretch;min-height:100vh;max-width:1520px;margin:0 auto}
+.rail{
+  flex:0 0 172px;display:flex;flex-direction:column;gap:7px;padding:16px 12px 18px;
+  border-right:1px solid var(--line);position:sticky;top:0;align-self:stretch;
+  min-height:100vh;max-height:100vh;overflow:auto;
 }
-.brand{display:flex; align-items:center; gap:10px; font-weight:650; font-size:15.5px; letter-spacing:.2px}
-.brand .mark{
+/* 左栏里的项长得必须一模一样（有用例按钮、也有一个 <a> 的「监控」）——
+   不然那一项看着比别人"更突出"，用户（图1）会以为它有更高的优先级。 */
+.rail a.linkbtn{
+  width:100%;justify-content:flex-start;font-size:13.5px;font-weight:600;
+  padding:9px 11px;border-radius:12px;border:1px solid transparent;
+  background:rgba(255,255,255,.04);color:var(--fg);
+}
+.rail a.linkbtn:hover{border-color:var(--line2);background:rgba(255,255,255,.07);color:var(--fg)}
+/* 点完按钮浏览器会画一圈焦点框 —— 和"选中"长得太像，于是同一列里看着有两项被选中
+   （用户图1 就是这么误读的："二维码的优先级比其他项高"）。这里去掉焦点框，
+   "选中"只由 .on 表达。 */
+.rail button:focus,.rail a:focus,.tabs .tab:focus{outline:none}
+.rail .logo{display:flex;align-items:center;gap:9px;font-weight:650;font-size:14.5px;
+  letter-spacing:.2px;margin:2px 2px 10px}
+.rail .mark{
   /* 手机端的 logo：34px 圆角 11px 渐变方块 + 柔和外发光 */
-  width:34px;height:34px;border-radius:11px;flex:0 0 auto;
+  width:30px;height:30px;border-radius:10px;flex:0 0 auto;
   background:linear-gradient(140deg,var(--acc),var(--acc2));
   box-shadow:0 6px 18px rgba(56,189,248,.28);
-  display:grid;place-items:center;color:#04121f;font-size:15px;font-weight:800;
+  display:grid;place-items:center;color:#04121f;font-size:14px;font-weight:800;
 }
-.spacer{flex:1}
+.rail button{
+  display:block;width:100%;text-align:left;padding:9px 11px;border-radius:12px;
+  border:1px solid transparent;background:rgba(255,255,255,.04);
+  font-size:13.5px;font-weight:600;color:var(--fg);
+}
+.rail button:hover{border-color:var(--line2);background:rgba(255,255,255,.07)}
+.rail button.on{color:var(--fg);border-color:rgba(56,189,248,.4);
+  background:linear-gradient(140deg,rgba(56,189,248,.16),rgba(167,139,250,.10))}
+.rail .sep{height:1px;background:var(--line);margin:7px 2px}
+.rail .node{margin:0 2px 8px;font-size:12px;color:var(--dim);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.rail .verline{margin-top:auto;padding-top:10px;font-size:11.5px;color:var(--dim2);line-height:1.55}
+.main{flex:1 1 auto;min-width:0;display:flex;flex-direction:column}
+.tabs{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:14px 18px 0}
+.tabs .tab{padding:8px 15px;border-radius:12px;border:1px solid var(--line);
+  background:rgba(255,255,255,.03);color:var(--dim);font-size:13.5px;font-weight:600}
+.tabs .tab:hover{color:var(--fg);border-color:var(--line2)}
+.tabs .tab.on{color:var(--fg);border-color:rgba(56,189,248,.45);
+  background:linear-gradient(140deg,rgba(56,189,248,.16),rgba(167,139,250,.10))}
+.tabs .grow{flex:1 1 auto}
+.panes{padding:8px 18px 30px;min-width:0}
+/* 只显示当前一级/二级菜单对应的内容 —— 这就是"二级菜单（对应详细和简洁）"的落点。
+   先默认全部藏起来，再把当前这一个放出来（后一条选择器更长，特异性更高，一定赢）。 */
+.card[data-pane]{display:none}
+body[data-pane="status"] .card[data-pane="status"],
+body[data-pane="devices"] .card[data-pane="devices"],
+body[data-pane="cast"] .card[data-pane="cast"],
+body[data-pane="multi"] .card[data-pane="multi"],
+body[data-pane="qr"] .card[data-pane="qr"],
+body[data-pane="ver"] .card[data-pane="ver"]{display:block}
+/* ★ 2026-10-18 用户：「二维码和版本号的二级菜单不要显示。只仅在详细和简洁有二级菜单」。
+   一级菜单停在「二维码 / 版本号」那两页时，二级菜单那四个标签（本机状态 / 设备与路由 /
+   广播 / 多耳机）整排不显示 —— 那两页不属于任何一个二级标签，摆着只会让人以为点了会有反应。
+   右边那一排全局动作按钮（放行防火墙 / 诊断 / 快速上手 / 测试音箱 / 刷新）**留着**：
+   它们不是二级菜单，是随手要点的工具（`.tabs .grow` 会把它们继续顶在右端）。 */
+/* ★ 2026-10-18：这里原来还有一条 `body[data-pane="qr"|"ver"] .card[data-pane=...]{display:block !important}`
+   （为了修"简洁档点「版本号」是一整页空白"）。改成**更对症**的做法：把「版本与运行」和
+   「设备关系图」两张卡片的 `full` 类去掉（见下面它们的标记）—— 它们本来就该在简洁档也看得见，
+   而「日志」那张卡照旧带 `full`，在简洁档收起来。用 !important 一把盖住整页会把日志也一起放出来，
+   那个"简洁档连日志都露"的副作用没必要引入。 */
+body[data-pane="qr"] .tabs .tab,
+body[data-pane="ver"] .tabs .tab{display:none}
+@media(max-width:860px){
+  .app{flex-direction:column;min-height:0}
+  .rail{flex:1 1 auto;flex-direction:row;flex-wrap:wrap;align-items:center;
+    position:static;min-height:0;max-height:none;border-right:0;border-bottom:1px solid var(--line);
+    padding:12px 14px}
+  .rail .logo{width:100%;margin:0 0 6px}
+  .rail button{width:auto}
+  .rail .node{width:100%;margin:0 0 6px}
+  .rail .sep{display:none}
+  .rail .verline{margin:0;padding:0;width:100%}
+}
 .tag{
   display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;
   background:rgba(255,255,255,.03);border:1px solid var(--line);color:var(--dim);
@@ -96,25 +177,28 @@ button.tiny{padding:4px 9px;font-size:11.5px;border-radius:9px}
 .banner.no .v{color:var(--warn);border-color:rgba(251,191,36,.3);background:rgba(26,20,5,.7)}
 
 /* ---------- layout ---------- */
-.wrap{max-width:1520px;margin:0 auto;padding:22px;display:grid;grid-template-columns:minmax(0,1.95fr) minmax(0,1fr);gap:22px;align-items:start}
-@media(max-width:1150px){.wrap{grid-template-columns:1fr;gap:18px}}
-.col{display:flex;flex-direction:column;gap:18px;min-width:0}
+/* ★ 2026-10-16：`.wrap / .col` 那套"两列网格 + 按高度装箱"整个删掉了（用户：
+   「这次直接改ui设计免得你对不齐」）。现在是单列内容 + 标签页，见上面的 .app/.rail/.panes。 */
 
-.card{background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden}
+/* ★ 2026-10-16 用户要求「取消所有大块的设计，让界面变的紧凑」：
+   卡片不再是"一只带边框的大盒子"，改成**扁平分区 + 一条细分隔线**，整页读起来是一整块。
+   注意 border-radius 必须原样留 16px —— 手机端主题对拍测试就按这个值比对
+   （tests 的 TestThemeParityWithPhone 那条），而底色去掉之后它本来就看不出来。 */
+.card{background:transparent;border:0;border-radius:16px;overflow:visible}
 .card>h2{
   display:flex;align-items:center;gap:10px;
-  margin:0;padding:15px 18px;font-size:15px;font-weight:650;letter-spacing:.2px;
+  margin:0;padding:16px 0 8px;font-size:13.5px;font-weight:650;letter-spacing:.2px;
   border-bottom:1px solid var(--line);background:transparent;
-}
-.card>h2 .n{
-  display:grid;place-items:center;width:24px;height:24px;border-radius:9px;flex:0 0 auto;
-  background:rgba(255,255,255,.05);border:1px solid var(--line);color:var(--dim);
-  font-size:11.5px;font-weight:700;
 }
 .card>h2 .sub{font-weight:400;color:var(--dim);font-size:12.5px}
 .card>h2 .right{margin-left:auto;display:flex;gap:8px;align-items:center}
-.body{padding:16px 18px}
-.body.tight{padding:12px 18px}
+/* ★ 紧凑（用户原话：「可以紧凑些」「取消所有大块」）。只收留白 —— 圆角/字号这些**共享值
+   一个都没动**，手机端那几个值有对拍测试盯着（见 tests 里的主题一致性那几条）。
+   编号徽章（.card>h2 .n）连同标题里的①②③一起删掉了（用户：「连编号也去掉」）。
+   2026-10-16（图7）之后卡片顺序就是 HTML 里的顺序 —— 拖动/⤢ 和那套记在 localStorage
+   里的版面机制全删了，所以 data-card 只剩"这张卡叫什么"的标记意义。 */
+.body{padding:10px 0}
+.body.tight{padding:8px 0}
 
 /* ---------- device table ---------- */
 table{width:100%;border-collapse:collapse}
@@ -140,6 +224,12 @@ td.addr{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--d
 .chip .k{font-size:10.5px;padding:1px 5px;border-radius:4px;font-weight:600;letter-spacing:.02em}
 .chip.sys .k{background:rgba(52,211,153,.14);color:#7ee7bd}
 .chip.out .k{background:rgba(56,189,248,.15);color:#9cd8f8}
+/* ★ 2026-10-16 用户：「这种电脑准备好了的，直接标黄，然后『手机未连接』」——
+   电脑侧已经就绪、只等手机把媒体音频发过来的状态，用黄色（--warn 那一套色）标出来，
+   一眼能看出"就差这一步"，而不是灰扑扑的像断了。
+   类名刻意不叫 .warn：简洁档有一条规则会把 .warn 元素整个隐藏。 */
+.chip.amber{border-color:rgba(251,191,36,.3);background:rgba(251,191,36,.08)}
+.chip.amber .k{background:rgba(251,191,36,.16);color:#fcd34d}
 .chip .x{color:var(--dim2);font-size:11px}
 
 .more{margin-top:7px;font-size:11.5px;color:var(--dim2)}
@@ -174,42 +264,60 @@ td.addr{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--d
    用户要"照手机端的样子、不要拖拽"。所以这里是设备为中心的卡片：
    名字 · 平台/IP · 状态标签 · 电平条 · 两个按钮（收听它的 / 送给它）。 */
 .dvtitle{font-size:12px;color:var(--dim);margin:14px 0 8px;padding-top:12px;border-top:1px solid var(--line)}
-/* 宽屏就把设备卡片排成两列（手机端是单列，但电脑是宽屏 —— 令牌照抄、排布用起宽度） */
-#deviceCards{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:12px}
+/* 宽屏就把设备卡片排成多列（手机端是单列，但电脑是宽屏 —— 令牌照抄、排布用起宽度） */
+/* ★ 2026-10-16 用户（图1，第三次说同一件事）：「我一直在说这些设备的卡片大小保持一致」。
+   图1 里最刺眼的那一处出在 `auto-fit`：它会把**空轨道折叠掉**，所以"局域网"只有一张卡时
+   那张卡被拉满整行（实测 980px），而下面蓝牙三张是 210px 的小方块 —— 一个满行、三个小方块，
+   怎么看都不是"一样大"。所以第一步是 `auto-fit` → `auto-fill`（空轨道保留，单张卡也不涨宽），
+   两个列表合并成**同一套栅格**：不管里面是几根条、几个滑杆、几个按钮，**宽度一律一样**。 */
+#deviceCards, #btList{
+  display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:10px;
+  align-items:stretch;
+}
+/* ★ 2026-10-16 用户（图2）改口：「蓝牙和 WiFi 的方块同宽就好了。不需要同高。（不然会留白不好看）」
+   —— 所以上一轮那条 `min-height:196px` 已经删掉：高度回到"内容决定"，卡片不再硬撑成一样高，
+   蓝牙方块下面那块多余的留白也就没有了。**宽度仍然一致**（靠上面那条共用栅格）。 */
 .dvcard{
-  background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:16px;
-  padding:14px 15px;transition:.16s;
+  background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:14px;
+  padding:8px 10px;transition:.16s;
+  display:flex;flex-direction:column;
 }
 .dvcard:hover{border-color:var(--line2)}
 .dvcard.self{border-color:rgba(56,189,248,.3);background:linear-gradient(180deg,rgba(56,189,248,.07),transparent)}
 .dvcard.off{opacity:.55}
-.dvhead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.dvname{font-weight:650;font-size:15.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dvtag{font-size:11px;padding:3px 9px;border-radius:999px;background:rgba(52,211,153,.12);
+.dvhead{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.dvname{font-weight:650;font-size:14px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dvtag{font-size:10.5px;padding:2px 8px;border-radius:999px;background:rgba(52,211,153,.12);
   border:1px solid rgba(52,211,153,.3);color:#7ee7bd;white-space:nowrap}
 .dvtag.me{background:rgba(56,189,248,.12);border-color:rgba(56,189,248,.32);color:#9cd8f8}
-.dvmeta{font-size:12px;color:var(--dim);margin-top:6px;font-family:ui-monospace,Menlo,Consolas,monospace}
+.dvmeta{font-size:11px;color:var(--dim);margin-top:2px;font-family:ui-monospace,Menlo,Consolas,monospace}
 /* 22 段电平条（和手机端 .bars 同一套做法：一段一段点亮） */
-.dvbar{display:flex;gap:3px;align-items:flex-end;height:22px;margin-top:10px}
-.dvbar i{flex:1;height:6px;border-radius:3px;background:rgba(255,255,255,.10);transition:height .1s linear}
+.dvbar{display:flex;gap:2px;align-items:flex-end;height:14px;margin-top:5px}
+.dvbar i{flex:1;height:5px;border-radius:2px;background:rgba(255,255,255,.10);transition:height .1s linear}
 .dvbar i.hot{background:linear-gradient(180deg,var(--acc),var(--ok))}
 .dvflow{font-size:12px;color:var(--dim);margin-top:6px;font-variant-numeric:tabular-nums}
+/* ★ 2026-10-18 用户：「电脑端蓝牙每次操作都会让整个模块重新刷新，我要求仅被操作卡片刷新」。
+   忙态只落在**这一张**卡片里（一句灰字 + 它的按钮临时禁用），不再整块换 innerHTML。 */
+.dvcard.btbusy{opacity:.75}
+.dvcard .btbusynote{margin-top:7px;font-size:12px;color:var(--dim)}
+.dvcard button[disabled]{opacity:.5;cursor:default}
 /* 收 / 送 两条实时电平（左边一个字的标签 + 22 段条 + 数字） */
-.dvlevel{display:flex;align-items:center;gap:9px;margin-top:9px}
-.dvlevel .lbl{width:16px;flex:0 0 auto;color:var(--dim);font-size:12px}
+.dvlevel{display:flex;align-items:center;gap:7px;margin-top:4px}
+/* 标签从 16px 放宽到 26px：2026-10-16 起这里会出现两个字（「输出」「信号」）。 */
+.dvlevel .lbl{width:26px;flex:0 0 auto;color:var(--dim);font-size:11.5px}
 .dvlevel .dvbar{flex:1;margin-top:0}
-.dvlevel .num{flex:0 0 auto;min-width:74px;text-align:right;font-size:11.5px;color:var(--dim);
+.dvlevel .num{flex:0 0 auto;min-width:66px;text-align:right;font-size:11px;color:var(--dim);
   font-variant-numeric:tabular-nums}
 /* ★ 用户要的"各设备可调节的音量条"：滑块和电平条并排，滑的是我们这一层的增益 */
-.dvslide{display:flex;align-items:center;gap:9px;margin-top:8px}
-.dvslide .lbl{width:58px;flex:0 0 auto;color:var(--dim);font-size:12px}
-.dvslide input[type=range]{flex:1;min-width:80px;accent-color:var(--acc)}
-.dvslide .val{flex:0 0 auto;min-width:34px;text-align:right;font-size:11.5px;color:var(--dim);
+.dvslide{display:flex;align-items:center;gap:7px;margin-top:5px}
+.dvslide .lbl{width:52px;flex:0 0 auto;color:var(--dim);font-size:11.5px}
+.dvslide input[type=range]{flex:1;min-width:70px;accent-color:var(--acc)}
+.dvslide .val{flex:0 0 auto;min-width:32px;text-align:right;font-size:11px;color:var(--dim);
   font-family:ui-monospace,Menlo,Consolas,monospace}
-.dvslide .dvtag2{flex:0 0 auto;font-size:10.5px;color:var(--dim2);white-space:nowrap}
+.dvslide .dvtag2{flex:0 0 auto;font-size:10px;color:var(--dim2);white-space:nowrap}
 .dvslide input[type=range]:disabled{opacity:.45}
-.dvacts{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
-.dvself{font-size:12px;color:var(--dim)}
+.dvacts{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px}
+.dvacts button{padding:3px 8px;font-size:11px;border-radius:9px}
 @media(max-width:560px){.dvacts button{flex:1 1 auto}}
 
 .pick{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px}
@@ -220,8 +328,7 @@ td.addr{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--d
 .picklist{display:flex;flex-direction:column;gap:6px}
 .picklist .chk{display:flex;align-items:center;gap:8px;font-size:12.5px}
 
-/* 卡片摆放的抓手（moveCard 用，和路由拖拽无关） */
-.grip{color:var(--dim2);font-size:13px;letter-spacing:-1px;line-height:1;cursor:grab}
+/* ★ 2026-10-16 用户（图7）之后卡片不再有抓手/拖拽，.grip 那条规则随功能一起删掉。 */
 
 .fields{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
 .f{display:flex;flex-direction:column;gap:5px}
@@ -244,10 +351,10 @@ input:focus,select:focus{outline:none;border-color:var(--acc);
 
 /* ---------- stats ---------- */
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:10px}
-.stat{background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:12px;padding:12px 13px}
-.stat .k{font-size:11.5px;color:var(--dim);margin-bottom:3px}
-.stat .v{font-size:17px;font-weight:700;font-variant-numeric:tabular-nums}
-.stat .v.sm{font-size:14px}
+.stat{background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:12px;padding:7px 10px}
+.stat .k{font-size:11px;color:var(--dim);margin-bottom:2px}
+.stat .v{font-size:15px;font-weight:700;font-variant-numeric:tabular-nums}
+.stat .v.sm{font-size:13px}
 .stat .v.ok{color:var(--ok)}
 .stat .v.warn{color:var(--warn)}
 
@@ -263,7 +370,7 @@ pre{
   padding:12px 14px;overflow:auto;max-height:230px;font-size:11.5px;line-height:1.75;color:#93a1b3;
   font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all;
 }
-.msg{font-size:12.5px;color:var(--dim);min-height:1.2em}
+/* .msg 那条规则随 #setMsg 一起删掉（2026-10-16）：页面上已经没有这个元素了。 */
 .warnbox{padding:11px 14px;border-radius:12px;font-size:12.5px;line-height:1.65;
   background:rgba(248,113,113,.09);border:1px solid rgba(248,113,113,.28);color:#fca5a5;margin-top:10px}
 /* 黄字版：用来报"能用但要当心"，红字版报"现在就是坏的"。
@@ -311,30 +418,102 @@ pre{
 .toast.show{opacity:1;transform:translate(-50%,0)}
 .toast.ok{border-color:rgba(52,211,153,.45)}
 .toast.err{border-color:rgba(248,113,113,.5)}
+
+/* ---------------- 设备关系图（ComfyUI 风格） ----------------
+   ★ 2026-10-18 用户要求：节点可拖、线是柔和的曲线、按连接方式分色（WiFi 蓝 / 蓝牙绿 / 广播橙），
+   整块当成"图标式的监控"，只表示连接关系。节点是绝对定位的 div（好做圆角卡片和圆点），
+   线画在它下面那层 SVG 里（好做贝塞尔 + 点线删除 + 命中测试）。 */
+#relWrap{position:relative;height:400px;overflow:hidden;border:1px solid var(--line);
+  border-radius:14px;background:
+    radial-gradient(700px 300px at 12% 0%,rgba(56,189,248,.06),transparent),
+    radial-gradient(600px 300px at 88% 100%,rgba(167,139,250,.06),transparent),
+    rgba(255,255,255,.02);
+  /* ★ 2026-10-18 用户：「comfyui不要有滚动条，可以用按住CTRL+滚轮放大缩小。像网页一样。
+     但是不能连着外面主页面一起变」——所以这里 overflow:hidden（一条滚动条都不出现），
+     改用「Ctrl+滚轮缩放 + 在空白处按住拖平移」来逛整张图，见 relInitEvents 里的说明。 */
+  cursor:grab}
+#relWrap.panning{cursor:grabbing}
+#relCanvas{position:relative;min-width:100%;width:1000px;height:400px;min-height:100%;transform-origin:0 0}
+#relSvg{position:absolute;left:0;top:0;width:100%;height:100%;overflow:visible}
+/* ★ 节点层必须 `pointer-events:none` + 节点自己 `auto`：这一层是一个铺满整块的 div，
+   默认会**挡住底下 SVG 里的线** —— 后果就是"点线删除"永远点不中（鼠标落在 div 上，
+   而不是在那条 path 上）。节点自己开着 auto，所以拖拽/圆点照常。
+   ★ 幽灵线（拖出来的那半条）也要 none：松手那一刻它正好停在指针底下，
+   不关掉的话 elementFromPoint 会先摸到它，落点判断就废了。 */
+#relNodes{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}
+#relSvg .ln{fill:none;stroke-width:2.4;stroke-linecap:round;cursor:pointer;pointer-events:stroke}
+#relSvg .ln.wifi{stroke:#38bdf8}
+#relSvg .ln.bt{stroke:#34d399}
+#relSvg .ln.bc{stroke:#fbbf24}
+#relSvg .ln.dashed{stroke-dasharray:6 6;opacity:.55}
+/* ★ 2026-10-18 用户第 4 条：「如果comfyui的线图出现了回环，即声音回环。要在ui最上方表明警告。
+   并将回环线路标红，但是正常运行，一切后果让使用者自己承担。」——回环的线一律标红加粗，
+   程序照常跑（不拦），顶部那条警告条见 renderLoopWarn。 */
+#relSvg .ln.cycle{stroke:#f87171;stroke-width:3.6;opacity:1;stroke-dasharray:none}
+#relSvg .ln:hover{stroke-width:4}
+#relSvg .lnhot{fill:none;stroke:transparent;stroke-width:16;cursor:pointer}
+#relSvg .ghost{fill:none;stroke:#8ea0b8;stroke-width:2.4;stroke-dasharray:5 5;pointer-events:none}
+.relnode{position:absolute;width:158px;padding:9px 12px;border-radius:13px;cursor:grab;
+  background:rgba(255,255,255,.05);border:1px solid var(--line);user-select:none;
+  /* 上面那层 `pointer-events:none` 是为了不挡线；节点自己必须收回点击权。 */
+  pointer-events:auto;
+  transition:border-color .15s,box-shadow .15s}
+.relnode:hover{border-color:var(--line2)}
+.relnode.self{border-color:rgba(56,189,248,.45);
+  background:linear-gradient(180deg,rgba(56,189,248,.10),rgba(99,102,241,.06))}
+.relnode.bt{border-color:rgba(52,211,153,.35)}
+.relnode.off{opacity:.5}
+.relnode .rn{font-weight:650;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;color:var(--fg)}
+.relnode .rs{font-size:11px;color:var(--dim);margin-top:2px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;
+  font-family:ui-monospace,Menlo,Consolas,monospace}
+.relnode .rk{position:absolute;top:50%;width:12px;height:12px;margin-top:-6px;border-radius:50%;
+  background:#141c28;border:2px solid var(--line2)}
+/* ★ 2026-10-18 用户第 2 条：「comfyui中应当只能控制电脑的主动发送声音。我刚刚连线发现，
+   手机设备的发送线也能拖拽」——现在**只有本机那两个圆点能当拖拽起点**：
+     本机右侧「送」→ 拖到某台设备 = 本机送给它（主动发）；
+     本机左侧「收」→ 拖到某台设备 = 本机收听它（用户当场选了"送+收都留"）。
+   设备那一侧的圆点只是**落点提示**（不是拖拽起点）；蓝牙那张连落点都不给，免得拖半天
+   拖出一条不存在的路由（蓝牙是物理链路，不是路由端点）。 */
+.relnode .rk.send{right:-7px;cursor:crosshair}
+.relnode .rk.recv{left:-7px;cursor:crosshair}
+.relnode .rk.drop{left:-7px;background:rgba(255,255,255,.05);border-color:var(--line)}
+.relnode .rk:hover{border-color:var(--acc);background:var(--acc)}
+.relnode.bt .rk{display:none}
+.rellegend{display:flex;gap:18px;flex-wrap:wrap;align-items:center;margin-top:10px;
+  font-size:12px;color:var(--dim)}
+.rellegend .sw{display:inline-block;width:18px;height:3px;border-radius:2px;margin-right:6px;
+  vertical-align:middle}
+.rellegend .sw.wifi{background:#38bdf8}
+.rellegend .sw.bt{background:#34d399}
+.rellegend .sw.bc{background:#fbbf24}
+.rellegend .sw.cyc{background:#f87171}
+.rellegend .dim{color:var(--dim2)}
+/* ★ 2026-10-18 用户第 4 条：回环要在 UI 最上方警告。这一条是全局的（每一页都看得见），
+   因为回环是**整套路由**的性质，不该非得点进「版本号」才知道。 */
+#loopWarn{display:none;margin:10px 18px 0;padding:10px 14px;border-radius:12px;
+  font-size:13px;line-height:1.75;font-weight:600;
+  background:rgba(248,113,113,.10);border:1px solid rgba(248,113,113,.45);color:#ffc9c9}
+#loopWarn b{color:#fca5a5}
+
 /* ---------------- display modes ----------------
    简洁 is the default: three things a person actually decides (谁在线 / 听什么 / 播到哪),
    with every explanation, table, counter and log tucked behind 详细. Nothing is removed
    from the DOM, only hidden, so the scripts keep finding every element they need. */
-html:not(.fullui) .full,
-html:not(.fullui) .note,
-html:not(.fullui) .tip,
-html:not(.fullui) .warn,
-html:not(.fullui) .tech { display: none !important; }
+/* ★ 2026-10-18：这一组（.full/.note/.tip/.warn/.tech）原来在文件里**重复写了两遍**，
+   下面那一组是它的超集（多了 .mini/.bthint/.more/.sub/#backendTag）。重复的那一版删掉，
+   只留下面完整的那一组 —— 同一份规则写两处，改一处漏一处是迟早的事。 */
 /* These two live inside a .note but are the point of the card in 简洁: the current
    state, and the address to open on a phone. */
 html:not(.fullui) #chState,
 html:not(.fullui) #phoneUrl { display: block !important; }
-/* The peer list has two shapes: a one-line-per-device list for 简洁 and the full table
-   (with every device each peer can capture or play) for 详细, which is what the
-   drag-and-drop route builder needs. */
-html.fullui .brief { display: none !important; }
-.peerline { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); }
-.peerline:last-child { border-bottom: 0; }
-.peerline .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* Level sparkline: the one reading that tells a person "is sound flowing right now",
-   which no counter does. Kept in 简洁 too, because that is where it matters most. */
-.spark { background: rgba(255,255,255,.03); border: 1px solid var(--line); border-radius: 12px; padding: 7px 9px 2px; margin-bottom: 12px; }
-.spark svg { display: block; width: 100%; height: 46px; }
+/* 设备清单只保留一份：① 里那张表（每台设备能采到什么/能当谁的音响）只在详细档出现，
+   简洁档的设备就是 ② 里的卡片。原来还有一行一台设备的 .brief 列表，
+   和 ② 的卡片是同一批设备的同一批信息，2026-10-15 按用户要求删掉了。 */
+/* .spark（老的折线小图容器）已经删掉了：2026-10-16 用户要求「这个折线图全删吧，
+   因为我们已经用"送""收"两条路表示清楚信号强度了」——现在信号强度是设备方块上的
+   收/送电平条 + 大圆球外面那三圈。 */
 /* 简洁 is the default: the controls, and the state of things. Every explanation,
    table, counter, log and hint lives behind 详细. */
 html:not(.fullui) .full,
@@ -356,63 +535,49 @@ html:not(.fullui) .action { display: block !important; }
   border-left: 2px solid var(--warn); padding: 4px 0 4px 8px; margin-top: 8px;
 }
 .meta { color: var(--dim); font-size: 12px; white-space: nowrap; }
-/* Per-path quality curves: the arrival/write interval over time, with a dashed line for
-   the ideal. A volume meter showed that something was playing; this shows which link is
-   misbehaving, which is the question that actually comes up. */
 .micgain { width: 96px; vertical-align: middle; }
-/* ⑦ 蓝牙 / ⑧ 网络音源：每一行用同一套栅格。
-   用户原话「第七部分标签页蓝牙设备上下不对齐好难受啊」—— 以前是 flex + 名字列 auto 宽，
-   每行名字长度不同，后面的状态胶囊和按钮就一行一个位置，看上去歪歪扭扭。
-   现在名字列固定宽度、胶囊与按钮各自对齐（只作用于这两个列表，不动 ③ 的输入行）。 */
-#btList .btrow, #netAudioList .btrow{
-  display:grid; grid-template-columns:minmax(96px,150px) repeat(5, minmax(0,auto));
-  gap:8px 10px; align-items:center;
+/* 这两个列表曾经用"一行一台、按列对齐"的栅格（2026-10-15 修过一次「上下不对齐」和
+   「UI 重叠」）。2026-10-16 用户要求「把蓝牙的设备也做成局域网内的设备一样的
+   小方块」，栅格就整段换成下面的方块容器了 —— 旧的列数/窄屏规则一并去掉，
+   免得和新规则打架。 */
+/* ★ 2026-10-16 用户要求「把蓝牙的设备也做成局域网内的设备一样的小方块」：
+   蓝牙列表不再是一行一台的细行，改成和 #deviceCards 一模一样的方块。方块里的名字列
+   必须能"要多宽有多宽" —— 2026-10-15 用户截图里稍长的手机名被截成半截，
+   就是上一版把这一列封了顶。
+   2026-10-16 用户（图1）第三次强调「卡片大小保持一致」之后，这条栅格并到
+   #deviceCards 那一条去了（上面 261 行）—— 两个列表共用一套，尺寸才可能真的一样。
+   这里只剩名字列这一条。 */
+#btList .dvcard .dvname{
+  min-width:0; font-weight:650; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
 }
-#btList .btrow .nm, #netAudioList .btrow .nm{
-  min-width:0; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-}
-#btList .btrow .chip, #netAudioList .btrow .chip{
-  justify-self:start; min-width:126px; justify-content:flex-start;
-}
-#btList .btrow button, #netAudioList .btrow button{ justify-self:start; min-width:56px; }
-#btList .btrow .meta, #netAudioList .btrow .meta{ justify-self:start; }
-#btList .btrow input[type=range], #netAudioList .btrow input[type=range]{ width:96px; }
-@media(max-width:900px){
-  #btList .btrow, #netAudioList .btrow{ grid-template-columns:minmax(96px,1fr) auto auto; }
-}
-.qbox { margin-top: 12px; }
-.qchart { width: 100%; height: 36px; display: block; background: rgba(0,0,0,.28);
-          border: 1px solid var(--line); border-radius: 12px; }
-.qchart.inline { width: 150px; height: 30px; display: inline-block; vertical-align: middle; }
-.qmeta { font-size: 12px; color: var(--dim); margin-top: 6px; line-height: 1.5; }
-.qmeta b { color: var(--fg); }
+/* ★ 2026-10-16 用户（图4）：「蓝牙也要和图5一个风格……可以偏绿」——
+   手机（蓝牙 / Wi-Fi 送声音）的方块给一层偏绿的描边与底色，和局域网设备方块同一套骨架、
+   但一眼能分出"这是手机的声音"。颜色用现成的 --ok（#34d399），不新造令牌。 */
+.dvcard.phone{border-color:rgba(52,211,153,.26);
+  background:linear-gradient(180deg,rgba(52,211,153,.06),transparent)}
+.dvcard.phone:hover{border-color:rgba(52,211,153,.45)}
+/* 「一台电脑，多个耳机」那一行（它必须一眼找得到，见上面的注释）。 */
+.mohead{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:14px 0 8px;
+  padding:10px 13px;border:1px solid var(--line);border-radius:12px;background:rgba(255,255,255,.03)}
+.mohead .moTitle{font-size:13.5px;font-weight:650;color:var(--fg)}
+.mohead .mochip{font-size:11.5px;color:var(--dim);border:1px solid var(--line);border-radius:999px;
+  padding:2px 9px}
+.mohead #moToggle{margin-left:auto;padding:5px 13px;font-size:12.5px}
 .linkbtn {
   display: inline-flex; align-items: center; padding: 8px 14px; border-radius: 11px;
   border: 1px solid var(--line); background: rgba(255,255,255,.03); color: var(--dim);
   font-size: 13px; font-weight: 600; text-decoration: none; white-space: nowrap;
 }
 .linkbtn:hover { border-color: var(--acc); color: var(--acc); }
-/* Cards are arranged by hand: ⠿ moves one, ⤢ widens it to the full row. Free pixel
-   resizing would fight the responsive columns - a width picked at one window size is
-   wrong at the next - so the layout remembers *order* and *span* instead. */
-.cardtools { display: inline-flex; gap: 2px; align-items: center; margin-left: 8px; }
-.cardtools button { padding: 1px 7px; line-height: 1.5; }
-.grip { cursor: grab; touch-action: none; }
-.card.dragging { opacity: .55; outline: 2px dashed var(--acc); outline-offset: 2px; }
-/* ⤢ gives a card a column to itself - the useful meaning now that columns are packed
-   by height: a long card stops pushing a hole under its short neighbours. */
-.card.wide { }
-/* Columns are packed in JavaScript by measured height (see packColumns): a tall card
-   gets a column to itself while the short ones stack beside it, so nothing is left with
-   a hole under it. A grid cannot do that - every card in a row becomes as tall as the
-   tallest one, which is exactly the empty space this replaces. */
-html:not(.fullui) .wrap { max-width: 1320px; display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; }
-html.fullui .wrap { max-width: none; display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; }
-.wrap > .col { flex: 1 1 0; min-width: 300px; display: flex; flex-direction: column; gap: 14px; }
-html:not(.fullui) .card { margin-bottom: 0; }
-html.fullui .card { margin-bottom: 0; }
-html.fullui .body { padding: 11px 13px; }
-html.fullui .body.tight { padding: 9px 13px; }
+/* ★ 2026-10-16 用户（图7）：「现在每个区块的这个图标和功能都可以删掉了」——
+   卡片工具栏（.cardtools）、抓手（.grip）、⤢ 独占一列（.card.wide）、拖拽高亮
+   （.card.dragging）全部删掉。卡片顺序改由 HTML 决定，不再由用户拖动。
+   下面这几行只是说明，没有任何规则依赖它们被删掉的旧行为。 */
+/* ★ 2026-10-16：上面这一整段（html:not(.fullui)/fullui 的 .wrap、.wrap > .col、
+   卡片 margin）随两列装箱一起删掉了 —— 现在是单列标签页。 */
+.card { margin-bottom: 0; }
+html.fullui .body { padding: 8px 0; }
+html.fullui .body.tight { padding: 6px 0; }
 html.fullui table td, html.fullui table th { padding: 4px 7px; font-size: 12.5px; }
 .mini { color: var(--dim); font-size: 12.5px; line-height: 1.6; }
 
@@ -445,13 +610,46 @@ details summary:hover{color:var(--fg)}
 /* ④ 因为"对端已经没了"而停发的那一行：红色，让人一眼看到为什么没声音 */
 .row.badrow{border-color:rgba(248,113,113,.35);background:rgba(248,113,113,.06)}
 .dvblocked{color:var(--err);font-size:12px;line-height:1.6;margin-top:8px}
+/* ★ 2026-10-16 用户（图5）：「已经连上的」那一段整块删掉了，原来给"简洁档把它藏起来"
+   写的那条 display:none 规则也一并删掉（块都没了，留一条指着它的规则只会误导）。 */
+
+/* ---------- ★ 主角位：本机状态（2026-10-15 起；2026-10-16 加大圆球三圈）----------
+   用户原话：「电脑的ui可以紧凑些更炫酷些本机状态在中间（大圆球我喜欢）」。
+   2026-10-16 又加了一条：「我全都要。电平是声音大小。然后外面套一圈蓝牙，再套一圈WiFi。
+   点对点本质还是WiFi」——所以大圆球变成**三层同心圆**：
+     内圈 = 播放电平（声音大小）、中圈 = 蓝牙链路质量、外圈 = Wi-Fi 链路质量（点对点并入它）。
+   位置仍由 packColumns 里的 data-hero 决定；这一条只作用于电脑面板，
+   不动手机端那套 150px 的排版（那边是权威）。 */
+/* ★ 2026-10-16（图2）：原来这里靠 `.col.hero`（主角位独占一整行）撑开，现在「本机状态」
+   是一个**标签页**，不再需要那个位置概念 —— 选择器改挂到本机状态这一页里的球上。 */
+.card[data-pane="status"] .stage{padding:4px 0 8px}
+.card[data-pane="status"] .ring{
+  /* ★ 2026-10-16 用户（图1）：「本机状态根本不需要这么大地方」——原来这里把球放大到
+     208px，现在回落到基础值 150px（正好和手机端那套一致，主题也不分叉）。 */
+  width:150px;height:150px;
+  background:radial-gradient(circle,rgba(56,189,248,.16),rgba(52,211,153,.05) 58%,transparent 70%);
+  border-radius:50%;
+}
+/* 三圈的半径 86 / 72 / 58（周长 540.4 / 452.4 / 364.4 —— 下面 JS 用同一组数算偏移）。 */
+.ring #wifiProg{stroke:#38bdf8}
+.ring #btProg{stroke:#a78bfa}
+/* ★ 2026-10-16 用户（图1）：「Wi-Fi —」「蓝牙 已连接」这两行圈名全删了 —— 圆心那三个
+   轮换读数用**颜色**说明自己是哪一圈（见 RING_CELLS），不再在圈上写名字。 */
+/* 大圆球左右两侧那两列指标（用户：「这几个分别列在大圆球两侧」）。 */
+.ballrow{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);
+  gap:10px;align-items:center;margin-top:4px}
+/* ★ 每侧 5 项排成 **2 列**（3 行），而不是竖着排 5 行 —— 这是"本机状态太占地方"的主因：
+   竖排 5 行每侧约 280px 高，2 列栅格直接砍到约 150px，整张卡矮掉一大截。 */
+.ballrow .stats.side{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
+@media(max-width:900px){
+  .ballrow{grid-template-columns:1fr;gap:8px}
+  .ballrow .stats.side{width:100%;
+    grid-template-columns:repeat(auto-fit,minmax(96px,1fr))}
+}
+.col.hero > h2{background:linear-gradient(90deg,rgba(56,189,248,.10),transparent 62%)}
+
 tr.offline td{opacity:.55}
 tr.offline .addr{color:var(--warn)}
-/* ① 自动收听提示条：对方请求收听时，明确告诉用户设置被改过，并给一键撤销 */
-#autoListenBox .alrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
-  padding:10px 12px;margin-top:8px;border-radius:12px;
-  background:rgba(56,189,248,.08);border:1px solid rgba(56,189,248,.25)}
-#autoListenBox .alrow .grow{flex:1;min-width:200px;font-size:12.5px;line-height:1.6}
 
 /* ---------- ③ 大状态圆环 + 22 段电平条（照手机端 .ring / .bars） ---------- */
 .stage{display:flex;flex-direction:column;align-items:center;gap:6px;padding:6px 0 10px}
@@ -461,12 +659,11 @@ tr.offline .addr{color:var(--warn)}
 .ring .prog{fill:none;stroke:url(#ringGrad);stroke-width:8;stroke-linecap:round;
             transition:stroke-dashoffset .12s linear}
 .ring .core{text-align:center;z-index:1}
-.ring .core .big{font-size:34px;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
-.ring .core .unit{font-size:12.5px;color:var(--dim);margin-top:2px}
-.ring .core .st{font-size:12.5px;color:var(--dim);margin-top:6px}
-.ring.live .core .big{color:var(--ok)}
-.ring.busy .core .big{color:var(--warn)}
-.ring.bad .core .big{color:var(--err)}
+/* ★ 2026-10-16 用户（图1）：圆心只留"数据本身"，三个读数每 3 秒轮换，各用自己那一圈的
+   颜色（由 renderRingCore 直接写 inline style）。所以 .unit / .st 两条规则随那两行字
+   一起删掉，.live/.busy/.bad 的着色也删掉 —— 颜色现在**按当前显示的是哪个读数**定，
+   不是按"有没有在出声"定。 */
+.ring .core .big{font-size:26px;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
 .bars{display:flex;gap:3px;height:26px;align-items:flex-end;justify-content:center;margin-top:2px;
       width:150px}
 .bars i{flex:1;height:6px;border-radius:3px;background:rgba(255,255,255,.10);
@@ -484,7 +681,7 @@ html:not(.fullui) .card .body { padding-top: 6px; }
 <body>
 
 <div id="boot" style="padding:22px;font:14px/1.7 system-ui,'Microsoft YaHei',sans-serif;color:#8b97a8">
-  <b style="color:#e8eef7">WaveLink 页面已下载，正在连接本机服务…</b><br>
+  <b style="color:#e8eef7">Audio Mixing 页面已下载，正在连接本机服务…</b><br>
   如果这段文字一直停在这里没有消失，说明页面的脚本没有跑起来。<br>
   <span style="color:#5e6b7d">请把这个情况告诉我，并顺便在手机浏览器里打开 <code>/plain</code> 试试。</span>
 </div>
@@ -496,49 +693,73 @@ html:not(.fullui) .card .body { padding-top: 6px; }
   </div>
 </noscript>
 
-<div class="top">
-  <div class="brand"><span class="mark">W</span>Audio Mixing</div>
-  <span class="tag" id="nodeTag"><b>…</b></span>
-  <!-- 版本号必须显眼：用户上次拿一个 7 小时前的旧 exe 测了一整天，
-       而面板上没有任何地方写着自己在跑哪一版。 -->
-  <span class="tag" id="versionTag" title="当前运行的版本与构建时间">v…</span>
-  <button class="primary" id="guideBtn" onclick="openGuide()" style="flex:0 0 auto"
-          title="第一次用就点这里：四步自检，每步都能一键修">🚀 快速上手</button>
-  <span class="spacer"></span>
-          <a class="linkbtn" href="/monitor" title="看谁给谁数据、走哪个通道、数据量与延迟" style="flex:0 0 auto">监控</a>
-        <span class="seg" id="modeSeg">
-    <button class="on" data-mode="simple" onclick="setUiMode('simple')">简洁</button>
-    <button data-mode="full" onclick="setUiMode('full')">详细</button>
-  </span>
-  <span class="tag" id="backendTag">音频后端 …</span>
-  <span class="tag" id="peerTag">设备 0</span>
-  <span class="tag" id="streamTag">流 0</span>
-  <button id="testBtn" onclick="testTone()" title="在本机默认输出播 2 秒测试音，确认耳机/音箱是通的">测试音箱</button>
-  <button class="ghost icon" onclick="refreshAll()" title="立即刷新">⟳</button>
-</div>
+<!-- ★ 2026-10-16 用户（图2）：「UI问题，学习localsend。按我的图2排版。括号内内容不要写进按键哦」。
+     照他画的图：左边一竖条**一级菜单**（LOGO / 监控 / 简洁 / 详细 / 二维码 / 版本号），
+     上面一行**二级菜单**标签（本机状态 / 设备与路由 / 广播 / 多耳机），右边是内容。
+     他在「设备与路由」旁边括注的「蓝牙 + WiFi」是写给我看的**标注**，
+     按他要求一律**不进按钮文案** —— 按钮上只有「设备与路由」四个字。 -->
+<div class="app">
+  <aside class="rail" id="rail">
+    <!-- ★ 2026-10-17 用户（图3）：「里面的字母改成「A」就好了」—— 方块里那个字原来是更名前的
+         旧标识「W」的遗留，品牌既然叫 Audio Mixing，方块里就该是 A。 -->
+    <div class="logo"><span class="mark">A</span>Audio Mixing</div>
+    <div class="node" id="nodeTag" title="本机节点名"><b>…</b></div>
 
-<!-- 发现更新版本时的提示（用户跑旧版本一整天就是这么发生的）。 -->
-<div id="versionWarn"></div>
+    <!-- 一级菜单：监控（另一页）/ 简洁 / 详细（浏览密度）/ 二维码 / 版本号（都是本页的一级页） -->
+    <a class="linkbtn" id="railMonitor" href="/monitor"
+       title="看谁给谁数据、走哪个通道、数据量与延迟">监控</a>
+    <button id="railSimple" data-rail="simple" onclick="setUiMode('simple')">简洁</button>
+    <button id="railFull" data-rail="full" onclick="setUiMode('full')">详细</button>
+    <button data-rail="qr" onclick="setRail('qr')">二维码</button>
+    <button data-rail="ver" onclick="setRail('ver')">版本号</button>
+    <div class="verline" id="verline">v…</div>
+  </aside>
 
-<div class="banner" id="lanBanner">
-  <span class="k">别的电脑/手机用这个网址打开：</span>
-  <span class="v" id="lanUrl" onclick="copyLanUrl()" title="点击复制">—</span>
-  <button class="tiny" onclick="copyLanUrl()">复制</button>
-  <span class="hint" id="lanHint"></span>
-</div>
+  <div class="main">
+    <!-- ★ 2026-10-18 用户第 4 条：「如果comfyui的线图出现了回环，即声音回环。要在ui最上方表明警告。
+         并将回环线路标红，但是正常运行，一切后果让使用者自己承担。」——放在最上方（`.main` 的第一个
+         子节点，比二级菜单还高），**每一页**都看得见：回环是整套路由的性质，
+         不该非得点进「版本号」才知道。内容由 renderLoopWarn 写。 -->
+    <div id="loopWarn"></div>
+    <nav class="tabs" id="tabs">
+      <button class="tab on" data-tab="status" onclick="setTab('status')">本机状态</button>
+      <button class="tab" data-tab="devices" onclick="setTab('devices')">设备与路由</button>
+      <button class="tab" data-tab="cast" onclick="setTab('cast')">广播</button>
+      <button class="tab" data-tab="multi" onclick="setTab('multi')">多耳机</button>
+      <span class="grow"></span>
+      <!-- 全局动作放在标签行右端（和标签同一行 → 不存在"对不对齐"的问题）：
+           放行防火墙 / 诊断 / 快速上手 / 测试音箱 / 立即刷新。 -->
+      <button class="ghost" onclick="runFirewall()" title="手机连不上时先点这里：给当前这份程序放行入站 TCP/UDP">放行防火墙</button>
+      <a class="linkbtn" href="/diagnose" title="把当前状态整理成一份文字报告，全选即可复制">诊断</a>
+      <button class="primary" id="guideBtn" onclick="openGuide()"
+              title="第一次用就点这里：四步自检，每步都能一键修">🚀 快速上手</button>
+      <button id="testBtn" onclick="testTone()" title="在本机默认输出播 2 秒测试音，确认耳机/音箱是通的">测试音箱</button>
+      <button class="ghost icon" onclick="refreshAll()" title="立即刷新">⟳</button>
+    </nav>
 
-<div class="wrap">
-  <div class="col">
+    <!-- 发现更新版本时的提示（用户跑旧版本一整天就是这么发生的）。 -->
+    <div id="versionWarn"></div>
 
-    <!-- ① 设备 -->
-    <section class="card">
-      <h2><span class="n">①</span>局域网里的设备
-        <span class="sub">两台设备要连同一个 Wi-Fi</span>
-        <span class="right"><span class="tag off" id="discoveryTag">发现中…</span></span>
+    <div class="banner" id="lanBanner">
+      <span class="k">别的电脑/手机用这个网址打开：</span>
+      <span class="v" id="lanUrl" onclick="copyLanUrl()" title="点击复制">—</span>
+      <button class="tiny" onclick="copyLanUrl()">复制</button>
+      <span class="hint" id="lanHint"></span>
+    </div>
+
+    <div class="panes">
+
+    <!-- 找设备：发现到的节点清单 -->
+    <section class="card" data-card="find" data-pane="devices">
+      <h2>找设备
+        <span class="sub">两台设备连同一个 Wi-Fi，设备清单在「设备与路由」里</span>
       </h2>
       <div class="body tight">
-        <!-- ① 对方请求收听时，这里明确写出"设置被自动改过"，并给撤销按钮 -->
-        <div id="autoListenBox"></div>
+        <!-- ★ 2026-10-18 用户第 6 条：「这种警告就不要出现了。直接在如图3的每个对应设备的小卡片
+             加入第4按键「智连」。默认关闭，开启后，自动接受其他设备的听和送」——
+             于是原来这里那两块（"对方请求收听、已自动打开"的提示条 + 一个全局的自动收听总开关）
+             **整块删掉**：自动打开不再是默认行为，也就没有"被自动改了设置"这回事要通报。
+             现在"要不要自动"是**每台设备自己的一个开关**，就在下面那张设备卡片的第 4 颗按钮上。 -->
         <div id="peersBox"></div>
         <div class="fields" style="margin-top:12px;padding-top:12px">
           <div class="f grow"><label>手动添加设备 IP</label>
@@ -548,11 +769,11 @@ html:not(.fullui) .card .body { padding-top: 6px; }
         <details class="more" style="margin-top:12px">
           <summary><span class="ar"></span>为什么手机上装着浏览器、却不能被添加成设备？</summary>
           <div style="padding:10px 2px 2px;font-size:12.5px;line-height:1.85;color:#9aa7b8">
-            WaveLink 要求<b>每台设备都运行一个节点程序</b>。手机上的浏览器只能<b>打开这个页面</b>
+            Audio Mixing 要求<b>每台设备都运行一个节点程序</b>。手机上的浏览器只能<b>打开这个页面</b>
             （当遥控器），它本身不是一个节点，所以：<br>
             · 手机可以看这个控制台、可以当"音响"播放（如果装了客户端）<br>
             · 手机<b>不能</b>被 ping 通，也<b>不能</b>被添加成设备——它上面没有任何东西在监听<br><br>
-            <b>想分享手机的声音</b>，先把手机声音送进任意一台电脑，再交给 WaveLink：<br>
+            <b>想分享手机的声音</b>，先把手机声音送进任意一台电脑，再交给 Audio Mixing：<br>
             · <b>蓝牙</b>：手机蓝牙连电脑，或使用 Phone Link 的声音投射<br>
             · <b>数据线</b>：手机耳机口 → 电脑 Line-in / USB 声卡<br>
             声音一旦进入电脑，WASAPI 环回采集会<b>自动抓到它</b>，在路由里把"声音来自"选成那台电脑即可。<br><br>
@@ -564,26 +785,26 @@ html:not(.fullui) .card .body { padding-top: 6px; }
       </div>
     </section>
 
-    <!-- ② 设备与路由 -->
-    <section class="card">
-      <h2><span class="n">②</span>设备与路由
+    <!-- 设备与路由 -->
+    <section class="card" data-card="routes" data-pane="devices">
+      <h2>设备与路由
         <span class="sub">每台设备一张卡片，点按钮就连上</span>
         <span class="right"><button class="tiny ghost" onclick="showTemplates()">常用例子</button></span>
       </h2>
       <div class="body">
-        <div class="qbox">
-          <svg class="qchart" id="qP2p" viewBox="0 0 200 36" preserveAspectRatio="none"></svg>
-          <div class="qmeta" id="qP2pText">等待数据…</div>
-        </div>
-
         <!-- 设备卡片：照手机端那种卡片（名字 · 平台 · IP · 状态 · 电平条 · 按钮）。
              用户原话："电脑端的路由可以效仿手机端，也不要拖动了，都改成对设备的按键。"
              所以路由的入口是这里的两个按钮，不再是拖拽区。 -->
         <div class="dvtitle">局域网里的设备</div>
         <div id="deviceCards"></div>
 
-        <div class="dvtitle">已经连上的（谁的声音 → 放到谁的耳机）</div>
-        <div class="routes" id="routesBox"></div>
+        <!-- ★ 2026-10-16 用户（图5）：「这个路由不需要了，我们已经有卡片显示当前状态了」——
+             「已经连上的（谁的声音 → 放到谁的耳机）」整段删掉。每条路由的状态现在由
+             上面那些设备卡片承担（收/送音量条 + 信号质量条 + 卡片上的"正在收听/送给"按钮）。
+             如实说明代价：这一段是**每条路由单独静音**的唯一入口，删掉之后没有静音了
+             （断开仍然可用：设备卡片上的按钮，或监控页每行的「断开」）。
+             下面「高级」里那条勾选式路由表保留 —— 那是"一次连多台/指定输出设备"的入口，
+             与这个"只读的状态列表"不是一回事。 -->
 
         <details class="more" style="margin-top:12px">
           <summary><span class="ar"></span>高级：一次连多台 / 指定输出设备 / 音量 / 编码</summary>
@@ -623,43 +844,87 @@ html:not(.fullui) .card .body { padding-top: 6px; }
           两边各勾设备、再点「添加这条路由」。<br>
           <span style="color:#8b97a8">一台设备的「收听它的」和「送给它」是两条独立的路由，互不影响。</span>
         </div>
+
+        <!-- ★ 原来是独立的 ⑦，现在并进这里（2026-10-15 用户要求：
+             「电脑上的第7板块和第2板块可以合并。功能相对重复」）。
+             #btList 这个 id 没动 —— loadBluetooth()/renderBluetooth() 直接按它取节点，
+             改了就是一个静默失效的空面板。（卡片版面那套按编号存 localStorage 的机制
+             2026-10-16 已经整体删掉，见上面 packColumns 那段说明。） -->
+        <div class="dvtitle" style="display:flex;align-items:center;gap:8px">
+          蓝牙（手机的声音）
+          <button class="tiny ghost" style="margin-left:auto" onclick="loadBluetooth()">刷新</button>
+        </div>
+        <div id="btList" class="list">正在读取…</div>
+        <div class="note" style="margin-top:10px">
+          点「连接」后，<b>手机就把它当成一个蓝牙音箱</b>（手机上会出现这个电脑的名字，选中它即可）。
+          连上后手机会多出一个 <code>麦克风 (&lt;手机名&gt; A2DP SNK)</code> 采集设备 —— 到
+          <b>「频道（局域网广播）→ 音源」</b> 里把它选上，勾「广播我的声音」，声音就进了你的耳机。<br>
+          <span style="color:#8b97a8">蓝牙是点对点的：<b>一块适配器同时只能接一台手机</b>。要同时接多台，插多个 USB 蓝牙适配器，
+          然后把它们全部选进频道音源（程序会混成一路）。</span>
+        </div>
+
+        <!-- ★ 2026-10-16 用户（图4）：「蓝牙区块下的手机WiFi的ui还没删除。我们的的手机WiFi
+             功能已经整合到路由了」——「Wi-Fi 送声音的手机」那一段（标题 + 刷新 + 那个列表）整块删掉。
+             如实说明能力没有丢：
+               · 正在送声音的手机现在就在**上面那些设备卡片**里（收听它的 / 送给它 / 我听它的音量）；
+               · 「频道 → 音源」那个下拉仍然把它们列出来（标着「手机（正在送声音）」）；
+               · 「手机在发但没加进音源所以听不到」这句提醒还在（挪到了频道那页的音源行下面）。
+             ★ 2026-10-18 用户（图2）：蓝牙这一块最后原来还挂着一个**全局勾**，含义是
+               "手机一开始送声音就自动收编成音源播放"。用户当场指出它说的就是每台设备卡片上
+               那颗「智连」，所以整块删掉了：留着既让人以为它和蓝牙有关，又多出一套
+               "随机触发"的口径。行为没有丢，只是改由「智连」**逐台**决定（默认关）：
+               开了「智连」的设备一开始送声音就自动收编/播放，没开的仍然可以手动加进「音源」。 -->
       </div>
     </section>
-  </div>
 
-  <div class="col">
-    <!-- ③ 本机状态 -->
-    <section class="card">
-      <h2><span class="n">③</span>本机状态<span class="sub" id="levelText">音量 —</span></h2>
+    <!-- 本机状态。★ 2026-10-16（图2）之后它不再是"主角位独占一整行"，而是二级菜单里的
+         一页；原来那一层列容器也随两列装箱一起删掉了（单列，不再有列可分）。 -->
+    <section class="card" data-card="status" data-pane="status">
+      <!-- ★ 2026-10-16：标题右边原来挂着一个 `<span id="levelText">音量 —</span>`，
+           页面脚本里**从来没有任何地方往它写字**（全页搜 levelText 只有这一处）——
+           也就是说它永远显示"音量 —"。这正是你第 1 条说的"这些字全删了"：那个数字
+           现在由圆心那三格轮换承担（直读当前输出设备），标题旁边不再留一个死占位。 -->
+      <h2>本机状态</h2>
       <div class="body">
-        <!-- 大状态圆环 + 22 段电平条：和手机端同一个做法（手机端才是这套视觉的样板）。
-             数字＝正在播放的电平百分比；没有本机播放时退回来显示链路评分。 -->
-        <div class="stage">
-          <div class="ring" id="ring">
-            <svg viewBox="0 0 120 120">
-              <defs>
-                <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
-                  <stop offset="0%" stop-color="#38bdf8"/><stop offset="100%" stop-color="#34d399"/>
-                </linearGradient>
-              </defs>
-              <circle class="track" cx="60" cy="60" r="52"></circle>
-              <circle class="prog" id="ringProg" cx="60" cy="60" r="52"
-                      stroke-dasharray="326.7" stroke-dashoffset="326.7"></circle>
-            </svg>
-            <div class="core">
-              <div class="big" id="ringMetric">—</div>
-              <div class="unit" id="ringUnit">播放电平 %</div>
-              <div class="st" id="ringState">空闲</div>
+        <!-- 大圆球＝三层同心圆（2026-10-16 用户：「我全都要。电平是声音大小。然后外面
+             套一圈蓝牙，再套一圈WiFi。点对点本质还是WiFi」）：
+               外圈 = Wi-Fi 链路质量（点对点并入它）、中圈 = 蓝牙链路质量、内圈 = 本机播放电平。
+             半径 86 / 72 / 58，周长 540.4 / 452.4 / 364.4 —— 下面 JS 用同一组数算 dashoffset。 -->
+        <div class="ballrow">
+          <div class="stats side" id="statsLeft"></div>
+          <div class="stage">
+            <div class="ring" id="ring">
+              <svg viewBox="0 0 200 200">
+                <defs>
+                  <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+                    <stop offset="0%" stop-color="#38bdf8"/><stop offset="100%" stop-color="#34d399"/>
+                  </linearGradient>
+                </defs>
+                <circle class="track" cx="100" cy="100" r="86"></circle>
+                <circle class="prog" id="wifiProg" cx="100" cy="100" r="86"
+                        stroke-dasharray="540.4" stroke-dashoffset="540.4"></circle>
+                <circle class="track" cx="100" cy="100" r="72"></circle>
+                <circle class="prog" id="btProg" cx="100" cy="100" r="72"
+                        stroke-dasharray="452.4" stroke-dashoffset="452.4"></circle>
+                <circle class="track" cx="100" cy="100" r="58"></circle>
+                <circle class="prog" id="ringProg" cx="100" cy="100" r="58"
+                        stroke-dasharray="364.4" stroke-dashoffset="364.4"></circle>
+              </svg>
+              <!-- ★ 2026-10-16 用户（图1）：「这些字全删了。只留信号强度和声音大小百分比
+                   （三个数据采用相对应环的颜色。3秒切换一次）」。
+                   原来这里写着「Wi-Fi —」「蓝牙 已连接」「本机播放电平 %」「空闲：没有声音在流」
+                   四行字，占了球一大半；现在**一个字都不留**，圆心只显示数据本身，
+                   三个读数每 3 秒轮换，各用自己那一圈的颜色（见 renderRingCore）。 -->
+              <div class="core">
+                <div class="big" id="ringMetric">—</div>
+              </div>
             </div>
+            <div class="bars" id="levelBars"></div>
           </div>
-          <div class="bars" id="levelBars"></div>
+          <div class="stats side" id="statsRight"></div>
         </div>
+
         <div class="rows" id="inputsBox" style="margin-top:12px"></div>
-        <div class="qbox">
-          <div class="qmeta" style="margin:0 0 5px">输出段（喂声卡）—— 与音频走蓝牙还是有线无关</div>
-          <svg class="qchart" id="qBt" viewBox="0 0 200 36" preserveAspectRatio="none"></svg>
-          <div class="qmeta" id="qBtText">等待数据…</div>
-        </div>
         <div class="stats" id="statsBox"></div>
         <!-- 音源状态告警：某块采集源超过 10 秒没有新音频时必须显眼（缺陷 2）。
              由 renderSourceHealth() 填充。 -->
@@ -669,8 +934,36 @@ html:not(.fullui) .card .body { padding-top: 6px; }
       </div>
     </section>
 
-    <!-- ④ 传输 -->
-          <section class="card">
+    <!-- ★ 2026-10-16 用户（图2）：多耳机=独立的一个二级菜单标签。
+         搬出来还有个副作用是好的：本机状态那张卡少了一整块，高度降下来了
+         （v1.27 遗留的"这张卡下不去"就有解了）。下面那些 id 一个都没改：脚本按 id 取节点。 -->
+    <section class="card" data-card="multiout" data-pane="multi">
+      <h2>一台电脑，多个耳机<span class="sub">一份采集、多路播放，各调各的音量</span></h2>
+      <div class="body">
+        <div class="mohead">
+          <span class="mochip" id="moSummary">未开启</span>
+          <button id="moToggle" class="btn">设置设备</button>
+        </div>
+        <div id="moBody" style="display:none;margin-top:10px">
+          <div class="note" style="font-size:12px;margin-bottom:8px">
+            勾上要同时出声的设备，各调各的音量。蓝牙比有线慢，用「延迟」补偿对齐。<br>
+            刚插上的设备几秒内自动出现。<b>Windows 正在用的那块不在列表里</b>
+            —— 它本来就在响，再勾一份会变成金属音。
+          </div>
+          <div id="moList" style="display:flex;flex-direction:column;gap:6px;
+               max-height:290px;overflow:auto"></div>
+          <div style="display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap">
+            <button id="moApply" class="btn" style="padding:4px 12px;font-size:12px">应用</button>
+            <button id="moStop" class="btn" style="padding:4px 12px;font-size:12px">全部停止</button>
+            <button id="moRefresh" class="btn" style="padding:4px 12px;font-size:12px">刷新设备</button>
+            <span id="moStatus" style="font-size:12px;opacity:.75"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 手机扫码 / 传输 -->
+          <section class="card" data-card="qr" data-pane="qr">
         <h2>手机扫码<span class="sub">手机相机扫一下，不用输 IP</span></h2>
         <div style="display:flex;gap:22px;flex-wrap:wrap;align-items:flex-start">
           <div style="text-align:center">
@@ -688,7 +981,8 @@ html:not(.fullui) .card .body { padding-top: 6px; }
                  style="background:#fff;border-radius:8px;padding:5px">
             <div style="font-size:12px;opacity:.7;margin-top:4px">手机↔手机直连</div>
           </div>
-          <div style="font-size:12px;opacity:.72;line-height:1.8;max-width:330px">
+          <!-- 这四行是"怎么用/为什么"，属于解释性文字：简洁档收起来，详细档才展开。 -->
+          <div class="mini" style="font-size:12px;opacity:.72;line-height:1.8;max-width:330px">
             手机要和这台电脑连同一个 Wi-Fi。<br>
             左：打开听众页，点一下手机就开始放这台电脑的声音（先打开「广播我的声音」）。<br>
             中：下载手机端，用来把手机的声音送到这台电脑。<br>
@@ -698,26 +992,26 @@ html:not(.fullui) .card .body { padding-top: 6px; }
           </div>
         </div>
       </section>
-<section class="card full">
-      <h2><span class="n">④</span>正在传输的声音</h2>
+<section class="card full" data-card="streams" data-pane="devices">
+      <h2>正在传输的声音</h2>
       <div class="body"><div class="rows" id="streamsBox"></div></div>
     </section>
 
-    <!-- ⑤ 设备 -->
-    <section class="card full">
-      <h2><span class="n">⑤</span>本机音频设备</h2>
+    <!-- 本机音频设备 -->
+    <section class="card full" data-card="devices" data-pane="devices">
+      <h2>本机音频设备</h2>
       <div class="body tight"><div id="devicesBox"></div></div>
     </section>
 
-    <!-- ⑥ 设置 -->
-    <section class="card">
-      <h2><span class="n">⑥</span>频道（局域网广播）</h2>
+    <!-- 频道（局域网广播） -->
+    <section class="card" data-card="channel" data-pane="cast">
+      <h2>频道（局域网广播）</h2>
       <div class="body">
         <div class="fields" style="margin-top:0;padding-top:0;border:0">
           <label class="chk"><input type="checkbox" id="chBroadcast" onchange="saveChannel()"> 广播我的声音</label>
           <label class="chk"><input type="checkbox" id="chListen" onchange="saveChannel()"> 只听（收听频道，且不发送本机声音）</label>
           <label class="chk"><input type="checkbox" id="chLocal" onchange="saveChannel()"> 本机直通（把音源直接放到本机耳机）</label>
-          <div class="f"><label>频道音量（我们这一层，不动 Windows 系统音量）</label>
+          <div class="f"><label>频道音量</label>
             <input type="range" id="chGain" min="0" max="2" step="0.05" value="1"
                    oninput="chGainLabel(); setChannelGain(this.value)" style="width:150px">
             <span class="mono" id="chGainVal">1.00</span></div>
@@ -746,67 +1040,18 @@ html:not(.fullui) .card .body { padding-top: 6px; }
           <span id="phoneUrl" style="display:block;margin-top:8px"></span>
           <span class="mini" style="display:block;margin-top:6px" id="outHint">
             音源默认是<b>系统声音</b>（这台电脑放的一切，含手机蓝牙进来的声音），输出跟着 Windows 默认播放设备<span id="outDevice"></span>。
-            要单独指定某块声卡/麦克风、换输出设备、改抖动缓冲或编码，点右上角 <b>详细</b> → ⑥ 音源 / ⑧ 设置。
-            <br><b>这三个开关会被记住</b>：下次启动 WaveLink 时自动恢复到你现在选的状态。
+            要单独指定某块声卡/麦克风、换输出设备、改抖动缓冲或编码，点右上角 <b>详细</b> →「频道」的音源 /「设置」。
+            <br><b>这三个开关会被记住</b>：下次启动 Audio Mixing 时自动恢复到你现在选的状态。
           </span>
         </div>
       </div>
     </section>
 
-    <!-- ⑦ 蓝牙 -->
-    <section class="card">
-      <h2><span class="n">⑦</span>蓝牙（手机的声音）
-        <span class="right"><button class="tiny ghost" onclick="loadBluetooth()">刷新</button></span>
-      </h2>
-      <div class="body">
-        <div class="mini">
-          这里的曲线已移到 ③ 本机状态的「输出段」——蓝牙链路自身的卡顿（丢包、重传）
-          Windows 不提供任何计数，任何画在这里的"蓝牙质量曲线"都只能是假的。
-        </div>
+    <!-- 蓝牙已经从原来的独立板块并进「设备与路由」（2026-10-15 用户要求：功能重复）。
+         2026-10-16 起全面取消编号；卡片顺序就是 HTML 的顺序（拖动/⤢ 那套已删）。 -->
 
-        <div id="btList" class="list">正在读取…</div>
-        <div class="note" style="margin-top:10px">
-          点「连接」后，<b>手机就把它当成一个蓝牙音箱</b>（手机上会出现这个电脑的名字，选中它即可）。
-          连上后手机会多出一个 <code>麦克风 (&lt;手机名&gt; A2DP SNK)</code> 采集设备 —— 到
-          <b>⑥ 频道 → 频道音源</b> 里把它选上，勾「广播我的声音」，声音就进了你的耳机。<br>
-          <span style="color:#8b97a8">蓝牙是点对点的：<b>一块适配器同时只能接一台手机</b>。要同时接多台，插多个 USB 蓝牙适配器，
-          然后把它们全部选进频道音源（程序会混成一路）。</span>
-        </div>
-      </div>
-    </section>
-
-    <!-- ⑧ Wi-Fi 音频 -->
-    <section class="card">
-      <h2><span class="n">⑧</span>Wi-Fi 音频（手机的声音）
-        <span class="right"><button class="tiny ghost" onclick="loadNetMics()">刷新</button></span>
-      </h2>
-      <div class="body">
-        <div class="qbox">
-          <svg class="qchart" id="qWifi" viewBox="0 0 200 36" preserveAspectRatio="none"></svg>
-          <div class="qmeta" id="qWifiText">等待数据…</div>
-        </div>
-        <div id="netAudioList"><span class="x">正在读取…</span></div>
-        <div class="fields" style="margin-top:12px">
-          <button class="primary" onclick="addAllMics()">把正在发送的手机加入音源 + 开本机直通</button>
-          <a class="linkbtn" href="/mic" target="_blank">浏览器版（只发麦克风）</a>
-          <a class="linkbtn" href="/app" target="_blank">装 App（能发系统声音）</a>
-        </div>
-        <div class="fields" style="margin-top:10px">
-          <label class="chk"><input type="checkbox" id="autoPlay" onchange="saveAutoPlay()"> 正在发送的手机自动播放</label>
-          <!-- ① 自动收听总开关：对方按「送声音」时要不要自动开始收。默认开，可整体关掉。 -->
-          <label class="chk"><input type="checkbox" id="autoAcceptListen" onchange="saveAutoAcceptListen()"
-            title="对方按「送声音」时自动打开收听；关掉之后每次都要你自己点"> 自动接受收听请求</label>
-
-        </div>
-        <div class="mini" style="margin-top:8px">
-          手机和电脑连同一个 Wi-Fi 即可，声音从手机的浏览器或 App 直接送到这台电脑，
-          <b>不经过蓝牙</b>，所以不受蓝牙那一路的数量/带宽限制。
-        </div>
-      </div>
-    </section>
-
-    <section class="card full" id="cardSettings">
-      <h2><span class="n">⑨</span>设置</h2>
+    <section class="card full" id="cardSettings" data-card="settings" data-pane="cast">
+      <h2>设置</h2>
       <div class="body">
         <div class="fields" style="margin-top:0;padding-top:0;border:0">
           <div class="f grow"><label>节点名称</label><input type="text" id="setName"></div>
@@ -817,21 +1062,79 @@ html:not(.fullui) .card .body { padding-top: 6px; }
             <option value="pcm_s16">PCM 16bit</option><option value="opus">Opus</option>
           </select></div>
           <button class="primary" onclick="saveSettings()">保存</button>
-          <span class="msg" id="setMsg"></span>
+          <!-- ★ 2026-10-16：这里原来还有一个空的 <span id="setMsg">，但 saveSettings()
+               走的是 toast()，全页没有任何地方往它写字 —— 一个永远空着的占位，删掉。 -->
         </div>
         <div class="note" style="margin-top:12px">抖动缓冲越大越抗网络抖动、延迟也越高。有线或 5GHz 可以调到 40ms 以下。</div>
       </div>
     </section>
 
-    <!-- ⑨ 日志 -->
-    <section class="card full">
-      <h2><span class="n">⑩</span>日志
+    <!-- 一级菜单「版本号」这一页：版本 / 构建时间 / 后端 / 设备与流计数，下面接关系图和日志。
+         ★ 2026-10-18 去掉 `full` 类：这一页本来就没有"密度"这一维（setUiMode 里那句注释就是这么写的），
+         可是带 `full` 会在**简洁档被整张藏掉** → 简洁档点「版本号」看到的是一整页空白。
+         版本号必须一直看得见（用户上次拿一个 7 小时前的旧 exe 测了一整天，面板上却没写自己在跑哪一版）。 -->
+    <section class="card" data-card="ver" data-pane="ver">
+      <h2>版本与运行</h2>
+      <div class="body tight">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <!-- 版本号必须显眼：用户上次拿一个 7 小时前的旧 exe 测了一整天，
+               而面板上没有任何地方写着自己在跑哪一版。 -->
+          <span class="tag" id="versionTag" title="当前运行的版本与构建时间">v…</span>
+          <span class="tag" id="backendTag">音频后端 …</span>
+          <span class="tag" id="peerTag">设备 0</span>
+          <span class="tag" id="streamTag">流 0</span>
+        </div>
+        <div class="note" style="margin-top:10px">
+          「简洁 / 详细」在左边那一条一级菜单里切换：简洁档把说明性的小字收起来，只留能点的东西。
+        </div>
+      </div>
+    </section>
+
+    <!-- ★ 2026-10-18 用户：「在版本号那边加入comefyui（类似感觉就好，支持拖拽，可以连线最好）
+         以显示局域网内+蓝牙设备与本机关系，线条以柔和曲线分颜色标明是WIFI/蓝牙/广播模式连接。
+         （可以当作一个图标式的监控，但是仅表示连接关系）」
+         两个细节是按用户当场的两个选择做的：
+           · 「可操作：拖线 = 真建路由」—— 从一台的**右侧圆点**拖到另一台的**左侧圆点**，
+             就真的建一条「它送给你」路由（方向就是拖的方向），和点设备卡片上的按钮等价；
+           · 「连设备之间的路由也画」—— 不只是本机↔设备，两台设备之间已有的路由也画出来。
+         纯 SVG + 绝对定位的 div 手画，**不引任何外部库**（局域网里外链加载不出来，
+         自检脚本也会把外链判为不合格）。
+         ★ 2026-10-18 同样去掉 `full` 类：这是一张"看的"图，简洁档也该看得见。 -->
+    <section class="card" data-card="rel" data-pane="ver">
+      <h2>设备关系图
+        <span class="sub">拖节点摆位置；按住 Ctrl 滚轮缩放；在空白处按住拖可以平移；
+          从本机的圆点拖到某台设备 = 建一条路由（右边那个圆点＝送给它，左边＝收听它）；点线删掉它</span>
+        <span class="right">
+          <button class="tiny ghost" onclick="relResetPos()" title="把所有节点放回自动排的位置，并把视图复位">重排</button>
+          <button class="tiny ghost" onclick="relRefresh(true)" title="立刻重新读一次关系">刷新</button>
+        </span>
+      </h2>
+      <div class="body tight">
+        <div id="relWrap">
+          <div id="relCanvas">
+            <svg id="relSvg" xmlns="http://www.w3.org/2000/svg"></svg>
+            <div id="relNodes"></div>
+          </div>
+        </div>
+        <div class="rellegend">
+          <span><i class="sw wifi"></i>Wi-Fi / 点对点</span>
+          <span><i class="sw bt"></i>蓝牙</span>
+          <span><i class="sw bc"></i>广播 / 收听</span>
+          <span><i class="sw cyc"></i>回环（红色的那些，程序照常跑）</span>
+          <span class="dim">实线 = 现在真的有声音在流　虚线 = 现在没有（配置好了还没开始 / 对方离线 / 已经停了）</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="card full" data-card="logs" data-pane="ver">
+      <h2>日志
         <span class="right"><button class="tiny ghost" onclick="toggleLog()" id="logToggle">展开</button></span>
       </h2>
       <div class="body tight" id="logWrap" style="display:none"><pre id="logBox">（暂无）</pre></div>
     </section>
-  </div>
-</div>
+    </div><!-- /.panes -->
+  </div><!-- /.main -->
+</div><!-- /.app -->
 
 <div class="toast" id="toast"></div>
 
@@ -855,28 +1158,11 @@ html:not(.fullui) .card .body { padding-top: 6px; }
   </div>
 </div>
 
-      <section class="card" id="multiOutCard">
-        <h2 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-          一台电脑，多个耳机
-          <span class="sub" id="moSummary" style="font-weight:400">未开启</span>
-          <button id="moToggle" class="btn" style="margin-left:auto;padding:4px 12px;font-size:12px">设置设备</button>
-        </h2>
-        <div id="moBody" style="display:none;margin-top:10px">
-          <div class="note" style="font-size:12px;margin-bottom:8px">
-            勾上要同时出声的设备，各调各的音量。蓝牙比有线慢，用「延迟」补偿对齐。<br>
-            刚插上的设备几秒内自动出现。<b>Windows 正在用的那块不在列表里</b>
-            —— 它本来就在响，再勾一份会变成金属音。
-          </div>
-          <div id="moList" style="display:flex;flex-direction:column;gap:6px;
-               max-height:190px;overflow:auto"></div>
-          <div style="display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap">
-            <button id="moApply" class="btn" style="padding:4px 12px;font-size:12px">应用</button>
-            <button id="moStop" class="btn" style="padding:4px 12px;font-size:12px">全部停止</button>
-            <button id="moRefresh" class="btn" style="padding:4px 12px;font-size:12px">刷新设备</button>
-            <span id="moStatus" style="font-size:12px;opacity:.75"></span>
-          </div>
-        </div>
-      </section>
+      <!-- ★ 「一台电脑，多个耳机」这一整块已经移进 ③「本机状态」里了
+           （2026-10-15 用户原话：「电脑端的多个耳机也移上来」）。
+           它原来放在这里 = 卡片区之外 → 永远渲染在整个页面的最底下。
+           注意：下面这段脚本**必须留在原地**：它按 id 取节点（moList/moBody/moSummary/…），
+           而那些节点现在在 ③ 的 body 里、文档顺序在它前面，所以照样取得到。 -->
       <script>
       (function () {
         const list = document.getElementById('moList');
@@ -1115,47 +1401,45 @@ function extraBox(title, extra){
    —— 所以只作用于详细档（下面的表），简洁档那一列原样不动。 */
 const OFFLINE_KEEP_S = 60;
 
-/* ① 对方请求收听 → 面板必须明说"设置被改过了"，并给一键撤销（不能静默改用户设置）。
-   撤销之后这台设备进"永不再自动"名单（与手机端同名行为），以后再请求只提示、不自动打开。 */
-async function revokeAutoListen(nodeId, name){
-  try{
-    const cfg = await api('/api/routes');
-    const route = (cfg.routes || []).find(r => r.auto && (r.from || []).includes(nodeId));
-    if(route) await api('/api/routes/delete', {id: route.id});
-    await api('/api/listen/optout', {node_id: nodeId, name: name, on: true});
-    toast('已撤销：以后不再自动收听 ' + name + '（它再请求时会先问你）', 'ok');
-    refreshAll();
-  }catch(e){ toast('撤销失败：' + e.message, 'err'); }
+/* ══ 「智连」= 每台设备一个开关（2026-10-18 用户第 6 条）══
+
+   用户原话：「直接在如图3的每个对应设备的小卡片加入第4按键「智连」。默认关闭，
+   开启后，自动接受其他设备的听和送（手机端只能自动开启"听"，为了用户安全考虑。）」
+
+   这一颗按钮**取代**了原来的整套"自动收听"机制：
+     · 那个全局的总开关复选框（用户 2026-10-17 的原话是"用起来像是随机触发"）；
+     · "对方请求收听、已自动打开"的提示条 + 一键撤销 / 全部收回；
+     · 卡片上那条"请求被挡下、所以没自动开"的告警；
+     · 服务端那个"关过一次就永不再自动"的黑名单 —— 它正是用户第 1 条
+       「电脑主动发送声音手机不会主动接收」的病根（见 tests 里那条回归）。
+   现在只有一个判据：**这台设备开没开「智连」**。开了就一定自动、没开就一定不自动。
+
+   名单存在服务端配置里（`config.smart_link`），页面这份 `smartList` 只是它的镜像，
+   改一下就把**整张名单**POST 回去（和设备卡片的「自启」同一套做法）。 */
+let smartList = [];
+
+/** 这台设备开没开「智连」。命中 node_id 或名字都算（和引擎那边同一套判据）。 */
+function smartOnFor(n){
+  const keys = (smartList || []).map(k => String(k).toLowerCase());
+  const values = [String((n && n.value) || ''), String((n && n.name) || '')]
+    .filter(Boolean).map(v => v.toLowerCase());
+  return values.some(v => keys.indexOf(v) >= 0);
 }
 
-async function allowAutoListen(nodeId, name, host){
-  try{
-    await api('/api/listen/optout', {node_id: nodeId, name: name, host: host || '', on: false});
-    toast('已允许自动收听 ' + name, 'ok');
-    refreshAll();
-  }catch(e){ toast('操作失败：' + e.message, 'err'); }
-}
-
-function renderAutoListen(){
-  const box = $('autoListenBox');
-  if(!box) return;
-  const s = state.status || {};
-  const al = s.auto_listen || {};
-  const items = (al.items || []).filter(x => x.active);
-  let html = items.map(x => `<div class="alrow">
-    <span class="grow">📡 <b>${esc(x.name || x.node_id)}</b> 请求收听本机 —— <b>已自动打开</b>
-      （${esc(al.label || '')}）。这是对方按了「送声音」时自动加的，不是你自己加的。</span>
-    <button class="tiny ghost" onclick="revokeAutoListen('${esc(x.node_id)}','${esc(x.name || '')}')">撤销</button>
-  </div>`).join('');
-  // 被拒的请求也要说出来：用户关过它（或关了总开关）时，不能装作没发生。
-  (al.denied || []).forEach(d => {
-    html += `<div class="alrow" style="background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.25)">
-      <span class="grow">📡 <b>${esc(d.name || d.node_id)}</b> 请求收听 ——
-        <b>${esc(d.reason || '没有自动打开')}</b>，所以没有自动打开。要听它的话，点右边。</span>
-      <button class="tiny ghost" onclick="allowAutoListen('${esc(d.node_id)}','${esc(d.name || '')}','${esc(d.host || '')}')">这次打开</button>
-    </div>`;
+async function toggleSmart(value, name){
+  const on = !smartOnFor({value: value, name: name});
+  const list = (smartList || []).filter(k => {
+    const v = String(k).toLowerCase();
+    return v !== String(value).toLowerCase() && v !== String(name).toLowerCase();
   });
-  box.innerHTML = html;
+  if(on) list.push(String(value));
+  try{
+    const r = await api('/api/settings', {smart_link: list});
+    smartList = (r && r.smart_link) || list;
+    toast(on ? ('已开「智连」：' + name + ' 送声音过来会自动收听，它想听本机也会自动送给它')
+            : ('已关「智连」：' + name + ' 以后要你自己点「🎧 收听它的」'), 'ok');
+    refreshAll();
+  }catch(e){ toast('设置失败：' + e.message, 'err'); }
 }
 
 function renderPeers(){
@@ -1186,23 +1470,12 @@ function renderPeers(){
       <td>${del}</td>
     </tr>`;
   }).join('');
-  const brief = nodes.map(n => {
-    const cls = n.local ? 'self' : (n.online ? 'on' : 'off');
-    const state = n.local ? '本机' : (n.online ? '在线' : '离线');
-    const del = n.local ? ''
-      : `<button class="tiny ghost" onclick="removePeer('${esc(n.value)}','${esc(n.name)}')" title="从列表移除">移除</button>`;
-    return `<div class="peerline">
-      <span class="dot ${cls}"></span>
-      <span class="nm">${esc(n.name)}${n.manual?' <span class="chip"><span class="k">手动</span></span>':''}</span>
-      <span class="tag ${n.local||n.online?'':'off'}">${state}</span>
-      ${n.host ? `<button class="tiny ghost" title="发一个 UDP 探测包；手机端不回 PING/PONG，所以『没回应』不等于不通"
-        onclick="pingPeer('${esc(n.host)}', ${Number(n.audio_port) || 0})">测连通</button>` : ''}
-      ${del}
-    </div>`;
-  }).join('');
+  // ★ 这里只留详细档那张表 —— 简洁档的那一行一台设备（brief）删掉了：
+  //   同一批设备在 ② 里已经是卡片（名字/平台/IP/状态/电平/两个按钮），
+  //   上面再来一行一模一样的「设备 × N」就是纯重复。用户原话：
+  //   「局域网里的设备和路由有相当一部分重叠」（2026-10-15）。
   $('peersBox').innerHTML =
-    `<div class="brief">${brief}</div>`
-    + `<div class="full"><table><thead><tr>
+    `<div class="full"><table><thead><tr>
       <th>设备</th><th>地址</th>
       <th>可以采到的声音<small>要分享谁的桌面音频</small></th>
       <th>可以当音响用<small>把声音送到哪去</small></th>
@@ -1250,12 +1523,20 @@ function inboundKbps(key, bytes){
   return dt > 0 ? (bytes - prev.bytes) * 8 / dt / 1000 : 0;
 }
 
-/* 这台设备现在有没有数据在流：上行取发送端统计，下行取接收端统计。 */
+/* 这台设备现在有没有数据在流：上行取发送端统计，下行取接收端统计。
+   ★ 2026-10-16 用户（图6）：「现在都只有送/收两个条，现在定义为音量显示条」——
+   那两根条改成**音量**（0..1 的峰值）而不是码率：码率和"声音大小"完全没关系
+   （静音也照样按 1536kbps 出数据，满格看着像在响）。峰值由 sender/receiver
+   各自报出来（见 rtpaudio 里的 peak）。码率仍然保留，写在线条右边的文字里。 */
 function deviceFlow(nodeId, host){
   const st = state.status || {};
-  const flows = {up_kbps: 0, down_packets: 0, down_mb: 0, buf_ms: null, target_ms: null};
+  const flows = {up_kbps: 0, down_packets: 0, down_mb: 0, buf_ms: null, target_ms: null,
+                 out_peak: 0, in_peak: 0, quality: null};
   for(const s of (st.senders || [])){
-    if(host && s.host === host) flows.up_kbps += Number(s.kbps || 0);
+    if(host && s.host === host){
+      flows.up_kbps += Number(s.kbps || 0);
+      flows.out_peak = Math.max(flows.out_peak, Number(s.peak || 0));
+    }
   }
   const recv = (st.receiver && st.receiver.streams) || [];
   let in_bytes = 0, matched = false;
@@ -1267,11 +1548,42 @@ function deviceFlow(nodeId, host){
     in_bytes += Number(r.bytes || 0);
     flows.down_packets += Number(r.packets || 0);
     flows.down_mb += Number(r.bytes || 0) / 1048576;
+    flows.in_peak = Math.max(flows.in_peak, Number(r.peak || 0));
     if(r.buffered_ms != null) flows.buf_ms = Number(r.buffered_ms);
     if(r.target_ms != null) flows.target_ms = Number(r.target_ms);
   }
   flows.in_kbps = matched ? inboundKbps('in:' + nodeId, in_bytes) : 0;
+  // ★ 「信号」：和有没有在传声音**无关**。用户（2026-10-16）：「虽然二者没有收发声音，
+  //   但是设备间信号应当存在」—— 引擎按三种真实证据算好放在 s.signals 里（正在收的声音
+  //   的丢包 / PING-PONG 往返时延 / 信标心跳），这里只是取用，不再自己另算一套。
+  flows.signal = ((st.signals || {})[nodeId]) || {};
   return flows;
+}
+
+/* 外圈（Wi-Fi，点对点并入）的分数：两者里取更差的一个 —— 哪条断了都看得见。
+   renderQualityRings 和本机那张卡片的「信号」都用它，避免两处各算一套。 */
+function outerScore(st){
+  const q = (st && st.quality) || {};
+  const scoreOf = (entry) => {
+    const latest = (entry && entry.latest) || null;
+    return (latest && typeof latest.score === 'number') ? latest.score : null;
+  };
+  const wifi = scoreOf(q.wifi), p2p = scoreOf(q.p2p);
+  let outer = wifi;
+  if(p2p !== null) outer = (outer === null) ? p2p : Math.min(outer, p2p);
+  return outer;
+}
+
+/* 「信号」条右边那句短说明：必须告诉用户这个分是**拿什么量出来的**。
+   三种证据来源不同（正在收的声音 / 往返时延 / 信标心跳），混着只说"信号 xx 分"
+   用户没法判断该不该信它。 */
+function signalShort(sig){
+  if(sig.source === 'rtt' && sig.rtt_ms != null){
+    return '延迟 ' + Number(sig.rtt_ms).toFixed(1) + 'ms';
+  }
+  if(sig.source === 'stream') return '正在收声音';
+  if(sig.source === 'heartbeat') return '在线';   // 手机不回 PING/PONG，只能靠心跳
+  return '在线';
 }
 
 /* 22 段电平条的小工厂：bar 是 0..100 的百分比，返回 22 个 <i>。 */
@@ -1284,9 +1596,9 @@ function levelSegs(pct){
 }
 
 /* ★ 卡片上的音量滑块 ★ 控制的是【我们这一层】的增益（不动 Windows 系统音量）。
-   关键：手机送进来的声音常常【根本没有路由】—— 自动收编会把它加成"频道音源"，
-   走的是本机直通/频道那一路。以前滑块只会改"路由的 gain"，这种时候没有对象可改，
-   表现就是"电脑的音量条改动无效"。所以这里按下面顺序找【真的有对象】的那一层：
+   关键：手机送进来的声音常常【根本没有路由】—— 开了「智连」的那台设备会被自动收下、
+   加成"频道音源"，走的是本机直通/频道那一路。以前滑块只会改"路由的 gain"，这种时候
+   没有对象可改，表现就是"电脑的音量条改动无效"。所以这里按下面顺序找【真的有对象】的那一层：
      1) 有 它→本机 的路由        → 改那条路由的 gain（T_STATS 会把新值同步给对端）
      2) 它是网络音源（netmic）    → 改这台手机的采集增益 /api/mic/gain
      3) 它是频道/直通正在采的音源 → 改频道音量 channel_gain（所有音源共用，界面上写清楚）
@@ -1335,16 +1647,15 @@ function deviceCard(n, routes){
   // ④ 这台对端已经没了 → 明确写出来（不然用户只看到"送 0 kbps"，不知道是为什么）
   const blockedHere = ((state.status && state.status.senders_blocked) || [])
     .find(b => b.node_id === n.value || (b.host && b.host === n.host));
-  const local = (state.status && state.status.local) || {};
-  const peak = self ? Number(local.peak || 0) : 0;
+  // ★ 2026-10-19 用户：「智连按键反应的情况不真实 —— 智连未开启，设备也会自动开启「听」」。
+  //   它自己自动来听本机（共享表里那条 auto 路由）而这台设备没开「智连」时，引擎会拦下不发；
+  //   卡片必须把这件事**写出来**，不能让用户只能从"居然还听得到声音"里去反推。
+  const smartBlocked = !!(blockedHere && blockedHere.smart_blocked);
+  // ★ 2026-10-18 用户第 6 条：「直接在如图3的每个对应设备的小卡片加入第4按键「智连」」——
+  //   原来这里那块"请求被挡下、所以没自动开"的告警整块删掉：
+  //   自动打开不再是默认行为，没有"被拒"这回事要通报（用户原话「这种警告就不要出现了」）。
+  const out = (state.status && state.status.output) || {};
   const online = self || n.online !== false;
-
-  // 电平条：本机看播放电平，对端看上行码率（PCM 约 1536kbps、Opus 约 64kbps），
-  // 有下行时显示缓冲深度。跟手机端一样，一条细条就够说明"有没有在流"。
-  let bar = 0, barText = '空闲';
-  if(self && peak > 0){ bar = Math.min(100, peak * 100); barText = `播放电平 ${(peak * 100).toFixed(1)}%`; }
-  else if(flows.up_kbps > 0){ bar = Math.min(100, flows.up_kbps / 16); barText = `上行 ${flows.up_kbps.toFixed(0)} kbps`; }
-  else if(flows.buf_ms != null){ bar = Math.min(100, (flows.buf_ms / Math.max(1, flows.target_ms || 150)) * 100); barText = `下行缓冲 ${flows.buf_ms.toFixed(0)} ms`; }
 
   const tags = [];
   if(self) tags.push('本机');
@@ -1354,15 +1665,46 @@ function deviceCard(n, routes){
 
   const meta = [n.platform || '', n.host || '', n.version ? ('v' + n.version) : '']
     .filter(Boolean).join(' · ');
-  // 收 / 送 两条实时电平：收＝它给我们的码率（或缓冲深度），送＝我们给它的码率。
-  // 本机这张卡片没有"收"，只看播放电平。
-  const inPct = self ? 0 : Math.min(100, (flows.in_kbps || 0) / 16);
-  const outPct = self ? bar : Math.min(100, (flows.up_kbps || 0) / 16);
-  const inNum = self ? '' : ((flows.in_kbps || 0) > 0 ? `${flows.in_kbps.toFixed(0)} kbps`
-      : (flows.buf_ms != null ? `缓冲 ${flows.buf_ms.toFixed(0)}ms`
-      : (flows.down_packets ? `已收 ${flows.down_packets} 包` : '没有在收')));
-  const outNum = self ? barText
-      : ((flows.up_kbps || 0) > 0 ? `${flows.up_kbps.toFixed(0)} kbps` : '没有在送');
+
+  /* ★ 2026-10-16 用户（图6）：「电脑手机现在都只有"送""收"两个条，现在定义为音量显示条。
+     并添加一个信号质量条。」——每张设备卡片现在是三根条：
+       收 = 从它收到多大声（它给我们的那份音频的峰值）
+       送 = 我们送给它多大声（我们实际发出去的那份音频的峰值，含我们这一层的增益）
+       信号质量 = 这一路实测的链路分（和「音源」那一栏同一个口径）
+     本机那张卡片没有"收"，用「输出」代替（直读当前输出设备的电平）+ 信号质量。 */
+  const pctOf = (peak) => Math.max(0, Math.min(100, Number(peak || 0) * 100));
+  const volText = (peak) => {
+    const v = Number(peak || 0);
+    return v > 0.001 ? ('声音大小 ' + (v * 100).toFixed(0) + '%') : '现在没有声音';
+  };
+  const inPct = self ? pctOf(out.peak || 0) : pctOf(flows.in_peak || 0);
+  const outPct = self ? pctOf(flows.out_peak || 0) : pctOf(flows.out_peak || 0);
+  const inLabel = self ? '输出' : '收';
+  // 文字刻意短：这一列是 flex:0 0 auto，写太长会把左边的条挤没（一眼看不清就没意义了）。
+  // 码率仍然报出来（它说明"这一路有没有在流"），但只写 kbps，不再加一长串后缀。
+  const inNum = self
+      ? (out.meter_on ? volText(out.peak) : '未接电平表')
+      : ((flows.in_peak || 0) > 0.001 ? volText(flows.in_peak)
+         : ((flows.in_kbps || 0) > 0 ? `在收 ${flows.in_kbps.toFixed(0)} kbps` : '没有在收'));
+  const outNum = ((flows.out_peak || 0) > 0.001 ? volText(flows.out_peak)
+      : ((flows.up_kbps || 0) > 0 ? `在送 ${flows.up_kbps.toFixed(0)} kbps` : '没有在送'));
+  /* ★ 「信号」：2026-10-16 用户「虽然二者没有收发声音，但是设备间信号应当存在」。
+     这台设备和本机之间的链路**一直都在**（互相看得见），所以只要有可用的证据就给分：
+       · 正在收它的声音 → 用那一路的丢包/缓冲；
+       · 有 PING/PONG 往返 → 用延迟折算；
+       · 只有信标心跳（手机不回 PING/PONG）→ 用心跳新鲜度 + 抖动。
+     三种都没有（例如手动填了个 IP、对方从没回过话）才写"对方还没回过话"——
+     绝不拿一个 0 冒充"链路很差"。本机那张卡片用 Wi-Fi 外圈的分。 */
+  const sig = flows.signal || {};
+  let qPct = null, qNum = '对方还没回过话';
+  if(self){
+    const outer = outerScore(state.status);
+    qPct = (outer === null) ? null : Math.max(0, Math.min(100, outer));
+    qNum = (outer === null) ? 'Wi-Fi 还没测到' : (Math.round(outer) + ' 分 · Wi-Fi 链路');
+  } else if(sig.known && typeof sig.score === 'number'){
+    qPct = Math.max(0, Math.min(100, sig.score));
+    qNum = sig.score + ' 分 · ' + signalShort(sig);
+  }
   // ★ 用户要的"各设备可调节的音量条"：我听它的 / 我送它的。
   //   没有对应的那条路由时滑块禁用（先点下面的按钮连上），避免调了个不存在的音量。
   // DOM id 只留安全字符（设备 id 里可能有 ':' 之类）
@@ -1385,15 +1727,32 @@ function deviceCard(n, routes){
     </div>`;
   };
 
+  // ★ 2026-10-16 用户（图2）：「图2的白字删掉」——本机那张卡原来还写着一句
+  //   "这台电脑：用下面的「频道」开关决定它广播什么、听什么"。删掉：本机卡只留
+  //   名字 + 标签 + 地址 + 电平条，和别的设备卡一个长相（用户要的就是这个）。
+  // ★ 2026-10-16 用户（图1，卡片要一样大）之后，两个按钮的文案也收干净了：
+  //   ① 去掉带括号的注解（原来已连上时写的是「点一下断开」，那是设计稿上的标注，
+  //      用户早就说过"括号内内容不要写进按键"）；注解移到 title 里。
+  //   ② 已连上时不再展开成长句，用「✓ 收听中」：一行三个按钮放得下，
+  //      卡片就不会因为按钮换行而比别的卡高。复选框该有的意思（✓ + 主色）都还在。
+  // ★ 2026-10-18 用户第 6 条：第 4 颗按钮「智连」，**默认关闭**。
+  //   开了之后：这台设备送声音过来 → 本机自动开始收听它；它想听本机 → 本机自动把声音送给它
+  //   （= 用户原话"自动接受其他设备的听和送"）。没开就一律不自动，也就不存在"被自动改了设置"。
+  const smartOn = smartOnFor(n);
   const acts = self
-    ? `<div class="dvacts"><span class="dvself">这台电脑：用下面的 ⑥ 频道开关决定它广播什么、听什么</span></div>`
+    ? ''
     : `<div class="dvacts">
-         <button class="${inRoute ? 'primary' : ''}" onclick="quickRoute('${esc(n.value)}','in')">
-           ${inRoute ? '✓ 正在收听它的（点一下断开）' : '🎧 收听它的'}</button>
-         <button class="${outRoute ? 'primary' : ''}" onclick="quickRoute('${esc(n.value)}','out')">
-           ${outRoute ? '✓ 正在送给它（点一下断开）' : '🎤 送给它'}</button>
+         <button class="${inRoute ? 'primary' : ''}" title="${inRoute ? '再点一下断开' : '把它的声音收到这台电脑'}"
+                 onclick="quickRoute('${esc(n.value)}','in')">${inRoute ? '✓ 收听中' : '🎧 收听它的'}</button>
+         <button class="${smartBlocked ? 'ghost' : (outRoute ? 'primary' : '')}"
+                 title="${smartBlocked ? '它自动过来听本机，但这张卡片没开「智连」→ 已拦下、不给声音。要放行就点「智连」；也可以直接点这颗手动送' : (outRoute ? '再点一下断开' : '把这台电脑的声音送给它')}"
+                 onclick="quickRoute('${esc(n.value)}','out')">${smartBlocked ? '智连没开·已拦下' : (outRoute ? '✓ 送达中' : '🎤 送给它')}</button>
          ${n.host ? `<button class="tiny ghost" title="发一个 UDP 探测包；手机端不回 PING/PONG，所以『没回应』不等于不通"
             onclick="pingPeer('${esc(n.host)}', ${Number(n.audio_port) || 0})">测连通</button>` : ''}
+         <button class="tiny ${smartOn ? 'primary' : 'ghost'}"
+                 title="${smartOn ? '已开「智连」：它送声音过来本机自动收听/收下播放，它想听本机也自动送给它。再点一下关掉'
+                                  : '默认关。开了之后这台设备的「听」「送」都自动接受，一开始送声音就自动收下播放，不用你每次手点'}"
+                 onclick="toggleSmart('${esc(n.value)}','${esc(n.name)}')">${smartOn ? '✓ 智连' : '智连'}</button>
        </div>`;
 
   return `<div class="dvcard${self ? ' self' : ''}${online ? '' : ' off'}">
@@ -1403,10 +1762,13 @@ function deviceCard(n, routes){
     </div>
     <div class="dvmeta">${esc(meta || '—')}</div>
     ${blockedHere ? `<div class="dvblocked">⛔ ${esc(blockedHere.text)}</div>` : ''}
-    ${self ? '' : `<div class="dvlevel"><span class="lbl">收</span>
-      <span class="dvbar">${levelSegs(inPct)}</span><span class="num">${esc(inNum)}</span></div>`}
+    <div class="dvlevel"><span class="lbl">${inLabel}</span>
+      <span class="dvbar">${levelSegs(inPct)}</span><span class="num">${esc(inNum)}</span></div>
     <div class="dvlevel"><span class="lbl">送</span>
       <span class="dvbar">${levelSegs(outPct)}</span><span class="num">${esc(outNum)}</span></div>
+    <div class="dvlevel"><span class="lbl">信号</span>
+      <span class="dvbar">${levelSegs(qPct == null ? 0 : qPct)}</span>
+      <span class="num">${esc(qNum)}</span></div>
     ${self ? '' : gainRow('in', '我听它的')}
     ${self ? '' : gainRow('out', '我送它的')}
     ${acts}
@@ -1493,36 +1855,12 @@ function clearDraft(){
   toast('已清空勾选');
 }
 
-function renderRoutes(){
-  const nameOf = (id) => nodeLabel(id);
-  const routes = state.routes || [];
-  if(!routes.length){
-    $('routesBox').innerHTML = '<div class="empty">还没有连上任何设备。在上面那台设备的卡片上点「🎧 收听它的」或「🎤 送给它」。</div>';
-    return;
-  }
-  $('routesBox').innerHTML = routes.map(r => `
-    <div class="route${r.mute?' mute':''}">
-      <div class="flow">
-        <span class="node">${esc(r.from.map(nameOf).join(' + '))}</span>
-        <span class="arrow">→</span>
-        <span class="node dst">${esc(r.to.map(nameOf).join(' + '))}</span>
-        ${r.mute ? '<span class="meta">已静音</span>' : ''}
-        ${r.auto ? `<span class="meta" title="对端按了「送声音」时自动加的，可以断开">${esc(r.label || '对方请求收听（自动）')}</span>` : ''}
-      </div>
-      <div class="gainbox">
-        <span title="我们这一层的音量，不动 Windows 系统音量">音量</span>
-        <input type="range" min="0" max="2" step="0.05" value="${r.gain}"
-               oninput="setGain('${esc(r.id)}', this.value, this)"
-               title="我们这一层的音量（不动 Windows 系统音量）">
-        <span class="mono" id="g_${esc(r.id)}">${Number(r.gain).toFixed(2)}</span>
-      </div>
-      <div class="meta">${esc(r.codec)}${r.sink_device ? ' · ' + esc(r.sink_device) : ''}</div>
-      <div class="acts">
-        <button class="tiny" onclick="toggleMute('${esc(r.id)}', ${!r.mute})">${r.mute?'取消静音':'静音'}</button>
-        <button class="tiny danger" onclick="delRoute('${esc(r.id)}')">断开</button>
-      </div>
-    </div>`).join('');
-}
+/* ★ 2026-10-16 用户（图5）：`renderRoutes()` 连同 #routesBlock / #routesBox 整块删掉
+   （「这个路由不需要了，我们已经有卡片显示当前状态了」）。每条路由的状态现在由设备卡片
+   承担：卡片上的「正在收听它的 / 正在送给它」按钮就是这条路由的开关，收/送音量条就是它
+   的实时状态。代价如实说明：**每条路由单独静音**的入口没有了（`toggleMute` 也随之删除），
+   断开仍然可用（卡片按钮 / 监控页每行的「断开」）。
+   `setGain()` 保留 —— 设备卡片上的音量滑块仍然调它。 */
 
 async function addRoute(){
   if(!draft.from.length){ toast('请先在上面「要听谁的」里勾一台设备', 'err'); return; }
@@ -1545,17 +1883,9 @@ async function addRoute(){
     refreshAll();
   }catch(e){ toast('添加失败：' + e.message, 'err'); }
 }
-async function delRoute(id){ try{ await api('/api/routes/delete', {id}); toast('已删除', 'ok'); refreshAll(); }catch(e){ toast('删除失败：'+e.message,'err'); } }
-async function toggleMute(id, mute){ try{ await api('/api/routes/update', {id, mute}); refreshAll(); }catch(e){ toast('操作失败：'+e.message,'err'); } }
-
-let gainTimer = {};
-function setGain(id, value, el){
-  const lab = $('g_' + id); if(lab) lab.textContent = Number(value).toFixed(2);
-  clearTimeout(gainTimer[id]);
-  gainTimer[id] = setTimeout(async () => {
-    try{ await api('/api/routes/update', {id, gain: parseFloat(value)}); }catch(e){ toast('音量设置失败：'+e.message,'err'); }
-  }, 450);
-}
+/* delRoute / toggleMute / setGain 三个函数随 #routesBox 一起删掉：它们的唯一调用者
+   就是那段已删除的"已经连上的"列表。断开改用设备卡片上的按钮（quickRoute），
+   音量改用卡片上的滑块（setCardGain）。留着没人调的函数只会让人以为还有别的入口。 */
 
 async function addPeer(){
   const host = $('peerHost').value.trim();
@@ -1579,20 +1909,29 @@ function showTemplates(){
     '常用例子\n' +
     '─────────────────────\n' +
     '在这台电脑的耳机里听伴侣电脑的声音\n' +
-    '     ② 里找到「伴侣的电脑」那张卡片 → 点 🎧 收听它的\n\n' +
+    '     在「设备与路由」里找到「伴侣的电脑」那张卡片 → 点 🎧 收听它的\n\n' +
     '让伴侣也听到你的声音\n' +
     '     在【对方那台电脑】的控制台上，找到你这台机器的卡片 → 点 🎧 收听它的\n' +
     '     （或者在本机卡片上点 🎤 送给它，效果一样，看你在哪台机器上点）\n\n' +
     '办公室：把 3 台手机 + 2 台电脑都收进自己的耳机\n' +
-    '     ② → 展开「高级」→ 「要听谁的」勾选所有其它设备 →\n' +
+    '     「设备与路由」→ 展开「高级」→ 「要听谁的」勾选所有其它设备 →\n' +
     '     「用谁的耳机听」勾本机 → 点「添加这条路由」（多选就是混成一路）\n\n' +
     (has ? '' : '提示：现在只发现了一台设备，先在另一台电脑上也启动 Audio Mixing。')
   );
 }
 
 /* ---------------- ③ status ---------------- */
-/* 大圆环 + 22 段电平条：照手机端的做法（.ring / .bars 同一套取值）。
-   数字是本机播放电平的百分比；没有本机播放时退回来显示链路评分。 */
+/* 大圆环（三层同心圆）+ 22 段电平条。
+   ★ 2026-10-16 用户（图1）：「手机播放声音这个电平没有反应。此外这些字全删了。
+   只留信号强度和声音大小百分比（三个数据采用相对应环的颜色。3秒切换一次）」。
+   两件事都做了：
+     1. 电平改用**当前输出设备的直读表**（/api/status 的 output.peak）。旧写法只看
+        local.peak（本机直通那一路）—— 而手机走蓝牙进来时声音是 Windows 直接播放的，
+        本机直通根本没有数据，所以永远是 0（实机 /api/status 里 local.note 正是
+        "音源就是输出设备本身，这里不再重复处理"）。
+     2. 圆心不再写「本机播放电平 %」之类的说明，也不长时间停在一个数上：三个读数
+        每 3 秒轮换一次，各用**自己那一圈的颜色**（外圈 Wi-Fi 蓝 / 中圈蓝牙紫 /
+        内圈声音绿），看一眼颜色就知道现在显示的是哪个。 */
 const LEVEL_BARS = 22;
 const levelBarEls = [];
 let levelSmooth = 0;
@@ -1607,6 +1946,26 @@ let levelSmooth = 0;
   }
 })();
 
+/* 圆心的三个轮换读数。颜色就是各自那一圈的颜色（和上面的 CSS 一一对应）。 */
+const RING_CELLS = [
+  {key: 'wifi', color: '#38bdf8'},   // 外圈：Wi-Fi 链路（含点对点）
+  {key: 'bt',   color: '#a78bfa'},   // 中圈：蓝牙链路
+  {key: 'vol',  color: '#34d399'},   // 内圈：声音大小
+];
+const RING_CELL_MS = 3000;
+let ringCellIndex = 0;
+let ringCells = {wifi: '—', bt: '—', vol: '—'};
+function renderRingCore(){
+  const metric = $('ringMetric');
+  if(!metric) return;
+  const cell = RING_CELLS[ringCellIndex % RING_CELLS.length];
+  const value = ringCells[cell.key];
+  metric.style.color = cell.color;
+  metric.textContent = (value === null || value === undefined || value === '') ? '—' : String(value);
+}
+setInterval(() => { ringCellIndex = (ringCellIndex + 1) % RING_CELLS.length; renderRingCore(); },
+            RING_CELL_MS);
+
 function pushLevel(v){                 // v: 0..1
   levelSmooth = Math.max(v || 0, levelSmooth * 0.86);
   const shown = Math.min(1, levelSmooth);
@@ -1617,66 +1976,56 @@ function pushLevel(v){                 // v: 0..1
     el.classList.toggle('hot', on);
   });
   const prog = $('ringProg');
-  if(prog) prog.setAttribute('stroke-dashoffset', String(326.7 * (1 - shown * 0.92)));
-  const metric = $('ringMetric');
-  if(metric) metric.textContent = String(Math.round(shown * 100));
-  return Math.round(shown * 100);
+  // 内圈半径 58 → 周长 364.4（原来是 r=52 的 326.7）。
+  if(prog) prog.setAttribute('stroke-dashoffset', String(364.4 * (1 - shown * 0.92)));
+  const pct = Math.round(shown * 100);
+  ringCells.vol = pct + '%';
+  return pct;
 }
 
-function renderLevelMeter(s, l){
+function renderLevelMeter(s){
+  // 内圈 = 声音大小（用户：「电平是声音大小」）；蓝牙 / Wi-Fi 两圈由 renderQualityRings()
+  // 画，三层各管各的，不再互相借用同一个数。
   const ring = $('ring');
-  const unit = $('ringUnit'), state = $('ringState');
-  const recv = (s.receiver && s.receiver.streams) || [];
-  const wq = (s.quality && s.quality.wifi) || {};
-  const wl = wq.latest || null;
-  if(l && l.enabled && (l.frames || 0) > 0){
-    const pct = pushLevel(l.peak || 0);
-    if(unit) unit.textContent = '本机播放电平 %';
-    if(state) state.textContent = pct > 0 ? '本机正在出声' : '有数据，但现在是静音';
-    if(ring) ring.className = 'ring' + (pct > 0 ? ' live' : '');
-    return;
-  }
-  if(recv.length){
-    const score = Math.round(Number((wl && wl.score) || 0));
-    pushLevel(score / 100);
-    if(unit) unit.textContent = '链路评分';
-    if(state) state.textContent = '正在接收 ' + recv.length + ' 路声音';
-    if(ring) ring.className = 'ring' + (score >= 80 ? ' live' : (score ? ' busy' : ''));
-    return;
-  }
-  pushLevel(0);
-  if(unit) unit.textContent = '播放电平 %';
-  if(state) state.textContent = '空闲：没有声音在流';
-  if(ring) ring.className = 'ring';
+  const out = (s && s.output) || {};
+  const peak = (typeof out.peak === 'number') ? out.peak : 0;
+  const pct = pushLevel(peak);
+  if(ring) ring.className = 'ring' + (pct > 0 ? ' live' : '');
+}
+
+/* 外侧两圈：中圈蓝牙、外圈 Wi-Fi。用户原话「点对点本质还是WiFi」——所以点对点不单独
+   占一圈，而是并进 Wi-Fi 那一圈（取两者里最差的一个，哪条断了都看得见）。
+   某一路没有读数（score 为 null，例如蓝牙链路不可测）时把圈留空、读数写「—」，
+   免得"没有数据"看起来像"0 分"。 */
+function ringProgress(el, circumference, score){
+  if(!el) return;
+  const has = (typeof score === 'number' && isFinite(score));
+  const pct = has ? Math.max(0, Math.min(100, score)) : 0;
+  el.setAttribute('stroke-dashoffset', String(circumference * (1 - pct / 100)));
+}
+/* ★ 2026-10-16 修正中圈：它原来借的是 q.bt —— 那是"输出段（喂声卡）"的质量，
+   源码注释自己都写着"与音频走蓝牙还是有线无关"，也就是说那圈数字跟蓝牙毫无关系。
+   而蓝牙的声音质量本来就**测不出来**（面板/手机端都写着"蓝牙链路不可测"），
+   所以这里改用真实链路状态：正在收手机的声音 = 满圈；只连了通话 = 小半圈；
+   没连上 = 空圈；圆心轮到这个读数时写状态词，不再编一个假分数。外圈仍是 Wi-Fi
+   （含点对点），那一圈有真实读数。状态由 loadBluetooth() 写在 state.btLink 上。 */
+const BT_RING = {connected: [1.0, '已连接'], hfp: [0.35, '只有通话'],
+                 waiting: [0.0, '未连接'], off: [0.0, '未连接'], error: [0.0, '出错']};
+function renderQualityRings(s){
+  const outer = outerScore(s);           // 同一个口径（见 outerScore 的说明）
+  ringProgress($('wifiProg'), 540.4, outer);
+  const pair = BT_RING[state.btLink] || [0.0, '—'];
+  ringProgress($('btProg'), 452.4, pair[0] * 100);
+  // 圆心那三个轮换读数要的值就是这里算出来的：Wi-Fi 分 / 蓝牙状态词 / 声音百分比
+  // （vol 由 pushLevel 写）。分数取不到了就写「—」，不留一个假的 0。
+  ringCells.wifi = (outer === null ? '—' : Math.round(outer));
+  ringCells.bt = pair[1];
 }
 
 /* Level history for the sparkline: one sample per refresh, so the window is a few
    minutes of "is anything actually flowing". */
 let levelHistory = new Array(90).fill(0);
 
-function drawInputCurve(svgId, entry){
-  // One curve per input, on a metric that fits the path: an arrival interval means
-  // nothing for Bluetooth, where Windows exposes no timing, so there the curve is the
-  // link state itself - which at least shows the moment it drops.
-  const svg = $(svgId);
-  if(!svg) return;
-  const values = (entry.history || []).map(v => (typeof v === 'number' ? v : 0));
-  const ideal = entry.ideal || 20;
-  const w = 200, h = 30;
-  const top = Math.max(ideal * 2.5, 0.001);
-  const y = v => (h - 3 - Math.min(1, v / top) * (h - 8)).toFixed(1);
-  let out = '<line x1="0" y1="' + y(ideal) + '" x2="' + w + '" y2="' + y(ideal) +
-            '" stroke="#2a3648" stroke-width="1" stroke-dasharray="3 3"/>';
-  if(values.length > 1){
-    const step = w / (values.length - 1);
-    out += '<polyline fill="none" stroke="#4da3ff" stroke-width="1.5" points="' +
-           values.map((v, i) => (i * step).toFixed(1) + ',' + y(v)).join(' ') + '"/>';
-  } else if(values.length === 1){
-    out += '<line x1="0" y1="' + y(values[0]) + '" x2="' + w + '" y2="' + y(values[0]) +
-           '" stroke="#4da3ff" stroke-width="1.5"/>';
-  }
-  svg.innerHTML = out;
-}
 function renderInputs(){
   // Every sound arriving here, with the path it came in on and its own curve. Listing
   // only the Wi-Fi phones hid a phone feeding audio over Bluetooth, and a single big
@@ -1696,18 +2045,15 @@ function renderInputs(){
       + '<span class="nm">' + esc(x.name || '') + '</span>'
       + '<span class="meta">' + esc(x.state || '') + '</span>'
       + score
-      + '<svg class="qchart inline" id="inCh' + i + '" viewBox="0 0 200 30" preserveAspectRatio="none"></svg>'
       + '<span class="meta">' + esc(x.metric || '') + '</span>'
       + '<span class="meta" title="' + esc(x.detail || '') + '">' + esc(x.detail || '') + '</span>'
       + '</div>';
   }).join('');
-  inputs.forEach((x, i) => drawInputCurve('inCh' + i, x));
 }
 function renderStatus(){
   // Every status refresh redraws the curves: they are the panel's answer to
   // "which link is misbehaving", and a chart that only updates on a mode switch
   // is worse than no chart.
-  drawQuality();
   renderInputs();
   const s = state.status; if(!s) return;
   const t = s.totals || {};
@@ -1719,21 +2065,34 @@ function renderStatus(){
   $('streamTag').innerHTML = `流 <b>${t.active_streams||0}</b>`;
 
   const l = s.local || {};
+  const out = s.output || {};
   const wq = (s.quality && s.quality.wifi) || {};
   const wl = wq.latest || null;
   const errs = (s.receiver && s.receiver.streams || []).reduce((a,b) => a + (b.lost||0), 0);
-  renderLevelMeter(s, l);
-  $('statsBox').innerHTML = `
-    <div class="stat"><div class="k">播放到</div><div class="v sm">${esc(l.sink || '—')}</div></div>
-    <div class="stat"><div class="k">到达间隔</div><div class="v sm">${wl ? wl.v.toFixed(1) + ' ms' : '—'}</div></div>
-    <div class="stat"><div class="k">链路评分</div><div class="v ${wl && wl.score >= 80 ? 'ok' : ''}">${wl ? wl.score : '—'}</div></div>
-    <div class="stat"><div class="k">播放电平</div><div class="v sm">${l.peak ? (l.peak * 100).toFixed(1) + '%' : '0.0%'}</div></div>
-    <div class="stat"><div class="k">已播放</div><div class="v sm">${Math.round((l.frames || 0) / 48000)}s</div></div>
-    <div class="stat"><div class="k">下行</div><div class="v sm">${wl && wl.kbps ? wl.kbps.toFixed(0) + ' kbps' : '—'}</div></div>
-    <div class="stat"><div class="k">点对点流</div><div class="v sm">${t.active_streams||0}</div></div>
-    <div class="stat"><div class="k">上行</div><div class="v sm">${t.sent_kbps||0} kbps</div></div>
-    <div class="stat"><div class="k">丢包</div><div class="v sm ${errs?'warn':''}">${errs}</div></div>
-    <div class="stat"><div class="k">运行</div><div class="v sm">${Math.round(s.node.uptime_s||0)}s</div></div>` +
+  renderLevelMeter(s);
+  renderQualityRings(s);
+  renderRingCore();
+  // 10 项指标分列大圆球两侧（用户：「这几个分别列在大圆球两侧」）：前 5 项在左、后 5 项在右。
+  // ★ 2026-10-16：「播放电平」改用**直读当前输出设备**的那个值（s.output），不再只看
+  //   本机直通 —— 见 renderLevelMeter 上面那段说明。侧边栏标出它量的是哪块设备。
+  const volPct = (typeof out.peak === 'number') ? (out.peak * 100).toFixed(1) + '%' : '—';
+  const volWhere = out.meter_on ? ('当前输出：' + (out.device || '默认设备')) : '本机输出';
+  const stats = [
+    `<div class="stat" title="${esc(volWhere)}"><div class="k">播放电平</div><div class="v sm">${volPct}</div></div>`,
+    `<div class="stat"><div class="k">到达间隔</div><div class="v sm">${wl ? wl.v.toFixed(1) + ' ms' : '—'}</div></div>`,
+    `<div class="stat"><div class="k">链路评分</div><div class="v ${wl && wl.score >= 80 ? 'ok' : ''}">${wl ? wl.score : '—'}</div></div>`,
+    `<div class="stat"><div class="k">播放到</div><div class="v sm">${esc(l.sink || '—')}</div></div>`,
+    `<div class="stat"><div class="k">已播放</div><div class="v sm">${Math.round((l.frames || 0) / 48000)}s</div></div>`,
+    `<div class="stat"><div class="k">点对点流</div><div class="v sm">${t.active_streams||0}</div></div>`,
+    `<div class="stat"><div class="k">上行</div><div class="v sm">${t.sent_kbps||0} kbps</div></div>`,
+    `<div class="stat"><div class="k">丢包</div><div class="v sm ${errs?'warn':''}">${errs}</div></div>`,
+    `<div class="stat"><div class="k">运行</div><div class="v sm">${Math.round(s.node.uptime_s||0)}s</div></div>`,
+  ];
+  const left = $('statsLeft'), right = $('statsRight');
+  if(left) left.innerHTML = stats.slice(0, 5).join('');
+  if(right) right.innerHTML = stats.slice(5).join('');
+  // 音源体检仍是可变条数，留在球下面那一行（不适合塞进定长两列）。
+  $('statsBox').innerHTML = '' +
     // 音源状态：只报事实 —— 每块采集源收到过多少、最后一次收到是多久以前。
     // 没有数据的那块直接标红，用户自己就能看出"我在采集的这块是空的"，
     // 从而换成自己正在用的那一块。判断与设备类型无关（蓝牙/有线/USB/虚拟声卡一视同仁）。
@@ -1752,17 +2111,16 @@ function renderStatus(){
         + `${esc(x.name || '?')}<br><span style="font-size:11px">${detail}</span></div></div>`;
     }).join('');
 
-  const d = s.discovery || {};
-  $('discoveryTag').textContent = d.sent ? `发现 已广播${d.sent}次` : '发现 未启用';
-  $('discoveryTag').className = 'tag' + (d.sent ? ' live' : ' off');
-
+  // ★ 2026-10-19 用户（图1）：「这个删掉。没有用了」——「找设备」标题右边那颗
+  //   「发现 已广播 N 次」的绿签整块删掉了：广播次数是程序内部的计数，用户拿它没用，
+  //   设备清单本身（下面那些卡片）已经说明了发现到了谁。
+  //   （服务端 `discovery.sent` 仍在 /api/status 里，诊断报告还要用它，只是不再上界面。）
   $('errBox').innerHTML = s.last_error ? `<div class="warnbox">最近错误：${esc(s.last_error)}</div>` : '';
   // 两个新区域：音源空转（③）和频道音源体检（⑥）。每次刷新都重画，
   // 因为它们要回答的是"为什么没声音"，晚 2.5 秒才出现就等于没出现。
   renderSourceHealth();
   renderChannelHealth();
   renderVersion();
-  renderAutoListen();
 }
 
 /* ---------------- 版本可见性 ----------------
@@ -1774,6 +2132,16 @@ function renderVersion(){
   if(tag && b){
     tag.innerHTML = `<b>v${esc(b.version)}</b>`;
     tag.title = (b.text || '') + (b.path ? ('\n' + b.path) : '');
+  }
+  // 一级菜单最下面那行也常显版本（用户带一个旧 exe 测了一整天的教训：
+  // 面板上随时要能看见自己在跑哪一版）。和上面那个 tag 同一份数据。
+  // ★ 2026-10-16（图5）：用户要求「版本号和日期要换行（精确到日就好了）」——
+  //   所以这里两行：版本一行、构建日期一行，日期只取到天（构建时间里的时分没有意义）。
+  const line = $('verline');
+  if(line && b){
+    const day = String(b.build_time || '').slice(0, 10) || '未知';
+    line.innerHTML = `<b>v${esc(b.version)}</b><br>构建 ${esc(day)}`;
+    line.title = (b.text || '') + (b.path ? ('\n' + b.path) : '');
   }
   const box = $('versionWarn');
   if(!box) return;
@@ -1874,7 +2242,7 @@ async function guideAction(si, ai){
 /* 音源空转告警的阈值：与引擎 engine.NO_DATA_WARN_S 保持一致。
    写成常量而不是散在几处，是为了让"面板说没问题"和"引擎判定没数据"永远同一口径。 */
 const NO_DATA_WARN_S = 10;
-const SRC_ADVICE = '这块设备当前没有声音在播（虚拟声卡空转时就是采不到）；换成你真正的输出设备试试 —— ⑥的「音源」里改，或 ⑧ 设置 → 采集设备。';
+const SRC_ADVICE = '这块设备当前没有声音在播（虚拟声卡空转时就是采不到）；换成你真正的输出设备试试 ——「频道」的「音源」里改，或「设置」。';
 
 function alertBox(w){
   const cls = w.level === 'bad' ? 'warnbox' : 'warnbox amber';
@@ -1905,7 +2273,7 @@ function renderSourceHealth(){
   if(sw && sw.to){
     html += `<div class="warnbox amber">🔁 已自动把音源从「${esc(sw.from || '?')}」换成「${esc(sw.to)}」—— ${esc(sw.why || '')}
       <div style="margin-top:6px;font-size:12px;opacity:.92">本次切换发生在 ${Math.round(sw.age_s || 0)} 秒前，
-      已经写进配置（下次启动不会再走那块设备）。如果这不是你想要的，在 ⑥ 的「音源」里改回来。</div></div>`;
+      已经写进配置（下次启动不会再走那块设备）。如果这不是你想要的，在「频道」的「音源」里改回来。</div></div>`;
   }
   for(const w of ((s.channel && s.channel.warnings) || [])){
     if(w.scope !== 'capture') continue;               // 引擎给的那份带着更具体的建议
@@ -2102,10 +2470,15 @@ async function loadChannelSources(force){
     if(sel.innerHTML !== html) sel.innerHTML = html;
   }catch(e){ /* the settings card is optional */ }
 }
-/* A live line so "手机到底有没有在发" is answerable without guessing. */
+/* A live line so "手机到底有没有在发" is answerable without guessing.
+   ★ 2026-10-16（图4）：这里原来还负责画「Wi-Fi 送声音的手机」那一段的卡片列表，用户说
+   那一段已经并进路由了、整块删掉。现在只留三件事：
+     · 把 /api/mic 的结果存到 state.mics（② 「我听它的」滑块靠它判断该改哪一层增益）；
+     · 刷新频道那页的「音源」旁边的实时行（谁在发、有没有加进音源）；
+     · 把两个开关的勾选状态跟服务端对齐。
+   能力一个都没丢：手机本来就在设备卡片里，也在「频道 → 音源」的下拉里。 */
 async function loadNetMics(){
   const lines = [$('netMicLine')].filter(Boolean);
-  if(!lines.length) return;
   try{
     const m = await api('/api/mic');
     const mics = m.mics || [];
@@ -2125,82 +2498,34 @@ async function loadNetMics(){
       const [cfg, st] = await Promise.all([api('/api/config'), api('/api/status')]);
       const chosen = new Set(((cfg.config || {}).channel_sources) || []);
       window.__chosenSources = Array.from(chosen);
-      window.__autoPlay = ((cfg.config || {}).auto_play !== false);
-      window.__autoAcceptListen = ((cfg.config || {}).auto_accept_listen !== false);
+      // ★ 2026-10-18 第 6 条：全局「自动收听」开关没了，改成每台设备一个「智连」。
+      //   这份是名单的镜像（设备卡片上的按钮读它）。蓝牙那半边的名单是 btAutoList。
+      smartList = ((cfg.config || {}).smart_link) || [];
       const missing = mics.filter(x => !chosen.has(x.name)).map(x => x.name);
       if(missing.length){
         hint += `<div class="action">手机 <b>${missing.map(esc).join('、')}</b> 正在发送，但没加入「音源」，所以听不到。`
+             + ` 给它的卡片开「智连」就会自动收下/播放`
              + ` <button class="tiny primary" onclick='addMicToSources(${JSON.stringify(JSON.stringify(missing))})'>加入并开直通</button></div>`;
       }
       const note = (st.local && st.local.note) || '';
       if(note) hint += `<div class="action">本机直通：${esc(note)}</div>`;
     }catch(e){ /* status is optional */ }
-    // ⑧ has its own list, so a phone that is sending is visible without hunting
-    // through the source dropdown.
-    const box = $('netAudioList');
-    if(box){
-      box.innerHTML = !mics.length
-        ? '<span class="meta">还没有手机在发送</span>'
-        : mics.map((x, i) => {
-            const chosen = (window.__chosenSources || []).includes(x.name);
-            return `<div class="btrow">
-              <span class="nm">${esc(x.name)}</span>
-              <span class="chip ${x.live ? 'sys' : ''}"><span class="k">${x.live ? '正在发送' : '已静音'}</span></span>
-              <span class="meta">${x.device_rate}Hz · ${(x.bytes_in / 1048576).toFixed(1)} MB</span>
-              <span class="chip"><span class="k">${chosen ? '已加入' : '未加入'}</span></span>
-              <button class="tiny ${x.muted ? 'danger' : 'ghost'}" onclick="muteMic(${i})">${x.muted ? '已静音' : '静音'}</button>
-              <input type="range" class="micgain" min="0" max="200" value="${Math.round((x.gain || 1) * 100)}"
-                     title="我们这一层的音量：只改这台手机传进来的增益，手机的系统媒体音量我们不碰（手机端滑杆同名同义）"
-                     oninput="setMicGain(${i}, this.value)" onchange="setMicGain(${i}, this.value)">
-            </div>`;
-          }).join('');
-    }
+    // ★ 2026-10-16（图4）：这里原来画的是「Wi-Fi 送声音的手机」那一整列卡片
+    //   （每台一张、带音量滑杆和静音），用户说那一段已经并进路由了、整块删掉。
+    //   手机现在就在上面的设备卡片里（「收听它的」/「我听它的」），静音也可以直接在卡片上断开。
     lines.forEach(el => { el.innerHTML = html + hint; });
-    if($('autoPlay')) $('autoPlay').checked = !!(window.__autoPlay);
-    if($('autoAcceptListen')) $('autoAcceptListen').checked = (window.__autoAcceptListen !== false);
   }catch(e){ /* ignore */ }
 }
 
-async function saveAutoPlay(){
-  try{
-    await api('/api/settings', {auto_play: $('autoPlay').checked});
-    toast($('autoPlay').checked ? '新手机一开始发送就会自动播放' : '已关闭自动播放，需要手动加入音源', 'ok');
-  }catch(e){ toast('失败：' + e.message, 'err'); }
-}
-async function saveAutoAcceptListen(){
-  try{
-    await api('/api/settings', {auto_accept_listen: $('autoAcceptListen').checked});
-    toast($('autoAcceptListen').checked ? '对方按「送声音」时会自动打开收听'
-                                        : '已关闭自动收听：以后每次都要你自己点', 'ok');
-    refreshAll();
-  }catch(e){ toast('失败：' + e.message, 'err'); }
-}
-async function setMicGain(index, percent){
-  try{
-    const m = await api('/api/mic');
-    const mic = (m.mics || [])[index];
-    if(!mic) return;
-    await api('/api/mic/gain', {name: mic.name, gain: Math.max(0, Math.min(200, parseInt(percent, 10))) / 100.0});
-  }catch(e){ toast('设置音量失败：' + e.message, 'err'); }
-}
-async function muteMic(index){
-  try{
-    const m = await api('/api/mic');
-    const mic = (m.mics || [])[index];
-    if(!mic) return;
-    await api('/api/mic/mute', {name: mic.name, muted: !mic.muted});
-    toast(mic.muted ? ('已取消静音 ' + mic.name) : ('已静音 ' + mic.name), 'ok');
-    loadNetMics();
-  }catch(e){ toast('失败：' + e.message, 'err'); }
-}
-async function addAllMics(){
-  try{
-    const m = await api('/api/mic');
-    const names = (m.mics || []).map(x => x.name);
-    if(!names.length){ toast('现在没有手机在发送', 'err'); return; }
-    await addMicToSources(JSON.stringify(names));
-  }catch(e){ toast('失败：' + e.message, 'err'); }
-}
+/* ★ 2026-10-18 用户（图2）：那个全局勾的事件处理函数也随它一起删掉了（它只被那个勾调用过）。
+   收不收下某台设备送来的声音，改由那张卡片上的「智连」决定，默认关。 */
+/* ★ 2026-10-16（图4）：`setMicGain(index)` / `muteMic(index)` 随「Wi-Fi 送声音的手机」那一列
+   卡片一起删掉了 —— 它们俩只被那一列卡片上的滑杆/按钮调用。每台手机的音量现在由设备卡片上
+   的「我听它的」承担（它以名字找到这台手机的采集增益，走 /api/mic/gain 同一条路）；
+   「静音」不再单独提供，要停就断开那条路由。 */
+/* ★ 2026-10-16 用户（图4）：`addAllMics()`（那个大按钮）整块删掉了 —— 见上面 HTML 那段
+   注释。`addMicToSources()` 保留：频道那页的实时行里仍然有一个「加入并开直通」按钮，
+   它走这条路。 */
 async function addMicToSources(jsonNames){
   const names = JSON.parse(jsonNames);
   try{
@@ -2258,19 +2583,86 @@ function renderChannel(ch){
 let btDevices = [];
 let btShowHidden = false;
 let btAutoList = [];
+/**
+ * 最近一次读到的**全量**蓝牙设备（含被隐藏的），供「设备关系图」复用。
+ *
+ * <p>★ 2026-10-18 为什么要有这一份、而不是让关系图自己去问服务端：
+ * `bluetooth.list_devices_cached()` 的 docstring 明确写着"每个枚举要起一个 PowerShell（约 3 秒），
+ * 绝不能在面板定时轮询的那条请求上跑"，而且**枚举本身会扰动正在保持的蓝牙连接**
+ * （见 `held_count()` 的说明）。关系图原来是每 2.5 秒问一次 `/api/bluetooth`，
+ * 那样每 10 秒（缓存的 max_age）就会真的去枚举一次 —— 这正好踩在那条禁令上。
+ * 所以这里只**复用蓝牙卡片自己那份数据**：卡片什么时候刷新，关系图就跟着拿到什么，
+ * 一次多余的枚举都不发起。
+ */
+let btSnapshot = [];
 function btAutoListGet(){ return btAutoList; }
+/* ══ ★ 2026-10-18 用户：「电脑端蓝牙每次操作都会让整个模块重新刷新，我要求仅被操作卡片刷新」══
+
+   原来 btToggle 一上来就把整个 #btList 的 innerHTML 换成「正在断开…」—— 那一秒里**所有**蓝牙
+   卡片全都消失，回来再整块重建，滚动位置也跟着跳；btAuto 同样是整块 loadBluetooth()。
+   现在按**卡片**定位：每张卡片有自己的 DOM 节点（btcard-<i>），操作时只给那一张加忙态
+   （在它内部写一句灰字 + 暂时禁用它的按钮），别的卡片一个字节都不动；回来也只替换那一张。
+
+   注意这只解决"同一批卡片里操作某一张"的场景。**隐藏 / 恢复隐藏**会改变列表里到底有哪几张卡，
+   那种情况必须整块重画（否则每张卡片的序号都会和 DOM 上的 id 错位）—— 所以那两条保持原样。 */
+
+function btCardNode(i){
+  return document.getElementById('btcard-' + i);
+}
+
+/** 忙态只写在**这一张**卡片内部，不整块换 innerHTML，其余卡片一动不动。 */
+function btBusy(i, text){
+  const node = btCardNode(i);
+  if(!node) return;
+  node.classList.add('btbusy');
+  let note = node.querySelector ? node.querySelector('.btbusynote') : null;
+  if(!note){
+    note = document.createElement('div');
+    note.className = 'btbusynote';
+    node.appendChild(note);
+  }
+  note.textContent = text;
+  Array.prototype.forEach.call(node.querySelectorAll('button'), b => { b.disabled = true; });
+}
+
+/** 重新读一次蓝牙状态，但**只重画被操作的那一张**卡片。 */
+async function btRefreshOne(deviceId, beforeCount){
+  const first = btDevices.findIndex(d => d.id === deviceId);
+  if(first < 0){ loadBluetooth(); return; }
+  const r = await api('/api/bluetooth?refresh=1');
+  const all = r.devices || [];
+  btDevices = btShowHidden ? all : all.filter(d => !btHidden().includes(d.name));
+  // 顺便把这份全量留给「设备关系图」（它绝不自己去枚举蓝牙，见 btSnapshot 的说明）。
+  btSnapshot = all;
+  relFollowBt();
+  // 中圈的「蓝牙」要用这个（见 renderQualityRings）。
+  state.btLink = ['connected', 'hfp', 'waiting', 'error', 'off']
+    .find(st => all.some(d => d.link === st)) || '';
+  // 列表里卡片的**张数**变了 → 就地替换一张会挂错节点，那时候整块重画才是对的。
+  if(btDevices.length !== beforeCount){ loadBluetooth(); return; }
+  const at = btDevices.findIndex(d => d.id === deviceId);
+  const node = btCardNode(at);
+  if(!node){ loadBluetooth(); return; }
+  node.classList.remove('btbusy');
+  node.outerHTML = btCardHtml(btDevices[at], at);
+}
+
 async function btAuto(index){
   const d = btDevices[index];
   if(!d) return;
   const list = btAutoList.slice();
   const at = list.indexOf(d.name);
   if(at >= 0) list.splice(at, 1); else list.push(d.name);
+  btBusy(index, at >= 0 ? '正在取消「智连」…' : '正在开启「智连」…');
   try{
     await api('/api/settings', {autoconnect: list});
     btAutoList = list;
-    toast(at >= 0 ? ('已取消「' + d.name + '」的自启连接') : ('启动时会自动连接「' + d.name + '」'), 'ok');
-    loadBluetooth();
-  }catch(e){ toast('设置失败：' + e.message, 'err'); }
+    toast(at >= 0 ? ('已关「智连」：启动时不再自动连「' + d.name + '」，它送声音也不自动播放')
+                  : ('已开「智连」：启动时自动连「' + d.name + '」，连上后它一开始送声音就自动收进「音源」播放'), 'ok');
+    // 自启只影响这一张卡片上那颗按钮的文案 → 重画这一张就够，不整块刷新。
+    const node = btCardNode(index);
+    if(node){ node.classList.remove('btbusy'); node.outerHTML = btCardHtml(d, index); }
+  }catch(e){ toast('设置失败：' + e.message, 'err'); loadBluetooth(); }
 }
 function btHidden(){
   try { return JSON.parse(localStorage.getItem('wl-bt-hidden') || '[]'); } catch (e) { return []; }
@@ -2300,11 +2692,28 @@ async function loadBluetooth(){
     if(!r.available){ box.innerHTML = '<span class="x">这台机器不是 Windows，或找不到 powershell.exe，蓝牙功能不可用。</span>'; return; }
     const hidden = btHidden();
     const all = r.devices || [];
+    // ★ ④ 手机在它那边点了「走蓝牙」→ 这件事由**电脑**去连（用户要求）。
+    //   连成没连成必须写在这儿：不写的话，用户手机点完看不到任何结果，只会觉得"又没反应"。
+    //   故意不用 .bthint（简洁档会把它藏起来）—— 这条是结果，不是解释。
+    const reqs = (r.requests || []).map(q => {
+      const st = q.state;
+      const text = st === 'connecting' ? '正在连它…'
+        : (st === 'already' ? '电脑这边早就连着/已就绪了'
+        : (q.ok ? '已打开接收，等手机把媒体音频发过来' : ('没连上：' + (q.error || st || '?'))));
+      return '<div style="font-size:12px;color:#9aa7b8;margin:6px 0 2px;line-height:1.7">'
+        + '手机「' + esc(q.name || '') + '」点了「走蓝牙」 → ' + esc(text) + '</div>';
+    }).join('');
     try{
       const cfg = await api('/api/config');
       btAutoList = ((cfg.config || {}).autoconnect) || [];
     }catch(e){ btAutoList = []; }
     btDevices = btShowHidden ? all : all.filter(d => !hidden.includes(d.name));
+    // 把这份全量留给「设备关系图」：它复用这一份，绝不自己去枚举蓝牙（见 btSnapshot 的说明）。
+    btSnapshot = all;
+    relFollowBt();
+    // 中圈的「蓝牙」要用这个（见 renderQualityRings）：取最强的那一个状态。
+    state.btLink = ['connected', 'hfp', 'waiting', 'error', 'off']
+      .find(st => all.some(d => d.link === st)) || '';
     const hiddenCount = all.filter(d => hidden.includes(d.name)).length;
     const footer = hiddenCount
       ? `<div class="bthint">已隐藏 ${hiddenCount} 台：${esc(all.filter(d=>hidden.includes(d.name)).map(d=>d.name).join('、'))}
@@ -2312,21 +2721,42 @@ async function loadBluetooth(){
          <button class="tiny ghost" onclick="btUnhide()">全部恢复</button></div>`
       : '';
     if(!btDevices.length){
-      box.innerHTML = '<span class="x">没有可用于接收音频的蓝牙设备。请先在 Windows 设置里把手机配对（手机端不用装任何 App）。</span>' + footer;
+      box.innerHTML = reqs + '<span class="x">没有可用于接收音频的蓝牙设备。请先在 Windows 设置里把手机配对（手机端不用装任何 App）。</span>' + footer;
       return;
     }
     // The device id ends in "...}\SNK" and contains & # { }, so it must never be
     // inlined into an onclick string: a JS escape would eat the backslash and the
     // panel would then try to disconnect a key that does not exist. Pass an index.
-    box.innerHTML = btDevices.map((d, i) => {
+    // ★ 2026-10-18：每张卡片的 HTML 挪进 btCardHtml()，并且带上 id="btcard-<i>" ——
+    //   这样"操作某一张"就只重画那一个 DOM 节点，不用把整块列表推倒重来。
+    box.innerHTML = btDevices.map((d, i) => btCardHtml(d, i)).join('') + reqs + footer;
+  }catch(e){ box.innerHTML = '<span class="x">读取失败：' + esc(e.message) + '</span>'; }
+}
+
+/**
+ * 一张蓝牙卡片的 HTML。抽成函数只为一件事：操作某一张时能**就地**换掉它。
+ *
+ * <p>★ 2026-10-18 用户：「电脑端蓝牙每次操作都会让整个模块重新刷新，我要求仅被操作卡片刷新。」
+ * 顺带说明两处刻意的取舍：
+ * <ul>
+ *   <li>设备 id 结尾是 {@code ...}\SNK}，含 & # { } \ —— 绝不能拼进 onclick 字符串
+ *       （JS 转义会把反斜杠吃掉，面板就会去断一个不存在的键），所以传的是**下标 i**。</li>
+ *   <li>卡片的 DOM id 也用下标：id 一旦跟着设备 id 走就要考虑转义，而下标和
+ *       {@code btDevices} 是同一份顺序，出了偏差一眼能看出来。</li>
+ * </ul>
+ */
+function btCardHtml(d, i){
       // Three states, because "this PC opened its sink" and "a phone is connected" are
       // different things - State==Opened only means this machine is willing to receive.
+      // 3 项就够了：胶囊文案 / 胶囊配色 / 是否"已连上"。
+      // 2026-10-16 用户：「图3…为什么不删？」——每张方块里那行灰色说明去掉了：状态由胶囊
+      // 表达就够了，方块要和局域网设备一个长相（含 "phone" 主题 = 偏绿）。
       const map = {
         connected: ['正在接收手机声音', 'sys', true],
         // "waiting" is the PC's own state, not the phone's: nothing is being received
-        // yet. Saying "已开启接收" read like an active connection and confused exactly
-        // that - the label now leads with what is NOT happening.
-        waiting:   ['手机未连接（电脑已就绪）', 'off', false],
+        // yet. 2026-10-16 用户：「这种电脑准备好了的，直接标黄，然后『手机未连接』」——
+        // 所以文案砍掉后半句、颜色从灰改成黄（.chip.amber），一眼看出"就差这一步"。
+        waiting:   ['手机未连接', 'amber', false],
         hfp:       ['手机只连了通话(HFP)，没有媒体声音', '', false],
         error:     ['手机没有响应或出错', '', false],
         off:       ['未连接', '', false],
@@ -2338,29 +2768,630 @@ async function loadBluetooth(){
             : (d.link === 'error' && d.state
                 ? `<div class="bthint">${esc(d.state)}　—　手机可能没开机、不在附近，或已经被别的设备占用。</div>`
                 : ''));
-      return `<div class="btrow">
-        <span class="nm">${esc(d.name)}</span>
-        <span class="chip ${map[1]}"><span class="k">${map[0]}</span></span>
-        <button class="tiny ${map[2] ? 'danger' : 'primary'}" onclick="btToggle(${i})">${map[2] ? '断开' : '连接'}</button>
-        <button class="tiny ${btAutoList.includes(d.name) ? 'primary' : 'ghost'}" onclick="btAuto(${i})"
-                title="启动 Audio Mixing 时自动连接这台手机">${btAutoList.includes(d.name) ? '自启 ✓' : '自启'}</button>
-        <button class="tiny ghost" onclick="btHide(${i})" title="不再显示（不影响 Windows 里的配对）">隐藏</button>
-      </div>${hint}`;
-    }).join('') + footer;
-  }catch(e){ box.innerHTML = '<span class="x">读取失败：' + esc(e.message) + '</span>'; }
+    // 名字列用 1fr（能多宽就多宽）+ title 兜底：名字最多被省略号截一次，
+    // 鼠标停上去还能看到全名。原来那一版把名字列**封顶** 150px，
+    // 稍长的手机名直接被截成半截（2026-10-15 用户截图）。
+      // ★ 2026-10-16 用户（图3）：「蓝牙的那个条没有。最好还能标记蓝牙地址」——
+      //   和局域网设备卡同一套骨架：地址那一行 = LAN 卡的 IP 行；下面"收"的那条
+      //   = LAN 卡的收/送电平条。蓝牙的**声音质量测不出来**（手机端和面板都写着
+      //   "蓝牙链路不可测"），所以这条是按真实链路状态驱动的：正在收手机的声音 = 满条。
+      const addr = d.address ? String(d.address) : '—';
+      const btBar = {connected: 100, hfp: 35}[d.link] || 0;
+      // ★ 2026-10-16 用户（图6）之后每个方块都要有「信号质量」这一条 —— 蓝牙方块这一条
+      //   本来就是按**真实链路状态**驱动的（满条 = 正在收手机的声音），所以它当之无愧是
+      //   「信号」，只是原来标着「收」把它说成了音量。音量那一条这里没法给：蓝牙的声音
+      //   由 Windows 直接放进耳机，本工具拿不到它的电平（面板/手机端都写着"不可测"），
+      //   所以直说"音量不可测"，不编一根假条。
+      const barText = btBar >= 90 ? '在收声 · 音量不可测'
+        : (d.link === 'hfp' ? '只有通话' : '空闲');
+      return `<div class="dvcard phone" id="btcard-${i}">
+        <div class="dvhead">
+          <span class="dvname" title="${esc(d.name)}">${esc(d.name)}</span>
+          <span class="chip ${map[1]}"><span class="k">${map[0]}</span></span>
+        </div>
+        <div class="dvmeta" title="Windows 上的蓝牙地址（设备实例里那一串）">${esc(addr)}</div>
+        <div class="dvlevel"><span class="lbl">信号</span>
+          <span class="dvbar">${levelSegs(btBar)}</span><span class="num">${esc(barText)}</span></div>
+        <div class="dvacts">
+          <button class="tiny ${map[2] ? 'danger' : 'primary'}" onclick="btToggle(${i})">${map[2] ? '断开' : '连接'}</button>
+          <button class="tiny ${btAutoList.includes(d.name) ? 'primary' : 'ghost'}" onclick="btAuto(${i})"
+                  title="蓝牙这一路的「智连」：启动时自动连接这台手机；连上后它一开始送声音，本机就自动把它收进「音源」播放（默认关）">${btAutoList.includes(d.name) ? '✓ 智连' : '智连'}</button>
+          <button class="tiny ghost" onclick="btHide(${i})" title="不再显示（不影响 Windows 里的配对）">隐藏</button>
+        </div>
+        ${hint}
+      </div>`;
 }
+
 async function btToggle(index){
   const d = btDevices[index];
   if(!d) return;
   const live = d.link === 'connected' || d.link === 'waiting';
-  const box = $('btList');
-  if(box) box.innerHTML = '<span class="x">' + (live ? '正在断开…' : '正在连接，请在手机上确认…') + '</span>';
+  const before = btDevices.length;
+  // ★ 原来这里把整个列表换成「正在断开…」，于是所有卡片一起消失、再整块重建。
+  //   现在忙态只落在**被点的那一张**卡片里（见文件上方那段说明）。
+  btBusy(index, live ? '正在断开…' : '正在连接，请在手机上确认…');
   try{
     const r = live ? await api('/api/bluetooth/disconnect', {id: d.id})
                    : await api('/api/bluetooth/connect', {id: d.id});
     toast(live ? '已断开' : ('连接状态：' + (r.state || '已发起')), r.ok === false ? 'err' : 'ok');
   }catch(e){ toast((live ? '断开' : '连接') + '失败：' + e.message, 'err'); }
-  setTimeout(loadBluetooth, live ? 800 : 1500);
+  // 系统那边把链路状态改过来要点时间，按原来的节奏等一下再读；回来也只重画这一张。
+  setTimeout(() => { btRefreshOne(d.id, before).catch(() => {}); }, live ? 800 : 1500);
+}
+
+/* ══════════════════ 设备关系图（ComfyUI 风格） ══════════════════
+
+   ★ 2026-10-18 用户：「在版本号那边加入comefyui（类似感觉就好，支持拖拽，可以连线最好）以显示
+   局域网内+蓝牙设备与本机关系，线条以柔和曲线分颜色标明是WIFI/蓝牙/广播模式连接。
+   （可以当作一个图标式的监控，但是仅表示连接关系）」
+
+   用户当场选定的两件事：
+     · **拖线 = 真建路由**（不是画着玩）：从一台的右侧圆点拖到另一台左侧圆点 → 真的建一条
+       「它送给你」路由，方向就是拖的方向；
+     · **设备之间的路由也画**：不只是本机↔设备。
+
+   实现上刻意守住的几条：
+     · 不引任何外部库（局域网里外链根本加载不出来，tools/check_ui_syntax.py 也会判不合格）——
+       节点是绝对定位的 div（圆角卡片 + 两个圆点），线画在下面那层 SVG 里（贝塞尔 + 点线删除）；
+     · 线是不是"真的在通"取自 /api/monitor：**那条流里真的有数据**（字节/速率非 0）= 实线；
+       配置了但当前没声音在流（对方离线、已经停了） = 虚线 —— 这正是"仅表示连接关系"要的那层信息；
+       ★ 2026-10-19 用户「线的形式和实际情况不匹配」：原来只要 route_id 出现在监控里就算实线，
+         而"已配置 · 当前没有数据"那几行也带 route_id（它要用它给「断开」按钮），于是离线设备
+         还被画成实线。现在按"有没有数据"判。
+     · 蓝牙设备那一份**复用蓝牙卡片读回来的 btSnapshot**，关系图自己一次枚举都不发起
+       （`/api/bluetooth` 冷缓存时会起一个约 3 秒的 PowerShell，而且枚举会扰动正在保持的
+       蓝牙连接 —— `bluetooth.py` 里那条禁令就是为它写的）；
+     · 蓝牙只画不连：蓝牙是点对点的物理链路、不是路由端点，所以蓝牙节点不给圆点，
+       CSS 里直接 `.relnode.bt .rk{display:none}`，免得用户拖半天拖出一条不存在的线。
+*/
+
+var REL_W = 158, REL_ROW = 78, REL_COL_GAP = 76;
+var relPos = {};          // key -> {x,y}：用户拖过就记住
+var relNodes = [];        // 本次渲染的节点
+var relLinks = [];        // 本次渲染的线
+var relH = {};            // key -> 卡片实际高度（线的两端要按真实高度算圆心）
+var relEl = {};           // key -> DOM 节点（拖动时直接改它的 left/top）
+var relData = { flows: [] };
+var relDragNode = null, relDragLink = null, relPan = null;
+/** 视图：平移 + 缩放（Ctrl+滚轮 / 空白处拖动）。存这里是"图谱自己的"，不碰浏览器缩放。 */
+var relView = { x: 0, y: 0, k: 1 };
+
+/** 把 relView 落到 #relCanvas 的 transform 上。 */
+function relApplyView(){
+  const c = $('relCanvas');
+  if(!c || !c.style) return;
+  c.style.transform = 'translate(' + relView.x + 'px,' + relView.y + 'px) scale(' + relView.k + ')';
+}
+/** 屏幕坐标 → 画布内容坐标（画布整体被 translate+scale 过，所以要反着算回来）。 */
+function relToCanvas(ev){
+  const c = $('relCanvas');
+  const rect = c ? c.getBoundingClientRect() : {left: 0, top: 0};
+  return {x: (ev.clientX - rect.left) / relView.k, y: (ev.clientY - rect.top) / relView.k};
+}
+
+function relLoadPos(){
+  try { relPos = JSON.parse(localStorage.getItem('wl-relpos') || '{}') || {}; } catch(e){ relPos = {}; }
+}
+function relSavePos(){
+  try { localStorage.setItem('wl-relpos', JSON.stringify(relPos)); } catch(e){}
+}
+function relResetPos(){
+  relPos = {};
+  relSavePos();
+  relView = {x: 0, y: 0, k: 1};     // 「重排」同时把视图复位（不然缩到很小之后找不回来）
+  relApplyView();
+  relRender();
+  toast('已把节点放回自动排的位置', 'ok');
+}
+function relCanvasW(){
+  const c = $('relCanvas');
+  return (c && c.clientWidth) || 1000;
+}
+/* 一条柔和的三次贝塞尔：控制点水平伸出去，两端离得越远伸得越长 —— ComfyUI 那种"软软的线"。 */
+function relPath(x1, y1, x2, y2){
+  const dx = Math.max(36, Math.abs(x2 - x1) * 0.45);
+  return 'M ' + x1 + ' ' + y1 + ' C ' + (x1 + dx) + ' ' + y1 + ', ' +
+         (x2 - dx) + ' ' + y2 + ', ' + x2 + ' ' + y2;
+}
+
+/**
+ * 从**点对点路由**里找出所有"闭合"的边 —— 也就是用户说的"声音回环"。
+ *
+ * <p>★ 2026-10-18 用户第 4 条：「如果comfyui的线图出现了回环，即声音回环。要在ui最上方表明警告。
+ * 并将回环线路标红，但是正常运行，一切后果让使用者自己承担。」
+ *
+ * <p>只算点对点（Wi-Fi）那些边，**不算广播/收听**：广播是"本机→全网"、只听是"全网→本机"，
+ * 两条同时开着天然就构成环 —— 而那是用户明确要的 FM 电台用法（两条线独立、想说就说想听就听），
+ * 拿它当回环报警会变成天天误报。真正危险的是**一串点对点路由绕回自己**（A 送 B、B 送 A），
+ * 那才是会啸叫的那件事。
+ *
+ * <p>判定算法很直白：一条边 u→v 属于某个环，当且仅当**从 v 还能走回 u**。
+ * 图很小（几十条边），这样写比上 Tarjan 好读得多。
+ */
+function routeCycleInfo(){
+  const edges = [], adj = {};
+  (state.routes || []).forEach(function(r){
+    const froms = [].concat(r.from || []), tos = [].concat(r.to || []);
+    froms.forEach(function(a){
+      tos.forEach(function(b){
+        if(!a || !b || a === b || a === '*' || b === '*') return;
+        const u = String(a), v = String(b);
+        edges.push([u, v]);
+        (adj[u] = adj[u] || []).push(v);
+      });
+    });
+  });
+  function canReach(start, goal){
+    const seen = {};
+    const stack = [start];
+    while(stack.length){
+      const cur = stack.pop();
+      if(seen[cur]) continue;
+      seen[cur] = 1;
+      const nx = adj[cur] || [];
+      for(let i = 0; i < nx.length; i++){
+        if(nx[i] === goal) return true;
+        stack.push(nx[i]);
+      }
+    }
+    return false;
+  }
+  const pairs = {}, cyc = [];
+  edges.forEach(function(e){
+    if(canReach(e[1], e[0])){ pairs[e[0] + '|' + e[1]] = 1; cyc.push(e); }
+  });
+  return {pairs: pairs, edges: cyc};
+}
+
+/** 顶部那条回环警告。**不拦任何东西**：只警告，程序照常跑（用户第 4 条的原话）。 */
+function renderLoopWarn(){
+  const el = $('loopWarn');
+  if(!el) return;
+  const info = routeCycleInfo();
+  if(!info.edges.length){
+    if(el.style.display !== 'none'){ el.style.display = 'none'; el.innerHTML = ''; }
+    return;
+  }
+  const shown = info.edges.slice(0, 4).map(function(e){
+    return esc(nodeLabel(e[0]) + ' → ' + nodeLabel(e[1]));
+  });
+  el.innerHTML = '⚠ <b>检测到声音回环</b>：' + shown.join('　')
+    + (info.edges.length > 4 ? ('　… 共 ' + info.edges.length + ' 条') : '')
+    + '　—— 声音会绕一圈回到自己，可能啸叫或叠加。<b>程序照常运行，后果自负</b>；'
+    + '要消除就在「版本号 → 设备关系图」里点掉其中一条<b>红色</b>的线。';
+  el.style.display = 'block';
+}
+
+/** 把当前状态拼成节点 + 线。只做数据，不碰 DOM。 */
+function relBuild(){
+  const me = state.self || {};
+  const nodes = [], links = [];
+  const keyOf = {};
+
+  function addNode(key, kind, name, sub, online, id){
+    nodes.push({key: key, kind: kind, name: name, sub: sub, online: online !== false, id: id || ''});
+    return key;
+  }
+
+  addNode('self', 'self', me.name || '本机', '本机' + (me.host ? (' · ' + me.host) : ''), true, me.id);
+  if(me.id) keyOf[me.id] = 'self';
+  if(me.short_id) keyOf[me.short_id] = 'self';
+  if(me.name) keyOf[me.name] = 'self';
+  keyOf['self'] = 'self';
+  keyOf['本机'] = 'self';
+
+  (state.peers || []).forEach(function(p){
+    const key = 'lan:' + (p.node_id || p.host || p.name);
+    addNode(key, 'lan', p.name || p.node_id || '?',
+            (p.host || '') + (p.online ? '' : ' · 离线'), !!p.online, p.node_id);
+    [p.node_id, p.short_id, p.name, p.host].forEach(function(v){ if(v) keyOf[v] = key; });
+  });
+
+  // 蓝牙设备：不并进 keyOf（名字可能和局域网设备撞车），单独用 bt: 前缀。
+  // 数据来自 btSnapshot（蓝牙卡片读回来的那份），**不是**这里自己去枚举的。
+  (btSnapshot || []).forEach(function(d){
+    if(!d || !d.name) return;
+    addNode('bt:' + d.name, 'bt', d.name, d.address || '蓝牙', d.link === 'connected',
+            '');
+  });
+
+  // 找节点：路由表里的 id 先按表查，查不到就现造一个"离线/不可达"节点，别让线凭空消失。
+  function keyForId(id){
+    const t = String(id || '');
+    if(!t || t === '*') return '';
+    if(keyOf[t]) return keyOf[t];
+    const key = 'x:' + t;
+    if(!nodes.some(function(n){ return n.key === key; })){
+      addNode(key, 'lan', nodeLabel(t), '不在线 / 不可达', false, t);
+      keyOf[t] = key;
+    }
+    return key;
+  }
+
+  // 点对点路由（含「设备↔设备」——用户当场选的就是要画这一层）
+  const cyc = routeCycleInfo().pairs;
+  (state.routes || []).forEach(function(r){
+    const fromIds = [].concat(r.from || []), toIds = [].concat(r.to || []);
+    fromIds.forEach(function(aId){
+      toIds.forEach(function(bId){
+        const a = keyForId(aId), b = keyForId(bId);
+        if(!a || !b || a === b) return;
+        links.push({from: a, to: b, kind: 'wifi', route: r.id || '', mute: !!r.mute,
+                    live: false,
+                    // ★ 第 4 条：这条边属于某个环 → 画成红的（程序照常跑）
+                    cycle: !!cyc[String(aId) + '|' + String(bId)]});
+      });
+    });
+  });
+
+  // 广播 / 只听：从 monitor 的两条频道流里认，认出来的就是"本机↔全网设备"那一片橙线。
+  let bcSend = false, bcListen = false;
+  (relData.flows || []).forEach(function(f){
+    const ch = String(f.channel || '');
+    const rid = String(f.route_id || '');
+    // 有流在同一条路上 → 这条线是实线（真的在通）
+    // ★ 2026-10-19 用户：「线的形式和实际情况不匹配」——监控页里那些
+    //   「已配置 · 当前没有数据」的路由行**也带 route_id**（它要靠这个 id 提供「断开」按钮），
+    //   原来"只要这个 id 出现在监控里就算有声音在流"，于是"对方离线 + 已经停止发送"的路由
+    //   被画成了**实线** —— 而实线在图例里的意思正是"现在真的有连接/有声音在流"。
+    //   现在要求这条流里**真的有数据**（字节数和速率都不是 0）才算"在流"，否则画虚线。
+    const flowing = Number(f.bytes || 0) > 0 || Number(f.rate_kbps || 0) > 0;
+    if(rid && flowing){
+      const hit = links.filter(function(l){
+        return l.route && rid.split(',').indexOf(String(l.route)) >= 0;
+      });
+      hit.forEach(function(l){ l.live = true; });
+    }
+    if(ch === '广播' && String(f.state || '') === '正在广播') bcSend = true;
+    // ★ 2026-10-20：监控页那两路已经分开标了（"点对点" / "广播"），所以这里不再依赖通道名，
+    //   直接看 route_id：带 channel 的那条就是"本机在听广播"。
+    if(rid.indexOf('channel') >= 0 && String(f.to) === '本机') bcListen = true;
+  });
+  const lanOnline = nodes.filter(function(n){ return n.kind === 'lan' && n.online; })
+                         .map(function(n){ return n.key; });
+  if(bcSend) lanOnline.forEach(function(k){ links.push({from: 'self', to: k, kind: 'bc', live: true}); });
+  if(bcListen) lanOnline.forEach(function(k){ links.push({from: k, to: 'self', kind: 'bc', live: true}); });
+
+  // 蓝牙链路：连着 = 实线；电脑这边已就绪但手机还没发媒体音频 = 虚线。
+  nodes.filter(function(n){ return n.kind === 'bt'; }).forEach(function(n){
+    if(n.online) links.push({from: 'self', to: n.key, kind: 'bt', live: true});
+    else if((btSnapshot || []).some(function(d){ return 'bt:' + d.name === n.key && d.link === 'waiting'; })){
+      links.push({from: 'self', to: n.key, kind: 'bt', live: false});
+    }
+  });
+
+  relNodes = nodes;
+  relLinks = links;
+}
+
+/** 没摆过的节点自动排位：本机一列、局域网一列、蓝牙一列。 */
+function relAutoPos(){
+  const W = relCanvasW();
+  const cols = [22,
+                Math.max(22 + REL_W + REL_COL_GAP, W * 0.36),
+                Math.max(22 + (REL_W + REL_COL_GAP) * 2, W * 0.68)];
+  const used = {0: 0, 1: 0, 2: 0};
+  relNodes.forEach(function(n){
+    if(relPos[n.key]) return;
+    const col = n.kind === 'self' ? 0 : (n.kind === 'bt' ? 2 : 1);
+    relPos[n.key] = {x: Math.round(cols[col]), y: 24 + used[col] * REL_ROW};
+    used[col] += 1;
+  });
+}
+
+/** 只重画线（拖节点时每次 mousemove 都要调，绝不能顺手重建 DOM，否则拖到一半就被换掉）。 */
+function relDrawLinks(){
+  const svg = $('relSvg');
+  if(!svg) return;
+  const out = [];
+  relLinks.forEach(function(l, i){
+    const a = relPos[l.from], b = relPos[l.to];
+    if(!a || !b) return;
+    const y1 = a.y + (relH[l.from] || 52) / 2;
+    const y2 = b.y + (relH[l.to] || 52) / 2;
+    const d = relPath(a.x + REL_W, y1, b.x, y2);
+    // 一条加粗的透明命中层 + 一条看得见的线：线才 2.4px，直接点它太难点中。
+    const cls = 'ln ' + l.kind + (l.live ? '' : ' dashed') + (l.cycle ? ' cycle' : '');
+    out.push('<path class="lnhot" data-i="' + i + '" d="' + d + '"></path>');
+    out.push('<path class="' + cls + '" data-i="' + i +
+             '" d="' + d + '"><title>' + esc(relLinkText(l)) + '</title></path>');
+  });
+  if(relDragLink){
+    const a = relPos[relDragLink.from];
+    if(a){
+      const y1 = a.y + (relH[relDragLink.from] || 52) / 2;
+      out.push('<path class="ghost" d="' + relPath(a.x + REL_W, y1, relDragLink.x, relDragLink.y) + '"></path>');
+    }
+  }
+  svg.innerHTML = out.join('');
+}
+
+function relNameOf(key){
+  const n = relNodes.find(function(x){ return x.key === key; });
+  return n ? n.name : key;
+}
+function relLinkText(l){
+  const a = relNameOf(l.from), b = relNameOf(l.to);
+  const kind = l.kind === 'bt' ? '蓝牙' : (l.kind === 'bc' ? '广播 / 收听' : 'Wi-Fi 点对点');
+  return (l.cycle ? '⚠ 回环：' : '') + kind + '：' + a + ' → ' + b +
+         (l.live ? '（现在有声音在流）' : '（当前没有声音在流）') +
+         (l.route ? '　点这条线可以删掉这条路由' : '');
+}
+
+function relRender(){
+  const box = $('relNodes'), svg = $('relSvg'), canvas = $('relCanvas');
+  if(!box || !svg) return;
+  if(!relNodes.length){
+    box.innerHTML = '<div class="empty" style="padding:24px">正在读取设备关系…</div>';
+    svg.innerHTML = '';
+    return;
+  }
+  relAutoPos();
+  box.innerHTML = relNodes.map(function(n){
+    const p = relPos[n.key] || {x: 0, y: 0};
+    let cls = 'relnode';
+    if(n.kind === 'self') cls += ' self';
+    if(n.kind === 'bt') cls += ' bt';
+    if(n.online === false) cls += ' off';
+    // ★ 2026-10-18 用户第 2 条：「应当只能控制电脑的主动发送声音。我刚刚连线发现，
+    //   手机设备的发送线也能拖拽」——只有本机那两个圆点是**拖拽起点**；
+    //   设备那侧只是**落点提示**（拖着本机的圆点往它身上一放就行）。
+    const ports = n.kind === 'self'
+      ? '<span class="rk send" title="从这儿拖到某台设备 = 把这台电脑的声音送给它（主动发）"></span>'
+        + '<span class="rk recv" title="从这儿拖到某台设备 = 收听那台设备送来的声音"></span>'
+      : (n.kind === 'bt' ? '' : '<span class="rk drop" title="把本机那个「送」或「收」圆点拖到这儿"></span>');
+    return '<div class="' + cls + '" data-key="' + esc(n.key) + '"'
+      + ' style="left:' + p.x + 'px;top:' + p.y + 'px">'
+      + '<div class="rn" title="' + esc(n.name) + '">' + esc(n.name) + '</div>'
+      + '<div class="rs" title="' + esc(n.sub || '') + '">' + esc(n.sub || '') + '</div>'
+      + ports
+      + '</div>';
+  }).join('');
+
+  // 量一次真实高度：卡片里的字可能换行，圆心必须按量出来的来。
+  relH = {}; relEl = {};
+  Array.prototype.forEach.call(box.querySelectorAll('.relnode'), function(el){
+    const k = el.dataset.key;
+    relH[k] = el.offsetHeight || 52;
+    relEl[k] = el;
+  });
+  const W = relCanvasW();
+  let maxY = 0;
+  relNodes.forEach(function(n){
+    const p = relPos[n.key];
+    if(p) maxY = Math.max(maxY, p.y + (relH[n.key] || 52));
+  });
+  const H = Math.max(400, maxY + 28);
+  if(canvas) canvas.style.height = H + 'px';
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  svg.setAttribute('width', W);
+  svg.setAttribute('height', H);
+  relApplyView();
+  relDrawLinks();
+}
+
+/** 读一次关系数据并重画。不在「版本号」那一页就**不去请求**（省得白跑）。
+
+ *  ★ 2026-10-18：这里**只**问 `/api/monitor`，**不问** `/api/bluetooth` —— 后者在缓存过期时
+ *  会真的去起一个 PowerShell 枚举（约 3 秒），而且枚举本身会扰动正在保持的蓝牙连接，
+ *  `bluetooth.py` 里那条"绝不能在面板轮询的请求上跑"的禁令就是为它写的。
+ *  蓝牙那一份改用 btSnapshot（蓝牙卡片自己读回来的那份，见它的说明）。
+ *  `/api/monitor` 是**便宜**的：它只读缓存里的设备名单和收发表，监控页自己就每 1 秒问一次。
+ */
+async function relRefresh(force){
+  if(!force && activePane !== 'ver') return;
+  try{
+    const mon = await api('/api/monitor');
+    relData.flows = (mon && mon.flows) || [];
+  }catch(e){
+    // 读不到就按"只有本机、没有别的"画 —— 整块空白比一句"读不到"更让人以为功能坏了。
+  }
+  relBuild();
+  relRender();
+}
+
+/** 蓝牙卡片刚换了数据 → 关系图跟着重画一次（只在「版本号」那一页上才动手）。 */
+function relFollowBt(){
+  if(activePane !== 'ver') return;
+  relBuild();
+  relRender();
+}
+
+/** 拖线松开：真的建一条路由（方向 = 拖动方向）。 */
+async function relCreate(fromKey, toKey){
+  const a = relNodes.find(function(n){ return n.key === fromKey; });
+  const b = relNodes.find(function(n){ return n.key === toKey; });
+  if(!a || !b || fromKey === toKey) return;
+  if(a.kind === 'bt' || b.kind === 'bt'){
+    toast('蓝牙是点对点的物理链路，不能当路由端点：请在上面蓝牙那张卡上点「连接」', 'err');
+    return;
+  }
+  if(!a.id || !b.id){
+    toast('这台设备还没上报过节点 id（等它发一次信标再来拖）', 'err');
+    return;
+  }
+  // 同一条 from→to 已经在表里了就别再建一条：两条完全一样的路由在图上是**重叠的一条线**，
+  // 用户下次点它只会删掉其中一条，看起来就是"点了没反应"。重复路由对声音没有任何区别。
+  const already = (state.routes || []).some(function(r){
+    const f = [].concat(r.from || []).map(String), t = [].concat(r.to || []).map(String);
+    return f.length === 1 && t.length === 1 && f[0] === String(a.id) && t[0] === String(b.id);
+  });
+  if(already){
+    toast(a.name + ' → ' + b.name + ' 这条线已经有了（图上那条蓝线就是它）', 'ok');
+    return;
+  }
+  try{
+    await api('/api/routes/add', {route: {from: [a.id], to: [b.id], codec: 'pcm_s16', gain: 1.0}});
+    toast('已建路由：' + a.name + ' 送给 ' + b.name, 'ok');
+    // 自取一次路由表再画：refreshAll() 有可能因为"上一轮还没回来"（inFlight）整轮被跳过，
+    // 那样这条新线要等到下一个 2.5 秒才出现 —— 用户刚拖完却看不到线，就是"点了没反应"。
+    try{ state.routes = (await api('/api/routes')).routes || state.routes; }catch(e){}
+    refreshAll();
+    relRefresh(true);
+  }catch(e){ toast('建路由失败：' + e.message, 'err'); }
+}
+
+/**
+ * 松手时指针落在**哪一张卡**上 —— 按几何位置算，不用 elementFromPoint。
+ *
+ * ★ 2026-10-18 实测换掉 elementFromPoint 的两个理由：
+ *   ① SVG 里的线（`.ln` / `.lnhot` 都是 `pointer-events:stroke`）会**抢走命中**：
+ *      指针明明落在某张卡上，elementFromPoint 却摸到一条从卡上穿过的线，于是
+ *      `closest('.relnode')` 得空、"拖过去什么也没发生"；
+ *   ② 画布整体被 translate+scale 过，elementFromPoint 的结果还受滚动位置影响，
+ *      同一套坐标在不同视口下指向不同卡片（探针里反复复现）。
+ *   改成直接拿每张卡的 getBoundingClientRect 比：点在卡里 = 命中；都不在卡里就取最近的
+ *   一张（36px 以内），再远就当"没落上"，免得松手在空白处也被判成拖到了某台设备。
+ */
+function relHitNode(clientX, clientY){
+  let best = '', bestD = Infinity;
+  Object.keys(relEl).forEach(function(k){
+    const el = relEl[k];
+    if(!el || !el.getBoundingClientRect) return;
+    const r = el.getBoundingClientRect();
+    if(!r.width || !r.height) return;
+    const dx = Math.max(r.left - clientX, 0, clientX - r.right);
+    const dy = Math.max(r.top - clientY, 0, clientY - r.bottom);
+    if(dx === 0 && dy === 0){ best = k; bestD = 0; return; }   // 点在卡片里，直接定案
+    if(bestD === 0) return;                                    // 已经命中卡里的了，别被顶掉
+    const d = Math.sqrt(dx * dx + dy * dy);
+    if(d < bestD){ bestD = d; best = k; }
+  });
+  return bestD <= 36 ? best : '';
+}
+
+/** 点线 = 删掉它（广播那两条没路由可删，指路到「广播」页）。 */
+async function relDeleteLink(l){
+  const text = relNameOf(l.from) + ' → ' + relNameOf(l.to);
+  if(l.kind === 'bc'){
+    toast('这条是广播 / 收听关系：请到「广播」那一页把开关关掉', 'err');
+    return;
+  }
+  if(!l.route){
+    toast('这条线不是本机建的路由，删不掉（它由对方那台管）', 'err');
+    return;
+  }
+  if(!window.confirm('删掉这条路由吗？\n' + text)) return;
+  try{
+    await api('/api/routes/delete', {id: l.route});
+    toast('已删掉 ' + text, 'ok');
+    try{ state.routes = (await api('/api/routes')).routes || state.routes; }catch(e){}
+    refreshAll();
+    relRefresh(true);
+  }catch(e){ toast('删除失败：' + e.message, 'err'); }
+}
+
+/* ---- 交互：拖节点摆位置 / 从**本机**的圆点拖出一条线 / Ctrl+滚轮缩放 / 空白处拖动平移 ---- */
+function relInitEvents(){
+  const box = $('relNodes'), svg = $('relSvg'), wrap = $('relWrap');
+  if(!box || !svg) return;
+  if(wrap){
+    /** 空白处按住拖 = 平移（第 3 条：不要滚动条，就像网页那样逛）。 */
+    wrap.addEventListener('mousedown', function(ev){
+      if(ev.target.closest && ev.target.closest('.relnode')) return;   // 节点上的事节点自己处理
+      relPan = {sx: ev.clientX, sy: ev.clientY, vx: relView.x, vy: relView.y};
+      wrap.classList.add('panning');
+      ev.preventDefault();
+    });
+    /**
+     * Ctrl+滚轮 = **只**缩放这张图。
+     *
+     * ★ 2026-10-18 用户第 3 条：「comfyui不要有滚动条，可以用按住CTRL+滚轮放大缩小。像网页一样。
+     * 但是不能连着外面主页面一起变（现在的主页面也可以滚轮放大缩小，别删。就是分开放大缩小）」
+     * —— `preventDefault()` 是这里的关键：不挡的话浏览器会把**整个页面**一起放大。
+     * 不按 Ctrl 时直接 return，滚轮照旧交给页面（用户明确要求主页面那套别删）。
+     * 缩放围绕**指针那一点**：指针底下的那个节点不会跑掉。
+     */
+    wrap.addEventListener('wheel', function(ev){
+      if(!ev.ctrlKey) return;
+      ev.preventDefault();
+      const rect = wrap.getBoundingClientRect();
+      const cx = (ev.clientX - rect.left - relView.x) / relView.k;
+      const cy = (ev.clientY - rect.top - relView.y) / relView.k;
+      const k = Math.max(0.35, Math.min(2.5,
+        relView.k * (ev.deltaY < 0 ? 1.12 : (1 / 1.12))));
+      relView.k = k;
+      relView.x = ev.clientX - rect.left - cx * k;
+      relView.y = ev.clientY - rect.top - cy * k;
+      relApplyView();
+    }, {passive: false});
+  }
+  box.addEventListener('mousedown', function(ev){
+    const card = ev.target.closest ? ev.target.closest('.relnode') : null;
+    if(!card) return;
+    const port = ev.target.closest ? ev.target.closest('.rk') : null;
+    const key = card.dataset.key;
+    // ★ 第 2 条：**只有本机那两个圆点**能当拖拽起点（右侧=送、左侧=收）。
+    //   设备那侧的圆点只是落点提示，从它拖不动 —— 这正是用户报的那个 bug。
+    if(port && key === 'self' && (port.classList.contains('send') || port.classList.contains('recv'))){
+      const c = relToCanvas(ev);
+      relDragLink = {from: key, mode: port.classList.contains('send') ? 'send' : 'recv',
+                     x: c.x, y: c.y};
+      ev.preventDefault();
+      return;
+    }
+    if(port) return;
+    const p = relPos[key];
+    if(!p) return;
+    const c = relToCanvas(ev);
+    relDragNode = {key: key, ox: c.x - p.x, oy: c.y - p.y};
+    ev.preventDefault();
+  });
+  document.addEventListener('mousemove', function(ev){
+    if(relPan){
+      relView.x = relPan.vx + (ev.clientX - relPan.sx);
+      relView.y = relPan.vy + (ev.clientY - relPan.sy);
+      relApplyView();
+      return;
+    }
+    if(!relDragNode && !relDragLink) return;
+    const c = relToCanvas(ev);
+    if(relDragNode){
+      const p = relPos[relDragNode.key];
+      if(!p) return;
+      p.x = Math.max(0, c.x - relDragNode.ox);
+      p.y = Math.max(0, c.y - relDragNode.oy);
+      const el = relEl[relDragNode.key];
+      if(el){ el.style.left = p.x + 'px'; el.style.top = p.y + 'px'; }
+      relDrawLinks();
+      return;
+    }
+    relDragLink.x = c.x;
+    relDragLink.y = c.y;
+    relDrawLinks();
+  });
+  document.addEventListener('mouseup', function(ev){
+    if(relPan){
+      relPan = null;
+      if(wrap) wrap.classList.remove('panning');
+      return;
+    }
+    if(relDragLink){
+      // 松手时看指针落在哪一张卡片上。**整张卡片都是落点**（不用精确命中那个小圆点，
+      // 那个圆点只是提示），蓝牙那张也照样落得下去 —— 落上去由 relCreate 给人话说明。
+      const from = relDragLink.from, mode = relDragLink.mode;
+      relDragLink = null;
+      const to = relHitNode(ev.clientX, ev.clientY);
+      if(to && to !== from){
+        if(mode === 'recv') relCreate(to, from);      // 本机「收」→ 拉着的那台送给本机
+        else relCreate(from, to);                     // 本机「送」→ 本机送给它
+      }else{
+        relDrawLinks();
+      }
+      return;
+    }
+    if(relDragNode){
+      relDragNode = null;
+      relSavePos();
+      relRender();
+    }
+  });
+  svg.addEventListener('click', function(ev){
+    const path = ev.target.closest ? ev.target.closest('path[data-i]') : null;
+    if(!path) return;
+    const i = parseInt(path.dataset.i, 10);
+    if(relLinks[i]) relDeleteLink(relLinks[i]);
+  });
 }
 
 /* ---------------- settings ---------------- */
@@ -2426,9 +3457,12 @@ async function refreshAll(){
     renderPeers();
     renderDeviceCards();
     renderPickers();
-    renderRoutes();
     renderStatus();
     renderStreams();
+    // ★ 第 4 条：回环警告是**全局**的（每一页都看得见），所以放在这里、不放在关系图那一页里。
+    renderLoopWarn();
+    // 设备关系图：只停在「版本号」那一页时才会真的去请求（函数里自己会挡）。
+    relRefresh();
 
     // First successful render: the page is genuinely working, drop the boot notice.
     const boot = document.getElementById('boot');
@@ -2475,16 +3509,11 @@ function uiRoot(){
   const el = document.documentElement;
   return el && el.classList ? el : null;
 }
-function uiSegButtons(){
-  return document.querySelectorAll ? document.querySelectorAll('#modeSeg button') : [];
-}
 function setUiMode(mode){
   const full = mode === 'full';
   const root = uiRoot();
   if (root) root.classList.toggle('fullui', full);
   try { localStorage.setItem('wl-mode', full ? 'full' : 'simple'); } catch (e) {}
-  // Each mode has its own saved arrangement, so re-apply it on every switch.
-  if (typeof applyCardLayout === 'function') applyCardLayout();
   const hint = document.getElementById('outHint');
   if (hint && state.status) {
     // Named from the live configuration, never hardcoded: this page ships to everyone.
@@ -2493,195 +3522,110 @@ function setUiMode(mode){
     const el = document.getElementById('outDevice');
     if (el) el.textContent = sink ? '（当前：' + sink + '）' : '';
   }
+  // ★ 2026-10-16（图1/图2）：密度是**另一个维度**，改它不该动页面维度 —— 但如果此刻正停在
+  //   二维码/版本号那两页（那里没有"密度"，小字照样全显示），只换密度等于什么都没发生，
+  //   用户会说"点了没反应"。所以这种情况下回到上一次所在的那个标签页，让他看得见变化。
+  if (activePane === 'qr' || activePane === 'ver') {
+    activePane = lastTab;
+    try { localStorage.setItem('wl-pane', lastTab); } catch (e) {}
+  }
   initUiMode();
   if (typeof refreshAll === 'function') refreshAll();
 }
-function drawSpark(svgId, textId, entry, ideal){
-  const svg = $(svgId);
-  if(!svg) return;
-  const text = $(textId);
-  const history = (entry && entry.history) || [];
-  const history0 = entry && entry.history ? entry.history : [];
-  const latest = entry && entry.latest;
-  if(text){
-    text.innerHTML = latest
-      ? '<b>' + latest.score + ' 分</b> · ' + esc(latest.detail) + (latest.label ? ' · ' + esc(latest.label) : '')
-      : '该通道当前未在工作';
-  }
-  if(!history.length){ svg.innerHTML = ''; return; }
-  const values = history.map(e => (e && typeof e.v === 'number') ? e.v : 0);
-  // A fixed ceiling per metric, so the curve only moves when the data moves. Rescaling
-  // to the current maximum drew steps that were not in the audio at all.
-  const top = Math.max(ideal * 2.5, 0.001);
-  const w = 200, h = 36;
-  const step = values.length > 1 ? w / (values.length - 1) : 0;
-  const y = v => (h - 3 - Math.min(1, v / top) * (h - 8)).toFixed(1);
-  const points = values.map((v, i) => (i * step).toFixed(1) + ',' + y(v)).join(' ');
-  svg.innerHTML = '<line x1="0" y1="' + y(ideal) + '" x2="' + w + '" y2="' + y(ideal) +
-    '" stroke="#2a3648" stroke-width="1" stroke-dasharray="3 3"/>' +
-    '<polyline fill="none" stroke="#4da3ff" stroke-width="1.6" points="' + points + '"/>';
-}
-function drawQuality(){
-  const q = (state.status && state.status.quality) || {};
-  drawSpark('qWifi', 'qWifiText', q.wifi, 20);
-  drawSpark('qBt', 'qBtText', q.bt, 11);
-  drawSpark('qP2p', 'qP2pText', q.p2p, 60);
-}
-
 function initUiMode(){
+  // 密度（简洁/详细）也是"哪一项该高亮"的一部分，统一交给 applyPane 刷 ——
+  // 两处各写一套必然有一处漏掉（上一版就是这么漏的：属性名换了，旧名字还在比，
+  // 结果两颗按钮永远没有选中态，浏览器实测抓到的真缺陷）。
+  applyPane();
+}
+/* ---------------- 一级菜单 / 二级菜单（用户图2 的排版） ----------------
+   ★ 2026-10-16 用户：「UI问题，学习localsend。按我的图2排版。……这次直接改ui设计免得你对不齐」。
+
+   一级菜单 = 左边那一竖条（监控 / 简洁 / 详细 / 二维码 / 版本号）；
+   二级菜单 = 上面那一行标签（本机状态 / 设备与路由 / 广播 / 多耳机）。
+
+   ★ 2026-10-16 第二轮修正（用户图1/图2）：「第一菜单有时候不能保持，直接第二菜单生效了。
+   我要求是双维度控制。就像乘法一样。」
+     上一版的错在于**把两个菜单塞进了同一个状态变量**：点标签会把二维码/版本号的选中冲掉，
+     点二维码又看不出左边该亮哪一项，于是"第一菜单保不住"，看起来还像"二维码优先级更高"。
+     现在两个维度**各自独立、各自持久化**，而且两边**永远各有一项高亮**：
+         · 页面维度（wl-pane）：四个标签 + 二维码 + 版本号；
+         · 密度维度（wl-mode）：简洁 / 详细，对所有页都生效。
+     左栏的高亮规则（永远恰好一项，不会两项都亮）：
+         · 当前在二维码/版本号那两页 → 亮它自己；
+         · 当前在四个标签页 → 亮当前密度（简洁或详细）。
+     顶部标签的高亮规则：永远亮"你上一次所在的标签页"——所以在二维码那页时，
+     左边亮「二维码」、上面亮「本机状态」，两个维度同时可见，正是"像乘法一样"。
+   ★ 这一版把"两列 + 按高度装箱"（packColumns / applyCardLayout）**整个删掉**了：
+   单列内容 + 标签页，两列不齐这个类别的问题从此不存在；`data-hero` 那个"主角位"标记
+   也随之没有意义（本机状态就是一个标签页）。
+   ★ 括号里的字（例如他在「设备与路由」旁边括注的「蓝牙 + WiFi」）是用户写给我看的标注，
+   按他明确要求**不进按钮文案** —— 按钮只写「设备与路由」。 */
+const TABS = ['status', 'devices', 'cast', 'multi'];   // 二级菜单
+const PAGES = TABS.concat(['qr', 'ver']);              // 一级菜单里那两页也算"页面"
+let activePane = 'status';      // 当前页面（维度一）
+let lastTab = 'status';         // 上一次所在的标签页（在二维码/版本号页时，上面那一行靠它保持）
+
+function densityName(){
   const root = uiRoot();
-  const full = !!(root && root.classList.contains('fullui'));
-  uiSegButtons().forEach(b => { b.classList.toggle('on', (b.dataset.mode === 'full') === full); });
+  return (root && root.classList.contains('fullui')) ? 'full' : 'simple';
 }
-/* ---------------- card layout: drag to move, ⤢ to widen ----------------
-   Stored per display mode, because the two modes show different cards and a sensible
-   arrangement in one is usually wrong in the other. Nothing here is required for the
-   panel to work: if the browser refuses localStorage, the default order is used. */
-function cardKey(card){
-  const n = card.querySelector('h2 .n');
-  return n ? ('c' + n.textContent.trim()) : '';
+function setTab(tab){
+  if(TABS.indexOf(tab) < 0) return;
+  activePane = tab;
+  lastTab = tab;
+  try { localStorage.setItem('wl-pane', tab); } catch (e) {}
+  applyPane();
 }
-function layoutStore(){
-  // v2: the meaning of wide changed from span-a-row to own-a-column, so the old
-  // saved flags must not be reused - they would give half the cards a column each.
-  return document.documentElement.classList.contains('fullui') ? 'wl-layout-v2-full' : 'wl-layout-v2-simple';
+function setRail(page){
+  if(page !== 'qr' && page !== 'ver') return;
+  activePane = page;
+  try { localStorage.setItem('wl-pane', page); } catch (e) {}
+  applyPane();       // 两个维度互不相干：这里一个字都不动密度那一维
+  // 切到「版本号」时立刻把关系图画出来，不等那 2.5 秒一轮 —— 否则点过去先是空的。
+  if(page === 'ver') relRefresh(true);
 }
-function readLayout(){
-  try { return JSON.parse(localStorage.getItem(layoutStore()) || '{}') || {}; } catch (e) { return {}; }
-}
-function writeLayout(data){
-  try { localStorage.setItem(layoutStore(), JSON.stringify(data)); } catch (e) {}
-}
-function saveCardLayout(){
+/* 纯展示函数：把 body[data-pane] 和两个维度的高亮一起刷一遍。
+   用属性选择器（见 CSS）而不是逐个 style.display —— 那样漏一个就会"点了没反应"。 */
+function applyPane(){
   try{
-    const cards = Array.from(document.querySelectorAll('.wrap .card[data-card]'));
-    writeLayout({
-      order: cards.map(c => c.dataset.card),
-      wide: cards.filter(c => c.classList.contains('wide')).map(c => c.dataset.card),
+    const onRailPage = (activePane === 'qr' || activePane === 'ver');
+    document.body.setAttribute('data-pane', activePane);
+    const tabs = document.querySelectorAll ? document.querySelectorAll('.tabs .tab') : [];
+    Array.prototype.forEach.call(tabs, b => b.classList.toggle('on', b.dataset.tab === lastTab));
+    const rails = document.querySelectorAll ? document.querySelectorAll('.rail button[data-rail]') : [];
+    Array.prototype.forEach.call(rails, b => {
+      const r = b.dataset.rail;
+      if(r === 'qr' || r === 'ver') b.classList.toggle('on', activePane === r);
+      else b.classList.toggle('on', !onRailPage && r === densityName());
     });
   }catch(e){}
 }
-function toggleWide(button){
-  const card = button.closest('.card');
-  if(!card) return;
-  card.classList.toggle('wide');
-  saveCardLayout();
-  packColumns();
+function initPane(){
+  let saved = '';
+  try { saved = localStorage.getItem('wl-pane') || ''; } catch (e) {}
+  activePane = PAGES.indexOf(saved) >= 0 ? saved : 'status';
+  lastTab = TABS.indexOf(activePane) >= 0 ? activePane : 'status';
+  applyPane();
 }
-function enableCardDrag(){
-  document.querySelectorAll('.card .grip').forEach(grip => {
-    grip.addEventListener('pointerdown', (ev) => {
-      const card = grip.closest('.card');
-      if(!card) return;
-      card.classList.add('dragging');
-      ev.preventDefault();
-      const move = (e) => {
-        const under = document.elementFromPoint(e.clientX, e.clientY);
-        const target = under && under.closest ? under.closest('.card') : null;
-        if(!target || target === card) return;
-        const box = target.getBoundingClientRect();
-        const after = (e.clientY - box.top) > box.height / 2;
-        target.parentNode.insertBefore(card, after ? target.nextSibling : target);
-      };
-      const up = () => {
-        document.removeEventListener('pointermove', move);
-        document.removeEventListener('pointerup', up);
-        card.classList.remove('dragging');
-        saveCardLayout();
-        packColumns();
-        packColumns();
-      };
-      document.addEventListener('pointermove', move);
-      document.addEventListener('pointerup', up);
-    });
-  });
-}
-function applyCardLayout(){
+
+/* 「放行防火墙」：改名/换目录之后规则就不覆盖当前这份 exe 了（入站会被 Windows 拦掉），
+   所以这一颗按钮要在面板上随手可点 —— 点完会弹一次管理员确认窗口。 */
+async function runFirewall(){
   try{
-    if(!document.querySelectorAll || !document.querySelector('.wrap')) return;
-    const saved = readLayout();
-    const wide = new Set(saved.wide || []);
-    document.querySelectorAll('.wrap .card').forEach(card => {
-      const key = cardKey(card);
-      if(!key) return;
-      card.dataset.card = key;
-      card.classList.toggle('wide', wide.has(key));
-      const head = card.querySelector('h2');
-      if(head && !head.querySelector('.cardtools')){
-        const tools = document.createElement('span');
-        tools.className = 'cardtools';
-        tools.innerHTML = '<button class="tiny ghost grip" title="按住拖动，改变卡片位置">⠿</button>'
-                        + '<button class="tiny ghost" title="让这张卡独占一列 / 还原" onclick="toggleWide(this)">⤢</button>';
-        head.appendChild(tools);
-      }
-    });
-    packColumns();
-  }catch(e){ /* the layout is a convenience, never a requirement */ }
+    const r = await api('/api/firewall', {});
+    toast((r && r.note) || '已请求以管理员身份放行', 'ok');
+  }catch(e){ toast('调用失败：' + e.message, 'err'); }
 }
 
-/* Greedy height packing: measure each card at the real column width, then drop them one
-   by one into whichever column is currently shortest. A card marked ⤢ is given a column
-   of its own, which is how a long card stops leaving a hole under a short one. */
-function packColumns(){
-  const wrap = document.querySelector('.wrap');
-  if(!wrap || !wrap.clientWidth || !wrap.querySelector) return;
-  const cards = Array.from(wrap.querySelectorAll('.card'));
-  if(!cards.length) return;
-
-  // Keep the order the user arranged; anything unknown keeps its DOM position.
-  const saved = readLayout().order || [];
-  cards.sort((a, b) => {
-    const ia = saved.indexOf(a.dataset.card), ib = saved.indexOf(b.dataset.card);
-    return (ia < 0 ? 999 : ia) - (ib < 0 ? 999 : ib);
-  });
-
-  const gap = 14;
-  const only = document.createElement('div');
-  only.className = 'col';
-  cards.forEach(c => only.appendChild(c));
-  while(wrap.firstChild) wrap.removeChild(wrap.firstChild);
-  wrap.appendChild(only);
-  const heights = cards.map(c => c.getBoundingClientRect().height || 120);
-
-  const narrow = document.documentElement.classList.contains('fullui') ? 430 : 360;
-  // Clamped: a zoomed-out page or a freak clientWidth must not turn six cards into
-  // six squeezed columns, which is exactly what happened once.
-  const wanted = Math.max(1, Math.min(4, Math.floor((wrap.clientWidth + gap) / (narrow + gap))));
-  const columns = [];
-  const loads = [];
-  for(let i = 0; i < wanted; i++){
-    const col = document.createElement('div');
-    col.className = 'col';
-    columns.push(col);
-    loads.push(0);
-  }
-  cards.forEach((card, i) => {
-    if(card.classList.contains('wide')){
-      // Own column: appended at the end, so the packed columns stay side by side.
-      const solo = document.createElement('div');
-      solo.className = 'col';
-      solo.appendChild(card);
-      wrap.appendChild(solo);
-      return;
-    }
-    let best = 0;
-    for(let k = 1; k < columns.length; k++){
-      if(loads[k] < loads[best] - 1) best = k;
-    }
-    columns[best].appendChild(card);
-    loads[best] += heights[i] + gap;
-  });
-  columns.forEach(col => { if(col.children.length) wrap.appendChild(col); });
-  if(only.parentNode) only.parentNode.removeChild(only);
-}
-applyCardLayout();
-enableCardDrag();
-let resizePackTimer = 0;
-window.addEventListener('resize', () => {
-  clearTimeout(resizePackTimer);
-  resizePackTimer = setTimeout(packColumns, 150);
-});
+/* ★ 2026-10-16（图2）：packColumns / applyCardLayout / data-hero 那一整套"两列 + 按高度
+   装箱"的代码在这里**整块删掉**了（用户：「这次直接改ui设计免得你对不齐」）：
+   现在是单列内容 + 标签页，没有列可分，自然不存在对不齐；`data-hero` 也不再有任何用途。
+   窗口大小变化时同样不需要再重排 —— 浏览器自己就会按单列流式布局重排。 */
 initUiMode();
+initPane();
+relLoadPos();
+relInitEvents();
 
 refreshAll();
 loadNetMics();

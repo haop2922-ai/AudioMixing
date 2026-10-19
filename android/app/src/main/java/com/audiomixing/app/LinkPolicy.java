@@ -1,5 +1,7 @@
 package com.audiomixing.app;
 
+import java.util.List;
+
 /**
  * 链路策略：全是<b>纯函数</b>，没有安卓依赖 —— 所以能拿离线门禁一条条断言。
  *
@@ -89,72 +91,189 @@ public final class LinkPolicy {
                 + " 秒没有消息了（关掉 App 或离开局域网）。它回来会自动继续，不用你再点。";
     }
 
+    /**
+     * ★ 断联多久就直接把这张设备卡片（以及它撑着的陈旧条目 / 提示）从界面上清掉。
+     *
+     * <p>用户原话：「这种已经信号断联两分钟的就直接删掉就好了。不然全堆积在程序里」。
+     * 上面的 {@link #GRACE_MS}（18 秒）只是"先别发"；这条是"直接删掉"—— 超过它，
+     * 这个对端不会再回来，留着一张写着"还没收到它的心跳"的卡片只会越堆越多。
+     *
+     * <p>为什么是纯函数：判据抽出来，{@code android/tools/PolicyProbe.java} 这条零桩门禁
+     * 才能直接钉住它（"断联 2 分钟后卡片被清掉"）——不给真机上凑数的机会。
+     */
+    public static final long CARD_STALE_MS = 120000L;
+
+    /** 这张卡片是不是该清掉了（断联超过 {@link #CARD_STALE_MS}；从没见过 = 不算，那是"还没出现"）。 */
+    public static boolean cardStale(long ageMs) {
+        return ageMs != NEVER && ageMs >= CARD_STALE_MS;
+    }
+
     // ══════════════════ ① 自动收听 ══════════════════
 
     public static final int LISTEN_IGNORE = 0;      // 什么都不做
     public static final int LISTEN_ADD = 1;         // 自动加入收听
     public static final int LISTEN_ALREADY = 2;     // 已经在听了
-    public static final int LISTEN_REVOKED = 3;     // 用户手动关过它，不再自动加
+    /** ★ 对端明确说"我不送了" → 收回<b>我们替它自动打开</b>的那一条（2026-10-15）。 */
+    public static final int LISTEN_REMOVE = 4;
 
     /**
      * 收到"请求收听"时该怎么办。
      *
-     * @param autoAccept        全局开关「自动接受别人的收听请求」是否打开
-     * @param alreadyListening  这台现在已经在收听名单里
-     * @param userRevoked       用户曾经手动把这台的收听关掉过（撤销过就不能再自动加）
-     * @param wantListen        对端这次是不是在请求
+     * <p>★ 2026-10-18 用户第 6 条：判据只剩一条 —— **这台设备有没有开「智连」**。
+     * <pre>
+     *   · smart —— 这台设备在「智连」名单里（默认名单是空的 = 一台都不自动）
+     *   · alreadyListening —— 现在已经在收听名单里了
+     *   · wantListen —— 对端这一轮还在请求我收听（它还在送声音）
+     *   · autoAdded —— 这条收听是【我们替它自动开的】（只有这种才允许被"我不送了"收回去）
+     * </pre>
+     *
+     * <p>被这一版**删掉**的两个旧判据，都是为了修用户真机反馈：
+     * <ul>
+     *   <li>{@code autoAccept}（全局总开关）—— 用户要的是"每台设备一个开关"；</li>
+     *   <li>{@code userRevoked}（"关过一次就永不再自动"的黑名单）—— 它造成了用户第 1 条那个
+     *       「电脑主动发送声音手机不会主动接收」：用户手动关过一次收听，那台电脑就<b>永久</b>
+     *       被记进黑名单，之后电脑再怎么点「送给它」，这边都永远不再自动打开
+     *       （旧代码里那份记忆只有在"对端不再请求"时才过期，而电脑一直在请求，所以永远不过期）。
+     *       现在"要不要自动"完全由「智连」那个开关注定，不存在会卡死的中间态。</li>
+     * </ul>
      */
-    public static int autoListenAction(boolean autoAccept, boolean alreadyListening,
-                                       boolean userRevoked, boolean wantListen) {
+    public static int listenAction(boolean smart, boolean alreadyListening,
+                                   boolean wantListen, boolean autoAdded) {
         if (!wantListen) {
-            return LISTEN_IGNORE;
+            // 它不送了：只有"我们替它自动开的"这条该收回；用户自己开的一律不碰。
+            return (alreadyListening && autoAdded) ? LISTEN_REMOVE : LISTEN_IGNORE;
         }
         if (alreadyListening) {
-            return LISTEN_ALREADY;       // 已经在听：别重复弹提示
+            return LISTEN_ALREADY;       // 已经在听：别重复加，也别弹提示
         }
-        if (userRevoked) {
-            return LISTEN_REVOKED;       // ★ 必须可撤销：用户关过的，永远不再自动加
+        return smart ? LISTEN_ADD : LISTEN_IGNORE;
+    }
+
+    /**
+     * 「信号质量」0~100，只用<b>实测计数器</b>算 —— 用户（图6）要的第三条
+     * （「现在定义为音量显示条。并添加一个信号质量条」）。
+     *
+     * <p>算法：丢包比例越大分越低（丢 5% 约扣 20 分）；缓冲比 60ms 深得越多再扣一点
+     * （缓冲深说明这一路一直在补迟到/重排的包）。
+     *
+     * @param received   收到的包数
+     * @param lost       判为丢掉的包数
+     * @param bufferedMs 当前缓冲深度（毫秒）
+     * @return 0~100 的分数；<b>-1 = 一个包都没统计到</b>，即"没有依据" ——
+     *         界面按 -1 写"不可测"。0 分和"不可测"是两件事，不能混。
+     */
+    public static int qualityScore(long received, long lost, int bufferedMs) {
+        long total = received + lost;
+        if (total <= 0) {
+            return -1;
         }
-        if (!autoAccept) {
-            return LISTEN_IGNORE;        // 全局关掉了自动接受
+        double penalty = (lost / (double) total) * 400.0;
+        if (bufferedMs > 60) {
+            penalty += Math.min(30.0, (bufferedMs - 60) * 0.5);
         }
-        return LISTEN_ADD;
+        return (int) Math.max(0L, Math.min(100L, Math.round(100.0 - penalty)));
+    }
+
+    /**
+     * 「信号质量」的**兜底**：完全没有音频流、也没有往返时延时用的分。
+     *
+     * <p>★ 2026-10-16 用户（图1）：「虽然二者没有收发声音，但是设备间信号应当存在」——
+     * 原来只在"正在收它的音频流"时才有分，两台设备明明互相看得见，卡片上却写着
+     * "还没有可测的链路"。手机端尤其明显：手机<b>不回 PING/PONG</b>，所以没有音频流时
+     * 就一点依据都没有了 —— 可链路本身一直在（每 ~2 秒一个信标）。
+     *
+     * <p>口径与电脑端 {@code engine._heartbeat_score} 逐字对齐：刚听到（≤2500ms）算满，
+     * 越久没听到扣得越多（5 秒 → 80 分，10 秒 → 40 分，15 秒 → 0 分）。
+     */
+    public static int heartbeatScore(long ageMs) {
+        double seconds = Math.max(0L, ageMs) / 1000.0;
+        double penalty = Math.max(0.0, seconds - 2.5) * 8.0;
+        long score = Math.round(100.0 - Math.min(100.0, penalty));
+        return (int) Math.max(0L, Math.min(100L, score));
     }
 
     // ══════════════════ ① 音量条两端同步 ══════════════════
 
     /**
-     * 收到对端的增益值时，要不要采纳（一个共享增益，谁后改以谁为准）。
+     * 对端报来的共享音量要不要采纳？—— <b>不拿时序/时钟判新旧</b>。
      *
-     * <p>规则（简单、可解释、能收敛）：
+     * <p>★ 2026-10-16 真机反馈改的（用户原话：「拖动音量调大约 5 秒另一个设备同步。然后有时候
+     * 会出现听送两条音量条都自己刷回 1」）。原来这里第二条是 {@code remoteTs > localTs}
+     * （比墙钟时间戳）、第三条是"本机超过 5 秒没动过就采纳"——两台机器的墙钟本来就对不齐，
+     * 于是：本地一改，对端的值 5 秒内一律不采纳（**要等 5 秒才同步**）；
+     * 5 秒一到，对端那个值（在老电脑上可能是"没有这条路由"时的默认 1.0）
+     * 又被采纳进来（**音量条自己刷回 1**）。延迟和回弹是同一个原因。
+     *
+     * <p>现在只剩两条规则，都好预测：
      * <ol>
-     *   <li>对端的时间戳更新 → 采纳（后改的赢）；</li>
-     *   <li>时间戳不新，但<b>我们本地已经 5 秒没动过</b>且值确实不一样 → 也采纳。
-     *       这一条是为了兜住两台设备时钟有偏差的情况（否则一台慢了几秒的设备怎么调都同步不过去）；</li>
-     *   <li>其余情况忽略（我们刚改的更新，别被对面那条旧广播顶回去）。</li>
+     *   <li>值一样 → 不动（这也就不会来回弹）；</li>
+     *   <li>本机 1.2 秒内刚动过 → 不抢（用户还在拖的时候别被对端拉走）；
+     *       其余情况<b>最后到达的为准</b>。</li>
      * </ol>
-     *
-     * @param remoteTs            对端报的"最后修改时刻"（墙钟毫秒，0 = 它没报）
-     * @param localTs             我本地最后修改时刻（0 = 我从没改过）
-     * @param sinceLocalChangeMs  距我上次修改过了多少毫秒（{@link #NEVER} = 从没改过）
+     * 时间戳仍然收下并写回去（报给对端看"我这个值是什么时候改的"），但不参与判断。
      */
     public static boolean adoptRemoteGain(long remoteTs, long localTs, long sinceLocalChangeMs,
                                           float remoteGain, float localGain) {
         if (Math.abs(remoteGain - localGain) < 0.005f) {
             return false;                                  // 值一样：不用动（也不会来回弹）
         }
-        if (remoteTs > localTs) {
-            return true;                                   // 后改的赢
-        }
-        return sinceLocalChangeMs == NEVER || sinceLocalChangeMs > 5000L;   // 时钟偏差兜底
+        return sinceLocalChangeMs == NEVER || sinceLocalChangeMs >= LOCAL_HOLD_MS;
     }
 
-    /** 增益夹到 0.00 ~ 1.50（界面滑杆的范围）。 */
+    /** 本机刚动过之后，这段时间内不让对端的值抢走（用户还在拖）。 */
+    public static final long LOCAL_HOLD_MS = 1200L;
+
+    /** 增益夹到 0.00 ~ 2.00（和电脑端同一个口径：两端上限一致）。 */
     public static float clampGain(float g) {
         if (Float.isNaN(g)) {
             return 1f;
         }
-        return Math.max(0f, Math.min(1.5f, g));
+        return Math.max(0f, Math.min(2f, g));
+    }
+
+    // ══════════════════ ④ 我在不在对端的蓝牙名单里 ══════════════════
+
+    /**
+     * 对端（电脑）报的蓝牙名单里有没有我这台 —— 决定"送声音"前要不要先问一句走哪条路。
+     *
+     * <p>用户原话：「手机界面点击送声音后，应当判断手机是否在电脑的蓝牙设备列表里。
+     * 如果是就让用户判断到底用蓝牙还是WiFi。如果否就直接走WiFi路径。」
+     * 注意这个判断只决定<b>要不要多问一句</b>，判错不改变 WiFi 这条路本身是否可用。
+     *
+     * <p>规则（简单、可预测，故意不做模糊匹配）：
+     * <ol>
+     *   <li>{@code roster} 为 null / 空 → false：老版本电脑没报 {@code bt} 键，直接走 WiFi；</li>
+     *   <li>{@code mine} 为空（或去掉空白后不足 2 字符）→ false；</li>
+     *   <li>两边都 {@code trim} + 小写后<b>任一边包含另一边</b>就算匹配 ——
+     *       不能用全等：系统会给同型号设备的名字加短后缀（{@code 小红的手机} vs {@code 小红的手机_2}），
+     *       电脑看到的和手机自己报的常常就差这一截；</li>
+     *   <li>长度小于 2 的条目直接跳过，免得 {@code "a"} 这种把什么都匹配上。</li>
+     * </ol>
+     */
+    public static boolean btNameMatches(String mine, List<String> roster) {
+        if (roster == null || roster.isEmpty()) {
+            return false;
+        }
+        if (mine == null) {
+            return false;
+        }
+        String a = mine.trim().toLowerCase(java.util.Locale.ROOT);
+        if (a.length() < 2) {
+            return false;                 // 空串 / 单字符不参与匹配
+        }
+        for (String raw : roster) {
+            if (raw == null) {
+                continue;
+            }
+            String x = raw.trim().toLowerCase(java.util.Locale.ROOT);
+            if (x.length() < 2) {
+                continue;                 // 单字符条目不参与匹配（"a" 会匹配上一切）
+            }
+            if (a.contains(x) || x.contains(a)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ══════════════════ 控制包：复用 T_STATS 的三个新字段 ══════════════════
@@ -164,9 +283,9 @@ public final class LinkPolicy {
     // 老版本收到不认识它们会原样忽略，所以新旧可以混跑。
     //
     //   "want_listen": true|false   我在把声音送给对端，请求对端自动打开收听（幂等；停了自然变 false）
-    //   "gain": 0.00~1.50          我→对端这条链路的共享音量（= 我的"我送它的"）
+    //   "gain": 0.00~2.00          我→对端这条链路的共享音量（= 我的"我送它的"）
     //   "gain_ts": <墙钟毫秒>       上面那个值最后一次被修改的时刻
-    //   "gain_rx": 0.00~1.50       对端→我这条链路的共享音量（= 我的"我听它的"）
+    //   "gain_rx": 0.00~2.00       对端→我这条链路的共享音量（= 我的"我听它的"）
     //   "gain_rx_ts": <墙钟毫秒>
     //
     // 为什么把这段解析放在这个类里：它是**纯逻辑**，放这儿就能被离线门禁逐条断言
@@ -183,7 +302,7 @@ public final class LinkPolicy {
     public interface LinkFields {
         void setWantListen(boolean v);
 
-        /** @param gain 已夹到 0.00~1.50；{@code unset=true} 表示对面根本没报这个字段 */
+        /** @param gain 已夹到 0.00~2.00；{@code unset=true} 表示对面根本没报这个字段 */
         void setGain(float gain, long ts, boolean unset);
 
         void setGainRx(float gain, long ts, boolean unset);

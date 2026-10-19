@@ -1,7 +1,7 @@
 """The control panel: a dependency-free HTTP server plus a single-page UI.
 
-Runs inside the WaveLink node process, so one command gives you both the audio
-engine and the thing you click on. The page itself lives in ``wavelink/ui/index.html``
+Runs inside the Audio Mixing node process, so one command gives you both the audio
+engine and the thing you click on. The page itself lives in ``audiomixing/ui/index.html``
 (plain HTML/CSS/JS — no build step, no node_modules, no CDN, so it works on an
 isolated LAN); this module only serves it and exposes the JSON API it talks to.
 
@@ -26,11 +26,13 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from .net import discovery as disc
 from .net import rtpaudio
 from . import bluetooth
+# 解 PowerShell 输出的编码（中文 Windows 上是 GBK）——见 netcheck.decode_powershell 的说明。
+from .netcheck import decode_powershell as _decode_powershell
 
 MAX_BODY = 256 * 1024
 _LAST_FORCED_BT = 0.0
@@ -56,7 +58,7 @@ class RawAudioServer(threading.Thread):
     """
 
     def __init__(self, node, port: int) -> None:
-        super().__init__(daemon=True, name="wavelink-rawmic")
+        super().__init__(daemon=True, name="audiomixing-rawmic")
         self.node = node
         self.port = port
         self.stop_event = threading.Event()
@@ -159,7 +161,7 @@ class RawAudioServer(threading.Thread):
         self.stop_event.set()
 
 
-class WaveLinkApi:
+class AudioMixingApi:
     """Thin logic layer; the HTTP handler only parses and serialises."""
 
     def __init__(self, node, *, web=None, on_routes_changed: Callable[..., None] | None = None) -> None:
@@ -208,8 +210,56 @@ class WaveLinkApi:
 
     @staticmethod
     def _is_frozen() -> bool:
-        """现在是打包后的 exe 还是源码在跑（Nuitka 不设 sys.frozen，所以两个都看）。"""
+        """现在是打包后的 exe 还是源码在跑（Nuitka 不设 sys.frozen，所以两个都看）。
+
+        口径必须只有这一处：诊断报告和面板都调它。曾经诊断报告自己写
+        `getattr(sys, "frozen", False)`，结果跑的是 exe、报告里却写「源码运行」，
+        和同一份报告上方的「版本 exe」自相矛盾（2026-10-14 实测）。
+        """
         return bool(globals().get("__compiled__")) or bool(getattr(sys, "frozen", False))
+
+    @staticmethod
+    def _frozen_exe_path() -> Path | None:
+        """打包后，用户双击的那个 exe 到底在哪（找不到返回 None）。
+
+        Nuitka onefile 实测形态：``sys.executable`` 指向解包出来的临时
+        ``...\\Temp\\onefile_<pid>_...\\python.exe``，**不是**那个 exe；
+        于是对它取 mtime 会失败（异常被吞掉 → 面板显示「构建于 未知」）。
+        真正的位置按可靠度排序：
+
+          __compiled__.original_argv0  onefile 原始的 argv[0]，就是那个 exe
+          __compiled__.containing_dir  onedir/standalone：exe 所在目录
+          sys.argv[0] / sys.executable 兜底（onedir 时 sys.executable 就是它）
+
+        注意：这几个候选可能指向不存在的路径（如上面那个临时 python.exe），
+        所以逐个 is_file() 试，第一个真实存在的才算数。
+        """
+        candidates: list[str] = []
+        comp = globals().get("__compiled__")
+        if comp is not None:
+            for attr in ("original_argv0", "containing_dir"):
+                try:
+                    value = getattr(comp, attr, None)
+                except Exception:
+                    continue
+                if value:
+                    candidates.append(str(value))
+        try:
+            candidates.append(str(sys.argv[0] or ""))
+        except Exception:
+            pass
+        candidates.append(str(getattr(sys, "executable", "") or ""))
+
+        for raw in candidates:
+            if not raw:
+                continue
+            try:
+                p = Path(raw).resolve()
+            except (OSError, ValueError):
+                continue
+            if p.is_file():
+                return p
+        return None
 
     def build_info(self) -> dict[str, Any]:
         """当前跑的是哪个版本、什么时候编出来的、旁边有没有更新的版本。
@@ -218,20 +268,26 @@ class WaveLinkApi:
         （比当时的代码早 7 个小时），于是所有修复都不在他测的那个程序里 ——
         而面板上没有任何地方写着版本。这条必须显眼。
         """
-        from . import __version__
+        from . import __version__, __build_time__
 
         frozen = self._is_frozen()
         if frozen:
-            path = Path(sys.executable)
+            # sys.executable 在 Nuitka onefile 下指向解包出来的临时 python.exe，
+            # 不是那个 exe —— 必须另找（见 _frozen_exe_path 的说明）。
+            real = self._frozen_exe_path()
+            path = real if real is not None else Path(sys.executable)
             channel = "exe"
         else:
             path = Path(__file__).resolve().parent / "__init__.py"
             channel = "源码"
-        build_time = ""
-        try:
-            build_time = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-        except OSError:
-            pass
+        # 打包时写死的时间优先：exe 复制到桌面后文件时间会变，构建时间不该跟着变。
+        # 拿不到（源码运行 / 老包）才退回看文件时间。
+        build_time = __build_time__ if (frozen and __build_time__) else ""
+        if not build_time:
+            try:
+                build_time = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            except OSError:
+                pass
         running = self._version_tuple(__version__)
 
         # 旁边有没有更新的版本：桌面 + 当前程序所在目录。
@@ -318,7 +374,7 @@ class WaveLinkApi:
                 and int(local.get("frames") or 0) > 0
             if playing and not float(local.get("peak") or 0.0):
                 detail = ("不过电平一直是 0 —— 如果你的游戏/音乐正在放，说明声音走的是另一块设备，"
-                          "把系统的输出设备也切到这块，或在 ⑥ 的「音源」里改选声音真正在走的那一块。")
+                          "把系统的输出设备也切到这块，或在「频道」的「音源」里改选声音真正在走的那一块。")
             steps.append({"id": "capture", "n": 1, "title": "采集源到底有没有声音？",
                           "state": "ok", "text": text, "detail": detail, "actions": []})
         elif stalled:
@@ -586,9 +642,14 @@ class WaveLinkApi:
 
         def ps(script: str) -> str:
             try:
-                return (sp.run(["powershell", "-NoProfile", "-Command", script],
-                               creationflags=flags, capture_output=True, text=True,
-                               timeout=25).stdout or "").strip()
+                # ★ 2026-10-16 用户图1：规则里那些中文目录名（版本备份 / 成品）和网络位置名
+                #   全显示成 "??" 方块 —— 就是这里原来写 `encoding="utf-8", errors="replace"`
+                #   造成的：PowerShell 5.1 在中文 Windows 上输出的是 GBK 字节，按 UTF-8 解不出来
+                #   就整片替换。改成**先按字节读回来**，再交给 decode_powershell 试 UTF-8 / 系统 ANSI。
+                raw = sp.run(["powershell", "-NoProfile", "-Command", script],
+                             creationflags=flags, capture_output=True,
+                             timeout=25).stdout or b""
+                return _decode_powershell(raw).strip()
             except Exception as exc:
                 return "读取失败: %s" % exc
 
@@ -607,40 +668,84 @@ class WaveLinkApi:
         fw = ps("Get-NetFirewallProfile | ForEach-Object { $_.Name + '=' + $_.Enabled }")
         add("防火墙状态", True, "；".join(x.strip() for x in fw.splitlines() if x.strip()) or "读不到")
 
-        # 我们程序的入站规则：路径对不对、协议全不全
+        # 我们程序的入站规则：在不在、协议全不全、绑的是哪一个程序。
+        #
+        # ★ 2026-10-16 修正（用户图2 里两个永久红叉的根因）：这里原来按
+        #   `Program -like '*avelink*'` 过滤程序路径 —— 改名成 Audio Mixing 之后，
+        #   规则绑的程序路径里根本没有 "avelink" 这串字（连 "AudioMixing" 都不含它），
+        #   所以**一条规则都匹配不到**，现场就是「入站 TCP 放行 ✗ / 入站 UDP 放行 ✗」
+        #   永远红着，用户点多少次「放行防火墙」都不会变。
+        #   现在按**规则名**取（新版 Audio Mixing* / 旧版 WaveLink*），并把绑定的
+        #   程序路径一起读回来 —— 只有这样才能回答"覆盖的是不是当前这份 exe"。
         rules = ps(
-            "Get-NetFirewallApplicationFilter | "
-            "Where-Object { $_.Program -like '*avelink*' } | ForEach-Object { "
-            "$r = $_ | Get-NetFirewallRule; "
-            "$p = $r | Get-NetFirewallPortFilter; "
-            "if ($r.Direction -eq 'Inbound') { "
-            "$_.Program + '|' + $r.Action + '|' + $r.Profile + '|' + $p.Protocol } }")
-        lines = [x.strip() for x in rules.splitlines() if x.strip()]
-        tcp = any("|TCP" in x.upper() and "|Allow|" in x for x in lines)
-        udp = any("|UDP" in x.upper() and "|Allow|" in x for x in lines)
+            "Get-NetFirewallRule -DisplayName 'Audio Mixing*','WaveLink*' "
+            "-ErrorAction SilentlyContinue | ForEach-Object { "
+            "$p = $_ | Get-NetFirewallPortFilter; "
+            "$a = $_ | Get-NetFirewallApplicationFilter; "
+            "$prog = ''; if ($a) { $prog = [string]$a.Program }; "
+            "if ($_.Direction -eq 'Inbound') { "
+            "$_.DisplayName + '|' + $prog + '|' + $p.Protocol + '|' + "
+            "$_.Action + '|' + $_.Enabled } }")
+        parsed: list[dict[str, str]] = []
+        for raw in rules.splitlines():
+            parts = [part.strip() for part in raw.split("|")]
+            if len(parts) >= 5:
+                parsed.append({"name": parts[0], "program": parts[1], "protocol": parts[2],
+                               "action": parts[3], "enabled": parts[4]})
+        allowed = [r for r in parsed if r["action"].lower() == "allow"]
+        tcp = any(r["protocol"].upper() == "TCP" for r in allowed)
+        udp = any(r["protocol"].upper() == "UDP" for r in allowed)
+        listed = "；".join("%s → %s" % (r["name"], r["program"] or "(未绑定程序)") for r in allowed)
         howto = ("右键右下角托盘里的 Audio Mixing 图标，点「放行防火墙（需管理员）」，"
-                 "在弹窗里点「是」，然后重新检查")
+                 "在弹窗里点「是」，然后重新检查（这个页面上方的「放行防火墙」按钮是同一个功能）")
         add("入站 TCP 放行", tcp,
-            "；".join(lines) if tcp else
+            listed if tcp else
             "没有任何和本程序有关的入站规则，别人连不进来。" + howto)
         add("入站 UDP 放行", udp, "已放行" if udp else
             "没放行 UDP，收不到对方的发现广播，对端不知道你在哪。" + howto)
 
-        # 正在跑的 exe 路径：规则是绑路径的，换了目录旧规则就失效
-        exe = ps("(Get-Process -Name AudioMixing -ErrorAction SilentlyContinue | "
-                 "Select-Object -First 1 -ExpandProperty Path)")
-        add("当前程序路径", bool(exe), exe or "读不到")
-        if exe:
-            matched = any(x.lower().startswith(exe.lower()) for x in lines)
+        # 正在跑的程序是哪一个：规则是绑**程序路径**的，换了目录/文件名旧规则就失效。
+        #
+        # ★ 2026-10-16 修正（同一个红叉的第二个根因）：原来靠
+        #   `Get-Process -Name AudioMixing` 找正在跑的 exe，而桌面那份叫
+        #   「Audio Mixing v1.27.exe」—— 进程名带空格又带版本号，按 AudioMixing
+        #   **一个都匹配不到**，于是永远写「读不到」（用户截图就是这一行）。
+        #   改成本进程**自己**的路径：tray._real_exe() 在 Nuitka onefile 下会去取
+        #   __compiled__.original_argv0，也就是用户双击的那颗 exe，这才是"规则该覆盖
+        #   哪一个程序"的正确答案。
+        real = ""
+        try:
+            from .tray import _real_exe
+
+            real = str(_real_exe() or "")
+        except Exception:
+            real = ""
+        is_exe = real.lower().endswith(".exe")
+        if is_exe:
+            add("当前程序路径", True, real)
+        elif real:
+            # 措辞刻意避开"源码运行"四个字：诊断报告里那四个字有专门含义（见
+            # test_diagnose_says_exe_not_source_when_frozen），这里说的是"这一份不是 exe"。
+            add("当前程序路径", None,
+                "脚本方式启动（不是 exe）：%s —— 防火墙规则只对 exe 有意义" % real)
+        else:
+            add("当前程序路径", False, "读不到")
+        if is_exe and allowed:
+            matched = any((r["program"] or "").lower() == real.lower() for r in allowed)
             add("规则是否覆盖当前路径", matched,
                 "覆盖到了" if matched else
-                "没有覆盖。防火墙规则是绑程序路径的，这个路径从来没被放行过，"
-                "所以别人连不进来。" + howto +
-                "。另外提醒：以后把程序换个目录，规则就失效了，要在这里重新放行一次")
+                "没有覆盖。防火墙规则是绑程序路径的，当前这份 %s 从来没被放行过，"
+                "所以别人连不进来。" % real + howto +
+                "。另外提醒：以后把程序换个目录或改个文件名，规则就失效了，要在这里重新放行一次")
 
         out["ok"] = all(c["ok"] for c in out["checks"] if c["ok"] is not None)
         return out
 
+
+    def bluetooth_requests(self) -> list[dict[str, Any]]:
+        """对端（手机）点过「走蓝牙」的记录 —— 面板 ⑦ 与诊断报告共用同一份。"""
+        fn = getattr(self.node, "bluetooth_requests", None)
+        return list(fn()) if callable(fn) else []
 
     def diagnose(self) -> dict[str, Any]:
         """把所有和"传不了声音"有关的状态汇成一份纯文本报告。
@@ -664,7 +769,13 @@ class WaveLinkApi:
             lines.append("系统 %s" % platform.platform())
         except Exception:
             pass
-        lines.append("程序 %s" % (sys.executable if getattr(sys, "frozen", False) else "源码运行"))
+        # 判据必须和面板/别处共用 _is_frozen()：Nuitka 不设 sys.frozen，
+        # 曾经这里单看 sys.frozen，跑的是 exe 却报「源码运行」，与上方「版本 exe」矛盾。
+        if self._is_frozen():
+            exe = self._frozen_exe_path()
+            lines.append("程序 %s" % (str(exe) if exe is not None else sys.executable))
+        else:
+            lines.append("程序 源码运行")
         # 版本必须在报告里：用户上次拿一个 7 小时前的旧 exe 测了一整天，
         # 而报告里没有任何一处写着"这是哪个版本"。
         try:
@@ -695,6 +806,28 @@ class WaveLinkApi:
             lines.append("%-14s host=%-16s 在线=%s 手动添加=%s 音频端口=%s id=%s" % (
                 p.get("name"), p.get("host"), p.get("online"), p.get("manual"),
                 p.get("audio_port"), p.get("node_id")))
+
+        head("控制面（各走哪条路）")
+        # ★ 2026-10-15 起控制消息分两条路（见 docs 与 net/discovery.py 开头）：
+        #   对端信标里有 ctl:1 → 走【发现层】（那一层一直活着，接收器停着也收得到）；
+        #   老版本对端不认这层外衣 → 只能走【音频端口】，而它的接收器是按需启停的，
+        #   停下来的时候就收不到 —— 这正是"电脑送声音开着、手机的收听却不自动打开"的成因。
+        #   把每台走哪条路如实写出来，用户不用再靠猜。
+        ctl_stats = st.get("discovery") or {}
+        lines.append("发现层控制消息：已发 %s 条 · 已收 %s 条%s" % (
+            ctl_stats.get("ctl_sent", 0), ctl_stats.get("ctl_received", 0),
+            ("　最后错误：%s" % ctl_stats.get("ctl_error")) if ctl_stats.get("ctl_error") else ""))
+        # ★ 单播信标：手机端"经常丢失电脑端"就是因为电脑以前只发组播/广播（安卓省电会成批丢）。
+        #   这个数一直停在 0 就说明这条路没在走 —— 一眼能看出来。
+        lines.append("单播信标：已发 %s 份 · 这一轮 %s 台（手机端要靠它才不会丢设备）" % (
+            ctl_stats.get("unicast_sent", 0), ctl_stats.get("unicast_targets", 0)))
+        if not peers:
+            lines.append("（没有对端，暂时没有控制消息可发）")
+        for p in peers:
+            lines.append("%-14s %s" % (
+                p.get("name"),
+                "走发现层（它信标里有 ctl:1 —— 接收器停着也收得到）" if p.get("ctl") else
+                "只走音频端口（老版本对端：它的接收器一停就收不到控制消息）"))
 
         head("路由")
         routes = node.routes or []
@@ -798,6 +931,35 @@ class WaveLinkApi:
                 str(item.get("detail") or "")[:60]))
         lines.append("直通 " + json.dumps(st.get("local") or {}, ensure_ascii=False)[:200])
 
+        # ★ 蓝牙这一段是 2026-10-15 用户报「测试7异常，听不到声音」时补的：
+        #   以前报告里**完全没有**这一路的状态，只能靠用户描述，没法定位。
+        #   现在把"电脑这边打开没打开 sink、手机的媒体链路到底有没有上来"写清楚。
+        #   （2026-10-15 稍后：面板上的 ⑦ 已经并进 ②「设备与路由」里的那一段，
+        #     所以这里不再写编号，改成把位置说清楚。）
+        head("蓝牙（手机的声音经蓝牙进电脑 —— 面板在「设备与路由」里）")
+        try:
+            from . import bluetooth as bt
+
+            if not bt.available():
+                lines.append("这台机器不支持（不是 Windows，或找不到 powershell.exe）")
+            else:
+                devices = bt.cached_devices()
+                if not devices:
+                    lines.append("列表是空的：Windows 里还没配对过任何能送声音过来的手机")
+                link_cn = {"connected": "正在接收手机声音", "waiting": "手机未连接",
+                           "hfp": "只有通话通路（没有媒体声音）", "error": "出错", "off": "未连接"}
+                for dev in devices:
+                    lines.append("%s｜%s｜state=%s｜电脑已打开sink=%s｜手机媒体链路=%s｜通话通路=%s" % (
+                        link_cn.get(str(dev.get("link") or ""), str(dev.get("link") or "?")),
+                        dev.get("name"), dev.get("state"), bool(dev.get("held")),
+                        bool(dev.get("endpoint")), bool(dev.get("hfp"))))
+        except Exception as exc:
+            lines.append("读取失败：%s" % exc)
+        for req in (node.bluetooth_requests() if hasattr(node, "bluetooth_requests") else []):
+            lines.append("对端请求走蓝牙（手机点了「走蓝牙」）：%s → %s%s" % (
+                req.get("name"), req.get("state") or "?",
+                ("　" + str(req.get("error"))) if req.get("error") else ""))
+
         head("网络自检")
         for c in (self.netcheck().get("checks") or []):
             mark = "?" if c.get("ok") is None else ("通过" if c.get("ok") else "不通过")
@@ -899,6 +1061,15 @@ class WaveLinkApi:
                 "rate_kbps": round(rate, 1),
                 "latency_ms": round(float(item.get("median_ms") or 0.0), 1),
                 "detail": str(item.get("detail") or ""),
+                # ★ 2026-10-17 用户（图1）：「我们的每一个声音都应当有断开选项」。
+                #   这一行是手机经 Wi-Fi 送进来、正在本机播放的声音，原来只有数字没有出口。
+                #   这里给的是【本机侧的断开】：把这台手机的采集设备静音，本机立刻不再播放它
+                #   （手机那边照常发送，它自己的「送声音」开关我们不去动 —— 跨端改别人的设置
+                #   正是上一轮用户明确否掉的做法）。id 单独放 disconnect_id，不占用 route_id，
+                #   免得把"已配置但当前没有数据"那一行的去重逻辑搅乱。
+                "disconnect": "mic",
+                "disconnect_id": name,
+                "hint": "断开这台手机经 Wi-Fi 送来的声音（本机不再播放它，手机那边照常发送）",
             })
         self._mon_prev = current_prev
 
@@ -918,6 +1089,13 @@ class WaveLinkApi:
                     "rate_kbps": None,
                     "latency_ms": None,
                     "detail": "系统直接播放，本工具不参与，不计数据量",
+                    # ★ 2026-10-16 用户（图3）：「蓝牙模式缺少断开按钮」。
+                    #   这一行原来只有状态、没有可操作的按钮，用户想断蓝牙只能去系统设置里找。
+                    #   设备 id 就是 bluetooth.disconnect() 要的那个 —— /api/monitor/disconnect
+                    #   的 bluetooth 分支早就有，只是没人给它填这两格。
+                    "disconnect": "bluetooth",
+                    "route_id": str(device.get("id") or ""),
+                    "hint": "断开这台手机的蓝牙音频（电脑这边松手，手机会回到自己的扬声器）",
                 })
         except Exception:
             pass
@@ -995,7 +1173,7 @@ class WaveLinkApi:
             flows.append({
                 "disconnect": "route",
                 "route_id": str(rid).split("|", 1)[0],
-                "hint": "静音这条路由",
+                "hint": "删掉这条路由（本机不再送给它）",
                 "from": source_label,
                 "to": target,
                 "channel": "点对点",
@@ -1049,22 +1227,41 @@ class WaveLinkApi:
                 value = stream.get(field)
                 if value:
                     bits.append("%s %s" % (label, value))
-            flows.append({
+            # ★ 2026-10-17 用户（图1）：「每一个声音都应当有断开选项」—— 收进来的这一路
+            #   原来只有一串数字，没有任何出口。路由 id 是【本机的】route id（接收端按
+            #   desired_sinks() 的键给每条流打标，见 engine.assign_routes），所以能直接拿来断：
+            #     · 有具名路由（点对点）→ 静音这条路由，本机立刻不再播放它；
+            #     · 只剩频道那条（route_id 以 channel 开头，或根本没挂上任何路由）→ 关掉
+            #       「听广播」这个开关（频道规则是引擎合成出来的、不落盘，update_route 改不到它）。
+            #   route_id 可能是 "a,b" 这种多路由拼接，所以按逗号拆开再挑具名的那条。
+            stream_routes = [x for x in str(stream.get("route_id") or "").split(",") if x]
+            named_routes = [x for x in stream_routes if not x.startswith("channel")]
+            row: dict[str, Any] = {
                 "from": str(stream.get("node_name") or stream.get("source") or "其它电脑"),
                 "to": "本机",
                 # 带上 route_id：这样"已配置但当前没有数据"那一行才能认出这条路由
                 # 其实正在收数据，不会再多显示一行（2026-10-12 修）。
                 "route_id": str(stream.get("route_id") or ""),
-                # 收到的流可能来自广播通道，也可能来自点对点路由；协议里不带这个信息，
-                # 所以不猜：写清楚两种都可能，要看本机是否开着「只听」（只听只影响广播）。
-                "channel": "点对点/广播",
+                # ★ 2026-10-20 用户：「我手机用的点对点，这边监控怎么是点对点/广播」——
+                #   老注释说"协议里不带这个信息所以不猜"，其实**归属已经算出来了**（上面 named_routes）：
+                #   命中的是具名路由 = 点对点；只落进频道（通配）那条 = 广播。
+                #   一律写"点对点/广播"只会让用户以为把点对点当成广播处理了。
+                "channel": "点对点" if named_routes else "广播",
                 "state": "正在接收",
                 "bytes": int(stream.get("bytes") or 0),
                 "rate_kbps": round(float(stream.get("kbps") or 0.0), 1),
                 "latency_ms": round(float(stream.get("depth_ms") or 0.0), 1),
                 "detail": "　".join(bits) or "丢包 %s 迟到 %s" % (
                     stream.get("lost", 0), stream.get("late", 0)),
-            })
+            }
+            if named_routes:
+                row["disconnect"] = "route"
+                row["disconnect_id"] = named_routes[0]
+                row["hint"] = "删掉这条路由：本机不再播放这台设备送来的声音"
+            else:
+                row["disconnect"] = "listen"
+                row["hint"] = "停止收听广播：本机不再收听广播里的声音（广播方不受影响）"
+            flows.append(row)
 
         try:
             clocks = (node.receiver.stats() or {}).get("clocks") or []
@@ -1115,8 +1312,15 @@ class WaveLinkApi:
                     src_ids = [src_ids]
                 if isinstance(dst_ids, str):
                     dst_ids = [dst_ids]
+                # ★ 2026-10-18 用户（图1）：「点对点没有"断开"。你忘加了。」
+                #   这一行正是图1 里那两条「已配置 · 当前没有数据」——它们原来一个按钮都没有。
+                #   它和"正在发送/正在接收"那两行是同一类东西（都是点对点路由），
+                #   所以断开的方式也必须是同一个：删掉这条路由（见 monitor_disconnect 的 route 分支）。
                 flows.append({
                     "route_id": rid,
+                    "disconnect": "route",
+                    "disconnect_id": rid,
+                    "hint": "删掉这条路由（两台都不再收发；对方那台也会清掉这一条）",
                     "from": "、".join(_name_of(x) for x in src_ids) or "?",
                     "to": "、".join(_name_of(x) for x in dst_ids) or "?",
                     "channel": "点对点",
@@ -1136,11 +1340,59 @@ class WaveLinkApi:
             "mic_count": len(mics),
             "updated": round(time.time(), 1),
             "uptime_s": round(time.time() - getattr(node, "started_at", time.time()), 1),
-            "local_peak": local.get("peak"),
+            # ★ 2026-10-16：这里原来只取 local.*（本机直通那一路）。而手机走蓝牙进来时
+            #   声音是 Windows 直接播放的，本机直通根本没有数据 → 监控页脚那行
+            #   「本机输出电平」永远是 0。改用和面板同一个口径（output_level()）。
+            "local_peak": self.node.output_level().get("peak"),
             "node": str(getattr(node, "name", "")),
         }
 
 # HWHHYN 用 DEEPSEEK 制作
+
+    def monitor_disconnect(self, kind: str, target: str = "") -> tuple[int, dict[str, Any]]:
+        """监控页每一行的「断开」，按 kind 分派，返回 (HTTP 码, 响应体)。
+
+        ★ 2026-10-17 用户（图1）：「我们的每一个声音都应当有断开选项（WiFi/蓝牙/广播）」。
+        原来只有 broadcast / route / bluetooth 三种，而且**在 GET 和 POST 两个分支里各抄了一份**
+        一模一样的判定 —— 补一种就得改两处、必然漏一处（"放行防火墙"那个按钮就是只写进 GET
+        分支、点下去拿 404 才发现的）。所以收到 Api 这一层统一实现，页面只做一层转发，
+        测试也能直接考它，不用为了测四种 kind 去起一个 HTTP 服务。
+
+        kind 一览：
+          broadcast  停掉本机的「广播我的声音」
+          listen     关掉本机的「听广播」（频道那条规则由引擎合成、不落盘，改不到它，只能改开关）
+          route      删掉某条路由（点对点：两台都不再收发；与设备卡片"再点一次就断开"同一个意思）
+          mic        静音某台手机的 Wi-Fi 音源（本机不再播放它；手机那边照常发送，不去动别人的设置）
+          bluetooth  断开某台手机的蓝牙音频（电脑这边松手）
+        """
+        if kind == "broadcast":
+            self.set_settings({"broadcast": False})
+            return 200, {"ok": True, "note": "已停止广播"}
+        if kind == "listen":
+            self.set_settings({"listen": False})
+            return 200, {"ok": True, "note": "已停止收听广播"}
+        if kind == "route" and target:
+            # ★ 2026-10-18 用户（图1）：「点对点没有"断开"。你忘加了。」
+            #   顺带把语义纠成一个：这条路由上的「断开」= **删掉这条路由**，不是"静音"。
+            #   设备卡片上的「收听它的 / 送给它」本来就是"再点一次就断开"= 删掉；监控页却只静音，
+            #   于是用户点了"断开"，那条路由还在（仍然显示"已配置 · 当前没有数据"）——
+            #   又是一次"点了没反应"。两处必须同一个意思。
+            self.delete_route({"id": target})
+            return 200, {"ok": True, "note": "已删掉这条路由"}
+        if kind == "mic" and target:
+            from .audio.backends import netmic as netmic_backend
+
+            if not netmic_backend.set_muted(target, True):
+                # 设备已经不在了（手机停了送声音、窗口关了）→ 目标其实已经达成，不算失败。
+                return 200, {"ok": False, "note": "这台手机现在没有在送声音"}
+            return 200, {"ok": True, "note": "已断开 %s 经 Wi-Fi 送来的声音" % target}
+        if kind == "bluetooth" and target:
+            from . import bluetooth as bt
+
+            result = bt.disconnect(target)
+            return 200, {"ok": bool(result.get("ok")),
+                         "note": result.get("state") or result.get("error") or ""}
+        return 400, {"error": "不支持的断开类型: %r" % kind}
 
     def streams(self) -> dict[str, Any]:
         stats = self.node.receiver.stats()
@@ -1306,7 +1558,11 @@ class WaveLinkApi:
                     node.sender.node_name = node.name
                     if node.beacon is not None:
                         node.beacon.name = node.name
-        for key in ("broadcast", "listen", "local", "auto_play"):
+        # ★ 2026-10-18 用户（图2）：「「正在发送的手机自动播放」就是蓝牙的「智连」」——
+        #   原来这里还有一个 auto_play（面板上那个全局勾）可以改，现在整块删掉：
+        #   收不收下某台设备送来的声音，只由那张卡片上的「智连」决定（局域网 smart_link /
+        #   蓝牙 autoconnect，两张名单都在这下面各自处理）。
+        for key in ("broadcast", "listen", "local"):
             if key in payload:
                 value = bool(payload[key])
                 setattr(node.config, key, value)
@@ -1325,17 +1581,19 @@ class WaveLinkApi:
                 raise ApiError("open_panel_on_start 只能是 none、simple 或 full", 400)
             node.config.open_panel_on_start = want
             changed.append("open_panel_on_start")
-        if "auto_accept_listen" in payload:
-            node.config.auto_accept_listen = bool(payload["auto_accept_listen"])
-            changed.append("auto_accept_listen")
-        if "listen_optout" in payload:
-            raw = payload["listen_optout"]
+        if "smart_link" in payload:
+            # ★ 2026-10-18 用户第 6 条：每台设备一个「智连」，**默认空 = 一台都不自动**
+            #   （用户原话「默认关闭」）。这里收的是**整张名单**，和设备卡片的 autoconnect 同一套做法。
+            #   它取代了原来的两个旧口径：全局总开关 auto_accept_listen、
+            #   以及"关过一次就永不再自动"的黑名单 listen_optout（后者正是"电脑送音手机不自动收"
+            #   那条真机反馈的根因，已随这次改动一起删掉）。
+            raw = payload["smart_link"]
             if isinstance(raw, str):
                 raw = [raw]
             if not isinstance(raw, list):
-                raise ApiError("listen_optout must be a list")
-            node.config.listen_optout = [str(x).strip() for x in raw if str(x).strip()][:16]
-            changed.append("listen_optout")
+                raise ApiError("smart_link must be a list of device ids or names")
+            node.config.smart_link = [str(x).strip() for x in raw if str(x).strip()][:16]
+            changed.append("smart_link")
         if "channel_gain" in payload:
             node.config.channel_gain = max(0.0, min(4.0, float(payload["channel_gain"])))
             changed.append("channel_gain")
@@ -1438,7 +1696,7 @@ class WaveLinkApi:
             note = ("%s:%d 没有回应 UDP 探测包（%s）。"
                     "注意：安卓/手机端不回 PING/PONG（它只把控制包记一笔），"
                     "所以「超时」不等于连不通 —— 能不能听到声音请看它有没有在发声音、"
-                    "以及「① 局域网里的设备」里是不是显示在线。"
+                    "以及「找设备」里是不是显示在线。"
                     % (host, port, exc))
             return {"ok": False, "error": str(exc), "host": host, "port": port, "note": note}
         finally:
@@ -1479,7 +1737,7 @@ class WaveLinkApi:
             time.sleep(0.3)
             sink.stop()
 
-        threading.Thread(target=run, name="wavelink-tone", daemon=True).start()
+        threading.Thread(target=run, name="audiomixing-tone", daemon=True).start()
         return {"ok": True, "device": spec.get("device"), "seconds": seconds, "freq": freq}
 
 
@@ -1604,7 +1862,7 @@ def ws_frame(payload: bytes, opcode: int = 0x2) -> bytes:
 
 class _Handler(BaseHTTPRequestHandler):
     server_version = "AudioMixing/1.0"
-    api: WaveLinkApi
+    api: AudioMixingApi
     quiet = True
 
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003 - stdlib signature
@@ -1642,7 +1900,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/vnd.android.package-archive")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Content-Disposition", 'attachment; filename="%s"' % apk.name)
+        self.send_header("Content-Disposition", content_disposition(apk.name))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         if self.command != "HEAD":
@@ -1963,7 +2221,13 @@ class _Handler(BaseHTTPRequestHandler):
                     else:
                         _LAST_FORCED_BT = now
                 devices = bluetooth.list_devices_cached(force=refresh)
-                self._json(200, {"available": bluetooth.available(), "devices": devices})
+                self._json(200, {
+                    "available": bluetooth.available(),
+                    "devices": devices,
+                    # ★ ④ 手机点过「走蓝牙」的记录：电脑这边去连它连成没连成，
+                    #   面板 ⑦ 那张卡直接把结果写出来，用户不用猜。
+                    "requests": self.api.bluetooth_requests(),
+                })
                 return
             if path in ("/mic", "/mic.html", "/microphone"):
                 self._send(200, mic_html().encode("utf-8"), "text/html; charset=utf-8")
@@ -1990,7 +2254,8 @@ class _Handler(BaseHTTPRequestHandler):
                     "bytes": (info or {}).get("bytes", 0),
                 })
                 return
-            if path in ("/app/download", "/app/AudioMixing-mic.apk", "/app/wavelink-mic.apk"):
+            if path in ("/app/download", "/app/AudioMixing-mic.apk",
+                        "/app/AudioMixing-手机版.apk", "/app/wavelink-mic.apk"):
                 self._send_apk()
                 return
             if path == "/api/mic":
@@ -2116,32 +2381,14 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, self.api.netcheck())
                 return
             if path == "/api/monitor/disconnect":
-                # 监控页每行的"断开"。三种都走这里，按 kind 分派：
-                #   broadcast 关掉广播开关；route 静音那条路由；bluetooth 断开手机。
+                # 监控页每行的"断开"。判定统一在 api.monitor_disconnect() 里（见那里的说明），
+                # 这里只负责取参数 + 转发 —— 以前这里和 POST 分支各抄了一份判定，加一种 kind
+                # 就得改两处、必然漏一处。
                 body = self._read_json() if method == "POST" else {}
                 kind = str(body.get("kind") or "")
                 target = str(body.get("id") or "")
-                if kind == "broadcast":
-                    self.api.set_settings({"broadcast": False})
-                    self._json(200, {"ok": True, "note": "已停止广播"})
-                    return
-                if kind == "route" and target:
-                    self.api.update_route({"id": target, "mute": True})
-                    self._json(200, {"ok": True, "note": "已静音这条路由"})
-                    return
-                if kind == "bluetooth" and target:
-                    from . import bluetooth as bt
-
-                    result = bt.disconnect(target)
-                    self._json(200, {"ok": bool(result.get("ok")),
-                                     "note": result.get("state") or result.get("error") or ""})
-                    return
-                if kind == "incoming":
-                    self._json(200, {"ok": False,
-                                     "note": "收到的流由对方决定是否发送：请在对方那台停止广播，"
-                                             "或删掉/静音对端那条路由"})
-                    return
-                self._json(400, {"error": "不支持的断开类型: %r" % kind})
+                code, result = self.api.monitor_disconnect(kind, target)
+                self._json(code, result)
                 return
             if path == "/qr":
                 # 手机上扫一下就进来，省得手输 IP。参数 what=listen|app，
@@ -2273,28 +2520,12 @@ class _Handler(BaseHTTPRequestHandler):
                                  "note": "已请求以管理员身份放行。若没看到管理员确认窗口，"
                                          "请右键运行 " + bat})
             elif path == "/api/monitor/disconnect":
-                # 监控页每行的"断开"。必须放在 POST 分支：页面用的是 POST，
+                # 监控页每行的"断开"：必须放在 POST 分支 —— 页面用的是 POST，
                 # 只写进 GET 分支的话点按钮只会拿到 404（放行防火墙踩过同一个坑）。
-                kind = str(body.get("kind") or "")
-                target = str(body.get("id") or "")
-                if kind == "broadcast":
-                    self.api.set_settings({"broadcast": False})
-                    self._json(200, {"ok": True, "note": "已停止广播"})
-                elif kind == "route" and target:
-                    self.api.update_route({"id": target, "mute": True})
-                    self._json(200, {"ok": True, "note": "已静音这条路由"})
-                elif kind == "bluetooth" and target:
-                    from . import bluetooth as bt
-
-                    result = bt.disconnect(target)
-                    self._json(200, {"ok": bool(result.get("ok")),
-                                     "note": result.get("state") or result.get("error") or ""})
-                elif kind == "incoming":
-                    self._json(200, {"ok": False,
-                                     "note": "收到的流由对方决定是否发送：请在对方那台停止广播，"
-                                             "或删掉/静音对端那条路由"})
-                else:
-                    self._json(400, {"error": "不支持的断开类型: %r" % kind})
+                # 判定只有一处：api.monitor_disconnect()。
+                code, result = self.api.monitor_disconnect(
+                    str(body.get("kind") or ""), str(body.get("id") or ""))
+                self._json(code, result)
             elif path == "/api/routes":
                 self._json(200, self.api.set_routes(body))
             elif path == "/api/routes/add":
@@ -2309,21 +2540,6 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, self.api.remove_peer(body))
             elif path == "/api/settings":
                 self._json(200, self.api.set_settings(body))
-            elif path == "/api/listen/optout":
-                # ① 自动收听：撤销时把设备记进"永不再自动"名单；"这次打开"时移出去。
-                node = self.api.node
-                on = bool(body.get("on", True))
-                node_id = str(body.get("node_id") or "").strip()
-                name = str(body.get("name") or "").strip()
-                if not node_id and not name:
-                    raise ApiError("missing node_id or name")
-                node.set_listen_optout(node_id, name, on=on)
-                if not on:
-                    # 这次打开：立刻按请求把它加回来（等同再收到一次 want_listen）
-                    node._grant_listen_request(node_id, name, str(body.get("host") or ""))
-                self._json(200, {"ok": True, "on": on,
-                                 "note": ("已加入「不再自动收听」名单：" + (name or node_id)) if on
-                                         else ("已允许自动收听：" + (name or node_id))})
             elif path == "/api/guide/fix":
                 # 「快速上手」里的"一键修"：换设备 / 试采 / 修广播。一次只做用户点的那一件。
                 self._json(200, self.api.guide_fix(body))
@@ -2427,7 +2643,7 @@ class WebUI:
         self.node = node
         self.host = host
         self.port = port or node.config.web_port
-        self.api = WaveLinkApi(node, web=self, on_routes_changed=self.broadcast_routes)
+        self.api = AudioMixingApi(node, web=self, on_routes_changed=self.broadcast_routes)
         self.httpd: ThreadingHTTPServer | None = None
         self.raw: RawAudioServer | None = None
         self.thread: threading.Thread | None = None
@@ -2469,7 +2685,7 @@ class WebUI:
                     self.broadcast_log.append("push to %s failed: %s" % (peer.name, exc))
             del self.broadcast_log[:-50]
 
-        threading.Thread(target=run, name="wavelink-route-push", daemon=True).start()
+        threading.Thread(target=run, name="audiomixing-route-push", daemon=True).start()
 
     def start(self) -> int:
         handler = type("BoundHandler", (_Handler,), {"api": self.api})
@@ -2483,7 +2699,7 @@ class WebUI:
         if self.httpd is None:
             raise OSError("could not bind a web port starting at %d" % self.port)
         self.node.config.web_port = self.bound_port
-        self.thread = threading.Thread(target=self.httpd.serve_forever, name="wavelink-web", daemon=True)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, name="audiomixing-web", daemon=True)
         self.thread.start()
         # The phone's audio arrives on its own plain TCP port, next to the panel. One
         # connection, raw PCM, no request/response per block.
@@ -2511,7 +2727,7 @@ class WebUI:
 # The page itself
 # --------------------------------------------------------------------------
 
-# The control panel lives in wavelink/ui/index.html so that editing the UI never
+# The control panel lives in audiomixing/ui/index.html so that editing the UI never
 # means editing Python. It is embedded into the executable by tools/build_exe.py
 # (`--add-data`); when running from a source checkout it is read from disk. The
 # placeholder below is only used if the file is genuinely missing, so the server
@@ -2521,14 +2737,14 @@ FALLBACK_HTML = """<!DOCTYPE html>
 <style>body{background:#0b0e14;color:#e8eef7;font:14px/1.7 system-ui,"Microsoft YaHei";padding:40px;max-width:720px;margin:auto}
 code{background:#1a202c;padding:2px 6px;border-radius:4px}a{color:#60a5fa}</style></head><body>
 <h2>Audio Mixing 控制台页面文件缺失</h2>
-<p>后端正在运行，但没找到 <code>wavelink/ui/index.html</code>。接口仍然可用：</p>
+<p>后端正在运行，但没找到 <code>audiomixing/ui/index.html</code>。接口仍然可用：</p>
 <ul>
   <li><a href="/api/status">/api/status</a> — 节点状态</li>
   <li><a href="/api/peers">/api/peers</a> — 设备列表</li>
   <li><a href="/api/routes">/api/routes</a> — 路由表</li>
   <li><a href="/api/devices">/api/devices</a> — 本机音频设备</li>
 </ul>
-<p>如果你是从源码运行，请确认 <code>wavelink/ui/index.html</code> 存在；<br>
+<p>如果你是从源码运行，请确认 <code>audiomixing/ui/index.html</code> 存在；<br>
 如果是打包版，请重新运行 <code>python tools/build_exe.py</code>。</p>
 </body></html>
 """
@@ -2600,34 +2816,84 @@ def mic_html() -> str:
     return _phone_html("mic")
 
 
-def apk_path() -> Path | None:
-    """Where the phone app lives, if one was built or shipped alongside the node.
+# 交付链上这颗安装包出现的名字：桌面/备份那条叫「AudioMixing-手机版.apk」，
+# release 与 installer 那条叫「AudioMixing-mic.apk」，老名字放最后兜底。
+_APK_NAMES = ("AudioMixing-手机版.apk", "AudioMixing-mic.apk", "wavelink-mic.apk")
 
-    Deliberately a search rather than a fixed location: whoever builds the APK can drop
-    it next to the exe, into the ui folder, or point WAVELINK_APK at it.
+
+def _apk_dirs() -> list[Path]:
+    """可能放着手机端安装包的目录，按可靠度排序。
+
+    必须覆盖三种运行形态 —— 2026-10-15 用户现场（手机扫二维码装 App，页面报
+    「这台电脑上还没有手机端安装包」）就是这里漏了前两种：
+      · 双击 exe：包就在**那颗真 exe 旁边**（桌面上叫 AudioMixing-手机版.apk）。
+        注意 Nuitka onefile 下 sys.executable 指向解包出来的临时 python.exe，
+        对它取目录必然落空 —— 必须走 _frozen_exe_path()。
+      · 源码运行：源码树根目录、audiomixing/ui/、以及 tools/installer_payload（安装器载荷）。
+      · PyInstaller 解包：sys._MEIPASS/audiomixing/ui。
     """
-    candidates: list[Path] = []
-    env = os.environ.get("WAVELINK_APK")
-    if env:
-        candidates.append(Path(env))
+    dirs: list[Path] = []
+    real = AudioMixingApi._frozen_exe_path()
+    if real is not None:
+        dirs.append(real.parent)
     base = getattr(sys, "_MEIPASS", None)
     if base:
-        candidates.append(Path(base) / "audiomixing" / "ui" / "AudioMixing-mic.apk")
-    candidates.append(Path(base) / "audiomixing" / "ui" / "wavelink-mic.apk")
+        dirs.append(Path(base) / "audiomixing" / "ui")
     here = Path(__file__).resolve().parent
-    candidates.append(here / "ui" / "AudioMixing-mic.apk")
-    candidates.append(here / "ui" / "wavelink-mic.apk")
+    dirs.append(here / "ui")
+    dirs.append(here.parent)
+    dirs.append(here.parent / "tools" / "installer_payload")
     try:
-        candidates.append(Path(sys.executable).resolve().parent / "wavelink-mic.apk")
+        dirs.append(Path.cwd())
     except OSError:
         pass
-    candidates.append(Path.cwd() / "wavelink-mic.apk")
-    for path in candidates:
+    return dirs
+
+
+def content_disposition(name: str) -> str:
+    """给中文文件名的附件下载造一个**既能用又合法**的 Content-Disposition。
+
+    为什么不能直接把文件名塞进头部：交付链上这颗安装包叫「AudioMixing-手机版.apk」，
+    里面有非 ASCII 字符。HTTP 头按 RFC 只允许 ASCII，把 UTF-8 原样写进去，.NET 的
+    HttpWebRequest 会直接判成"服务器提交了协议冲突（CR 后面必须是 LF）"，
+    某些手机浏览器同样会当成坏响应 —— 用户点下载就失败（2026-10-15 实测）。
+    所以：`filename=` 只放 ASCII 兜底名，真名用 RFC 5987 的 `filename*=UTF-8''百分号编码`。
+    """
+    stem, _dot, ext = str(name or "").rpartition(".")
+    ascii_stem = "".join(ch for ch in stem if ch.isascii() and (ch.isalnum() or ch in "-_"))
+    ascii_stem = ascii_stem.strip("-_. ")          # 「AudioMixing-手机版」→「AudioMixing」，不留孤零零的短横
+    ext = "".join(ch for ch in ext if ch.isascii() and ch.isalnum())
+    safe = (ascii_stem or "AudioMixing") + ("." + ext if ext else "")
+    return 'attachment; filename="%s"; filename*=UTF-8\'\'%s' % (safe, quote(name))
+
+
+def apk_path() -> Path | None:
+    """手机端安装包在哪；找不到返回 None（安装页会给出该把它放哪）。
+
+    为什么是"搜索"而不是一个固定位置：谁编的 APK 都可以丢在 exe 旁边、塞进 ui 目录、
+    或者用 AUDIOMIXING_APK 指过来（旧名 WAVELINK_APK 仍然认）。**但搜索本身必须不能抛异常** —— 这里原来是
+    `Path(base)` 而 base 在非 PyInstaller 时是 None，于是 `apk_path()` 直接抛
+    TypeError，/api/app 跟着 500，安装页只剩一句"还没有安装包"（用户看到的现场）。
+    """
+    env = os.environ.get("AUDIOMIXING_APK") or os.environ.get("WAVELINK_APK")
+    if env:
         try:
-            if path.is_file():
-                return path
-        except OSError:
-            continue
+            p = Path(env)
+            if p.is_file():
+                return p
+        except (OSError, ValueError):
+            pass
+    for folder in _apk_dirs():
+        for name in _APK_NAMES:
+            try:
+                p = folder / name
+            except (TypeError, ValueError):
+                continue
+            try:
+                if p.is_file():
+                    return p
+            except OSError:
+                continue
     return None
 
 
@@ -2760,14 +3026,23 @@ def monitor_html() -> str:
     return """<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
 <title>Audio Mixing 监控</title>
+<!-- ★ favicon：2026-10-17 用户（图2）反馈监控窗「logo 不显示」。和主页面同款内联 SVG
+     （蓝色渐变圆角方块 + 白 A），不引外部文件 —— 局域网里外链图片加载不出来，
+     tools/check_ui_syntax.py 也会把 http(s) 外链判为不合格。 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%2338bdf8'/%3E%3Cstop offset='1' stop-color='%236366f1'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='url(%23g)'/%3E%3Cpath fill='%23fff' fill-rule='evenodd' d='M32 13L50 51L41.4 51L38.3 44L25.7 44L22.6 51L14 51Z M32 25.5L27.4 36L36.6 36Z'/%3E%3C/svg%3E">
 <style>
  :root{--bg:#0e1116;--card:#171c24;--line:#242c38;--fg:#e8edf5;--dim:#8b97a8;
        --ok:#3fb950;--warn:#d29922;--accent:#2f81f7}
  *{box-sizing:border-box}
  body{margin:0;background:var(--bg);color:var(--fg);
       font:14px/1.5 "Microsoft YaHei UI",system-ui,sans-serif}
- header{display:flex;align-items:baseline;gap:12px;padding:16px 20px 10px}
- h1{font-size:16px;margin:0}
+ header{display:flex;align-items:center;gap:12px;padding:16px 20px 10px}
+ h1{font-size:16px;margin:0;display:flex;align-items:center;gap:8px}
+ /* ★ 2026-10-17：原来标题上只有一个绿点「●」，用户（图2）说 logo 不显示。
+    这里换成和主页面同一套的蓝色渐变方块 + 白 A（品牌字形变了，方块里的字跟着改成 A）。 */
+ .mark{width:22px;height:22px;border-radius:7px;flex:0 0 auto;
+       background:linear-gradient(140deg,#38bdf8,#6366f1);
+       display:grid;place-items:center;color:#04121f;font-size:12px;font-weight:800}
  .dot{color:var(--ok)}
  .dim{color:var(--dim);font-size:12px}
  .tabs{display:flex;gap:6px;margin-left:6px}
@@ -2791,7 +3066,7 @@ def monitor_html() -> str:
 </style></head>
 <body>
 <header>
-  <h1><span class="dot">●</span> Audio Mixing</h1>
+  <h1><span class="mark">A</span>Audio Mixing</h1>
   <nav class="tabs">
     <a class="tab on" href="/monitor">监控</a>
     <a class="tab" href="/">控制台</a>
@@ -2801,6 +3076,14 @@ def monitor_html() -> str:
      title="把当前状态整理成一份文字报告，在同一窗口打开，全选即可复制"
      style="padding:4px 12px;border-radius:8px;background:#1d2634;color:#e8edf5;
             text-decoration:none">诊断</a>
+  <!-- ★ 2026-10-20 用户：「监控模式右上角『放行防火墙』的左侧添一个『本机』激活按钮，
+       就仅监控与本机有关的设备，而不是整个局域网的设备全部监控，同时在激活情况下隐藏时钟通道。
+       不然看起来太乱了」——打开后只留"本机收发的那几路"，并把时钟通道藏起来（开关状态记在浏览器里，
+       下次打开还是你上次选的那个）。 -->
+  <button id="localOnly"
+          title="只看和本机有关的设备：打开后只显示本机收发的那几路，并隐藏时钟通道（关掉则显示整屏）"
+          style="padding:4px 12px;border-radius:8px;border:0;background:#1d2634;color:#e8edf5;
+                 cursor:pointer">本机</button>
   <button id="fw" title="点对点或广播不通时，多半是本机防火墙挡了入站。点这里放行。"
           style="margin-left:auto;padding:4px 12px;border-radius:8px;border:0;
                  background:#1d2634;color:#e8edf5;cursor:pointer">放行防火墙</button>
@@ -2819,12 +3102,8 @@ def monitor_html() -> str:
     <b style="font-size:13px">网络自检</b>
     <button id="runChk" style="padding:3px 10px;border-radius:6px;border:0;
             background:#1d2634;color:#e8edf5;cursor:pointer">检查</button>
-    <span class="dim" id="chkNote">连不通的时候点一下，看是哪一项没过</span>
+    <span class="dim" id="chkNote"></span>
   </div>
-  <div class="dim" style="font-size:12px;margin-bottom:6px">
-    规则：<b>广播</b>要对方打开「只听」才会播放，它不依赖路由；
-    <b>点对点</b>只要路由在就播放，不需要对方配合。
-    </div>
   <div style="display:none">
   </div>
   <div id="chkRows" class="dim" style="font-size:12px">还没有检查</div>
@@ -2839,12 +3118,37 @@ function fmtBytes(n){
   return (n/1073741824).toFixed(2) + ' GB';
 }
 function cls(ch){ return ch === '蓝牙' ? 'bt' : (ch === '点对点' ? 'p2p' : 'wifi'); }
+/* ★ 2026-10-20：「本机」这颗开关 —— 打开后只看和本机有关的那几路，并隐藏时钟通道。 */
+var localOnly = (localStorage.getItem('am.monitor.localOnly') === '1');
+function paintLocalOnly(){
+  var b = document.getElementById('localOnly');
+  b.className = localOnly ? 'on' : '';
+  b.textContent = localOnly ? '✓ 本机' : '本机';
+  b.style.background = localOnly ? 'var(--accent)' : '#1d2634';
+  b.style.color = localOnly ? '#06121f' : '#e8edf5';
+  b.style.fontWeight = localOnly ? '600' : '400';
+}
+document.getElementById('localOnly').onclick = function(){
+  localOnly = !localOnly;
+  localStorage.setItem('am.monitor.localOnly', localOnly ? '1' : '0');
+  paintLocalOnly();
+  tick();
+};
+paintLocalOnly();      // 打开页面就按上次选的那一档画一次
 async function tick(){
   try{
     const d = await (await fetch('/api/monitor', {cache:'no-store'})).json();
     document.getElementById('who').textContent = d.node || '';
     document.getElementById('when').textContent = '更新于 ' + new Date().toLocaleTimeString();
-    const rows = d.flows || [];
+    let rows = d.flows || [];
+    if(localOnly){
+      /* 只留"本机收发的那几路"：其它设备之间的来往一律不显示；时钟通道（对端↔时钟对齐）也藏起来。 */
+      const me = String(d.node || '');
+      rows = rows.filter(function(f){
+        if(String(f.channel || '') === '时钟') return false;
+        return String(f.from || '') === me || String(f.to || '') === me;
+      });
+    }
     document.getElementById('empty').style.display = rows.length ? 'none' : 'block';
     document.getElementById('rows').innerHTML = rows.map(f => `
       <tr>
@@ -2856,7 +3160,7 @@ async function tick(){
         <td class="num">${f.rate_kbps == null ? '-' : f.rate_kbps + ' KB/s'}</td>
         <td class="num">${f.latency_ms == null ? '-' : f.latency_ms + ' ms'}</td>
         <td>${f.disconnect ? '<button class="disc" data-kind="' + f.disconnect +
-             '" data-id="' + (f.route_id || '') + '" title="' +
+             '" data-id="' + (f.disconnect_id || f.route_id || '') + '" title="' +
              (f.hint || '断开') + '">断开</button>' : ''}</td>
       </tr>`).join('');
     const peak = d.local_peak;

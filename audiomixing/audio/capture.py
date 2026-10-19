@@ -55,7 +55,7 @@ class _Capture:
 
     def start_reader(self) -> None:
         self.created_at = time.monotonic()
-        self.thread = threading.Thread(target=self._reader, name="wavelink-capture-%s" % self.name[:16], daemon=True)
+        self.thread = threading.Thread(target=self._reader, name="audiomixing-capture-%s" % self.name[:16], daemon=True)
         self.thread.start()
 
     def wedged(self, now: float | None = None) -> bool:

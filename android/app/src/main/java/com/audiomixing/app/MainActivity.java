@@ -21,7 +21,6 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
-import android.media.AudioManager;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -64,9 +63,14 @@ import java.util.Map;
  *
  * <p><b>★ 为什么"送什么声音"要做成显式可选的</b>：早期版本只采麦克风，用户的原话是
  * 「你这手机都是采集的麦克风的声音，那不成对讲机了吗？我的需求一直都是桌面音频啊」。
- * 所以这个页面上：①音源选择放在最显眼的位置；②下面那行<b>永远写"实际在送的是哪一个"</b>，
- * 采不到本机声音就如实写原因并说明已退回麦克风；③限制（安卓 10 以下没有这个能力、
- * DRM/主动禁止采集的内容采不到、部分 ROM 阉割）都写在界面上，不让用户再被误导一次。
+ * 所以这个页面上：①音源选择放在最显眼的位置；②下面那行<b>永远写"实际在送的是哪一个"</b>；
+ * ③限制（安卓 10 以下没有这个能力、DRM/主动禁止采集的内容采不到、部分 ROM 阉割）都写在界面上。
+ *
+ * <p>★ 2026-10-19 用户第 1/2/3/4 条：主控区那两颗音源按钮（🔊 本机声音 / 🎤 麦克风）现在是
+ * <b>真正的 toggle</b>：视觉状态每次刷新都从引擎的<b>真实状态</b>读（见 {@link Engine#sourceState}），
+ * 点未激活的 = 激活、点已激活的 = 关闭。两个音源<b>互斥</b>（同一时刻只能采一路）——
+ * 点麦克风时「本机声音」那颗会真地灭掉，并在状态行里写明原因。<b>绝不自动开麦</b>：
+ * 本机声音采集停止/授权被收回时一律显示"已停止 + 原因"，麦克风只由用户主动点击才开。
  *
  * <p>视觉对齐 {@code audiomixing/ui/phone.html}：深色底 + 圆角卡片 + 大状态 + 电平条。
  * 工程零依赖（没有 appcompat），所以界面全部用代码搭、圆角用 {@link GradientDrawable} 画。
@@ -98,20 +102,18 @@ public class MainActivity extends Activity {
 
     private Engine engine;
     private Handler ui;
-    private AudioManager audioManager;
-    private int sysVolMax;
 
     private LinearLayout listBox;
     private TextView pill;
-    private TextView detailToggle;
     private LinearLayout detailWrap;
-    private TextView volumeVal;
-    private SeekBar volumeBar;
-    /** ★ 系统媒体音量那一行（只显示，不修改）。 */
-    private TextView sysVolText;
     /** 头部那行"本机名字 · 平台"（点它就能改名）。 */
     private TextView subLine;
-    // ★ 「送什么声音」那一块
+    // ★ 主控大块里分成"三档都能看见"和"只有详细档才有"的两部分
+    /** 音源的实时状态（"现在实际送的是哪一个" + 静音提醒）：补充信息，只在详细档露出。 */
+    private LinearLayout sourceInfoWrap;
+    /** 「🚀 快速上手 / ✏️ 改名」：只在详细档出现（简洁档一个多余的字都不要）。 */
+    private LinearLayout detailOnlyRow;
+    // ★ 音源
     private TextView playChip;
     private TextView micChip;
     private TextView sourceNow;
@@ -125,22 +127,17 @@ public class MainActivity extends Activity {
     private TextView broadcastChip;
     private TextView broadcastNow;
     private boolean lastBroadcastOn;
-    /** 「自动接受收听请求」开关上一次的选中态（只在变了才重建背景）。 */
-    private boolean lastAutoAccept;
-    /** 「❔ 展开说明」/「收起说明」（简洁档里把长文字收起来用）。 */
-    private TextView helpChip;
-    // ★ ①④ 自动收听 + 安全停发的界面元素
-    private TextView autoListenLine;
+    // ★ ④ 安全停发提示（"已停止向 XXX 发送…"，和自动收听是两件事，保留）。
+    //   ★ 2026-10-18 用户第 6 条：全局的「自动收听路由声音」开关及其提示/一键收回已整段删掉 ——
+    //     自动听不听改由每台设备卡片上的第 4 颗「智连」按钮各自决定（默认关），
+    //     不再有能"随机触发"的全局开关，也就没有需要解释/收回的东西。
     private TextView suspendedLine;
-    private TextView autoAcceptChip;
-    private TextView autoAcceptHint;
 
     private final Map<String, PeerRow> rows = new LinkedHashMap<String, PeerRow>();
     private final Map<String, TextView> kvValues = new LinkedHashMap<String, TextView>();
 
     /** null 表示还没建过列表，这样第一次刷新一定会把"搜索中"的空状态画出来。 */
     private String lastSig;
-    private boolean detailsOpen;
     private boolean ticking;
     private int tickCount;
     /** 等权限 / 等投屏授权回来之后再开始送的那台设备。 */
@@ -150,9 +147,14 @@ public class MainActivity extends Activity {
     //
     // 用户原话：「补充：手机app也应当设置监控/简洁/详细，三个页面。」
     // 三档的定位（和电脑端、和用户统一的口径，名字不再改）：
-    //   · 简洁：只留最关键的东西 —— 打开就知道点哪里（长说明收起来）
-    //   · 详细：把"详情"里的东西变成一档常驻显示（本机信息 + 每台的完整信息）
+    //   · 简洁：只留最关键的东西 —— 打开就知道点哪里
+    //   · 详细：本机信息 + 每台的完整信息 + 所有说明文字，常驻展开
     //   · 监控：只读的实时数字面板（收发/丢包/坏包/缓冲/带宽/逐流/发现层自检），一屏读完
+    //
+    // ★ 2026-10-15 用户把这条规则说死了：「简洁模式下所有的标注补充式文本全部不要」，
+    //   以及「（快速上手/改名/详情/展开说明）全部删掉，这些详细页全部都有还不常用，
+    //   凭什么出现在简洁页面」。所以「简洁」现在是【真的简洁】：一句说明、一个多余入口都没有
+    //   （连"❔ 展开说明"那个按钮也一起去掉了 —— 有它在，简洁档就等于还没简洁）。
     // ★ 同一份数据三种呈现：三档全部复用 Engine 的查询接口，没有第二套取数逻辑。
     private static final int MODE_SIMPLE = 0;
     private static final int MODE_DETAIL = 1;
@@ -167,19 +169,19 @@ public class MainActivity extends Activity {
     private TextView monitorText;
     private View monitorCard;
     private View channelCard;
-    private View controlCard;
     private View hintCard;
-    /** 「简洁」档里被收起来的长说明（点「❔ 展开说明」还能看）。 */
+    /** 说明性长文字：只有「详细」档才显示（简洁档一个补充字都不要）。 */
     private final List<View> longTextViews = new ArrayList<View>();
-    private boolean helpExpanded;
+    /**
+     * 每次换设备列表（{@link #rebuild}）都会重建的那几块长说明（空列表状态卡片里的）。
+     * 单独放一个列表、每次 rebuild 清空，免得把已经丢弃的旧 View 一直留在集合里（那是个内存泄漏）。
+     */
+    private final List<View> dynLongTextViews = new ArrayList<View>();
 
-    /** 三档切换（分段控件，和「送什么声音」同一套视觉）。 */
+    /** 三档切换（分段控件，和音源那两格同一套视觉）。 */
     private void setViewMode(int mode) {
         viewMode = mode;
         saveViewMode();
-        if (mode == MODE_DETAIL) {
-            detailsOpen = true;      // 「详细」档 = 把「详情」里的东西常驻展开
-        }
         applyMode();
         if (mode == MODE_MONITOR && monitorText != null) {
             setTextIfChanged(monitorText, engine.monitorText());   // 切过去立刻有内容，不等 300ms
@@ -206,15 +208,31 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * 说明性长文字该不该露出来：<b>只有「详细」档露</b>。
+     *
+     * <p>★ 2026-10-15：原来「简洁」档也能靠「❔ 展开说明」把这些放出来 —— 用户把这条否了：
+     * 「简洁模式下所有的标注补充式文本全部不要」。而那个展开按钮本身就是"简洁页上多出来
+     * 的一个东西"，所以按钮一起去掉：简洁档从此一句补充说明都没有。
+     */
+    private boolean longTextVisible() {
+        return viewMode == MODE_DETAIL;
+    }
+
+    /** 把一块解释性长说明登记进"只有详细档才显示"的集合，并按当前档位立刻定一次可见性。 */
+    private void registerLong(List<View> into, View v) {
+        into.add(v);
+        v.setVisibility(longTextVisible() ? View.VISIBLE : View.GONE);
+    }
+
     /** 按当前档位切换"显示什么"—— 数据一份，呈现三样。 */
     private void applyMode() {
         boolean monitor = viewMode == MODE_MONITOR;
-        // 「简洁」把长说明收起来（可展开）；「详细」一律展开
-        boolean showLong = viewMode == MODE_DETAIL || (viewMode == MODE_SIMPLE && helpExpanded);
+        boolean detail = viewMode == MODE_DETAIL;
         if (modeSimple != null) {
             styleChip(modeSimple, viewMode == MODE_SIMPLE, "简洁");
-            styleChip(modeDetail, viewMode == MODE_DETAIL, "详细");
-            styleChip(modeMonitor, viewMode == MODE_MONITOR, "监控");
+            styleChip(modeDetail, detail, "详细");
+            styleChip(modeMonitor, monitor, "监控");
         }
         if (monitorCard != null) {
             monitorCard.setVisibility(monitor ? View.VISIBLE : View.GONE);
@@ -225,26 +243,33 @@ public class MainActivity extends Activity {
         if (listBox != null) {
             listBox.setVisibility(monitor ? View.GONE : View.VISIBLE);
         }
-        if (controlCard != null) {
-            controlCard.setVisibility(monitor ? View.GONE : View.VISIBLE);
+        // ★ 音源那两格（本机声音 / 麦克风）：监控档是只读面板，不出现。
+        //   诊断那一格照旧常在 —— 它是"看"的入口，不是开关。
+        if (playChip != null) {
+            playChip.setVisibility(monitor ? View.GONE : View.VISIBLE);
+        }
+        if (micChip != null) {
+            micChip.setVisibility(monitor ? View.GONE : View.VISIBLE);
+        }
+        // 下面这些全是"补充信息/不常用入口"：只有详细档露（用户原话见类里的那段说明）。
+        if (sourceInfoWrap != null) {
+            sourceInfoWrap.setVisibility(detail ? View.VISIBLE : View.GONE);
+        }
+        if (detailOnlyRow != null) {
+            detailOnlyRow.setVisibility(detail ? View.VISIBLE : View.GONE);
         }
         if (hintCard != null) {
-            // 底部说明：只有"简洁 + 展开了说明"或"详细"档才显示（监控档没有这些块）
-            hintCard.setVisibility(!monitor && showLong ? View.VISIBLE : View.GONE);
+            hintCard.setVisibility(detail ? View.VISIBLE : View.GONE);
         }
         for (View v : longTextViews) {
-            v.setVisibility(showLong ? View.VISIBLE : View.GONE);
+            v.setVisibility(detail ? View.VISIBLE : View.GONE);
         }
-        if (helpChip != null) {
-            // 「展开/收起说明」只在简洁档有意义（详细档本来就全展开，监控档没有说明块）
-            setTextIfChanged(helpChip, helpExpanded ? "❔ 收起说明" : "❔ 展开说明");
-            helpChip.setVisibility(viewMode == MODE_SIMPLE ? View.VISIBLE : View.GONE);
+        for (View v : dynLongTextViews) {
+            v.setVisibility(detail ? View.VISIBLE : View.GONE);
         }
         if (detailWrap != null) {
-            // 「详细」档：本机信息块（IP/端口/统计/对端回话…）常驻展开；
-            // 其他档回到用户自己的「▸ 详情」开关。
-            boolean showDetails = viewMode == MODE_DETAIL || detailsOpen;
-            detailWrap.setVisibility(showDetails ? View.VISIBLE : View.GONE);
+            // 「详细」档：本机信息块（IP/端口/统计/对端回话…）常驻展开。
+            detailWrap.setVisibility(detail ? View.VISIBLE : View.GONE);
         }
     }
 
@@ -270,9 +295,8 @@ public class MainActivity extends Activity {
         super.onCreate(state);
         engine = Engine.get(this);
         ui = new Handler(Looper.getMainLooper());
-        audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
-        sysVolMax = (audioManager == null)
-                ? 0 : audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        // ★ 系统媒体音量现在只在「详细」档和诊断报告里出现（引擎那边读的），
+        //   界面上不再单开一行 —— 用户把「送什么声音」那一整块连同它一起删掉了。
         viewMode = loadViewMode();     // ★ 上次看的是哪一档，这次还看哪一档
 
         Window w = getWindow();
@@ -383,7 +407,6 @@ public class MainActivity extends Activity {
         }
         refreshSourceRow();
         refreshChannelRow();
-        refreshVolumeRow();
         if (subLine != null) {
             // 名字被改过之后，标题下面那行要跟着变（信标 2 秒内带出去，界面立刻变）
             setTextIfChanged(subLine, engine.localName() + " ✏️ · " + engine.platform());
@@ -393,20 +416,6 @@ public class MainActivity extends Activity {
             setTextIfChanged(monitorText, engine.monitorText());
         }
         updateHeader(peers.size());
-    }
-
-    /** 刷新音量那两块（我们这一层的值 + 只读的系统音量）。 */
-    private void refreshVolumeRow() {
-        if (sysVolText != null) {
-            setTextIfChanged(sysVolText, readSystemVolume() + " · " + engine.volumeExplainText());
-        }
-        if (volumeBar != null && !volumeBar.isPressed()) {
-            // 滑杆没被按住时跟一下引擎里的真实值（比如服务重启后回到默认）
-            int want = Math.round(engine.volume() * 100);
-            if (volumeBar.getProgress() != want) {
-                volumeBar.setProgress(want);
-            }
-        }
     }
 
     /** 刷新「听广播 / 广播我的声音」那一块（状态会随"收到几个包"变，所以每 150ms 一起刷）。 */
@@ -442,28 +451,11 @@ public class MainActivity extends Activity {
             }
         }
 
-        // ★ ① 「XXX 请求收听，已自动打开（你可以随时关掉）」
-        if (autoListenLine != null) {
-            String notice = engine.autoListenNotice();
-            setTextIfChanged(autoListenLine, notice.length() > 0 ? ("📣 " + notice) : "");
-            autoListenLine.setVisibility(notice.length() > 0 ? View.VISIBLE : View.GONE);
-        }
         // ★ ④ 「已停止向 XXX 发送 —— 它已经 18 秒没有消息了…」
         if (suspendedLine != null) {
             String susp = engine.sendSuspendedText();
             setTextIfChanged(suspendedLine, susp.length() > 0 ? ("⏸ " + susp) : "");
             suspendedLine.setVisibility(susp.length() > 0 ? View.VISIBLE : View.GONE);
-        }
-        // 自动接受开关的选中态 + 一句解释
-        if (autoAcceptChip != null) {
-            boolean autoOn = engine.isAutoAcceptListen();
-            if (autoOn != lastAutoAccept) {
-                lastAutoAccept = autoOn;
-                styleChip(autoAcceptChip, autoOn, "自动接受收听请求");
-            }
-            setTextIfChanged(autoAcceptHint, autoOn
-                    ? "开：别人点「送给它」我就自动开始听（那台的收听按钮随时能关）"
-                    : "关：别人点「送给它」我也不会自动听，要自己点「🎧 收听」");
         }
     }
 
@@ -472,23 +464,26 @@ public class MainActivity extends Activity {
      *
      * <p>为什么每 150ms 都刷：音源会因为"授权被系统收回""设备采不到本机声音"而<b>自己变</b>，
      * 用户看到的必须是当下真实的那一个，而不是他上次点的那个。
+     *
+     * <p>★ 2026-10-19 用户第 2/4 条：两颗按钮的视觉状态<b>每次都从引擎的真实状态</b>
+     * （{@link Engine#sourceActive}）现读，不用任何缓存的标志位 —— 否则就会出现
+     * "实际在采麦克风、按钮却还是灰的"。
      */
     private void refreshSourceRow() {
         if (sourceNow == null) {
             return;
         }
-        int want = engine.sourceKind();
         boolean supported = engine.playbackSupported();
         boolean sending = engine.senderRunning();
-        int act = engine.activeSourceKind();
+        int state = engine.sourceState();      // 真实状态：OFF / MIC / PLAYBACK
         // 只在状态真的变了才重建按钮背景（150ms 一次，别一直产生垃圾对象）
-        String sig = want + "|" + supported + "|" + sending + "|" + act + "|" + engine.hasProjection();
+        String sig = state + "|" + supported + "|" + sending + "|" + engine.hasProjection();
         if (!sig.equals(lastSrcSig)) {
             lastSrcSig = sig;
             // 低版本把「本机声音」画成没选中的样子：点了会明确告诉你"不支持"，
             // 而不是选中了却什么也采不到（那正是会误导人的地方）。
-            styleChip(playChip, supported && want == AudioSend.SRC_PLAYBACK, "🔊 本机声音");
-            styleChip(micChip, want == AudioSend.SRC_MIC, "🎤 麦克风");
+            styleChip(playChip, supported && engine.sourceActive(AudioSend.SRC_PLAYBACK), "🔊 本机声音");
+            styleChip(micChip, engine.sourceActive(AudioSend.SRC_MIC), "🎤 麦克风");
         }
         setTextIfChanged(sourceNow, engine.sourceStateText());
         int color = engine.sourceMismatch() ? WARN : (sending ? OK : DIM);
@@ -516,6 +511,7 @@ public class MainActivity extends Activity {
     private void rebuild(List<Discovery.Peer> peers) {
         listBox.removeAllViews();
         rows.clear();
+        dynLongTextViews.clear();      // 空状态卡片里的长说明跟着旧 View 一起丢掉
         if (peers.isEmpty()) {
             listBox.addView(buildEmptyCard());
             return;
@@ -545,8 +541,8 @@ public class MainActivity extends Activity {
     }
 
     private void refreshDetails() {
-        if (!detailsOpen) {
-            return;
+        if (viewMode != MODE_DETAIL) {
+            return;      // 只有「详细」档才刷这串数字（别的档这些 View 本来就看不见，白算一遍）
         }
         put("name", engine.nodeName() + " · " + engine.platform()
                 + (engine.localNameIsCustom() ? "（名字：用户自定义）" : "（名字：默认）"));
@@ -583,20 +579,121 @@ public class MainActivity extends Activity {
     }
 
     private void onSendClick(Discovery.Peer p) {
-        // ★ 广播开着的时候，每台都会收到我的声音 —— 单独关某一台没有意义（它还会从广播那条路收到），
-        //   所以这里直说清楚，而不是让用户点了没反应还以为是 bug。
-        if (engine.isBroadcasting()) {
-            toast("正在「📢 广播我的声音」，每一台都会收到；想只送给某台就先关掉广播");
-            return;
-        }
+        // ★ 2026-10-16 用户把这件事钉死了：「广播是和路由独立开的。你别混一起了。
+        //   广播就是设备想说就说想听就听，但是不能关闭或者开启其他设备的听说。」
+        //   所以这里**不再**因为"正在广播"去拦着逐台那个按钮 —— 广播是电台，
+        //   逐台「送声音」是点对点，两条线互不相干：广播开着也能单独补送给某台。
         if (engine.isSending(p)) {
             engine.setSending(p, false);
             toast("已停止送给 " + p.label());
             refreshNow();
             return;
         }
+        // ★ 2026-10-19：音源开关关着就没有声音可送 —— 明确提示去主控区打开，而不是悄悄替你开
+        //   （尤其是绝不能替用户打开麦克风）。
+        if (!engine.sourceEnabled()) {
+            toast("音源已关闭：先在主控区点「🔊 本机声音」或「🎤 麦克风」打开采集");
+            return;
+        }
+        // ★ ④ 用户原话：「手机界面点击送声音后，应当判断手机是否在电脑的蓝牙设备列表里。
+        //   如果是就让用户判断到底用蓝牙还是WiFi。如果否就直接走WiFi路径。」
+        //   只在"从没在送 → 要开始送"这条路上问（上面的"正在送 → 停止"已经提前返回，绝不弹窗）。
+        //   匹配不上（老电脑没报 bt / 名单里没有我这台）就完全保持原样，直接走 WiFi。
+        if (LinkPolicy.btNameMatches(engine.localName(), p.btNames)) {
+            askBluetoothOrWifi(p);
+            return;
+        }
         startSendFlow(p);
     }
+
+    /**
+     * ★ ④ 这台电脑的蓝牙名单里有我 —— 先问一句走蓝牙还是 WiFi。
+     *
+     * <p>为什么默认/推荐是 WiFi：用户前几条反馈刚把 WiFi 这条路修好并测通，而蓝牙那条
+     * （电脑端面板 ②「设备与路由」里的蓝牙那一段）还在验证中；所以推荐项永远是 WiFi，
+     * 让用户"什么都不想，点一下最左边的按钮"就能拿到今天这个已经能用的结果。
+     *
+     * <p>为什么选「走蓝牙」不直接开始发送：蓝牙这条路要先在系统设置里把电脑连上、
+     * 还要确认「媒体音频」开着 —— 这两件事 App 没有权限替用户做，只能把人送到设置页。
+     */
+    private void askBluetoothOrWifi(final Discovery.Peer p) {
+        final String pcName = p.label();      // 电脑名：toast 里要照着念给它
+        // 用工程自己的深色 Dialog，不用系统 AlertDialog —— 理由见 showDiagnosisDialog 的注释：
+        // 系统那个是亮色底板，和整页深色视觉不搭（这个工程零依赖、圆角全靠自己画）。
+        final Dialog d = new Dialog(this);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackground(roundRect(0xF5070B12, dp(18), LINE, Math.max(1, dpi(1))));
+        int pad = dpi(16);
+        box.setPadding(pad, pad, pad, pad);
+
+        box.addView(text("这台电脑也能用蓝牙接你的声音", 16f, FG, true));
+        TextView hint = text("它认得你 —— 你的手机名出现在这台电脑的蓝牙设备列表里。\n"
+                + "走 WiFi：和现在一样，声音走局域网，已经在正常工作（推荐）。\n"
+                + "走蓝牙：**由电脑去连你的蓝牙**（连接由那边发起，你这边不用动手）—— "
+                + "声音就不占 WiFi 了。要是电脑回报「没找到你这台」，说明还没在 Windows 里配对过，"
+                + "去手机蓝牙设置里配对一次就好。", 11.5f, DIM, false);
+        hint.setLineSpacing(dp(3), 1f);
+        box.addView(hint, margins(MATCH, WRAP, 0, dpi(8), 0, dpi(12)));
+
+        TextView wifi = chip("走 WiFi（推荐）");
+        styleChip(wifi, true, "走 WiFi（推荐）");     // 推荐项高亮，等于"点最上面那个就是今天的效果"
+        wifi.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                d.dismiss();
+                startSendFlow(p);                    // 保持今天的行为
+            }
+        });
+        box.addView(wifi, margins(MATCH, dpi(46), 0, 0, 0, dpi(8)));
+
+        TextView bt = chip("走蓝牙（电脑去连）");
+        bt.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                d.dismiss();
+                askPcForBluetooth(p);
+            }
+        });
+        box.addView(bt, margins(MATCH, dpi(46), 0, 0, 0, dpi(8)));
+
+        TextView cancel = chip("取消");
+        cancel.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                d.dismiss();
+            }
+        });
+        box.addView(cancel, margins(MATCH, dpi(46), 0, 0, 0, 0));
+
+        d.setContentView(box);
+        Window dw = d.getWindow();
+        if (dw != null) {
+            dw.setBackgroundDrawable(new ColorDrawable(0));
+            dw.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            dw.setDimAmount(0.62f);
+            dw.setLayout(MATCH, WRAP);
+        }
+        d.show();
+    }
+
+    /**
+     * ★ ④ 请**电脑**去连我的蓝牙（用户原话：「手机确认走蓝牙后应当由电脑发送蓝牙请求
+     * 并配对互相连接」）。
+     *
+     * <p>手机这边只把请求挂在这台的统计包里（每 2 秒重复一次，幂等）；真正打开
+     * A2DP sink 的是电脑 —— 蓝牙设备列表在它那边，而且一次连接要跑几秒 PowerShell。
+     * <p>电脑连成没连成，会在**电脑面板 ② 里「蓝牙（手机的声音）」那一段**写出来
+     * （以及电脑的诊断报告里），所以这里只负责把话说清楚，不让用户盯着手机等。
+     */
+    private void askPcForBluetooth(final Discovery.Peer p) {
+        engine.setBtWant(p, true);
+        toast("已请电脑去连你的蓝牙 —— 连上后声音就走蓝牙过去；"
+                + "连成没连成看电脑面板 ② 里「蓝牙（手机的声音）」那一段");
+    }
+
     /**
      * 「送声音」的完整流程。顺序是有原因的：
      * <ol>
@@ -610,11 +707,14 @@ public class MainActivity extends Activity {
         if (p == null) {
             return;
         }
+        // 走这条路 = 走 WiFi：把之前"请电脑连蓝牙"的请求撤掉（幂等字段，撤了自然变 false），
+        // 免得用户改主意之后电脑还一直往蓝牙那条路使劲。
+        engine.setBtWant(p, false);
         int want = engine.sourceKind();
         if (want == AudioSend.SRC_PLAYBACK && !engine.playbackSupported()) {
-            toast("你的安卓版本不支持采本机声音（要 Android 10 及以上），只能用麦克风");
-            engine.setSourceKind(AudioSend.SRC_MIC);
-            want = AudioSend.SRC_MIC;
+            // ★ 绝不自动改用麦克风（用户隐私硬约束）：如实说明，让用户自己去点「🎤 麦克风」。
+            toast("你的安卓版本不支持采本机声音（要 Android 10 及以上），请改用麦克风");
+            return;
         }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
@@ -656,32 +756,38 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 用户点了音源按钮。正在送声音时是热切换（不中断发送、不会两路声音叠着发）。 */
+    /**
+     * 用户点了音源按钮。
+     *
+     * <p>★ 2026-10-19 用户第 4 条：<b>真正的 toggle</b> ——
+     * 「点击未激活按键即为激活，再次点击即为关闭」。新状态由纯策略
+     * {@link SourcePolicy#toggle} 算出来（当前真实状态 → 点这颗之后的状态），
+     * 所以"点在已亮的那颗 = 关闭"这件事和线上跑的是同一段逻辑（离线探针逐条钉住）。
+     *
+     * <p>同一时刻只能采一路（采集端只有一份 AudioRecord）：点麦克风时"本机声音"那颗会自动灭，
+     * 界面在状态行里写明原因（见 Engine.sourceStateText）。
+     */
     private void onSourceClick(int kind) {
-        if (kind == AudioSend.SRC_PLAYBACK && !engine.playbackSupported()) {
+        int current = engine.sourceState();
+        int next = SourcePolicy.toggle(current, kind);
+        if (next == SourcePolicy.SRC_PLAYBACK && !engine.playbackSupported()) {
             toast("你的安卓版本不支持采集本机声音（要 Android 10 及以上），只能用麦克风");
             return;
         }
-        engine.setSourceKind(kind);
-        if (kind == AudioSend.SRC_PLAYBACK && !engine.hasProjection()) {
-            if (requestProjection()) {
+        engine.applySourceState(next, "");
+        if (next == SourcePolicy.SRC_PLAYBACK && !engine.hasProjection()) {
+            if (!requestProjection()) {
+                engine.applySourceState(SourcePolicy.SRC_OFF, "这台设备没有投屏服务");
+                toast("这台设备没有投屏服务，采不了本机声音；可以改用麦克风");
+            } else {
                 toast("请在系统窗口里点「立即开始」/「允许」（授权一次，之后一直用）");
             }
+        } else if (next == SourcePolicy.SRC_OFF) {
+            toast("已关闭「" + AudioSend.sourceShortName(kind) + "」采集");
         } else {
-            toast(kind == AudioSend.SRC_PLAYBACK
-                    ? "已切到本机声音（正在送的话会立刻换过来）"
-                    : "已切到麦克风");
+            toast("已打开「" + AudioSend.sourceShortName(kind) + "」采集；点任意一台的「送声音」开始送");
         }
         refreshNow();
-    }
-
-    private void toggleDetails() {
-        detailsOpen = !detailsOpen;
-        detailWrap.setVisibility(detailsOpen ? View.VISIBLE : View.GONE);
-        setTextIfChanged(detailToggle, detailsOpen ? "▾ 详情" : "▸ 详情");
-        if (detailsOpen) {
-            refreshDetails();
-        }
     }
 
     // ────────────────────────────── 诊断 ──────────────────────────────
@@ -956,26 +1062,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    /**
-     * 读系统媒体音量（<b>只读</b>）。
-     *
-     * <p>这里原来叫 {@code applySystemVolume}，会调用 {@code AudioManager.setStreamVolume}
-     * 真的去改系统音量 —— 那是错的（用户明确指出过）：我们要调的是"我们这一层"的增益，
-     * 不该顺手把用户手机自己的声音也改了。现在这个函数只读不写，读出来是为了把
-     * "系统音量 × 播放器音量 × 我们这一层"这三层关系摆在界面上。
-     */
-    private String readSystemVolume() {
-        if (audioManager == null || sysVolMax <= 0) {
-            return "系统媒体音量：读不到（没有音频服务）";
-        }
-        try {
-            int cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-            return "系统媒体音量 " + cur + " / " + sysVolMax + "（只显示，我们不改它）";
-        } catch (Throwable t) {
-            return "系统媒体音量：读不到（" + t + "）";
-        }
-    }
-
     private void toast(String s) {
         Toast.makeText(this, s, Toast.LENGTH_SHORT).show();
     }
@@ -996,10 +1082,11 @@ public class MainActivity extends Activity {
         scroll.addView(root, new ViewGroup.LayoutParams(MATCH, WRAP));
 
         root.addView(buildHeader());
-        root.addView(buildModeBar());
-        // ★ 工具栏（🩺 诊断 / 🚀 快速上手 / ✏️ 改名）放在三档切换下面、三档都看得见 ——
-        //   用户明确要求过"不要藏在某一档里"。
-        root.addView(buildToolsCard());
+        // ★ 一个大块、6 个小格（用户 2026-10-15）：
+        //   简洁 / 详细 / 监控 / 诊断 / 本机声音 / 麦克风。
+        //   原来这三样（三档切换、工具栏、音源）散在三张卡片里，第 6 格还拖着一整块
+        //   说明和一根全局音量滑杆 —— 用户原话是无用的"整个大块全删掉"。
+        root.addView(buildMainCard());
         // ★ 「听广播 / 广播我的声音」放在设备列表【上面】：用户现在最常见的情况就是列表里 0 台设备
         //   （电脑在广播、手机看不见它），那时候列表里没有任何东西可点，
         //   而这个开关恰恰是"电脑在广播，我要能听见"的唯一入口 —— 放进列表里等于藏起来。
@@ -1014,19 +1101,38 @@ public class MainActivity extends Activity {
         monitorCard = buildMonitorCard();
         root.addView(monitorCard);
 
-        controlCard = buildControlCard();
-        root.addView(controlCard);
+        // 底部说明：只有「详细」档才显示（用户原话："简洁模式下所有的标注补充式文本全部不要"）
         hintCard = buildHintCard();
         root.addView(hintCard);
         applyMode();
         return scroll;
     }
 
-    /** ★ 顶部三档切换：简洁 / 详细 / 监控（分段控件，和「送什么声音」同一套视觉）。 */
-    private View buildModeBar() {
+    /**
+     * ★ 主控大块（2026-10-15 用户要求）：<b>一个大块，分 6 个小格</b>。
+     *
+     * <p>用户原话：「合成一个大块，分6个小块。简洁/详细/监控/诊断/本机声音/麦克风」——
+     * 这 6 样原来散在三张卡片里（三档切换一张、工具栏一张、"送什么声音"一张），
+     * 最后那张还塞了一整块说明和一根全局音量滑杆。
+     *
+     * <p>他同时把"多出来的东西"点掉了：
+     * <ul>
+     *   <li>「整个大块全删掉，音量功能重复了，诊断保留了，改名在页面左上角名字那也重复了」
+     *       —— 所以"我们这一层的音量"滑杆、只读的系统音量那一行、那一长段音源限制说明、
+     *       {@code ▸ 详情} 开关，以及诊断/改名的副本，全部删掉；</li>
+     *   <li>「全部删掉，这些详细页全部都有还不常用，凭什么出现在简洁页面」
+     *       —— 快速上手、改名、本机信息那串 kv，只在「详细」档出现。</li>
+     * </ul>
+     *
+     * <p>音量滑杆并没有消失：每台设备卡片里本来就有一对自己的「收 / 送」滑杆（见
+     * {@link #gainRow}），那才是用户真正在调的东西 —— 全局那一根是重复的，所以拿掉。
+     */
+    private View buildMainCard() {
         LinearLayout card = card();
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
+
+        // ── 第 1 行：三档切换（简洁 / 详细 / 监控）──
+        LinearLayout modes = new LinearLayout(this);
+        modes.setOrientation(LinearLayout.HORIZONTAL);
 
         modeSimple = chip("简洁");
         modeSimple.setOnClickListener(new View.OnClickListener() {
@@ -1037,7 +1143,7 @@ public class MainActivity extends Activity {
         });
         LinearLayout.LayoutParams p1 = margins(0, dpi(40), 0, 0, dpi(6), 0);
         p1.weight = 1f;
-        row.addView(modeSimple, p1);
+        modes.addView(modeSimple, p1);
 
         modeDetail = chip("详细");
         modeDetail.setOnClickListener(new View.OnClickListener() {
@@ -1048,7 +1154,7 @@ public class MainActivity extends Activity {
         });
         LinearLayout.LayoutParams p2 = margins(0, dpi(40), 0, 0, dpi(6), 0);
         p2.weight = 1f;
-        row.addView(modeDetail, p2);
+        modes.addView(modeDetail, p2);
 
         modeMonitor = chip("监控");
         modeMonitor.setOnClickListener(new View.OnClickListener() {
@@ -1059,25 +1165,10 @@ public class MainActivity extends Activity {
         });
         LinearLayout.LayoutParams p3 = margins(0, dpi(40), 0, 0, 0, 0);
         p3.weight = 1f;
-        row.addView(modeMonitor, p3);
-        card.addView(row);
+        modes.addView(modeMonitor, p3);
+        card.addView(modes);
 
-        // 一键展开/收起长说明（简洁档用；详细档不需要，监控档没有这些块）
-        helpChip = chip("❔ 展开说明");
-        helpChip.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                helpExpanded = !helpExpanded;
-                applyMode();
-            }
-        });
-        card.addView(helpChip, margins(MATCH, dpi(36), 0, dpi(8), 0, 0));
-        return card;
-    }
-
-    /** ★ 工具栏：三档都常驻（用户要求"不要藏在某一档里"）。 */
-    private View buildToolsCard() {
-        LinearLayout card = card();
+        // ── 第 2 行：诊断 / 本机声音 / 麦克风（三档都看得见 —— 诊断是"看"的入口）──
         LinearLayout tools = new LinearLayout(this);
         tools.setOrientation(LinearLayout.HORIZONTAL);
         tools.setGravity(Gravity.CENTER_VERTICAL);
@@ -1094,7 +1185,63 @@ public class MainActivity extends Activity {
         dlp.weight = 1f;
         tools.addView(diagChip, dlp);
 
-        // ★ 「快速上手」：把"该点哪里"写成 30 秒能读完的步骤（三档都进得来）
+        // ★ 「🔊 本机声音」—— 这一格必须放在最显眼的地方。
+        //   用户的原话：「你这手机都是采集的麦克风的声音，那不成对讲机了吗？
+        //   我的需求一直都是桌面音频啊」—— 音源选错是这个 App 最大的方向性缺陷。
+        playChip = chip("🔊 本机声音");
+        playChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                onSourceClick(AudioSend.SRC_PLAYBACK);
+            }
+        });
+        LinearLayout.LayoutParams plp = margins(0, dpi(42), 0, 0, dpi(6), 0);
+        plp.weight = 1f;
+        tools.addView(playChip, plp);
+
+        micChip = chip("🎤 麦克风");
+        micChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                onSourceClick(AudioSend.SRC_MIC);
+            }
+        });
+        LinearLayout.LayoutParams mlp = margins(0, dpi(42), 0, 0, 0, 0);
+        mlp.weight = 1f;
+        tools.addView(micChip, mlp);
+        card.addView(tools, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+
+        // ── 音源的实时状态（"现在实际送的是哪一个" + 静音提醒 + 限制说明）：只有详细档露 ──
+        sourceInfoWrap = new LinearLayout(this);
+        sourceInfoWrap.setOrientation(LinearLayout.VERTICAL);
+
+        // 这一行是"现在到底送的是什么"的唯一权威说法（绿=正常，黄=和你要的不一样）
+        sourceNow = text("", 12f, FG, false);
+        sourceNow.setLineSpacing(dp(3), 1f);
+        sourceInfoWrap.addView(sourceNow, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
+
+        // 采本机声音却一直是静音时的提醒（DRM / 禁止被采集的 App 就是这样）
+        sourceWarn = text("", 11.5f, WARN, false);
+        sourceWarn.setLineSpacing(dp(3), 1f);
+        sourceWarn.setVisibility(View.GONE);
+        sourceInfoWrap.addView(sourceWarn, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+
+        // 限制一次写清：别让用户以为"选上了就一定能采到"
+        TextView limit = text("🔊 本机声音 = 手机上正在放的音乐/视频/游戏（第一次要授权一次，之后一直用；"
+                + "安卓 10 以下没有这个能力，只能用麦克风）。\n"
+                + "注意：DRM 保护的内容（部分音乐/影视 App）和主动禁止被采集的 App 采不到，会是静音；"
+                + "少数厂商 ROM 也阉割了这个接口。\n"
+                + "🎤 麦克风 = 对讲：说给对面听。两种都走同一条音频链路，音质一样。", 11.5f, DIM, false);
+        limit.setLineSpacing(dp(3), 1f);
+        sourceInfoWrap.addView(limit, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
+        card.addView(sourceInfoWrap);
+
+        // ── 只有详细档才出现的那两个入口：快速上手 / 改名 ──
+        //   （"详情"已经变成这一档本身；"展开说明"连按钮一起去掉了 —— 简洁档一个补充字都没有。）
+        detailOnlyRow = new LinearLayout(this);
+        detailOnlyRow.setOrientation(LinearLayout.HORIZONTAL);
+        detailOnlyRow.setGravity(Gravity.CENTER_VERTICAL);
+
         TextView qsChip = chip("🚀 快速上手");
         qsChip.setOnClickListener(new View.OnClickListener() {
             @Override
@@ -1102,9 +1249,9 @@ public class MainActivity extends Activity {
                 showQuickStartDialog();
             }
         });
-        LinearLayout.LayoutParams qlp = margins(0, dpi(42), 0, 0, dpi(6), 0);
+        LinearLayout.LayoutParams qlp = margins(0, dpi(42), 0, dpi(10), dpi(6), 0);
         qlp.weight = 1f;
-        tools.addView(qsChip, qlp);
+        detailOnlyRow.addView(qsChip, qlp);
 
         // ★ 「✏️ 改名」：点标题下那行名字也能改，这里再给一个显式入口
         TextView renameChip = chip("✏️ 改名");
@@ -1114,10 +1261,28 @@ public class MainActivity extends Activity {
                 showRenameDialog();
             }
         });
-        LinearLayout.LayoutParams rlp = margins(0, dpi(42), 0, 0, 0, 0);
+        LinearLayout.LayoutParams rlp = margins(0, dpi(42), 0, dpi(10), 0, 0);
         rlp.weight = 1f;
-        tools.addView(renameChip, rlp);
-        card.addView(tools);
+        detailOnlyRow.addView(renameChip, rlp);
+        card.addView(detailOnlyRow);
+
+        // ── 详细档的本机信息（原来「▸ 详情」里那一串）──
+        detailWrap = new LinearLayout(this);
+        detailWrap.setOrientation(LinearLayout.VERTICAL);
+        card.addView(detailWrap);
+
+        kv("本机名称", "name");
+        kv("本机 IP", "ip");
+        kv("音频端口", "port");
+        kv("已发现", "found");
+        kv("已连接", "conn");
+        kv("实际收到", "streams");
+        kv("音量分层", "volume");
+        kv("收端统计", "recv");
+        kv("发端统计", "send");
+        // ★ 对端自己报的统计（两台设备互报的"我发了多少/我收了你多少"）
+        kv("对端回话", "peers");
+        kv("发现统计", "disc");
         return card;
     }
 
@@ -1172,6 +1337,11 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 boolean on = !engine.isBroadcasting();
+                if (on && !engine.sourceEnabled()) {
+                    // 音源开关关着就没声音可广播；绝不替用户打开采集（更不能开麦）。
+                    toast("音源已关闭：先在主控区点「🔊 本机声音」或「🎤 麦克风」打开采集");
+                    return;
+                }
                 engine.setBroadcasting(on);
                 toast(on ? "已开始广播：我的声音送给每一台在线设备" : "已停止广播");
                 refreshNow();
@@ -1186,50 +1356,15 @@ public class MainActivity extends Activity {
         channelNow.setLineSpacing(dp(3), 1f);
         card.addView(channelNow, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
 
-        // ★ ① 「请求收听」的横幅：别人点「送给它」时我这边自动打开了收听，
-        //   界面上必须明说 + 可撤销（点一下收起；那台的「收听」按钮照常能关）。
-        autoListenLine = text("", 11.5f, OK, false);
-        autoListenLine.setLineSpacing(dp(3), 1f);
-        autoListenLine.setVisibility(View.GONE);
-        autoListenLine.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                engine.clearAutoListenNotice();     // 点一下先收起这句话
-                refreshNow();
-            }
-        });
-        card.addView(autoListenLine, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
-
         // ★ ④ 安全检查的结果：「已停止向 XXX 发送 —— 它已经 18 秒没有消息了…」
         suspendedLine = text("", 11.5f, WARN, false);
         suspendedLine.setLineSpacing(dp(3), 1f);
         suspendedLine.setVisibility(View.GONE);
         card.addView(suspendedLine, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
 
-        // ★ 「自动接受别人的收听请求」全局开关（默认开，用户可关）
-        LinearLayout autoRow = new LinearLayout(this);
-        autoRow.setOrientation(LinearLayout.HORIZONTAL);
-        autoRow.setGravity(Gravity.CENTER_VERTICAL);
-        autoAcceptChip = chip("自动接受收听请求");
-        autoAcceptChip.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                boolean on = !engine.isAutoAcceptListen();
-                engine.setAutoAcceptListen(on);
-                toast(on ? "已打开：别人点「送给它」时我会自动打开收听"
-                        : "已关闭：别人点「送给它」时我要自己点收听");
-                refreshNow();
-            }
-        });
-        LinearLayout.LayoutParams alp = margins(0, dpi(38), 0, 0, dpi(8), 0);
-        alp.weight = 1f;
-        autoRow.addView(autoAcceptChip, alp);
-        autoAcceptHint = text("", 10.5f, DIM, false);
-        autoAcceptHint.setLineSpacing(dp(2), 1f);
-        LinearLayout.LayoutParams hlp = margins(0, WRAP, 0, 0, 0, 0);
-        hlp.weight = 1.1f;
-        autoRow.addView(autoAcceptHint, hlp);
-        card.addView(autoRow, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
+        // ★ 2026-10-18 用户第 6 条：这里原来的「自动收听路由声音」全局开关 + 说明 +「一键收回」
+        //   三块整段删掉 —— 自动听不听改由每台设备卡片上各自的第 4 颗「智连」按钮决定（默认关），
+        //   不再有全局开关，也就没有"请求收听横幅"和"一键收回"存在的必要。
 
         // 发送侧的状态（含"送给几台 + 真实带宽"）
         broadcastNow = text("", 12f, DIM, false);
@@ -1242,11 +1377,13 @@ public class MainActivity extends Activity {
                 + "📢 广播我的声音 = 反过来：我这台的声音同时送给局域网里每一台在线设备"
                 + "（逐个单播，不往广播地址盲发 —— 盲发在 Wi-Fi 上不可靠）。\n"
                 + "🎧 收听 / 🔊 送声音 = 点对点，只跟你点名的那一台来往。\n"
-                + "这些开关是【并存】的：可以只开一个，也可以都开。上面两行写的就是现在实际在收/在发什么。\n"
+                + "★ 广播和路由是【两条独立的线】，就像局域网里的 FM 电台：你想说就说、想听就听；"
+                + "它不会去开关别人的「听」「送」，也不会替你改动任何一台设备的路由状态"
+                + "（开着广播时，卡片上那些按钮还是你自己的选择）。\n"
                 + "同一台设备的声音如果从两条路都进来（电脑同时开着广播和点对点路由），只会播一路、不叠加。",
                 11.5f, DIM, false);
         hint.setLineSpacing(dp(3), 1f);
-        longTextViews.add(hint);      // 简洁档收起来
+        registerLong(longTextViews, hint);      // 简洁档收起来
         card.addView(hint, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
         return card;
     }
@@ -1284,184 +1421,6 @@ public class MainActivity extends Activity {
         return row;
     }
 
-    private View buildControlCard() {
-        LinearLayout card = card();
-
-        // ★ 『送什么声音』—— 这一块必须放在最显眼的地方。
-        //   用户的原话：「你这手机都是采集的麦克风的声音，那不成对讲机了吗？
-        //   我的需求一直都是桌面音频啊」—— 音源选错是这个 App 最大的方向性缺陷，
-        //   所以选择、当前实际音源、限制说明三样都摆在第一屏。
-        card.addView(text("送什么声音", 12.5f, DIM, false));
-
-        LinearLayout srcRow = new LinearLayout(this);
-        srcRow.setOrientation(LinearLayout.HORIZONTAL);
-
-        playChip = chip("🔊 本机声音");
-        playChip.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                onSourceClick(AudioSend.SRC_PLAYBACK);
-            }
-        });
-        LinearLayout.LayoutParams plp = margins(0, dpi(44), 0, 0, 0, 0);
-        plp.weight = 1f;
-        srcRow.addView(playChip, plp);
-
-        micChip = chip("🎤 麦克风");
-        micChip.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                onSourceClick(AudioSend.SRC_MIC);
-            }
-        });
-        LinearLayout.LayoutParams mlp = margins(0, dpi(44), dpi(8), 0, 0, 0);
-        mlp.weight = 1f;
-        srcRow.addView(micChip, mlp);
-        card.addView(srcRow, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
-
-        // 这一行是"现在到底送的是什么"的唯一权威说法（绿=正常，黄=和你要的不一样）
-        sourceNow = text("", 12f, FG, false);
-        sourceNow.setLineSpacing(dp(3), 1f);
-        card.addView(sourceNow, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
-
-        // 采本机声音却一直是静音时的提醒（DRM / 禁止被采集的 App 就是这样）
-        sourceWarn = text("", 11.5f, WARN, false);
-        sourceWarn.setLineSpacing(dp(3), 1f);
-        sourceWarn.setVisibility(View.GONE);
-        card.addView(sourceWarn, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
-
-        // 限制一次写清：别让用户以为"选上了就一定能采到"
-        TextView limit = text("🔊 本机声音 = 手机上正在放的音乐/视频/游戏（第一次要授权一次，之后一直用；"
-                + "安卓 10 以下没有这个能力，只能用麦克风）。\n"
-                + "注意：DRM 保护的内容（部分音乐/影视 App）和主动禁止被采集的 App 采不到，会是静音；"
-                + "少数厂商 ROM 也阉割了这个接口。\n"
-                + "🎤 麦克风 = 对讲：说给对面听。两种都走同一条音频链路，音质一样。", 11.5f, DIM, false);
-        limit.setLineSpacing(dp(3), 1f);
-        card.addView(limit, margins(MATCH, WRAP, 0, dpi(10), 0, dpi(4)));
-        longTextViews.add(limit);     // 简洁档收起来（点「❔ 展开说明」还能看）
-
-        View hr = new View(this);
-        hr.setBackgroundColor(LINE);
-        card.addView(hr, margins(MATCH, Math.max(1, dpi(1)), 0, dpi(4), 0, dpi(12)));
-
-        // ★ 音量：只管"我们这一层"，绝不动系统音量。
-        //
-        //   用户原话（2026-10-12）：「手机在调节本机音量时（本意应当是使收听方音量更适合），
-        //   会直接调节系统声音大小。我们的声音计算方式应当是：
-        //   系统声音 × 被监听软件声音 × 我们软件声音 = 实际接收端声音大小」。
-        //   所以这里：滑杆 → 只作用于我们自己处理的 PCM；系统音量单独一行【只读】。
-        card.addView(text("我们这一层的音量", 12.5f, DIM, false));
-
-        LinearLayout volRow = new LinearLayout(this);
-        volRow.setOrientation(LinearLayout.HORIZONTAL);
-        volRow.setGravity(Gravity.CENTER_VERTICAL);
-
-        volumeBar = new SeekBar(this);
-        volumeBar.setMax(150);          // 0~1.5 倍，和网页版滑杆一致
-        volumeBar.setProgress(100);
-        volumeBar.setProgressTintList(ColorStateList.valueOf(ACC));
-        volumeBar.setThumbTintList(ColorStateList.valueOf(ACC));
-        LinearLayout.LayoutParams vlp = margins(0, WRAP, 0, 0, 0, 0);
-        vlp.weight = 1f;
-        volRow.addView(volumeBar, vlp);
-
-        volumeVal = text("1.00", 12.5f, DIM, false);
-        volumeVal.setGravity(Gravity.END);
-        volumeVal.setTypeface(Typeface.MONOSPACE);
-        volRow.addView(volumeVal, new LinearLayout.LayoutParams(dpi(44), WRAP));
-
-        volumeBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override
-            public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
-                float g = progress / 100f;
-                if (volumeVal != null) {
-                    setTextIfChanged(volumeVal, String.format(Locale.US, "%.2f", g));
-                }
-                // 只改我们自己的增益（发侧乘 PCM / 收侧 AudioTrack 音量）。
-                // 注意：这里<b>刻意不再调用</b> AudioManager.setStreamVolume —— 见上面那段说明。
-                engine.setVolume(g);
-            }
-
-            @Override
-            public void onStartTrackingTouch(SeekBar sb) {
-            }
-
-            @Override
-            public void onStopTrackingTouch(SeekBar sb) {
-            }
-        });
-        card.addView(volRow, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
-
-        TextView volHint = text("只影响 Audio Mixing 送出去/播放出来的声音，不改你的系统音量。"
-                + "（播放侧上限 1.00，发送侧可以到 1.50。）", 11.5f, DIM, false);
-        volHint.setLineSpacing(dp(3), 1f);
-        card.addView(volHint, margins(MATCH, WRAP, 0, dpi(4), 0, 0));
-
-        // 系统音量：只显示、不修改。写在界面上是为了让三层关系一眼可见。
-        sysVolText = text("", 11.5f, DIM, false);
-        sysVolText.setLineSpacing(dp(3), 1f);
-        card.addView(sysVolText, margins(MATCH, WRAP, 0, dpi(2), 0, dpi(6)));
-
-        // 「详情」和「诊断」并排：详情是常驻的实时统计（看一眼），
-        // 诊断是一次性的完整快照（能整段复制发出去）—— 真机排查要的正是后者。
-        LinearLayout tools = new LinearLayout(this);
-        tools.setOrientation(LinearLayout.HORIZONTAL);
-        tools.setGravity(Gravity.CENTER_VERTICAL);
-
-        detailToggle = text("▸ 详情", 12.5f, DIM, false);
-        detailToggle.setGravity(Gravity.CENTER_VERTICAL);
-        detailToggle.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                toggleDetails();
-            }
-        });
-        LinearLayout.LayoutParams tlp = margins(0, dpi(40), 0, 0, 0, 0);
-        tlp.weight = 1f;
-        tools.addView(detailToggle, tlp);
-
-        // ★ 「诊断」入口：用户原话"要不加个诊断吧"——点开就是一段可复制的完整报告，
-        //   不用再靠截图里的几个数字猜是哪一端的问题。
-        TextView diagChip = chip("🩺 诊断");
-        diagChip.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                showDiagnosisDialog();
-            }
-        });
-        tools.addView(diagChip, margins(dpi(100), dpi(40), 0, dpi(12), 0, 0));
-
-        // ★ 「✏️ 改名」：和「诊断」并排（点标题下那行名字也能改，这里再给一个显式入口）
-        TextView renameChip = chip("✏️ 改名");
-        renameChip.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                showRenameDialog();
-            }
-        });
-        tools.addView(renameChip, margins(dpi(88), dpi(40), dpi(8), dpi(12), 0, 0));
-        card.addView(tools);
-
-        detailWrap = new LinearLayout(this);
-        detailWrap.setOrientation(LinearLayout.VERTICAL);
-        detailWrap.setVisibility(View.GONE);
-        card.addView(detailWrap);
-
-        kv("本机名称", "name");
-        kv("本机 IP", "ip");
-        kv("音频端口", "port");
-        kv("已发现", "found");
-        kv("已连接", "conn");
-        kv("实际收到", "streams");
-        kv("音量分层", "volume");
-        kv("收端统计", "recv");
-        kv("发端统计", "send");
-        // ★ 对端自己报的统计（两台设备互报的"我发了多少/我收了你多少"）
-        kv("对端回话", "peers");
-        kv("发现统计", "disc");
-        return card;
-    }
-
     private View buildHintCard() {
         LinearLayout card = card();
         TextView t = text("同一 Wi-Fi 下打开这个 App，设备会自己出现 —— 不用配对、不用房间号、不用扫码。\n"
@@ -1482,12 +1441,24 @@ public class MainActivity extends Activity {
      * 光有两根条子还是分不清哪根是哪根，所以每条前面写「收」/「送」，后面写一句人话。
      */
     private LinearLayout levelRow(String tag, LevelBar bar, String tail) {
+        return levelRow(tag, bar, tail, null);
+    }
+
+    /**
+     * 同上的版本，但把右边那句说明的 TextView 交回给调用方，好让它每 150ms 跟着改。
+     *
+     * <p>★ 2026-10-16（图6）之后多了「信号」那一条（信号质量条），它的说明是动态的
+     * （「78 分」/「不可测」），不能像原来那样在构造时写死。
+     *
+     * <p>标签宽度从 18dp 放宽到 28dp：现在会出现两个字（「信号」）。
+     */
+    private LinearLayout levelRow(String tag, LevelBar bar, String tail, TextView[] tailOut) {
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView k = text(tag, 11.5f, DIM, true);
-        row.addView(k, new LinearLayout.LayoutParams(dpi(18), WRAP));
+        row.addView(k, new LinearLayout.LayoutParams(dpi(28), WRAP));
 
         LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(0, dpi(10));
         blp.weight = 1f;
@@ -1495,6 +1466,9 @@ public class MainActivity extends Activity {
 
         TextView t = text(tail, 10.5f, DIM, false);
         row.addView(t, margins(WRAP, WRAP, dpi(8), 0, 0, 0));
+        if (tailOut != null && tailOut.length > 0) {
+            tailOut[0] = t;
+        }
         return row;
     }
 
@@ -1515,7 +1489,7 @@ public class MainActivity extends Activity {
         TextView k = text(tag, 11f, DIM, false);
         row.addView(k, new LinearLayout.LayoutParams(dpi(52), WRAP));
 
-        bar.setMax(150);              // 0.00 ~ 1.50，和「我们这一层的音量」滑杆同一口径
+        bar.setMax(200);              // 0.00 ~ 2.00，和电脑端滑杆**同一个上限**（2026-10-17 用户要求统一）
         bar.setProgress(100);
         bar.setProgressTintList(ColorStateList.valueOf(ACC));
         bar.setThumbTintList(ColorStateList.valueOf(ACC));
@@ -1578,6 +1552,7 @@ public class MainActivity extends Activity {
         TextView h = text("让另一台手机 / 电脑打开 Audio Mixing，它就会自动出现在这里。", 12f, DIM, false);
         h.setGravity(Gravity.CENTER);
         card.addView(h, margins(MATCH, WRAP, 0, dpi(12), 0, 0));
+        registerLong(dynLongTextViews, h);      // 教学文字：简洁档收起来
 
         // ★ 列表空着不等于没得听：电脑在广播时「听广播」照样能出声。
         //   真机现场最常见的就是"列表 0 台设备"，这时候必须给用户一条能走的路。
@@ -1590,6 +1565,7 @@ public class MainActivity extends Activity {
                 11.5f, DIM, false);
         e.setGravity(Gravity.CENTER);
         card.addView(e, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
+        registerLong(dynLongTextViews, e);      // 本机 IP/名字属于细节：简洁档收起来
 
         // 一张小抄：列表空着时按这个顺序查（和诊断报告里的【发现自检】对得上）
         TextView tip = text("一直搜不到设备？点「详情」看「发现统计」里的自检："
@@ -1598,6 +1574,7 @@ public class MainActivity extends Activity {
         tip.setGravity(Gravity.CENTER);
         tip.setLineSpacing(dp(3), 1f);
         card.addView(tip, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
+        registerLong(dynLongTextViews, tip);    // 排查说明（原理/教程）：简洁档收起来
         return card;
     }
 
@@ -1709,10 +1686,19 @@ public class MainActivity extends Activity {
         final TextView state;
         final TextView listenChip;
         final TextView sendChip;
-        /** 「收」电平条：我从它收到多少。 */
+        /** ★ 2026-10-18 第 6 条：这台设备的「智连」（默认关；只自动开"听"）。 */
+        final TextView smartChip;
+        /** 「收」电平条：我从它收到多少（= 音量大小）。 */
         final LevelBar recvLevel;
-        /** 「送」电平条：我送给它多少（逐目标统计，见 SendFanout）。 */
+        /** 「送」电平条：我送给它多少（逐目标统计，见 SendFanout）（= 音量大小）。 */
         final LevelBar sendLevel;
+        /** ★ 「信号」条：这一路的链路质量（见 Engine.peerQualityFor）。 */
+        final LevelBar signalLevel;
+        /** 「信号」条右边那句动态说明（「78 分」/「不可测」）。 */
+        final TextView signalTail;
+        /** 「收」「送」两条右边那句动态说明（「声音大小 43%」）。 */
+        final TextView recvTail;
+        final TextView sendTail;
         /** ★ 「我听它的」可调滑杆（收侧增益，只影响这一路）。 */
         final SeekBar recvGainBar;
         /** ★ 「我送它的」可调滑杆（送侧逐目标增益）。 */
@@ -1722,6 +1708,7 @@ public class MainActivity extends Activity {
         private boolean styledOnce;
         private boolean styledListen;
         private boolean styledSend;
+        private boolean styledSmart;
         private int styledSrc = -1;
 
         PeerRow(Discovery.Peer p) {
@@ -1751,12 +1738,28 @@ public class MainActivity extends Activity {
 
             // ★ 两条独立电平条（收 / 送）—— 用户原话：
             //   「每个设备都应当配备独立的收/送声音音频条」。原来只有一条，看不出是收还是送。
+            // ★ 2026-10-16 用户（图6）之后这两条的右边写**音量百分比**（不再是"我从它收到
+            //   多少"这种说明），因为它们现在就是"音量显示条"。
+            TextView[] recvTailOut = new TextView[1];
             recvLevel = new LevelBar(MainActivity.this, Math.max(2, dpi(3)));
-            card.addView(levelRow("收", recvLevel, "我从它收到多少"),
+            card.addView(levelRow("收", recvLevel, "没有在收", recvTailOut),
                     margins(MATCH, WRAP, 0, dpi(11), 0, 0));
+            recvTail = recvTailOut[0];
+            TextView[] sendTailOut = new TextView[1];
             sendLevel = new LevelBar(MainActivity.this, Math.max(2, dpi(3)));
-            card.addView(levelRow("送", sendLevel, "我送给它多少"),
+            card.addView(levelRow("送", sendLevel, "没有在送", sendTailOut),
                     margins(MATCH, WRAP, 0, dpi(5), 0, 0));
+            sendTail = sendTailOut[0];
+
+            // ★ 2026-10-16 用户（图6）：「电脑手机现在都只有"送""收"两个条，现在定义为
+            //   音量显示条。并添加一个信号质量条。」——前两条本来就是**峰值**（音量），
+            //   这里补上第三条：信号质量。它只用实测计数器算（丢包比例 + 缓冲深度），
+            //   测不到就如实写"不可测"，不编一个分数。
+            TextView[] signalTailOut = new TextView[1];
+            signalLevel = new LevelBar(MainActivity.this, Math.max(2, dpi(3)));
+            card.addView(levelRow("信号", signalLevel, "—", signalTailOut),
+                    margins(MATCH, WRAP, 0, dpi(5), 0, 0));
+            signalTail = signalTailOut[0];
 
             // ★★ 可调音量条（用户原话：「我要求的是各设备【可调节】的音量条。
             //    当然现在有的显示实际音量条也不错」）—— 电平条保留，旁边再加一条可调滑杆。
@@ -1803,6 +1806,24 @@ public class MainActivity extends Activity {
             slp.weight = 1f;
             btns.addView(sendChip, slp);
 
+            // ★ 2026-10-18 用户第 6 条：第 4 颗按钮「智连」，**默认关闭**。
+            //   手机端**只**自动开"听"（用户原话「手机端只能自动开启'听'，为了用户安全考虑」）——
+            //   开了之后：这台设备送声音过来，本机自动开始收听它。
+            //   绝不自动替本机往外送声音（那是把话筒往别人耳朵里塞，必须自己点）。
+            smartChip = chip("智连");
+            smartChip.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    boolean on = engine.toggleSmart(peer.host);
+                    toast(on ? ("已开「智连」：" + peer.label() + " 送声音过来会自动收听")
+                             : ("已关「智连」：" + peer.label() + " 以后要自己点「🎧 收听」"));
+                    refreshNow();
+                }
+            });
+            LinearLayout.LayoutParams mlp = margins(0, dpi(44), dpi(8), 0, 0, 0);
+            mlp.weight = 1f;
+            btns.addView(smartChip, mlp);
+
             card.addView(btns, margins(MATCH, WRAP, 0, dpi(12), 0, 0));
             sync();
         }
@@ -1812,14 +1833,17 @@ public class MainActivity extends Activity {
             boolean send = engine.isSending(peer);
             // 按钮上的图标直接表达"送的是什么"：🔊 本机声音 / 🎤 麦克风。
             int src = engine.sourceKind();
+            boolean smart = engine.isSmart(peer.host);
             // 只在状态真的变了才重建背景（每 150ms 重来一次会一直产生垃圾对象）
             if (!styledOnce) {
                 styledOnce = true;
                 styledListen = listen;
                 styledSend = send;
                 styledSrc = src;
+                styledSmart = smart;
                 styleChip(listenChip, listen, "🎧 收听");
                 styleChip(sendChip, send, sendChipLabel(src));
+                styleChip(smartChip, smart, "智连");
             } else {
                 if (listen != styledListen) {
                     styledListen = listen;
@@ -1830,13 +1854,50 @@ public class MainActivity extends Activity {
                     styledSrc = src;
                     styleChip(sendChip, send, sendChipLabel(src));
                 }
+                if (smart != styledSmart) {
+                    styledSmart = smart;
+                    styleChip(smartChip, smart, "智连");
+                }
             }
+
+            // ★ 这里**故意没有**"广播开着就把逐台按钮变灰"那套 —— 用户明确否了：
+            //   「广播是和路由独立开的…也不能对特定设备关闭听」。广播不碰任何一条路由的开关。
+            //   （卡片上按钮的亮/暗只反映用户自己勾过的选择；见 Engine.isSending。）
 
             // ★ 两条电平条各画各的（用户要的"每个设备独立的收/送音频条"）：
             //   「收」= 我从它收到多少（对方那一路的收包电平，不是混音总值）；
             //   「送」= 我送给它多少（SendFanout 逐目标统计，这一路发不出去它会自己塌下去）。
-            recvLevel.setLevel(listen ? engine.recvPeakFor(peer.host) : 0f);
-            sendLevel.setLevel(send ? engine.sendPeakFor(peer.host) : 0f);
+            //   ★ 2026-10-16：广播开着时**每一台都真的在收到我的声音**（电台式），
+            //     所以这条音量条不能只看"用户有没有单独勾过它" —— 那样会显示 0 而其实在送。
+            //     按钮的亮/暗仍然只反映用户自己的勾选（广播不点亮卡片），这两件事分开。
+            boolean broadcasting = engine.isBroadcasting();
+            boolean getsMySound = send || broadcasting;
+            float recvPeak = listen ? engine.recvPeakFor(peer.host) : 0f;
+            float sendPeak = getsMySound ? engine.sendPeakFor(peer.host) : 0f;
+            recvLevel.setLevel(recvPeak);
+            sendLevel.setLevel(sendPeak);
+            // 「音量显示条」：右边写清楚这一条现在是多少 dB 平量的百分比。0 就是真没有声音
+            // （不是"没在收"）—— 点了收听但对方没送声音时也走这一句，和电脑端的口径一致。
+            setTextIfChanged(recvTail, recvPeak > 0.001f
+                    ? ("声音大小 " + Math.round(recvPeak * 100) + "%")
+                    : (listen ? "收到的是静音" : "没有在收"));
+            setTextIfChanged(sendTail, sendPeak > 0.001f
+                    ? ("声音大小 " + Math.round(sendPeak * 100) + "%")
+                    : (getsMySound ? "送出去的是静音" : "没有在送"));
+            // ★ 第三条：信号质量。只用实测计数器算；没有依据时（还没收到过它的包）
+            //   条子留空、右边写"不可测" —— 不拿一个 0 冒充"链路很差"。
+            int quality = engine.peerQualityFor(peer.host);
+            if (quality < 0) {
+                signalLevel.setLevel(0f);
+                setTextIfChanged(signalTail, "还没收到它的心跳");
+            } else {
+                signalLevel.setLevel(quality / 100f);
+                // ★ 2026-10-16 用户（图1）：「虽然二者没有收发声音，但是设备间信号应当存在」——
+                //   没有音频流时这一格也要有读数（链路一直在）。右边那句话还必须说清
+                //   这个分是拿什么量出来的：正在收它的声音 / 只是"在线"（心跳）。
+                setTextIfChanged(signalTail, quality + " 分 · "
+                        + (engine.recvReceivingFrom(peer.host) ? "正在收声音" : "在线"));
+            }
 
             // ★ 两条可调滑杆跟着引擎里的真实值走（对方重新上线、接收器重建之后不会"跳回 1.00"）；
             //   正在被用户拖的那条不动（否则会跟手指打架）。
@@ -1857,8 +1918,8 @@ public class MainActivity extends Activity {
             int color;
             // ★ 「实际生效状态」：点了「收听」不等于真的在收 —— 用户说的"路由模式和广播模式
             //   混淆"就出在这里。所以这里区分三种：真的在收 / 点了但没收到包 / 没在听。
+            //   （broadcasting 上面算音量条时已经取过一次，这里不再查第二遍。）
             boolean reallyReceiving = listen && engine.recvReceivingFrom(peer.host);
-            boolean broadcasting = engine.isBroadcasting();
             if (listen && send) {
                 st = "收听✓ + 送声·" + AudioSend.sourceShortName(engine.activeSourceKind())
                         + (broadcasting ? "（广播）" : "");
@@ -1984,16 +2045,24 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 左上角的小图标：渐变圆角方块 + 四根声波竖条（对齐网页版那个 svg）。 */
+    /**
+     * 顶部左上角那枚角标：蓝色渐变圆角方块 + 白色「A」。
+     *
+     * <p>★ 2026-10-18 用户：「现在这个版本的手机版，左上角角标还没有更换」。
+     * 上一轮只换了**桌面上那个启动图标**（mipmap 里的 ic_launcher）和电脑端/网页上的方块，
+     * 手机 App 界面里这枚角标画的还是旧标识那四条音频柱 —— 里外就对不上，正是用户图3 说的那件事。
+     * 现在这里画的就是同一套东西：140° 蓝色渐变（{@link #ACC} → {@link #ACC2}）圆角方块 + 白 A，
+     * 和 exe 图标、APK 图标、电脑面板、监控窗逐字一致。
+     */
     private static final class LogoView extends View {
-        private static final float[] HEIGHTS = {0.30f, 0.62f, 0.78f, 0.44f};
         private final Paint box = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint bar = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint glyph = new Paint(Paint.ANTI_ALIAS_FLAG);
 
         LogoView(Context c) {
             super(c);
-            bar.setColor(ON_TEXT);
-            bar.setStrokeCap(Paint.Cap.ROUND);
+            glyph.setColor(ON_TEXT);
+            glyph.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+            glyph.setTextAlign(Paint.Align.CENTER);
         }
 
         @Override
@@ -2005,15 +2074,12 @@ public class MainActivity extends Activity {
             }
             box.setShader(new LinearGradient(0, 0, w, h, ACC, ACC2, Shader.TileMode.CLAMP));
             cv.drawRoundRect(0, 0, w, h, w * 0.30f, w * 0.30f, box);
-            bar.setStrokeWidth(Math.max(1f, w * 0.085f));
-            float cy = h / 2f;
-            float x0 = w * 0.27f;
-            float step = (w * 0.46f) / (HEIGHTS.length - 1);
-            for (int i = 0; i < HEIGHTS.length; i++) {
-                float x = x0 + step * i;
-                float half = h * HEIGHTS[i] / 2f;
-                cv.drawLine(x, cy - half, x, cy + half, bar);
-            }
+            // 字号按边长走；竖直居中必须用 FontMetrics 算基线 —— 直接把基线设成 h/2
+            // 会偏上一截（字形只在基线以上，ascent/descent 才是它真正占的高度）。
+            glyph.setTextSize(h * 0.62f);
+            Paint.FontMetrics fm = glyph.getFontMetrics();
+            float baseline = h / 2f - (fm.ascent + fm.descent) / 2f;
+            cv.drawText("A", w / 2f, baseline, glyph);
         }
     }
 

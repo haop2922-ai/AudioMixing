@@ -73,7 +73,7 @@ class LocalLoop(threading.Thread):
     """Capture -> render, both on this machine, paced by the capture device."""
 
     def __init__(self, source, sink, *, gain: float = 1.0, tap=None, name: str = "本机直通") -> None:
-        super().__init__(daemon=True, name="wavelink-local")
+        super().__init__(daemon=True, name="audiomixing-local")
         self.source = source
         self.sink = sink
         self.gain = float(gain)

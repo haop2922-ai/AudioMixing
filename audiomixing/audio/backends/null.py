@@ -1,6 +1,6 @@
 """Null backend: no hardware at all.
 
-Used for tests, for `wavelink doctor`, and as a safe fallback when no audio API
+Used for tests, for `audiomixing doctor`, and as a safe fallback when no audio API
 is available. It also provides the `tone` source (a 440 Hz sine) that lets the
 whole network path be exercised without touching a sound card.
 """

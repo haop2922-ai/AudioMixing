@@ -159,14 +159,13 @@ public final class FanoutProbe {
 
         System.out.println();
         System.out.println("== 9. 削顶保护：增益 1.5 时大声样本不会回绕成爆音 ==");
-        fan2.setTargetGain("127.0.0.1", 1.5f);
-        byte[] loud = flatPcmPacket(30000);          // 30000 × 1.5 = 45000 > 32767 → 必须削成 32767
+        fan2.setTargetGain("127.0.0.1", 1.5f);        byte[] loud = flatPcmPacket(30000);          // 30000 × 1.5 = 45000 > 32767 → 必须削成 32767
         fan2.send(loud, loud.length, 1f);
         int clipped = firstSample(gA);
         check("30000 × 1.50 → 削顶成 32767（不是回绕的负数），实测 " + clipped, clipped == 32767);
-        fan2.setTargetGain("127.0.0.1", 9f);         // 越界值必须被夹住
-        check("越界的增益被夹到 1.50（实测 " + fan2.targetGain("127.0.0.1") + "）",
-                Math.abs(fan2.targetGain("127.0.0.1") - 1.5f) < 0.001f);
+        fan2.setTargetGain("127.0.0.1", 9f);         // 越界值必须被夹住（夹到 2.0，和两端上限一致）
+        check("越界的增益被夹到 2.00（实测 " + fan2.targetGain("127.0.0.1") + "）",
+                Math.abs(fan2.targetGain("127.0.0.1") - 2f) < 0.001f);
 
         System.out.println();
         System.out.println("== 10. 增益会被记住：目标下线再上线，滑杆不回跳 ==");

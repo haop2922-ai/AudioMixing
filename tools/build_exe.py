@@ -7,7 +7,7 @@ What the resulting exe does when double-clicked (no arguments):
     * starts the node (capture + discovery + control panel)
     * opens http://127.0.0.1:17800 in the default browser
     * keeps its console window open so errors stay visible
-    * writes %APPDATA%\\WaveLink\\last-run.txt with the LAN URLs
+    * writes %APPDATA%\\AudioMixing\\last-run.txt with the LAN URLs
 
 Build notes:
     * ``--onefile`` keeps it to one file to copy around; start-up takes a few
@@ -35,7 +35,17 @@ NAME = "AudioMixing"
 
 # HWHHYN 用 DEEPSEEK 制作
 def make_icon() -> pathlib.Path | None:
-    """Draw a simple speaker/wave icon so the exe is recognisable in Explorer."""
+    """Draw a simple speaker/wave icon so the exe is recognisable in Explorer.
+
+    ★ 2026-10-17：**文件已经存在就直接沿用，绝不重画**。
+    用户（图3）刚把图标统一成「蓝色渐变圆角方块 + 白 A」（``tools/audiomixing.ico``，
+    打包时由 ``tools/build_nuitka.py`` 取用），而这里原来是无条件重画一个旧版"深色扬声器"
+    图标把它盖掉 —— 谁跑一次这个脚本，桌面上的 exe 和 App 里的 logo 就又对不上，
+    而这条路径从来不在打包流程里，没人会想到是它干的。仓库里那份是权威版本。
+    """
+    if ICON.is_file():
+        print("[build] 图标已存在，沿用: %s" % ICON)
+        return ICON
     try:
         from PIL import Image, ImageDraw
     except ImportError:
@@ -125,7 +135,7 @@ def relaunch(exe: pathlib.Path) -> None:
                     return
         except Exception:
             _time.sleep(1.0)
-    print("[build] 面板未在 90 秒内响应，请双击 dist\\AudioMixing.exe，失败原因写在 %%APPDATA%%\\WaveLink\\launcher.log")
+    print("[build] 面板未在 90 秒内响应，请双击 dist\\AudioMixing.exe，失败原因写在 %%APPDATA%%\\AudioMixing\\launcher.log")
 
 
 def _verify_imports() -> bool:

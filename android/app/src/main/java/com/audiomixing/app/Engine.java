@@ -11,6 +11,7 @@ import android.util.Log;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.Inet4Address;
+import java.nio.charset.StandardCharsets;
 import java.net.InetAddress;
 import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
@@ -93,6 +94,17 @@ public final class Engine {
             ? AudioSend.SRC_PLAYBACK : AudioSend.SRC_MIC;
 
     /**
+     * ★ 音源开关（2026-10-19 用户第 4 条）：true = 按 sourceKind 采集，false = 已停止。
+     *
+     * <p>用户原话：「这俩按键要真实显示用户设备实际情况。点击未激活按键即为激活，再次点击即为关闭」。
+     * 由用户点「🔊 本机声音」/「🎤 麦克风」切换（见 {@link SourcePolicy#toggle}）。
+     * 它与 {@link #sourceKind} 一起，就是界面那两颗按钮的唯一真实来源。
+     */
+    private volatile boolean sourceEnabled = true;
+    /** 上一次"音源被停掉"的原因（如实写进状态行；空 = 没停过）。 */
+    private volatile String sourceStopReason = "";
+
+    /**
      * 采本机声音要用的授权（MediaProjection）。<b>刻意在拿到之后一直留着</b>：
      * targetSdk 34 / Android 14 起，每次授权只能换一个 MediaProjection 对象，
      * 用完就丢的话用户每切一次音源都要再看一次系统弹窗。
@@ -124,6 +136,46 @@ public final class Engine {
     private final Map<String, String> listenHosts = new LinkedHashMap<String, String>();
     /** 用户点了「送声音」的设备 id（只会有 0 或 1 台）。 */
     private final Set<String> sendIds = new LinkedHashSet<String>();
+
+    /**
+     * ★ ④ 用户在哪几台上选了「走蓝牙」（按地址记）。
+     *
+     * <p>用户原话（2026-10-15）：「手机确认走蓝牙后应当由电脑发送蓝牙请求并配对互相连接。」
+     * 所以手机这边只负责**把这件事告诉电脑**（每 2 秒跟着统计包重复请求，幂等），
+     * 真正去连的是电脑那边（电脑手里才有蓝牙设备列表）。
+     *
+     * <p>按地址而不是按 id：统计包是按地址逐台发的，这里必须能和那一处对上。
+     * 界面线程添/删、发包线程读，所以用同步包装。
+     */
+    private final Map<String, Integer> btWantPorts =
+            java.util.Collections.synchronizedMap(new LinkedHashMap<String, Integer>());
+
+    /**
+     * ★ 刚停掉「送声音」/「收听」之后，还要**再报几轮统计**的设备。
+     *
+     * <p>为什么需要（2026-10-15 用户反馈④）：「手机 WiFi 送声音关闭后，电脑听的选项不会自动关」。
+     * 因为统计包的收件人就是"和我有关系的那些设备"——我这边一停，收件人立刻没了，
+     * 电脑**再也收不到 want_listen=false**，只能一直以为自己还在被收听。
+     * 所以停掉之后继续报 {@link #STATS_STOP_GRACE_MS} 毫秒，把"我停了"这件事送达。
+     */
+    private static final long STATS_STOP_GRACE_MS = 30000L;
+
+    /**
+     * ★ 对端"彻底没消息"多久之后，把它【替我们自动打开】的收听收回来（2026-10-15 自查补的缺口）。
+     *
+     * <p>为什么光靠 want_listen=false 不够：那条消息只有在<b>对端还在跑</b>时才送得到。
+     * 对端（电脑）直接把 App 关掉、或者整台机器走了，就没有任何人来说这句 false ——
+     * 那条自动打开的收听会一直挂着，界面显示"正在收听 XXX"，其实那边什么都没在发。
+     * （用户第 3 条抱怨的正是这种"停不下来"，只是成因是关程序而不是关送声音。）
+     *
+     * <p>90 秒：对端每 2 秒就报一次统计，这个时长足够容忍 Wi-Fi 抖动和几轮丢包；
+     * <b>只收自动开的那些</b>，用户自己点开的收听一律不碰（和 want_listen=false 一个边界）。
+     */
+    private static final long AUTO_LISTEN_STALE_MS = 90000L;
+    /** 上一轮真正发过统计的地址（用来发现"刚刚停掉的那一台"）。 */
+    private final Set<String> lastStatsHosts = new LinkedHashSet<String>();
+    private final Map<String, Integer> statsGracePorts = new LinkedHashMap<String, Integer>();
+    private final Map<String, Long> statsGraceUntil = new LinkedHashMap<String, Long>();
 
     /**
      * ★ 「听广播」（频道模式）：不挑发送方，谁往本机音频端口发声音就播谁。
@@ -198,12 +250,15 @@ public final class Engine {
     private volatile boolean statsRunning;
     private volatile long statsSent;
     private volatile String statsLastError = "";
+    /** 谁刚动了音量就置位（见 {@link #pokeStats()}）：让发送循环立刻醒一轮。 */
+    private volatile boolean statsPoke;
+    private final Object statsWake = new Object();
     /** 统计包的固定 ssrc：不是音频流，只为了在对端日志里能认出是同一个人发的。 */
     private final int statsSsrc = ((int) System.nanoTime()) | 1;
 
     private Engine(Context ctx) {
         this.app = ctx;
-        this.autoAcceptListen = loadAutoAccept();   // 默认开，用户关过就记着
+        loadSmartHosts();   // 从本地把「智连」名单读回来（默认空 = 一台都不自动听）
     }
 
     // ────────────────────────────── 生命周期 ──────────────────────────────
@@ -217,6 +272,16 @@ public final class Engine {
             started = true;
             sawPeer = false;
             audioPort = Proto.DEFAULT_AUDIO_PORT;
+            // ★ 接收器这次【不再】一开机就常驻。
+            //
+            // 上一个版本为了收对端那句"我在给你发声音、请收听我"（T_STATS 的 want_listen），
+            // 把接收器一直开着、名单钉成一个不可能命中的地址 —— 用户当场就问过：
+            // 「这一步不是瞎搞吗。我们设计了同一局域网设备能互相发现。那它本身就是
+            //   多个设备都在互相同步数据啊」。
+            //
+            // 他说得对：那句话现在走**发现层**（见 Discovery 的类注释，onControl 回调），
+            // 而那一层每 2 秒一发一收、本来就一直活着。接收器于是回到"按需启停"：
+            // 真要收声音才起来（点「收听」/「听广播」/「送声音」那三条路各自会拉起它）。
             try {
                 Discovery d = new Discovery(app);
                 // 回调在发现线程上，这里只做一件事：把列表存下来，别在这里碰界面。
@@ -225,6 +290,21 @@ public final class Engine {
                     public void onPeersChanged(List<Discovery.Peer> p) {
                         if (p != null) {
                             cache = p;
+                        }
+                    }
+
+                    @Override
+                    public void onControl(String host, String json) {
+                        // ★ 控制消息现在从发现层来（见 Discovery 的类注释）：这一层一直活着，
+                        //   所以接收器停着也收得到"请自动收听我"。正文和音频层那份对端统计
+                        //   是同一份，所以这里直接走同一个入口 —— 两处绝不能有两套处理逻辑。
+                        if (host == null || host.isEmpty() || json == null || json.isEmpty()) {
+                            return;
+                        }
+                        try {
+                            onPeerStats(host, json.getBytes(StandardCharsets.UTF_8));
+                        } catch (Throwable t) {
+                            Log.w(TAG, "发现层的控制消息处理失败（已忽略这一条）", t);
                         }
                     }
                 });
@@ -251,6 +331,7 @@ public final class Engine {
             listenIds.clear();
             listenHosts.clear();
             listenPorts.clear();
+            autoListenHosts.clear();
             sendIds.clear();
             channelListen = false;      // 「停止」= 一切都停，重启后不要留着一个用户看不见的开关
             broadcastOn = false;
@@ -289,17 +370,41 @@ public final class Engine {
             try {
                 List<Discovery.Peer> l = d.peers();
                 if (l != null) {
-                    cache = l;
-                    if (!l.isEmpty()) {
+                    List<Discovery.Peer> fresh = dropStale(l);
+                    cache = fresh;
+                    if (!fresh.isEmpty()) {
                         sawPeer = true;
                     }
-                    return new ArrayList<Discovery.Peer>(l);
+                    return new ArrayList<Discovery.Peer>(fresh);
                 }
             } catch (Throwable t) {
                 Log.w(TAG, "读取设备列表失败，用上一次的快照", t);
             }
         }
-        return new ArrayList<Discovery.Peer>(cache);
+        return new ArrayList<Discovery.Peer>(dropStale(cache));
+    }
+
+    /**
+     * ★ 断联超过 2 分钟的设备不再出现在列表里（口径见 {@link LinkPolicy#CARD_STALE_MS}）。
+     *
+     * <p>为什么这道过滤必须存在：设备列表的过期原本<b>只</b>靠 Discovery 里的 {@code sweep()}，
+     * 而那一步在发现 socket 短暂不可用时会被整段跳过 —— 于是对端早就断联两分多钟了，
+     * 卡片还挂在界面上（用户真机截图：一张 2025BJB 的卡片写着"还没收到它的心跳"，
+     * 上面还有一行"已停止向 192.168.0.103 发送 —— 它已经 128 秒没有任何消息了"）。
+     * 在这里按"它多久没消息了"再兜一道：超过 2 分钟的直接不返回，卡片就没了。
+     */
+    private static List<Discovery.Peer> dropStale(List<Discovery.Peer> in) {
+        if (in == null || in.isEmpty()) {
+            return new ArrayList<Discovery.Peer>();
+        }
+        List<Discovery.Peer> out = new ArrayList<Discovery.Peer>(in.size());
+        for (Discovery.Peer p : in) {
+            if (p == null || LinkPolicy.cardStale(p.ageMs())) {
+                continue;
+            }
+            out.add(p);
+        }
+        return out;
     }
 
     /** 设备身份：优先用节点 UUID，没有就退回 IP（同一台机器不会因为换字段就变成两张卡片）。 */
@@ -316,6 +421,32 @@ public final class Engine {
 
     // ────────────────────────────── 收听 / 送声音 ──────────────────────────────
 
+    /**
+     * ★ ④ 在某台上选了「走蓝牙 / 走 WiFi」。
+     *
+     * <p>用户原话（2026-10-15）：「手机确认走蓝牙后应当由电脑发送蓝牙请求并配对互相连接。」
+     * 手机这边只做两件事：① 记住这个选择 ② 每 2 秒跟着统计包把 {@code want_bt} 报给电脑
+     * （幂等）。真正打开蓝牙 sink 的是电脑 —— 蓝牙设备列表在它手里。
+     *
+     * <p>选「走 WiFi」时传 false：请求自然撤回，不用额外的取消消息。
+     */
+    public void setBtWant(Discovery.Peer p, boolean on) {
+        if (p == null || p.host == null || p.host.isEmpty()) {
+            return;
+        }
+        if (on) {
+            // 必须连端口一起记：它要进统计包的发送名单，而统计包是按 (地址, 端口) 发的。
+            btWantPorts.put(p.host, p.audioPort > 0 ? p.audioPort : Proto.DEFAULT_AUDIO_PORT);
+        } else {
+            btWantPorts.remove(p.host);
+        }
+    }
+
+    /** 这一台是不是被用户选了「走蓝牙」（发包线程读）。 */
+    public boolean btWantTo(String host) {
+        return host != null && !host.isEmpty() && btWantPorts.containsKey(host);
+    }
+
     /** 点「收听」：收这台发来的声音。可以同时收听多台，声音会混在一起。 */
     public void setListening(Discovery.Peer p, boolean on) {
         if (p == null) {
@@ -325,7 +456,8 @@ public final class Engine {
         synchronized (lock) {
             if (on) {
                 listenIds.add(id);
-                listenRevoked.remove(p.host);      // 用户自己打开了：撤销名单里去掉它
+                // ★ 用户自己点开的：从"我们自动开的"里去掉 —— 以后对端说"我不送了"也不能收它。
+                autoListenHosts.remove(p.host);
                 if (p.host != null && !p.host.isEmpty()) {
                     // 记下地址：设备列表以后怎么抖，这条收听都不受影响。
                     listenHosts.put(id, p.host);
@@ -336,10 +468,11 @@ public final class Engine {
                 listenIds.remove(id);
                 listenHosts.remove(id);
                 listenPorts.remove(id);
-                // ★ 必须可撤销：用户手动关掉的设备，之后不再被"请求收听"自动打开
-                if (p.host != null && !p.host.isEmpty()) {
-                    listenRevoked.add(p.host);
-                }
+                autoListenHosts.remove(p.host);     // 已经不在收听名单里了，不欠这一笔
+                // ★ 用户手动关掉这条收听【不再】写进任何黑名单：要不要自动只由这台设备的
+                //   「智连」开关说了算。旧代码在这里把设备永久记进 listenRevoked，正是用户第 1 条
+                //   「电脑主动发送声音手机不会主动接收」卡死的根因（只要电脑一直在请求，那份记忆
+                //   就永远不过期），已彻底拆掉。
             }
             if (listenIds.isEmpty()) {
                 // 用户明确取消了全部收听：这时候才停接收器。
@@ -378,7 +511,20 @@ public final class Engine {
     /**
      * 没有任何理由再收包时才停接收器。
      *
-     * <p>三个理由：还开着「听广播」、还在送声音（要收对端的统计回话）、还有收听目标。
+     * <p>三个理由：还开着「听广播」、还在送声音、还有收听目标。
+     *
+     * <p>★ 2026-10-15：这个方法以前是<b>反着写</b>的 —— 条件满足时不是停，而是把接收器
+     * 拉起来并常驻（名单钉成一个不可能命中的地址，谁都播不了），只为了收对端那句
+     * "请自动打开收听"。那是绕路，而且那条常驻的 Wi-Fi 锁会一直握着。用户当场就质疑过：
+     * 「这一步不是瞎搞吗。我们设计了同一局域网设备能互相发现。那它本身就是多个设备都在
+     *   互相同步数据啊」。
+     *
+     * <p>现在控制消息（want_listen / want_bt / 共享音量）都走发现层那个常驻 socket
+     * （见 {@link Discovery} 的类注释与 {@code onControl} 回调），接收器不必再为了收请求
+     * 而活着，所以这里回到本来的语义：真的没人要听、也没在送，就停掉。
+     *
+     * <p>「还在送声音」这一条留着：送的时候对端会把"我收了你多少"回过来，老版本对端
+     * 是发到音频端口的，收不到那一句界面就只能显示"对方：等它回话"。
      */
     private void stopReceiverIfIdle() {
         if (channelListen || sender != null || !listenIds.isEmpty()) {
@@ -445,6 +591,11 @@ public final class Engine {
      * 之后都是 {@code setTargets()}。所以对方上线/下线时正在送的声音不会断一下。
      */
     private void syncSenderTargets() {
+        if (!sourceEnabled) {
+            // ★ 音源关了 = 不采也不发（"送给谁"的意图已在 applySourceState 里清掉）。
+            stopSender();
+            return;
+        }
         List<String> eps = collectSendTargets();
         // 这个函数每 150ms 会被界面 tick 调一次：目标没变就什么都不做，
         // 免得一直重建目标表（目标表的比较用字符串签名，几分之一微秒的事）。
@@ -520,15 +671,23 @@ public final class Engine {
         }
         // ② 用户单独勾过、但发现列表里暂时没有的：看心跳（T_STATS）还在不在，
         //    以及"上次确认它还活着"距今多久。超过宽限期就不发（意图保留）。
+        //    ★ 但断联超过 2 分钟（LinkPolicy.CARD_STALE_MS）就直接删掉：这个对端不会回来了，
+        //      连"送声音"的意图一起清（用户原话「这种已经信号断联两分钟的就直接删掉就好了，
+        //      不然全堆积在程序里」）—— 那行"已停止向 XXX 发送"的陈旧提示也随之消失。
+        List<String> staleIds = new ArrayList<String>();
         for (String id : new ArrayList<String>(sendIds)) {
+            String host = sendHosts.get(id);
+            Long last = sendLastAliveMs.get(id);
+            if (host != null && last != null && LinkPolicy.cardStale(nowMs - last)) {
+                staleIds.add(id);
+                continue;
+            }
             if (out.contains(endpointOf(id))) {
                 continue;
             }
             if (broadcastOn && out.size() > 0) {
                 continue;   // 广播模式下别的设备已经在发了，这台单独走下面的活性判断
             }
-            String host = sendHosts.get(id);
-            Long last = sendLastAliveMs.get(id);
             if (host == null || last == null) {
                 continue;   // 还没见过它长什么样：交给发现层去发现，不算"走了"
             }
@@ -543,6 +702,13 @@ public final class Engine {
                     out.add(ep);
                 }
             }
+        }
+        for (String id : staleIds) {
+            // 意图、地址、活性记录一起清 —— 不留任何"堆在程序里"的陈旧条目。
+            sendIds.remove(id);
+            sendHosts.remove(id);
+            sendLastAliveMs.remove(id);
+            Log.i(TAG, "对端断联超过 2 分钟，已清掉送声目标：" + id);
         }
         if (broadcastOn && out.isEmpty() && !sendIds.isEmpty()) {
             gone.append("广播开着，但现在一台设备都联系不上（都离线了）。\n");
@@ -695,6 +861,7 @@ public final class Engine {
         applyRecvGain(host, v);
         linkRecvGainTs.put(host, System.currentTimeMillis());     // 本地改的：时间戳最新
         linkGainChangedAtMs.put(host, SystemClock.elapsedRealtime());
+        pokeStats();          // 别让对端等满 2 秒才看到新值
     }
 
     /** 某一台现在的"我听它的"增益。 */
@@ -720,6 +887,7 @@ public final class Engine {
         applySendGain(host, v);
         linkSendGainTs.put(host, System.currentTimeMillis());
         linkGainChangedAtMs.put(host, SystemClock.elapsedRealtime());
+        pokeStats();          // 同上：对端不等那 2 秒
     }
 
     /** 某一台现在的"我送它的"增益。 */
@@ -737,13 +905,22 @@ public final class Engine {
         }
     }
 
-    /** 这台设备现在会不会收到我的声音（单独勾了它，或者开着广播）。 */
+    /**
+     * 这台设备现在会不会收到我的声音（**用户单独勾了它**才算）。
+     *
+     * <p>★ 2026-10-16 用户澄清（原话）：「手机点击开广播，手机上就会直接打开所有路由上的"送声音"…
+     * 广播是设备只有开关本机"听""送"的权利的」——
+     * 广播是**一条独立的线路**，不是"逐台针对性发送"。所以这一台卡片上的「送声音」
+     * 永远只反映用户自己勾过的选择；广播开着时不再把每张卡都点亮
+     * （"我正在广播"只由上面那个 📢 开关显示）。
+     * 广播期间逐台那个按钮会被画成灰的、点了给一句说明（见 MainActivity.onSendClick）。
+     */
     public boolean isSending(Discovery.Peer p) {
         synchronized (lock) {
             if (p == null) {
                 return false;
             }
-            return broadcastOn || sendIds.contains(idOf(p));
+            return sendIds.contains(idOf(p));
         }
     }
 
@@ -843,26 +1020,6 @@ public final class Engine {
         return sourceKind;
     }
 
-    /**
-     * 换音源。正在送声音时是<b>热切换</b>：AudioSend 会在采集线程里重建 AudioRecord，
-     * 既不中断发送，也不会出现两路采集叠在一起发（那会让对端听到重音）。
-     */
-    public void setSourceKind(int kind) {
-        if (kind == AudioSend.SRC_PLAYBACK && !AudioSend.playbackSupported()) {
-            kind = AudioSend.SRC_MIC;      // 低版本没有这个能力，不给选
-        }
-        sourceKind = kind;
-        AudioSend s = sender;
-        if (s != null) {
-            try {
-                s.setProjection(projection);
-                s.setSourceKind(kind);
-            } catch (Throwable t) {
-                Log.w(TAG, "切换音源失败", t);
-            }
-        }
-    }
-
     /** <b>实际</b>在采的音源：没在送声音时就是用户选的那个。界面显示"现在送的是什么"必须用它。 */
     public int activeSourceKind() {
         AudioSend s = sender;
@@ -877,6 +1034,65 @@ public final class Engine {
         AudioSend s = sender;
         return s != null && s.isRunning() && s.activeSourceKind() >= 0
                 && s.activeSourceKind() != sourceKind;
+    }
+
+    /** 音源开关：true = 在采（按 sourceKind），false = 已停止。 */
+    public boolean sourceEnabled() {
+        return sourceEnabled;
+    }
+
+    /**
+     * 音源<b>真实的状态</b>（{@link SourcePolicy} 的 SRC_OFF / SRC_MIC / SRC_PLAYBACK）。
+     *
+     * <p>界面那两颗按钮的视觉状态只许从它读，而且<b>每次刷新都重新算</b>（实时问采集端
+     * {@link #activeSourceKind()}）—— 绝不用缓存的标志位，否则就会出现用户报过的
+     * "实际在采麦克风、按钮却还是灰的"。
+     */
+    public int sourceState() {
+        return SourcePolicy.state(sourceEnabled, activeSourceKind());
+    }
+
+    /** 这一颗音源按钮现在该不该点亮（供界面读；返回的就是引擎当下的真实状态）。 */
+    public boolean sourceActive(int kind) {
+        return SourcePolicy.lit(sourceState(), kind);
+    }
+
+    /**
+     * 应用一个音源状态（值来自 {@link SourcePolicy} 的纯函数，界面据此点亮/熄灭按钮）。
+     *
+     * <p>OFF = 停止采集：顺带把"送给谁 / 广播"的意图也清掉 —— 停止采集还显示"在送声音"是骗人的。
+     * MIC / PLAYBACK = 打开（或热切）那一路；<b>同一时刻只有一路</b>（采集端只有一份 AudioRecord）。
+     *
+     * @param state           {@link SourcePolicy} 的状态值
+     * @param whyIfStopping   停止时的原因（写进界面；空则用"你手动停止了采集"）
+     */
+    public void applySourceState(int state, String whyIfStopping) {
+        synchronized (lock) {
+            boolean on = state != SourcePolicy.SRC_OFF;
+            sourceEnabled = on;
+            if (on) {
+                sourceKind = state;
+                sourceStopReason = "";
+            } else {
+                String why = (whyIfStopping == null) ? "" : whyIfStopping;
+                sourceStopReason = why.length() > 0 ? why : "你手动停止了采集";
+                sendIds.clear();
+                broadcastOn = false;
+            }
+            AudioSend s = sender;
+            if (on && s != null) {
+                try {
+                    s.setProjection(projection);
+                    s.setSourceKind(sourceKind);
+                } catch (Throwable t) {
+                    Log.w(TAG, "切换音源失败", t);
+                }
+            }
+            syncSenderTargets();
+            if (!on) {
+                stopReceiverIfIdle();
+            }
+        }
     }
 
     /** 这台机器支不支持采本机声音（Android 10+）。 */
@@ -925,6 +1141,7 @@ public final class Engine {
         synchronized (lock) {
             projection = p;
             projectionError = "";
+            sourceStopReason = "";
             try {
                 // 必须注册回调：授权被系统收回时要立刻知道，否则界面会一直显示"送声中"
                 // 而实际上一片静音 —— 那是最难查的一种假象。
@@ -934,9 +1151,12 @@ public final class Engine {
             }
             target = (pendingSendId == null) ? "" : pendingSendId;
             pendingSendId = "";
-            // 正在送麦克风的话就热切到本机声音：用户点授权的意图很明确。
+            // ★ 用户点了系统授权窗口 = 明确要本机声音：把音源开关打开，再热切到本机声音。
+            if (sourceKind == AudioSend.SRC_PLAYBACK) {
+                sourceEnabled = true;
+            }
             AudioSend s = sender;
-            if (s != null && sourceKind == AudioSend.SRC_PLAYBACK) {
+            if (s != null && sourceEnabled && sourceKind == AudioSend.SRC_PLAYBACK) {
                 try {
                     s.setProjection(p);
                     s.setSourceKind(AudioSend.SRC_PLAYBACK);
@@ -944,6 +1164,8 @@ public final class Engine {
                     Log.w(TAG, "授权到手后切换到本机声音失败", t);
                 }
             }
+            // 授权到位后重建一次发送端：之前没授权时它打不开，现在能采了。
+            syncSenderTargets();
         }
         if (target.length() > 0) {
             Discovery.Peer t = findById(target);
@@ -962,15 +1184,15 @@ public final class Engine {
         synchronized (lock) {
             projectionError = msg;
             pendingSendId = "";
-            // 正在用旧授权送本机声音的话，先退回麦克风：授权没了还继续采只会是静音。
-            if (sourceKind == AudioSend.SRC_PLAYBACK && sender != null) {
+            AudioSend s = sender;
+            if (s != null) {
                 try {
-                    sender.setProjection(null);
-                    sender.setSourceKind(AudioSend.SRC_MIC);
+                    s.setProjection(null);
                 } catch (Throwable ignored) {
-                    // 切不过去也不影响"如实报告"，界面看 activeSourceKind() 就知道
                 }
             }
+            // ★ 绝不自动开麦：本机声音这条路断了就【停止】，并由用户自己决定下一步。
+            applySourceState(SourcePolicy.afterPlaybackLost(sourceState()), msg);
         }
         Log.w(TAG, "采本机声音的授权没拿到：" + msg);
     }
@@ -978,8 +1200,10 @@ public final class Engine {
     /**
      * 系统把授权收回了（用户在状态栏点"停止投放"、或者被别的 App / 系统抢走）。
      *
-     * <p>处理原则：<b>立刻退回麦克风 + 写明原因</b>。继续拿旧授权采集只会得到一片静音，
-     * 而用户看到的却是"送声中"，那种假象比直接报错难查得多。
+     * <p>★ 2026-10-19 用户第 1 条（隐私硬约束）：<b>绝不自动退回麦克风</b>。
+     * 旧代码在这里 {@code setSourceKind(SRC_MIC)}，于是用户"停止本机声音采集"时麦克风被
+     * <b>悄悄打开</b>（而按钮还是灰的，显示与实际不一致）—— 这正是"严重危害用户安全"那条。
+     * 现在的处理：本机声音采集一律<b>停止</b>，界面如实显示"已停止 + 原因"。
      */
     public void onProjectionStopped() {
         synchronized (lock) {
@@ -988,15 +1212,17 @@ public final class Engine {
             if (wasGranted) {
                 projectionError = "系统收回了「录制/投射」授权（在状态栏点了停止，或被别的 App 抢走）";
             }
+            String reason = projectionError.length() > 0 ? projectionError : "「录制/投射」授权没了";
             AudioSend s = sender;
-            if (s != null && s.activeSourceKind() == AudioSend.SRC_PLAYBACK) {
+            if (s != null) {
                 try {
                     s.setProjection(null);
-                    s.setSourceKind(AudioSend.SRC_MIC);
                 } catch (Throwable t) {
-                    Log.w(TAG, "授权被收回后切回麦克风失败", t);
+                    Log.w(TAG, "清掉旧授权失败", t);
                 }
             }
+            // 本机声音还在采 → 停掉；麦克风在采则不受影响（那条路和授权无关）。
+            applySourceState(SourcePolicy.afterPlaybackLost(sourceState()), reason);
         }
         Log.w(TAG, "采本机声音的授权被系统收回了");
     }
@@ -1131,32 +1357,38 @@ public final class Engine {
         return "最近 " + sec + " 秒没有声音（之前在正常采）";
     }
 
-    /** 界面主卡片里那句「现在送的是什么」。 */
+    /**
+     * 界面主卡片里那句「现在送的是什么」。
+     *
+     * <p>★ 说的是<b>引擎当下的真实状态</b>（{@link #sourceState()}，实时问采集端），不是"用户上次选的"。
+     * 用户第 1 条报的"实际在采麦克风、按钮却还是灰的"就是两者不一致造成的。
+     */
     public String sourceStateText() {
         if (!AudioSend.playbackSupported()) {
             return "你的安卓版本（Android " + Build.VERSION.RELEASE + "）不支持采集本机声音，只能用麦克风。"
                     + "要送手机上正在放的声音，需要 Android 10 及以上。";
         }
+        int state = sourceState();
+        if (state == SourcePolicy.SRC_OFF) {
+            String why = sourceStopReason.length() > 0 ? ("（" + sourceStopReason + "）") : "";
+            return "已停止采集" + why + "：两个音源都关着（同一时刻只能采一路）。"
+                    + "点「🔊 本机声音」或「🎤 麦克风」才会重新开始采。";
+        }
         AudioSend s = sender;
         boolean sending = s != null && s.isRunning();
-        if (!sending) {
-            StringBuilder sb = new StringBuilder("现在没在送声音。");
-            sb.append("选中「").append(AudioSend.sourceName(sourceKind))
-                    .append("」之后，点任意一台设备的「送声音」开始。");
-            if (sourceKind == AudioSend.SRC_PLAYBACK && projection == null) {
-                sb.append("第一次会让你在系统窗口里点一次允许（授权一次，之后一直用）。");
+        if (state == SourcePolicy.SRC_PLAYBACK) {
+            if (sending) {
+                return "正在送：🔊 本机声音（手机上正在放的音乐/视频/游戏）";
             }
-            return sb.toString();
+            return "已打开 🔊 本机声音采集；点任意一台设备的「送声音」开始送"
+                    + (projection == null ? "（第一次会让你在系统窗口里点一次允许）" : "") + "。";
         }
-        int act = s.activeSourceKind();
-        if (act == AudioSend.SRC_PLAYBACK) {
-            return "正在送：🔊 本机声音（手机上正在放的音乐/视频/游戏）";
+        // 麦克风：把"另一颗为什么灭了"写清楚（用户第 3 条口径：同一时刻只能采一路）。
+        String exclusive = "（同一时刻只能采一路：开了麦克风，「🔊 本机声音」那颗就是关的）";
+        if (sending) {
+            return "正在送：🎤 麦克风（对讲用的）" + exclusive;
         }
-        if (sourceKind == AudioSend.SRC_PLAYBACK) {
-            return "⚠ 你要的是 🔊 本机声音，但采不到，现在实际送的是 🎤 麦克风 —— "
-                    + mismatchReason(s);
-        }
-        return "正在送：🎤 麦克风（对讲用的）";
+        return "已打开 🎤 麦克风采集；点任意一台设备的「送声音」开始送。" + exclusive;
     }
 
     /** 采本机声音却一直是静音时的提醒；不需要提醒就返回空串。 */
@@ -1335,40 +1567,100 @@ public final class Engine {
         }
     }
 
-    /** 全局开关：自动接受别人的「请求收听」（默认开，用户可关）。 */
-    private volatile boolean autoAcceptListen = true;
-    /** 用户手动关过收听的设备（host）：关过就永远不再自动加 —— "必须可撤销"。 */
-    private final Set<String> listenRevoked = new LinkedHashSet<String>();
-    /** 界面要显示的那句提示（"XXX 请求收听，已自动打开…"）。 */
-    private volatile String autoListenNotice = "";
-    private volatile long autoListenNoticeAtMs;
+    /**
+     * ★ 「智连」名单（按设备地址 host 记，2026-10-18 用户第 6 条）。
+     *
+     * <p>命中的设备：它点「送给它」时，本机<b>自动替它打开收听</b>。手机端<b>只</b>自动开"听"，
+     * 绝不自动往外送声音 —— 那是用户点名的安全边界。默认名单是空的 = 一台都不自动。
+     *
+     * <p>为什么按 host 而不按节点 id：设备列表会随信标抖动重建，id 会变、地址不会 ——
+     * 和 {@link #listenHosts} 用地址做键同一个道理。
+     */
+    private final Set<String> smartHosts = new LinkedHashSet<String>();
+    /**
+     * ★ 我们替哪几台【自动打开过】收听（按 host 记，2026-10-15 用户反馈第 3 条）。
+     *
+     * <p>为什么必须单独记一笔：对端说"我不送了"（wantListen=false）时，只有
+     * <b>我们替它自动开的</b>那一条该收回；用户自己点开的一律不碰（撤销不是惩罚，
+     * 只是把当初替他打开的那一下收回去）。没有这份记录就只能猜，猜错就是动用户的设置。
+     */
+    private final Set<String> autoListenHosts = new LinkedHashSet<String>();
 
-    public boolean isAutoAcceptListen() {
-        return autoAcceptListen;
-    }
-
-    public void setAutoAcceptListen(boolean on) {
-        autoAcceptListen = on;
-        saveAutoAccept(on);
-    }
-
-    /** 界面拿走一条提示就清掉（避免一直挂着）。 */
-    public void clearAutoListenNotice() {
-        autoListenNotice = "";
-    }
-
-    /** 刚刚那条"自动收听"提示（10 秒内有效；没有就返回空串）。 */
-    public String autoListenNotice() {
-        if (autoListenNotice == null || autoListenNotice.isEmpty()) {
-            return "";
+    /** 这台设备开没开「智连」（host 为空一律算没开；界面拿它给第 4 颗按钮上色）。 */
+    public boolean isSmart(String host) {
+        if (host == null || host.isEmpty()) {
+            return false;
         }
-        if (SystemClock.elapsedRealtime() - autoListenNoticeAtMs > 10000L) {
-            return "";
+        synchronized (lock) {
+            return smartHosts.contains(host);
         }
-        return autoListenNotice;
     }
 
-    /** 对端在请求我收听：按策略自动加进收听名单（可撤销、可全局关掉）。 */
+    /**
+     * 切换这台设备的「智连」开关并落盘，返回<b>新状态</b>（界面据此立刻上色，不必等下一帧）。
+     *
+     * <p>不用额外做别的：名单一变，下一轮统计包（每 ~2 秒一次）走到 {@link #handleWantListen}
+     * 时判据自然就变了 —— 对端还在请求的话，那一轮就会自动把收听打开；对端没在请求，
+     * 开了也只是"允许"，不会凭空多出一条收听。
+     */
+    public boolean toggleSmart(String host) {
+        if (host == null || host.isEmpty()) {
+            return false;
+        }
+        synchronized (lock) {
+            boolean on;
+            if (smartHosts.contains(host)) {
+                smartHosts.remove(host);
+                on = false;
+            } else {
+                smartHosts.add(host);
+                on = true;
+            }
+            saveSmartHosts();
+            return on;
+        }
+    }
+
+    // ── 「智连」名单的持久化（键 smart_hosts，逗号分隔；host 里不会有逗号）──
+
+    private void saveSmartHosts() {
+        if (app == null) {
+            return;
+        }
+        try {
+            StringBuilder sb = new StringBuilder();
+            for (String h : smartHosts) {
+                if (sb.length() > 0) {
+                    sb.append(',');
+                }
+                sb.append(h);
+            }
+            app.getSharedPreferences("audiomixing", Context.MODE_PRIVATE)
+                    .edit().putString("smart_hosts", sb.toString()).apply();
+        } catch (Throwable t) {
+            Log.w(TAG, "「智连」名单存不下来", t);
+        }
+    }
+
+    private void loadSmartHosts() {
+        if (app == null) {
+            return;
+        }
+        try {
+            String raw = app.getSharedPreferences("audiomixing", Context.MODE_PRIVATE)
+                    .getString("smart_hosts", "");
+            for (String h : raw.split(",")) {
+                String t = h.trim();
+                if (!t.isEmpty()) {
+                    smartHosts.add(t);
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "「智连」名单读不回来", t);
+        }
+    }
+
+    /** 对端在请求我收听：**只有这台设备开了「智连」**才自动加进收听名单。 */
     private void handleWantListen(String host, Diagnosis.PeerStats ps) {
         synchronized (lock) {
             boolean already = false;
@@ -1378,8 +1670,12 @@ public final class Engine {
                     break;
                 }
             }
-            boolean revoked = listenRevoked.contains(host);
-            int action = LinkPolicy.autoListenAction(autoAcceptListen, already, revoked, ps.wantListen);
+            // ★ 2026-10-18 用户第 6 条：判据只剩「这台设备开没开『智连』」。
+            //   删掉的两个旧判据（全局总开关 + "关过一次就永不再自动"的黑名单）见 LinkPolicy.listenAction。
+            boolean smart = smartHosts.contains(host);
+            // ★ 这条收听是不是【我们替它自动开的】：只有这种才允许被"我不送了"收回去。
+            boolean autoAdded = autoListenHosts.contains(host);
+            int action = LinkPolicy.listenAction(smart, already, ps.wantListen, autoAdded);
             if (action == LinkPolicy.LISTEN_ADD) {
                 // 用节点 id 做键（找不到 Peer 就用地址兜底，和 listenHosts 的约定一致）
                 Discovery.Peer p = peerByHost(host);
@@ -1387,18 +1683,33 @@ public final class Engine {
                 listenIds.add(id);
                 listenHosts.put(id, host);
                 listenPorts.put(id, (p != null && p.audioPort > 0) ? p.audioPort : Proto.DEFAULT_AUDIO_PORT);
-                String name = (p != null) ? p.label() : host;
-                autoListenNotice = name + " 请求收听，已自动打开（你可以随时关掉）";
-                autoListenNoticeAtMs = SystemClock.elapsedRealtime();
-                Log.i(TAG, autoListenNotice);
+                autoListenHosts.add(host);      // 记一笔：这条是我们替它开的
+                // ★ 不再往界面上弹"XX 请求收听，已自动打开"这类提示（用户第 6 条点名不要）：
+                //   是否需要自动听由「智连」开关说了算，开着就静默生效，不需要每次都说一句。
+                Log.i(TAG, "「智连」已自动打开收听：" + ((p != null) ? p.label() : host));
                 ensureReceiver();
                 applyAllowedHosts();
-            } else if (action == LinkPolicy.LISTEN_REVOKED
-                    && (autoListenNotice == null || !autoListenNotice.startsWith(nameOrHost(host)))) {
-                // 用户关过它：尊重用户，不再自动加，但提示一句（否则用户会以为功能坏了）
-                autoListenNotice = nameOrHost(host) + " 请求收听 —— 你之前关过它，所以没有自动打开";
-                autoListenNoticeAtMs = SystemClock.elapsedRealtime();
+            } else if (action == LinkPolicy.LISTEN_REMOVE) {
+                // ★ 2026-10-15 用户反馈第 3 条「电脑停止送音后手机依旧收音不停止」：
+                //   对端明确说"我不送了" → 收回我们替它自动打开的那一条。
+                //   边界与电脑端逐字对齐：只收自动开的，用户自己点开的收听不碰。
+                java.util.Iterator<String> it = listenIds.iterator();
+                while (it.hasNext()) {
+                    String id = it.next();
+                    if (host.equals(listenHosts.get(id))) {
+                        it.remove();
+                        listenHosts.remove(id);
+                        listenPorts.remove(id);
+                    }
+                }
+                autoListenHosts.remove(host);
+                Log.i(TAG, "对端停了送声音，已收回自动打开的收听：" + nameOrHost(host));
+                applyAllowedHosts();
+                stopReceiverIfIdle();
             }
+            // ★ 2026-10-18 用户第 6 条：LISTEN_REVOKED 这个分支已随旧黑名单一起删掉。
+            //   旧的「关过一次就永不再自动」会永久卡死自动收听（用户第 1 条真机 bug），
+            //   现在"不自动"只是「智连」没开，对端再请求也会正常按开关重新判断。
         }
     }
 
@@ -1504,32 +1815,6 @@ public final class Engine {
         }
     }
 
-    // ── 自动接受开关的持久化 ──
-
-    private void saveAutoAccept(boolean on) {
-        if (app == null) {
-            return;
-        }
-        try {
-            app.getSharedPreferences("audiomixing", Context.MODE_PRIVATE)
-                    .edit().putBoolean("auto_accept_listen", on).apply();
-        } catch (Throwable t) {
-            Log.w(TAG, "自动接受开关存不下来", t);
-        }
-    }
-
-    private boolean loadAutoAccept() {
-        if (app == null) {
-            return true;
-        }
-        try {
-            return app.getSharedPreferences("audiomixing", Context.MODE_PRIVATE)
-                    .getBoolean("auto_accept_listen", true);
-        } catch (Throwable t) {
-            return true;
-        }
-    }
-
     /** 某一台自己报告的状态；没有就是 null（界面据此显示"等它回话…"）。 */
     public Diagnosis.PeerStats peerStats(String host) {        if (host == null) {
             return null;
@@ -1564,6 +1849,7 @@ public final class Engine {
 
     private void stopStatsThread() {
         statsRunning = false;
+        pokeStats();
         Thread t = statsThread;
         statsThread = null;
         if (t != null && t != Thread.currentThread()) {
@@ -1577,6 +1863,21 @@ public final class Engine {
     }
 
     /**
+     * 本机刚动了音量 / 收发状态 → <b>立刻</b>补发一轮统计，不等那 2 秒一次的周期。
+     *
+     * <p>用户真机反馈（2026-10-16）：「两边的音量调同步太慢了，要反应很久」。
+     * 统计包是唯一携带共享增益（{@code gain / gain_ts / gain_rx}）的消息，而它原来是固定的
+     * 2 秒一轮 —— 拖完滑杆，对端最多要等 2 秒才看见新值（再叠上对端自己的处理周期）。
+     * 这里只叫醒发送循环，包还是由它那一条线程发出去，界面线程不会为了一个包去等网络。
+     */
+    public void pokeStats() {
+        statsPoke = true;
+        synchronized (statsWake) {
+            statsWake.notifyAll();
+        }
+    }
+
+    /**
      * 统计包发送循环：每 2 秒给"和我有关系的每一台"单播一个 {@code T_STATS}。
      *
      * <p><b>为什么放在引擎这一层、而不是 AudioSend 里</b>：用户完全可能"只收听、不送声音"，
@@ -1584,8 +1885,11 @@ public final class Engine {
      * 否则对面看到的就是"连上了、数字在动、就是没声音"，还是只能靠猜。
      * 放在这里，统计和具体的音频收发解耦：只要和某台有收听/送声关系，就互报。
      *
-     * <p>socket 用临时端口（和 AudioSend 一样），统计包一律发到<b>对方的音频端口</b>
-     * （信标里公布的 {@code audio_port}，由对方的 AudioRecv 收）。
+     * <p><b>★ 发到哪条路（2026-10-15）</b>：对端信标里有 {@code ctl:1} → 走<b>发现层</b>
+     * （{@link Discovery#sendControl}，那层的 socket 一直活着）；老版本对端 → 照旧发
+     * <b>对方的音频端口</b>（信标里公布的 {@code audio_port}，由对方的 AudioRecv 收）。
+     * 分流的理由见 {@link Discovery} 的类注释：控制消息挂在按需启停的音频接收器上，
+     * 对端一停就永远收不到 —— 那就是"电脑送声音开着、手机的收听却不自动打开"的成因。
      */
     private void statsLoop() {
         DatagramSocket s;
@@ -1608,10 +1912,18 @@ public final class Engine {
                     statsLastError = "发统计失败：" + t;
                     Log.w(TAG, statsLastError);
                 }
-                // 拆成 100ms 小步睡：stop() 时能立刻醒来，不用等满 2 秒。
-                for (int i = 0; i < STATS_INTERVAL_MS / 100 && statsRunning; i++) {
-                    sleepQuiet(100);
+                // 拆成 100ms 小步睡：stop() 时能立刻醒来，不用等满 2 秒；
+                // 谁刚动了音量（pokeStats）也能立刻醒来，不必把新值压到下一轮 2 秒。
+                for (int i = 0; i < STATS_INTERVAL_MS / 100 && statsRunning && !statsPoke; i++) {
+                    synchronized (statsWake) {
+                        try {
+                            statsWake.wait(100);
+                        } catch (InterruptedException ignored) {
+                            break;
+                        }
+                    }
                 }
+                statsPoke = false;
             }
         } finally {
             try {
@@ -1623,6 +1935,10 @@ public final class Engine {
 
     /** 发一轮统计：给每台"有关系的设备"各发一个（内容按方向区分）。 */
     private void sendStatsRound(DatagramSocket s) {
+        // ★ 每轮先看一眼"对端是不是已经彻底没消息了"（关程序/离开局域网时没人来说
+        //   want_listen=false，只能靠这条兜底）—— 必须在下面那个 targets.isEmpty() 提前返回
+        //   之前跑，否则"什么都没在发生"的那一轮正好把该收的收听留下了。
+        revokeStaleAutoListens();
         AudioSend snd;
         Map<String, Integer> targets = new LinkedHashMap<String, Integer>();
         synchronized (lock) {
@@ -1645,6 +1961,36 @@ public final class Engine {
                     }
                 }
             }
+            // ★ ④ 只是"请电脑去连我的蓝牙"的那些，也必须进名单。
+            //   2026-10-15 用户真机：手机点了「走蓝牙（电脑去连）」，电脑毫无反应 ——
+            //   因为这种时候我既没在收听、也没在发送，targets 是空的，下面那句
+            //   `if (targets.isEmpty() && !channelListen) return;` 直接把整轮跳过，
+            //   want_bt **一个包都发不出去**（等于死代码）。
+            //   记在 btWantPorts 里的就是"我还要请它连蓝牙"的设备，直到用户改选 WiFi。
+            targets.putAll(btWantPorts);
+            // ★ ④ 「我刚停了」也要送达：停掉的那一台再报 30 秒（want_listen 已经是 false），
+            //   否则电脑那边永远收不到"你停了"，它替自动打开的那条收听就一直开着。
+            long nowMs = SystemClock.elapsedRealtime();
+            for (String host : lastStatsHosts) {
+                if (!targets.containsKey(host) && !statsGracePorts.containsKey(host)) {
+                    statsGracePorts.put(host, portForHost(host));
+                    statsGraceUntil.put(host, nowMs + STATS_STOP_GRACE_MS);
+                }
+            }
+            java.util.Iterator<Map.Entry<String, Integer>> it =
+                    statsGracePorts.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<String, Integer> e = it.next();
+                Long until = statsGraceUntil.get(e.getKey());
+                if (until == null || until <= nowMs) {
+                    it.remove();
+                    statsGraceUntil.remove(e.getKey());
+                    continue;
+                }
+                targets.put(e.getKey(), e.getValue());
+            }
+            lastStatsHosts.clear();
+            lastStatsHosts.addAll(targets.keySet());
         }
         // ★ 听广播时，把"我正在收的每一路"也告诉对方：对面才知道它广播的东西到没到我这儿。
         //   （否则用户只能看到"手机没声音"，而电脑那边毫无反馈。）
@@ -1688,6 +2034,14 @@ public final class Engine {
             boolean iSendToIt = sendingNow && ts != null;
             long mySent = (ts == null) ? 0 : ts.packetsSent;
             long myBytes = (ts == null) ? 0 : ts.bytesSent;
+            // ★ 2026-10-16 用户澄清的语义：广播是**一条独立线路** ——
+            //   "我在广播"这件事不再被写成"我在针对性送给你、请你自动打开收听"。
+            //   所以 want_listen 只对**用户单独勾过的那几台**为真（点对点路由）；
+            //   广播覆盖的那些照旧如实报 sending/sent（对端能看到有声音在来），
+            //   但绝不替对端把收听打开 —— 要不要听由**对端自己那台**的「听」决定
+            //   （用户原话：「广播是设备只有开关本机"听""送"的权利的」）。
+            Discovery.Peer dp = peerByHost(host);
+            boolean targeted = dp != null && sendIds.contains(idOf(dp));
             // 这条链路的收包数单独取：对方最想知道的就是"我发出去的它到底收到多少"。
             long recv = 0;
             long lost = 0;
@@ -1705,12 +2059,34 @@ public final class Engine {
             byte[] payload = Diagnosis.json(nodeName(),
                     iSendToIt ? mySent : 0, iSendToIt ? myBytes : 0, iSendToIt,
                     recv, lost, buf, streams, host,
-                    // ★ ① 请求对端自动收听：我正在送给它就一直为 true（幂等）
-                    iSendToIt,
+                    // ★ ① 请求对端自动收听：**只有用户单独点了「送声音」的那几台**才请求
+                    //   （广播这条独立线路不请求 —— 见上面 targeted 的说明）
+                    iSendToIt && targeted,
                     // ★ ① 我→它这条链路的共享音量（我这边的"我送它的"）
                     gainOf(linkSendGain, host), tsOf(linkSendGainTs, host),
                     // ★ ① 它→我这条链路的共享音量（我这边的"我听它的"）
-                    gainOf(linkRecvGain, host), tsOf(linkRecvGainTs, host));
+                    gainOf(linkRecvGain, host), tsOf(linkRecvGainTs, host),
+                    // ★ ④ 我在这台上选了「走蓝牙」→ 请**电脑**去连我的蓝牙（幂等）
+                    btWantTo(host));
+            // ★ 2026-10-15：对端信标里有 ctl:1 → 这条统计/请求改发**发现端口**。
+            //   那一层每 2 秒一发一收、一直活着，所以对端（手机）即使没在收听、接收器停着，
+            //   也照样收得到"我在把声音送给你，请自动打开收听" —— 这就是 ⑤ 的正解。
+            //   老版本对端没有这个键：落到下面照旧发音频端口，一个字都不少（新旧混跑不打哑）。
+            //   （dp 就是上面为了算 targeted 已经查过的那一台，别查第二遍。）
+            if (dp != null && dp.ctl && discovery != null) {
+                int dport = (dp.discPort > 0) ? dp.discPort : Proto.DEFAULT_DISCOVERY_PORT;
+                try {
+                    if (discovery.sendControl(new String(payload, StandardCharsets.UTF_8),
+                            host, dport)) {
+                        statsSent++;
+                        continue;
+                    }
+                } catch (Throwable e) {
+                    // 发不出去（对端刚走 / Wi-Fi 抖动）：绝不能静默丢掉 —— 落到音频端口再发一份。
+                    statsLastError = "控制消息发不到 " + host + ":" + dport + "：" + e;
+                    Log.w(TAG, statsLastError);
+                }
+            }
             Proto.Pkt pkt = new Proto.Pkt(Proto.T_STATS);
             pkt.ssrc = statsSsrc;                                  // 固定一个，对端日志里好认
             pkt.tsNs = System.currentTimeMillis() * 1_000_000L;
@@ -1725,6 +2101,57 @@ public final class Engine {
             }
         }
         expirePeerStats();
+    }
+
+    /**
+     * ★ 把"对端已经彻底没消息"的那些【自动打开的收听】收回来（见 AUTO_LISTEN_STALE_MS）。
+     *
+     * <p>跑在统计线程上（每 2 秒一轮）—— 必须是常驻线程：界面关掉时也要收，
+     * 否则用户回到界面看到的就是一条挂着的收听。
+     */
+    private void revokeStaleAutoListens() {
+        java.util.List<String> hosts;
+        synchronized (lock) {
+            if (autoListenHosts.isEmpty()) {
+                return;
+            }
+            hosts = new ArrayList<String>(autoListenHosts);
+        }
+        // 先只读快照对端统计（peerLock），再去动收听名单（lock）—— 两把锁不嵌套，避免出现
+        // "收包线程等界面线程、界面线程等收包线程"那种谁都不动的局面。
+        long now = SystemClock.elapsedRealtime();
+        java.util.List<String> stale = new ArrayList<String>();
+        synchronized (peerLock) {
+            for (String host : hosts) {
+                Diagnosis.PeerStats ps = peerStats.get(host);
+                long age = (ps == null) ? Long.MAX_VALUE : (now - ps.receivedAtMs);
+                if (age > AUTO_LISTEN_STALE_MS) {
+                    stale.add(host);
+                }
+            }
+        }
+        if (stale.isEmpty()) {
+            return;
+        }
+        synchronized (lock) {
+            for (String host : stale) {
+                if (!autoListenHosts.remove(host)) {
+                    continue;
+                }
+                java.util.Iterator<String> ids = listenIds.iterator();
+                while (ids.hasNext()) {
+                    String id = ids.next();
+                    if (host.equals(listenHosts.get(id))) {
+                        ids.remove();
+                        listenHosts.remove(id);
+                        listenPorts.remove(id);
+                    }
+                }
+                Log.i(TAG, "对端已经没消息了，已收回自动打开的收听：" + nameOrHost(host));
+            }
+            applyAllowedHosts();
+            stopReceiverIfIdle();
+        }
     }
 
     /** 过期的对端统计定期清掉：界面会显示"没在回话"，没必要一直占着内存。 */
@@ -1793,6 +2220,42 @@ public final class Engine {
             }
         }
         return 0f;   // 这台还没在发（点了收听但对方没点送声音）
+    }
+
+    /**
+     * 这一路的「信号质量」0~100；没有可测的链路返回 {@code -1}（界面据此写"不可测"）。
+     *
+     * <p>★ 2026-10-16 用户（图6）：「电脑手机现在都只有"送""收"两个条，现在定义为音量
+     * 显示条。并添加一个信号质量条。」—— 分值只用<b>实测计数器</b>算：丢包比例越小分越高，
+     * 缓冲越深（说明这一路一直在补迟到/重排的包）再扣一点。
+     *
+     * <p>为什么没有依据时返回 -1 而不是 0：0 分看起来像"链路很差"，而"根本没测到"和
+     * "链路很差"是两件事。界面按 -1 写"不可测"，绝不编一个分数。
+     */
+    public int peerQualityFor(String host) {
+        if (host == null || host.isEmpty()) {
+            return -1;
+        }
+        AudioRecv.Stats st = recvStats();
+        if (st == null || st.streams == null) {
+            return -1;
+        }
+        for (AudioRecv.StreamStats ss : st.streams) {
+            if (!host.equals(ss.host)) {
+                continue;
+            }
+            // 算式放在 LinkPolicy 里：那样 PolicyProbe 那道零桩门禁能直接把它测了，
+            // 不用起 Android 运行时（这条判据是纯计算，没有理由藏在 Engine 里）。
+            return LinkPolicy.qualityScore(ss.received, ss.lost, ss.bufferedMs);
+        }
+        // ★ 2026-10-16 用户（图1）：「虽然二者没有收发声音，但是设备间信号应当存在」——
+        //   没有音频流的时候**不能写"没有依据"**：链路本身一直在（互相看得见信标）。
+        //   手机端不回 PING/PONG，所以这条路是唯一的兜底 —— 用心跳新鲜度给分。
+        Discovery.Peer peer = peerByHost(host);
+        if (peer != null && peer.online()) {
+            return LinkPolicy.heartbeatScore(peer.ageMs());
+        }
+        return -1;
     }
 
     private static float clamp01(float v) {

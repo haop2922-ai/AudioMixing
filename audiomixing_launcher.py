@@ -29,7 +29,7 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win3
 
 # HWHHYN 用 DEEPSEEK 制作
 def _log_path() -> str:
-    base = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "Audio Mixing")
+    base = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "AudioMixing")
     try:
         os.makedirs(base, exist_ok=True)
     except OSError:
@@ -117,8 +117,13 @@ def _port_owner(port: int) -> int:
     if sys.platform != "win32":
         return 0
     try:
+        # 中文 Windows 上 netstat 的输出是 GBK：只写 text=True 会按 UTF-8 解码并抛
+        # UnicodeDecodeError，被下面的 except 吞掉 → 悄悄返回 0。后果很严重：
+        # 接管永远拿不到 PID，旧实例永远关不掉，新旧两个实例一起抢 17800
+        # （2026-10-14 实测）。加 encoding/errors 后 ASCII 关键字一定能解析出来。
         out = subprocess.run(["netstat", "-ano", "-p", "TCP"], creationflags=_NO_WINDOW,
-                             capture_output=True, text=True, timeout=15).stdout or ""
+                             capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=15).stdout or ""
     except Exception:
         return 0
     needle = ":%d" % port
@@ -147,6 +152,97 @@ def _stop_port_owner(port: int) -> bool:
         _log("结束 PID %d 失败: %s" % (pid, exc))
         return False
 
+
+
+_TAKE_OVER = "takeover"
+_DEFER = "defer"
+
+
+def _parse_version(text: object) -> tuple:
+    """"1.13" / "Audio Mixing v1.13" → (1, 13)；读不出来就是空元组。"""
+    import re
+
+    found = re.search(r"(\d+(?:\.\d+)*)", str(text or ""))
+    if not found:
+        return ()
+    try:
+        return tuple(int(x) for x in found.group(1).split("."))
+    except ValueError:
+        return ()
+
+
+def decide_takeover(running_version: object, our_version: object) -> str:
+    """运行中的实例该不该被新版本顶掉。
+
+    只按版本号比：比我们旧 → 接管（关掉它）；同版或更新 → 让位（不动它）。
+    任何一方版本读不出来就保守让位 —— 宁可多开一个窗，也绝不乱杀进程。
+
+    2026-10-14 用户的真实现场：双击新版，旧版还在跑，新版只是把旧版的面板
+    叫到前面就退出了 —— 于是他测的始终是旧代码。「新版要把旧版关掉」是他明确
+    提出的要求，这里就是那个判据（纯函数，好测）。
+    """
+    mine = _parse_version(our_version)
+    theirs = _parse_version(running_version)
+    if not mine or not theirs:
+        return _DEFER
+    return _TAKE_OVER if theirs < mine else _DEFER
+
+
+def _our_version() -> str:
+    try:
+        from audiomixing import __version__
+
+        return str(__version__)
+    except Exception:
+        return ""
+
+
+def _running_status(timeout: float = 2.5):
+    """读 17800 上那个实例的 /api/status；不是本程序（读不到）就返回 None。"""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:17800/api/status",
+                                    timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    # 只认自家产品：status 必须同时带 node 和 build 两段
+    if (isinstance(data, dict) and isinstance(data.get("node"), dict)
+            and isinstance(data.get("build"), dict)):
+        return data
+    return None
+
+
+def _message_box(text: str, title: str = "Audio Mixing") -> None:
+    """程序没有控制台，又必须如实告诉用户 —— 用系统弹窗。"""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(None, text, title, 0x10)
+    except Exception as exc:
+        _log("弹窗失败: %s" % exc)
+
+
+def _take_over(pid: int) -> bool:
+    """关掉占着 17800 的旧版本（连它的子进程），并把它开过的面板窗一并关掉。
+
+    只杀端口占用者这一个进程树，不做任何按名字的横扫 —— 杀错别人的程序
+    比"没能接管"严重得多。
+    """
+    if pid and pid != os.getpid():
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           creationflags=_NO_WINDOW, capture_output=True, timeout=15)
+            _log("已请求关闭旧版本 PID %d" % pid)
+        except Exception as exc:
+            _log("关闭旧版本 PID %d 失败: %s" % (pid, exc))
+    _close_panel_windows()
+    for _ in range(12):
+        time.sleep(0.5)
+        if _port_owner(17800) == 0:
+            return True
+    return False
 
 
 def _wait_for_monitor_window(seconds: float) -> bool:
@@ -200,7 +296,7 @@ def _close_panel_windows() -> int:
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
                              creationflags=_NO_WINDOW, capture_output=True, text=True,
-                             timeout=20).stdout or ""
+                             encoding="utf-8", errors="replace", timeout=20).stdout or ""
     except Exception as exc:
         _log("列出面板窗口进程失败: %s" % exc)
         return 0
@@ -272,16 +368,19 @@ def run_service() -> int:
     """起节点并打开监控窗，自己不占窗口。"""
     try:
         from audiomixing.config import Config
-        from audiomixing.engine import WaveLinkNode
+        from audiomixing.engine import AudioMixingNode
         from audiomixing.net import discovery as disc
         from audiomixing.webui import WebUI
 
         cfg = Config.load()
         port = int(cfg.web_port)
-        node = WaveLinkNode(cfg, audio_port=cfg.audio_port,
+        node = AudioMixingNode(cfg, audio_port=cfg.audio_port,
                             discovery_port=cfg.discovery_port, simulate=False)
         ui = WebUI(node, host="0.0.0.0", port=port)
         node.start()
+        # 面板上"声音大小"那根条 / 圆心那个百分比来自**直读当前输出设备**的电平表 ——
+        # 手机走蓝牙进来时声音是 Windows 直接播放的，本工具那条路没有数据，只有这里看得到。
+        node.enable_output_meter()
         port = int(ui.start() or port)
         address = "http://127.0.0.1:%d" % port
         try:
@@ -305,6 +404,17 @@ def run_service() -> int:
                 node.stop()
             except Exception as exc:
                 _log("停止节点失败: %s" % exc)
+            # ★ 用户真机反馈：「关闭服务后，手机声音依旧通过蓝牙传入电脑」。
+            #   蓝牙连接的寿命绑在助手子进程上，主进程退掉并不会挂断它 —— 必须显式
+            #   把所有还握着的连接放掉（见 bluetooth.disconnect_all 的说明）。
+            try:
+                from audiomixing import bluetooth as _bt
+
+                result = _bt.disconnect_all()
+                _log("退出时挂断蓝牙连接 %d 个（失败 %d 个）"
+                     % (result.get("count", 0), len(result.get("failed") or [])))
+            except Exception as exc:
+                _log("挂断蓝牙连接失败: %s" % exc)
             # 退出就该退干净：把程序自己开的窗口也关掉，
             # 否则图标没了、声音停了，窗口还留在桌面上。
             _close_panel_windows()
@@ -366,13 +476,40 @@ def main(argv: list[str] | None = None) -> int:
             running = True
 
     if running:
-        # 服务在跑：把监控窗叫到前面就够了，不要再起一个
+        # 服务在跑。先问清"跑的是谁、哪一版"，再决定顶掉它还是让位。
+        # 2026-10-14 用户的真实现场：双击新版，旧版还在跑，新版只是把旧版的面板
+        # 叫到前面就退出 —— 他测的始终是旧代码。新版必须能把旧版关掉。
+        status = _running_status()
+        if status is not None:
+            running_version = (status.get("build") or {}).get("version") or ""
+            if decide_takeover(running_version, _our_version()) == _TAKE_OVER:
+                _log("17800 上是旧版本 v%s，本版 v%s 接管"
+                     % (running_version, _our_version()))
+                if not _take_over(_port_owner(17800)):
+                    _log("接管失败：旧版本 v%s 没能关掉" % running_version)
+                    _message_box("检测到旧版本 v%s 在运行，但没能把它关掉。\n"
+                                 "请手动退出它（托盘图标 → 退出），再双击本程序。"
+                                 % running_version)
+                    return 1
+                _log("旧版本已关闭，端口已让出，开始启动本版")
+                return run_service()
+            # 同版或更新版：把它的监控窗叫到前面就够了，不要再起一个
+            handle = _window_handle()
+            if handle:
+                _log("服务在跑（v%s），监控窗已存在，提到最前面" % running_version)
+                _raise_window(handle)
+            else:
+                _log("服务在跑（v%s），打开监控窗" % running_version)
+                open_monitor("http://127.0.0.1:17800")
+            return 0
+        # 读不到状态：端口上确实有东西在应答，但认不出是哪一版。
+        # 这时绝不乱杀（杀错别人的程序更糟），沿用旧行为把面板打开。
         handle = _window_handle()
         if handle:
-            _log("服务在跑，监控窗已存在，提到最前面")
+            _log("服务在跑（读不到版本），提窗")
             _raise_window(handle)
         else:
-            _log("服务在跑，打开监控窗")
+            _log("服务在跑（读不到版本），打开监控窗")
             open_monitor("http://127.0.0.1:17800")
         return 0
 

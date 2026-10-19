@@ -177,7 +177,7 @@ def check(ok: bool, label: str, extra: str = "") -> None:
 def main() -> int:
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
-    env["WAVELINK_HOME"] = os.path.join(os.environ.get("TEMP", "."), "am-p2p-selftest")
+    env["AUDIOMIXING_HOME"] = os.path.join(os.environ.get("TEMP", "."), "am-p2p-selftest")
     print("== 起一个源码节点（沙箱配置，不动用户设置）==")
     proc = subprocess.Popen([sys.executable, "-m", "audiomixing", "serve"],
                             cwd=str(ROOT), env=env,

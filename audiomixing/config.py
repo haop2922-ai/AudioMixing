@@ -1,4 +1,4 @@
-"""Persistent configuration (~/.wavelink/config.json)."""
+"""Persistent configuration (~/.audiomixing/config.json; on Windows: %APPDATA%\\AudioMixing)."""
 
 from __future__ import annotations
 
@@ -36,7 +36,9 @@ def _migrate_old_dir(new_dir: "Path") -> None:
 
 
 def config_dir() -> Path:
-    override = os.environ.get("WAVELINK_HOME")
+    # 新名优先、旧名兜底：v1.22 及更早的启动器/脚本导出的还是 WAVELINK_HOME，
+    # 换了名字之后不能让它们悄悄指丢配置目录。
+    override = os.environ.get("AUDIOMIXING_HOME") or os.environ.get("WAVELINK_HOME")
     if override:
         return Path(override)
     system = platform.system()
@@ -91,10 +93,13 @@ class Config:
     # its own Bluetooth adapter - or a phone plus this machine's sound travel as one.
     channel_sources: list[str] = field(default_factory=list)
     # ① 自动收听（与手机端同名同义）：
-    #   auto_accept_listen —— 对方按「送声音」时，要不要自动让我收听它（默认开）
-    #   listen_optout      —— 用户明确关掉过的设备（node_id 或名字）：进过名单就不再自动加
-    auto_accept_listen: bool = True
-    listen_optout: list[str] = field(default_factory=list)
+    #   smart_link —— ★ 2026-10-18 用户第 6 条：全局总开关换成**每台设备一个「智连」**。
+    #     名单里有的那台设备，"它送声音过来"时才自动开始收听它（= 接受它的「送」）；
+    #     同时也表示"允许它听我"（它请求听本机时自动把声音送给它）。
+    #     **默认空 = 一台都不自动**（用户原话「默认关闭」）。
+    #     用户明确否掉的旧口径：那个"关过一次就永不再自动"的黑名单（listen_optout）——
+    #     它正是"电脑送音、手机不自动收"那条真机反馈的根因，现在删掉了。
+    smart_link: list[str] = field(default_factory=list)
     # 本机多设备输出：勾选的输出设备（每项含 device/gain/delay_ms）
     multi_out_devices: list[dict[str, Any]] = field(default_factory=list)
     # Play the channel's sources on *this* machine's output as well. This is what makes
@@ -103,10 +108,12 @@ class Config:
     # Phones to connect by themselves on startup, matched by name. Empty means "connect
     # nothing": opening an A2DP sink resets that phone's link, so this stays opt-in.
     autoconnect: list[str] = field(default_factory=list)
-    # A phone that starts sending gets picked up and played at once: this is a LAN, the
-    # operator knows what is on it, and requiring a click first was the step that kept
-    # swallowing the audio.
-    auto_play: bool = True
+    # ★ 2026-10-18 用户（图2）：「「正在发送的手机自动播放」就是蓝牙的「智连」」——
+    #   原来这里有一个全局开关 `auto_play`（面板上那个勾：手机一开始送声音就自动收编成音源播放）。
+    #   它和"每台设备的「智连」"说的是同一件事，所以整块删掉：要不要自动收下这台设备的声音，
+    #   只看那台设备的卡片开没开「智连」（局域网看 smart_link，蓝牙看 autoconnect）。
+    #   默认 = 一台都不自动（用户第 6 条的原话「默认关闭」）。
+    #   老配置里那个 "auto_play" 键不再读（from_dict 会当未知键忽略），不会报错。
     # Which window to open when the app starts: "none", "simple" or "full".
     # Set from the detailed panel; it is a rarely used preference, so it is hidden in
     # the simple view and never appears in the desktop window.
@@ -180,11 +187,9 @@ class Config:
             "listen": self.listen,
             "channel_gain": self.channel_gain,
             "channel_sources": self.channel_sources,
-            "auto_accept_listen": self.auto_accept_listen,
-            "listen_optout": self.listen_optout,
+            "smart_link": self.smart_link,
             "local": self.local,
             "autoconnect": self.autoconnect,
-            "auto_play": self.auto_play,
             # 启动时顺手打开面板窗口。在详细版面板里可以勾选。
             "open_panel_on_start": self.open_panel_on_start,
             "broadcast_excluded": self.broadcast_excluded,
@@ -222,7 +227,6 @@ class Config:
             "channel_sources": self.channel_sources,
             "local": self.local,
             "autoconnect": self.autoconnect,
-            "auto_play": self.auto_play,
             "open_panel_on_start": self.open_panel_on_start,
             "netmic_jitter_ms": self.netmic_jitter_ms,
             "path": str(config_path()),

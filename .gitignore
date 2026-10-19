@@ -33,6 +33,9 @@ venv/
 # Nuitka 编译产物（不要进仓库）
 dist_nuitka/
 
+# 打包时生成的构建时间模块（编完即删，别让它进仓库）
+audiomixing/_buildmeta.py
+
 # 版本备份（本机存档，不进仓库）
 版本备份/
 # Android 构建产物

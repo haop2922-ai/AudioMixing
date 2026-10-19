@@ -79,14 +79,31 @@ class WNDCLASSW(ctypes.Structure):
 
 
 # HWHHYN 用 DEEPSEEK 制作
+def _find_edge() -> str:
+    """找 Edge 的可执行文件；找不到返回空串（那时才退回默认浏览器）。
+
+    为什么自己找、不跨模块 import：这里原来写的是
+    ``from wavelink_launcher import _find_edge`` —— 可模块早就改名成
+    audiomixing_launcher 了，那个 import 必然失败、异常又被吞掉，于是 edge 恒为空、
+    每次都走 webbrowser.open：用户双击托盘图标看到的是「网页版」，
+    而不是那个没有地址栏的应用窗口（2026-10-14 用户现场）。
+    """
+    for path in (
+        os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Microsoft", "Edge",
+                     "Application", "msedge.exe"),
+        os.path.join(os.environ.get("ProgramFiles", ""), "Microsoft", "Edge",
+                     "Application", "msedge.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Edge",
+                     "Application", "msedge.exe"),
+    ):
+        if path and os.path.isfile(path):
+            return path
+    return ""
+
+
 def _open_url(url: str) -> None:
     """用应用模式打开页面；不行就退回默认浏览器。"""
-    try:
-        from wavelink_launcher import _find_edge  # 同目录，源码运行时可用
-
-        edge = _find_edge()
-    except Exception:
-        edge = ""
+    edge = _find_edge()
     if edge:
         try:
             profile = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
@@ -110,6 +127,42 @@ def _open_url(url: str) -> None:
         pass
 
 
+# HWHHYN 用 DEEPSEEK 制作
+def _real_exe() -> str:
+    """这次运行"到底是哪个程序"—— 用户双击的那颗 exe，源码运行时是入口 .py。
+
+    为什么不能直接信 sys.frozen / sys.executable（2026-10-15 自检时抓到的真缺陷）：
+      Nuitka onefile **既不设 sys.frozen**，又把 __file__ 指进**每次运行都不同的**
+      解包临时目录（...\\Temp\\onefile_<pid>_<随机串>\\audiomixing\\tray.py）。
+      于是原来的判断走的是"源码那条分支"，算出来的路径是那个临时目录里的
+      audiomixing_launcher.py —— 后果是：
+        · 放行防火墙写出来的规则绑在一个临时路径上，等于**什么都没放行**：
+          用户点完按钮，诊断报告还是写「规则没有覆盖当前路径」，手机照样连不上；
+        · 托盘图标 ExtractIconW 拿到的是那个 .py，取不到图标 → 退化成系统默认图标。
+      正确做法和 webui.py 里那处一致：先问 Nuitka 的 __compiled__ 要原始 exe 路径。
+    注意这几个候选可能指向不存在的路径（比如解包出来的临时 python.exe），
+    所以逐个 is_file() 试，第一个真实存在的才算数。
+    """
+    comp = globals().get("__compiled__")
+    if comp is not None:
+        for attr in ("original_argv0", "containing_dir"):
+            try:
+                value = getattr(comp, attr, None)
+            except Exception:
+                continue
+            if value and os.path.isfile(str(value)):
+                return str(value)
+    if getattr(sys, "frozen", False) and sys.executable:       # PyInstaller
+        return sys.executable
+    try:
+        argv0 = str(sys.argv[0] or "")
+    except Exception:
+        argv0 = ""
+    if argv0 and os.path.isfile(argv0):
+        return os.path.abspath(argv0)
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "audiomixing_launcher.py"))
+
+
 def add_firewall_rules() -> str:
     """给当前程序在防火墙上放行入站 TCP 和 UDP，返回批处理文件的路径。
 
@@ -123,12 +176,24 @@ def add_firewall_rules() -> str:
     """
     import tempfile
 
-    frozen = getattr(sys, "frozen", False)
-    exe = sys.executable if frozen else os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "audiomixing_launcher.py"))
+    exe = _real_exe()
 
     # 不带 chcp：批处理文件用系统编码写，控制台保持系统编码，中文路径才不会变乱码
     lines = ["@echo off"]
+
+    # ★ 2026-10-15 自查发现的两件事，都塞进这一次放行里做掉（用户点一次就够了）：
+    #   ① 规则是绑**程序路径**的，所以每换一版 exe 就要重新放行，旧规则会一直堆着 ——
+    #      这台机器上已经堆到 50 条，其中约 38 条指向早就删掉的 exe（连"某个 Nuitka 解包
+    #      临时目录里的 .py"都在里面）。死规则什么也不放行，只会让人对着列表看糊涂。
+    #   ② 当前这份 exe 常常**一条规则都没有**（上次点放行的是上一版）→ 入站 TCP/UDP 被
+    #      Windows 直接拦掉，手机连不上。这也是"设备看得见、却连不通"的一种成因。
+    #   判据只有一条：**规则指向的文件已经不存在** 就删。指向别的副本、文件还在的规则一律不碰。
+    #   刻意只用单引号（cmd 里双引号要转义，这个工程为引号踩过坑 —— 见上面那段说明）。
+    lines.append('powershell -NoProfile -ExecutionPolicy Bypass -Command '
+                 '"Get-NetFirewallRule | Get-NetFirewallApplicationFilter | '
+                 "Where-Object { $_.Program -and -not (Test-Path $_.Program) "
+                 "-and ($_.Program -match 'wavelink|audiomixing|audio mixing') } | "
+                 'ForEach-Object { Remove-NetFirewallRule -Name $_.InstanceID }"')
     for proto in ("TCP", "UDP"):
         name = "Audio Mixing " + proto
         lines.append('netsh advfirewall firewall delete rule name="%s" >nul 2>&1' % name)
@@ -295,10 +360,10 @@ class Tray:
         return bool(self.hwnd)
 
     def _icon(self):
-        # 优先用 exe 自带的图标，这样托盘和程序图标一致
+        # 优先用 exe 自带的图标，这样托盘和程序图标一致（系统默认图标认不出谁是谁）
         try:
-            path = sys.executable if getattr(sys, "frozen", False) else ""
-            if path:
+            path = _real_exe()
+            if path and path.lower().endswith(".exe"):
                 hicon = self.shell32.ExtractIconW(None, path, 0)
                 if hicon and hicon != 1:
                     return hicon

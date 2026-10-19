@@ -92,7 +92,7 @@ public final class Diagnosis {
          */
         public boolean wantListen;
         /**
-         * 这条链路（对端→我）的<b>共享音量</b>，0.00~1.50，两端同一个值。
+         * 这条链路（对端→我）的<b>共享音量</b>，0.00~2.00，两端同一个值。
          * 老版本不发这个字段时按 {@link #GAIN_UNSET} 处理（= 没同步过，保持各自的本地值）。
          */
         public float gain = GAIN_UNSET;
@@ -140,7 +140,7 @@ public final class Diagnosis {
         }
     }
 
-    /** "对端没报共享音量"的哨兵值（合法的增益是 0.00~1.50，负数不可能撞上）。 */
+    /** "对端没报共享音量"的哨兵值（合法的增益是 0.00~2.00，负数不可能撞上）。 */
     public static final float GAIN_UNSET = -1f;
 
     // ══════════════════════════════ 生成统计负载 ══════════════════════════════
@@ -166,7 +166,7 @@ public final class Diagnosis {
      * <ul>
      *   <li>{@code "want_listen": true|false} —— 发送方正在把声音送给对端，<b>请求对端自动打开收听</b>。
      *       幂等：还在送就一直是 true，停了自然变 false（不需要额外的取消消息）。</li>
-     *   <li>{@code "gain": 0.00~1.50} —— 这条链路（发送方→接收方）的<b>共享音量</b>，两端同一个值。</li>
+     *   <li>{@code "gain": 0.00~2.00} —— 这条链路（发送方→接收方）的<b>共享音量</b>，两端同一个值。</li>
      *   <li>{@code "gain_ts": <墙钟毫秒>} —— 该值最后一次被修改的时刻，用来判"谁后改以谁为准"。</li>
      * </ul>
      * 老版本收到这些字段<b>当未知字段忽略即可</b>（我们的 {@link #parse} 也只读自己认识的键），
@@ -176,7 +176,7 @@ public final class Diagnosis {
                               long recv, long lost, int bufMs, int streams, String target,
                               boolean wantListen, float gain, long gainTs) {
         return json(name, sent, bytes, sending, recv, lost, bufMs, streams, target,
-                wantListen, gain, gainTs, GAIN_UNSET, 0L);
+                wantListen, gain, gainTs, GAIN_UNSET, 0L, false);
     }
 
     /**
@@ -187,9 +187,9 @@ public final class Diagnosis {
      * <ul>
      *   <li>{@code "want_listen": true|false} —— 我正把声音送给对端，<b>请求对端自动打开收听</b>；
      *       幂等（还在送就一直 true，停了自然 false，不需要额外的取消消息）。</li>
-     *   <li>{@code "gain": 0.00~1.50} + {@code "gain_ts": <墙钟毫秒>} ——
+     *   <li>{@code "gain": 0.00~2.00} + {@code "gain_ts": <墙钟毫秒>} ——
      *       <b>我→对端</b>这条链路的共享音量（= 我这边的"我送它的"，= 对端那边的"我听它的"）。</li>
-     *   <li>{@code "gain_rx": 0.00~1.50} + {@code "gain_rx_ts": <墙钟毫秒>} ——
+     *   <li>{@code "gain_rx": 0.00~2.00} + {@code "gain_rx_ts": <墙钟毫秒>} ——
      *       <b>对端→我</b>这条链路的共享音量（= 我这边的"我听它的"，= 对端那边的"我送它的"）。</li>
      * </ul>
      * 规则：一个增益两端同一个值，谁后改以谁为准（比 {@code *_ts}）；值一样就什么都不做，
@@ -198,7 +198,7 @@ public final class Diagnosis {
     public static byte[] json(String name, long sent, long bytes, boolean sending,
                               long recv, long lost, int bufMs, int streams, String target,
                               boolean wantListen, float gain, long gainTs,
-                              float gainRx, long gainRxTs) {
+                              float gainRx, long gainRxTs, boolean wantBt) {
         StringBuilder sb = new StringBuilder(256);
         sb.append("{\"t\":\"").append(TAG_STATS).append("\",\"v\":1");
         sb.append(",\"name\":\"").append(escape(name)).append('"');
@@ -212,6 +212,10 @@ public final class Diagnosis {
         sb.append(",\"target\":\"").append(escape(target)).append('"');
         // ★ 新字段：老版本会忽略，不影响它们
         sb.append(",\"want_listen\":").append(wantListen);
+        // ★ ④ 2026-10-15 新增：用户点了「走蓝牙」→ 请**电脑**去连我的蓝牙
+        //   （用户原话：「手机确认走蓝牙后应当由电脑发送蓝牙请求并配对互相连接」）。
+        //   幂等：只是"请电脑去连"，电脑那边自己节流；用户改回 WiFi 时自然变 false。
+        sb.append(",\"want_bt\":").append(wantBt);
         if (gain != GAIN_UNSET) {
             sb.append(",\"gain\":").append(gainText(gain));
             sb.append(",\"gain_ts\":").append(gainTs);
@@ -379,10 +383,22 @@ public final class Diagnosis {
                 .append(e.listenTargetsText()).append('\n');
         // ★ 听广播（频道）：这是"电脑在广播、手机要能听见"的唯一入口，报告里必须有。
         sb.append("听广播  ：").append(e.isChannelListening() ? "已打开 ✓（谁来都听）" : "没开 ✗").append('\n');
-        // ★ ① 自动接受别人的「请求收听」（默认开）
-        sb.append("自动收听：").append(e.isAutoAcceptListen()
-                ? "接受别人的请求 ✓（别人点「送给它」我就自动听，可随时关掉那台的收听）"
-                : "已关 ✗（别人点「送给它」我也不会自动听）").append('\n');
+        // ★ ① 自动收听（2026-10-18 用户第 6 条）：改由每台设备各自的「智连」开关决定
+        //   （默认全关），不再有全局总开关 —— 所以报告里列出当前开了「智连」的那几台。
+        {
+            StringBuilder smart = new StringBuilder();
+            for (Discovery.Peer p : e.peers()) {
+                if (p != null && e.isSmart(p.host)) {
+                    if (smart.length() > 0) {
+                        smart.append('、');
+                    }
+                    smart.append(p.label());
+                }
+            }
+            sb.append("智连    ：").append(smart.length() == 0
+                    ? "一台都没开 ✗（别人点「送给它」我不会自动听）"
+                    : (smart + " ✓（这几台送声音过来我会自动开始听）")).append('\n');
+        }
         // ★ 广播我的声音（发出去）：一次采集 → 一包编码 → 分发给 N 个目标。
         sb.append("发广播  ：").append(e.isBroadcasting() ? "已打开 ✓（送给每一台在线设备）" : "没开 ✗")
                 .append('\n');

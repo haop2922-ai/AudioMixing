@@ -76,6 +76,12 @@ CAPTURE_PROBE_S = 2.0
 # 而真关机后 12 秒内一定停。
 PEER_SILENCE_GRACE_S = 12.0
 
+# ★ 停掉「送给它」之后，还要再报多少秒 want_listen=false（2026-10-15 用户反馈第 3 条
+# 「电脑停止送音后手机依旧收音不停止」）。为什么要宽限：对端是**没有状态**的接收方 ——
+# 我一停，"我还在送"这句话就发不出去了，它只能永远保持上一次收到的状态。
+# 30 秒 ≈ 15 轮统计包，丢几轮也送得到；手机端用的是同一个量级（STATS_STOP_GRACE_MS）。
+STATS_STOP_GRACE_S = 30.0
+
 # 对端请求"我听它"时自动建的那条路由的标签。面板原样显示，用户才知道设置被改过。
 AUTO_LISTEN_LABEL = "对方请求收听（自动）"
 
@@ -96,6 +102,33 @@ MAX_BACKLOG_BLOCKS = 6
 def is_self_token(token: str, node_id: str, name: str) -> bool:
     t = (token or "").strip().lower()
     return t in SELF_KEYWORDS or t == node_id.lower() or t == short_id(node_id) or t == name.lower()
+
+
+def bt_sink_phone_name(device_name: str) -> str:
+    """从蓝牙采集设备名里取出手机名（"麦克风 (<某台手机> A2DP SNK)" → "<某台手机>"）。
+
+    手机走蓝牙把声音送进来时，Windows 把它暴露成一块**采集**设备：名字形如
+    `麦克风 (<手机名> A2DP SNK)`（`engine` 里"连上了但没声音"那个坑也是它）。
+    只有这种名字才回手机名 —— 别的采集设备一律返回空串：
+    ★ 2026-10-18 用户（图2）「「正在发送的手机自动播放」就是蓝牙的「智连」」——
+      这里就是"这张蓝牙卡片开没开「智连」"的落点，认错名字等于把别的设备也自动收编。
+    """
+    text = str(device_name or "").strip()
+    if not text:
+        return ""
+    low = text.lower()
+    if "a2dp" not in low:
+        return ""
+    start, end = text.find("(") if "(" in text else text.find("（"), text.rfind(")")
+    if start < 0:
+        return ""
+    inner = text[start + 1:end if end > start else len(text)].strip()
+    for tail in ("A2DP SNK", "A2DP Sink", "A2DP"):
+        idx = inner.upper().rfind(tail.upper())
+        if idx >= 0:
+            inner = inner[:idx].strip()
+            break
+    return inner.strip(" -·")
 
 
 @dataclass
@@ -192,8 +225,103 @@ class _SinkFeed:
         }
 
 
-class WaveLinkNode:
-    """One WaveLink instance on one machine."""
+# ★ 「设备间信号」的三个折算函数（2026-10-16 用户：「虽然二者没有收发声音，但是设备间
+#   信号应当存在」）。放在模块级是为了能单独测：它们都是纯计算，没有状态。
+def _rtt_score(rtt_ms: float) -> int:
+    """往返时延折算成分：≤2ms 满分，之后每毫秒扣 0.5 分（100ms → 50，200ms → 0）。
+
+    LAN 上正常是 1~5ms，所以健康的链路看起来基本是满的 —— 这是**对的**，
+    不要为了让条子"看起来有变化"把满分线压低。
+    """
+    return max(0, min(100, int(round(100.0 - min(100.0, max(0.0, rtt_ms) * 0.5)))))
+
+
+def _heartbeat_score(age_s: float, jitter_ms: float | None) -> int:
+    """只有信标心跳可用时的分（手机不回 PING/PONG，走的就是这一条）。
+
+    心跳本该每 ~2 秒一次：刚听到（≤2.5 秒）算满，越久没听到扣得越多
+    （5 秒 → 80 分，10 秒 → 40 分，15 秒 → 0 分）；间隔忽长忽短再扣一点。
+    """
+    penalty = max(0.0, age_s - 2.5) * 8.0
+    if jitter_ms:
+        penalty += min(30.0, float(jitter_ms) * 0.5)
+    return max(0, min(100, int(round(100.0 - min(100.0, penalty)))))
+
+
+def _loss_score(stats: dict[str, Any]) -> int | None:
+    """正在收声音那一路的丢包/缓冲分；一个包都没统计到返回 None（**不是 0**）。"""
+    received = int(stats.get("packets") or 0)
+    lost = int(stats.get("lost") or 0)
+    if received + lost <= 0:
+        return None
+    penalty = (lost / float(received + lost)) * 400.0
+    buffered = float(stats.get("buffered_ms") or 0.0)
+    target = float(stats.get("target_ms") or 0.0)
+    if target and buffered > target * 1.5:
+        penalty += min(30.0, (buffered - target) * 0.5)
+    return max(0, min(100, int(round(100.0 - min(100.0, penalty)))))
+
+
+class _OutputLevelMeter(threading.Thread):
+    """后台直读「当前输出设备」的峰值表（见 ``wasapi.WasapiMeter``）。
+
+    为什么是"直读"而不是再开一路回环采集：真机反馈过"同一块设备多开一路采集会越听越卡"
+    （特别是蓝牙耳机），而手机走蓝牙进来时声音是 **Windows 直接播放**的，本工具那一路
+    根本没有数据 —— 面板上的"本机播放电平"于是永远是 0。``IAudioMeterInformation`` 是
+    音频引擎自带的峰值表，读一次 float 就有数，不占设备、不打扰正在播放的声音。
+
+    带一点衰减记忆：峰值表的窗口是 100ms，读到的值在 0 和峰值之间跳得厉害，直接显示会
+    变成一堆看不清的数字。
+    """
+
+    def __init__(self, spec: dict[str, Any], *, interval: float = 0.1) -> None:
+        super().__init__(daemon=True, name="audiomixing-outmeter")
+        self.spec = dict(spec)
+        self.interval = float(interval)
+        self.peak = 0.0
+        self.device = str(self.spec.get("device") or "@default")
+        self.error = ""
+        self._stop = threading.Event()
+        self._meter: Any = None
+
+    def run(self) -> None:
+        from .audio.backends.wasapi import WasapiMeter
+
+        self._meter = WasapiMeter(self.spec)
+        if self._meter.open():
+            self.device = self._meter.device()
+        else:
+            self.error = self._meter.error
+        misses = 0
+        while not self._stop.is_set():
+            value = self._meter.peak()
+            if value is None:
+                # 接口失效（设备换了一块/被独占/驱动重启）：隔三秒重开一次，
+                # 而不是每 100ms 都去撞一次失败的 COM 调用。
+                misses += 1
+                if misses >= 30:
+                    misses = 0
+                    if self._meter.open():
+                        self.device = self._meter.device()
+                        self.error = ""
+                    else:
+                        self.error = self._meter.error
+            else:
+                misses = 0
+                self.peak = max(float(value), self.peak * 0.82)
+            self._stop.wait(self.interval)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._meter is not None:
+            try:
+                self._meter.close()
+            except Exception:
+                pass
+
+
+class AudioMixingNode:
+    """One AudioMixing instance on one machine."""
 
     def __init__(
         self,
@@ -231,6 +359,9 @@ class WaveLinkNode:
         self._loop: LocalLoop | None = None
         self._loop_key: tuple | None = None
         self._local_note = ""
+        # ★ 「当前输出设备在出声多大声」的直读表（见 _OutputLevelMeter）。默认不开：
+        #   由真正的服务进程调 enable_output_meter() 打开，单元测试不会去碰真实声卡。
+        self._out_meter: _OutputLevelMeter | None = None
         # 打开成功但一帧都拿不到的输出设备。蓝牙耳机断开后 Windows 有时
         # 仍然把它报成可用，打开也不报错，就是没有数据。记下来，下次换一个。
         self._silent_captures: dict[str, float] = {}
@@ -255,10 +386,17 @@ class WaveLinkNode:
         self._gain_local_at: dict[str, float] = {}
         self._handled_stats_at = 0.0
         self._last_peer_stats = 0.0
+        # ★ 「我停了」的送达机制（见 _send_peer_stats 与 STATS_STOP_GRACE_S）：
+        #   _stats_last_keys —— 上一轮真正报过"在送"的那些；_stats_seen —— 它们的地址/端口；
+        #   _stats_grace    —— 刚停掉、还要继续报 want_listen=false 的那些（带截止时刻）。
+        self._stats_last_keys: set[str] = set()
+        self._stats_seen: dict[str, dict[str, Any]] = {}
+        self._stats_grace: dict[str, dict[str, Any]] = {}
+        # ★ ④ 对端（手机）点「走蓝牙」时请我这台电脑去连它的结果（面板 ⑦ 与诊断报告用）。
+        self._bt_requests: dict[str, dict[str, Any]] = {}
+        self._bt_request_at: dict[str, float] = {}
         # 每条路由的增益"最后一次被改"的墙钟毫秒（和对端交换的就是它）＋本机改动时刻
         self._gain_ts: dict[str, int] = {}
-        # 请求被拒的记录（用户关过它 / 总开关关了）——面板要说明"为什么没自动打开"
-        self._auto_listen_denied: dict[str, dict[str, Any]] = {}
         self.routes: list[dict[str, Any]] = []
         self._routes_lock = threading.RLock()
         self._stop = threading.Event()
@@ -273,6 +411,12 @@ class WaveLinkNode:
         # 对端再建、再推、本机再拉，全都会被这条规则过滤掉，永远回不来 ——
         # 现象就是"对端显示残留、一直在发，本机收不到也不响"（2026-10-11 实测）。
         self._dropped_ids: dict[str, float] = {}
+        # ★ 2026-10-19：每条路由"第一次出现在表里"的时刻（孤儿路由清扫用它算宽限期）。
+        self._route_first_seen: dict[str, float] = {}
+        # 孤儿路由清扫上次跑的時刻（节流用，见 tick()）。
+        self._last_orphan_sweep: float = 0.0
+        # "智连没开却被自动建出来"的路由清扫上次跑的時刻（节流用，见 tick()）。
+        self._last_auto_sweep: float = 0.0
         self._shared_sinks: dict[str, Any] = {}
         self.beacon: BeaconService | None = None
         self.devices: list[audio_base.AudioDevice] = []
@@ -572,6 +716,22 @@ class WaveLinkNode:
                 return detail != "capture"
         return True
 
+    def _bt_names(self) -> list[str]:
+        """我用蓝牙能收谁的音（名字列表）—— 交给发现信标，手机端据此决定要不要问用户。
+
+        用户原话（2026-10-15）：「手机界面点击送声音后，应当判断手机是否在电脑的蓝牙
+        设备列表里。如果是就让用户判断到底用蓝牙还是 WiFi。」
+
+        这里**只读缓存**：列设备要跑 3 秒 PowerShell，而信标每 2 秒发一次
+        （见 bluetooth.cached_names 的说明）。取不到就返回空表 —— 手机端照旧走 WiFi。
+        """
+        try:
+            from . import bluetooth as bt
+
+            return bt.cached_names()
+        except Exception:
+            return []
+
     def _autoconnect(self, wanted: list[str]) -> list[str]:
         """连上配置里写明的蓝牙设备。start 时调一次。"""
         from . import bluetooth as bt
@@ -618,6 +778,7 @@ class WaveLinkNode:
                 self.sink_list,
                 port=self.config.discovery_port,
                 version=__version__,
+                bt_provider=self._bt_names,
             )
             for peer in self.config.manual_peers:
                 host = str(peer.get("host") or "")
@@ -631,8 +792,8 @@ class WaveLinkNode:
             self.beacon.start()
         self.note("engine started on node %s (%s), audio port %d"
                   % (short_id(self.node_id), self.name, self.config.audio_port))
-        for target, thread_name in ((self._maintenance_loop, "wavelink-maintenance"),
-                                    (self._ping_loop, "wavelink-ping")):
+        for target, thread_name in ((self._maintenance_loop, "audiomixing-maintenance"),
+                                    (self._ping_loop, "audiomixing-ping")):
             worker = threading.Thread(target=target, name=thread_name, daemon=True)
             self._threads.append(worker)
             worker.start()
@@ -645,6 +806,9 @@ class WaveLinkNode:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._out_meter is not None:
+            self._out_meter.stop()
+            self._out_meter = None
         self.sender.stop_all()
         for engine in list(self.sinks.values()):
             self._stop_sink(engine.route_id)
@@ -765,6 +929,26 @@ class WaveLinkNode:
             self._sweep_dead_senders()
         except Exception as exc:
             self._note_once("残留清扫出错（已忽略）：%s" % exc)
+        # ★ 2026-10-19：孤儿路由清扫**不必**每半秒跑一次 —— 它只看"这张表是怎么构成的"，
+        #   而且一旦真要清就会触发一次 set_routes → apply_routes 调和（会话重建 = 一声"咔"）。
+        #   节流到 30 秒一次，把每 tick 的固定开销降下来（用户 2026-10-19 报了音频杂音，先排除
+        #   "周期性抖动"这一类原因）。判据本身没变，见 _sweep_orphan_routes。
+        if time.monotonic() - self._last_orphan_sweep >= self.ORPHAN_SWEEP_INTERVAL_S:
+            self._last_orphan_sweep = time.monotonic()
+            try:
+                self._sweep_orphan_routes()
+            except Exception as exc:
+                self._note_once("孤儿路由清扫出错（已忽略）：%s" % exc)
+        # ★ 2026-10-19 用户实测：「无论是否开启智连，设备都自动开启「听」「送」」——
+        #   智连没开却自动建出来的路由（两个方向）要清掉，否则卡片那两颗按钮会自己亮。
+        #   这条每 2 秒跑一次就够（用户点一下「智连」后最多 2 秒就恢复干净），开销只是一个
+        #   小遍历，不触发调和（没有该清的就不动路由表）。
+        if time.monotonic() - self._last_auto_sweep >= self.AUTO_ROUTE_SWEEP_INTERVAL_S:
+            self._last_auto_sweep = time.monotonic()
+            try:
+                self._sweep_unwanted_auto_routes()
+            except Exception as exc:
+                self._note_once("自动路由清扫出错（已忽略）：%s" % exc)
 
     def _apply_pushed_routes(self) -> None:
         """Accept route tables pushed by another node's control panel.
@@ -806,6 +990,73 @@ class WaveLinkNode:
     # 显式删除的路由压制多久。够长，能压住"推送删除"和"拉取合并"来回打架；
     # 又够短，用户在对端重建同一条路由后不用重启程序就能恢复。
     DROPPED_TTL = 120.0
+    # ★ 2026-10-19 孤儿路由（整条路由说的设备这台电脑从没见过）的宽限期。
+    #   给"路由先到、对方信标后到"留余量，别把刚推来的正常路由误扫掉。
+    ORPHAN_GRACE_S = 180.0
+    # 清扫本身的节流间隔：见 tick() 里那段说明（每半秒跑一次没必要，还会周期性打扰音频）。
+    ORPHAN_SWEEP_INTERVAL_S = 30.0
+    # "智连没开却被自动建出来"的路由（听/送两个方向）的清扫间隔：用户点一下按钮后要**很快**
+    # 看到卡片恢复"关着"，所以只节流到 2 秒。
+    AUTO_ROUTE_SWEEP_INTERVAL_S = 2.0
+
+    def _sweep_orphan_routes(self) -> None:
+        """清掉"整条路由都是在说一台这台电脑从来没见过的设备"的路由。
+
+        ★ 2026-10-19（用户连着两次反馈）：他在面板上看到一堆 `preview-…`「不在线 / 不可达」
+          的节点和红线 —— 那是我为了改功能在同一台电脑上起的**临时测试节点**留下的路由。
+          路由表是全网共享的（任何面板都能改，见 set_routes），被合进某台机器的内存表之后
+          就**再没人清**：它们的作者早就不在了，而两台机器还会互相把这张表推来推去，
+          于是删掉几秒后又回来（实测：本机删掉 8 条，另一台电脑还留着 7 条；只删一边没用）。
+
+        判据刻意选得**保守**，正常路由（对方只是关机了）不受任何影响：
+          · 注册表里的条目在本进程内**不会被删**（掉线只是把 online 置成 False），所以
+            "注册表里查不到"就等于"这台电脑从头到尾没见过这台设备"；
+          · 只要作者、或任意一端是本机自己 / 广播星号 / 注册表里认识的设备，就不算孤儿；
+          · 还有 ORPHAN_GRACE_S 宽限。
+        清掉时带上 drop 名单，对端在 TTL 内再推同样的 id 也会被挡住（不会来回打架）。
+        """
+        try:
+            alive = {str(r.get("id") or "") for r in self.routes if str(r.get("id") or "")}
+            for rid in list(self._route_first_seen):
+                if rid not in alive:
+                    self._route_first_seen.pop(rid, None)
+            now = time.monotonic()
+            orphans: list[str] = []
+            for rule in self.routes:
+                rid = str(rule.get("id") or "")
+                if not rid:
+                    continue
+                first = self._route_first_seen.setdefault(rid, now)
+                if now - first < self.ORPHAN_GRACE_S:
+                    continue
+                if self._route_is_orphan(rule):
+                    orphans.append(rid)
+            if not orphans:
+                return
+            gone = set(orphans)
+            self.set_routes([r for r in self.routes if str(r.get("id") or "") not in gone],
+                            drop=orphans)
+            self._note_once("清掉了 %d 条「整条路由都是没见过的设备」的残留路由"
+                            "（多半是别人测试留下的）" % len(orphans))
+        except Exception as exc:
+            self._note_once("孤儿路由清扫出错（已忽略）：%s" % exc)
+
+    def _route_is_orphan(self, rule: dict[str, Any]) -> bool:
+        """这条路由说的设备（作者 + 两端），这台电脑是不是**一个都没见过**？"""
+        tokens = [str(t) for t in (rule.get("from") or [])] + [str(t) for t in (rule.get("to") or [])]
+        tokens.append(str(rule.get("origin") or ""))
+        try:
+            for token in tokens:
+                if not token or token == "*":
+                    continue
+                if is_self_token(token, self.node_id, self.name):
+                    return False
+                if self.registry.get(token) is not None:
+                    return False
+            return True
+        except Exception:
+            return False
+
 
     def _purge_dropped(self) -> None:
         """把过期的"已删除路由"记录清掉，让同名路由有机会重新进来。"""
@@ -897,6 +1148,9 @@ class WaveLinkNode:
             except OSError as exc:
                 self.note("could not save config: %s" % exc)
         self.apply_routes()
+        # ★ 对端要**立刻**知道本机刚改了路由表 / 音量（见 push_peer_stats_now 的说明：
+        #   用户反馈的"调音量同步很慢""跨端自动启停很慢"就是这里等 2 秒造成的）。
+        self.push_peer_stats_now()
         return merged
 
     def _pull_peer_routes(self) -> None:
@@ -1106,6 +1360,26 @@ class WaveLinkNode:
                     continue
                 if not target.audio_port:
                     continue
+                # ★ 2026-10-19 用户：「智连按键反应的情况不真实 —— 智连未开启，设备也会自动开启「听」」。
+                #   对端自己"自动开始听本机"时，它在共享表里放下的是一条 `auto` 路由
+                #   本机→它（label=「对方请求收听（自动）」，见 _grant_listen_request）。
+                #   按用户第 6 条的口径：**只有这张卡片开着「智连」才自动接受它的「听」**；
+                #   没开就**不给声音** —— 而且要在卡片上如实写"已拦下"，不能让用户只能从
+                #   "居然能听到声音"里去反推（这就是他说的"按键反应不真实"）。
+                #   用户自己点「送给它」建的那条（不带 auto）不受影响，照发。
+                if self._is_auto_route(rule) and not self.smart_link_allows(target.node_id, target.name):
+                    key = "%s|%s" % (rule["id"], target.node_id)
+                    self._senders_blocked[key] = {
+                        "session_key": key,
+                        "route_id": rule["id"],
+                        "node_id": target.node_id,
+                        "name": target.name,
+                        "host": target.host,
+                        "smart_blocked": True,
+                        "text": ("「%s」想听本机的声音，但它没开「智连」→ 已拦下、不给声音"
+                                 "（要放行就在它的卡片上点「智连」）。" % target.name),
+                    }
+                    continue
                 # ★ 对端已经没了就别再发 ★ 见 PEER_SILENCE_GRACE_S 的注释：
                 # 路由的「到」是用户点选时写下的，对方关机后没人移除它，会一直白发。
                 # 注意：这里【不看】PeerEndpoints.online —— 它对"手动添加"的对端恒为 True
@@ -1138,7 +1412,15 @@ class WaveLinkNode:
             if not any(is_self_token(t, self.node_id, self.name) for t in rule["to"]) and "*" not in rule["to"]:
                 continue
             peers = [p for p in self._matching_nodes(rule["from"]) if p.node_id != self.node_id]
-            if not peers:
+            # ★ 2026-10-16 用户真机反馈第 6 条：「广播模式下。电脑开只听没有声音。」
+            #   根因就在这里：这条规则原来是"一个在线的发送方都没有 → 干脆不建播放端"。
+            #   频道（from:["*"]）是**广播式**的：收听方根本不需要先认识广播方 ——
+            #   谁在发就听谁。原来一旦对方还没被登记成在线设备（手动填的 IP、信标丢了、
+            #   路由器做了 AP 隔离），播放端就一个都不建，于是"开着只听、什么都没有"，
+            #   而面板上开关是亮着的，用户完全看不出为什么（探针复现：对方标离线后
+            #   desired_sinks 变空 → sinks 空 → 到的包只能写 "has no local sink yet"）。
+            #   所以只有**具名**规则（from 里没有通配）才要求"至少有一个在线对端"。
+            if not peers and "*" not in (rule.get("from") or []):
                 continue
             # A route may name the output it wants, but that name was typed on some
             # machine's panel and this table is shared with every node on the LAN. It
@@ -1276,6 +1558,39 @@ class WaveLinkNode:
         }
 
     def apply_routes(self) -> None:
+        """把"现在该收谁、该送谁"对齐到路由表上。
+
+        ★ 2026-10-16 真机崩溃后的**同线程重入保护**（WER 记录：Audio Mixing v1.31.exe /
+        audiomixing_launcher.dll / 0xC00000FD = 栈溢出，崩在用户拖音量那几分钟里）。
+        这条路原来是一条**同步递归回路**：
+            set_routes() → apply_routes() → _handle_peer_requests()
+              → _grant_listen_request() / _apply_shared_gain() / _revoke_auto_listen()
+              → set_routes() → …
+        手机每 2 秒一条 T_STATS（带 want_listen + gain/gain_rx），只要有一条"新"消息，
+        内层就把同一批消息**再处理一遍**、又改一次路由表、再进一层；探针实测嵌套到
+        **198 层**。源码运行时 Python 只是慢（每条控制消息白跑几百遍完整 reconcile ——
+        这正是用户说的"调音量反应很久"），Nuitka 打包版每帧占的 C 栈更大，
+        1MB 线程栈当场撑爆 → 应用直接消失，用户看到的就是"调音量时电脑端应用重启"。
+
+        只挡**同一条线程**里的重入（别的线程——HTTP 面板那条——照旧能进来）：
+        外层这一轮马上会带着新的路由表把收发两端 reconcile 完（_handle_peer_requests
+        在 desired_senders() 之前执行），所以被挡掉的内层调用不会漏掉任何事。
+        """
+        tl = getattr(self, "_apply_tls", None)
+        if tl is None:
+            tl = self._apply_tls = threading.local()
+        if getattr(tl, "on", False):
+            self._apply_reentered = int(getattr(self, "_apply_reentered", 0)) + 1
+            return
+        tl.on = True
+        started = time.monotonic()
+        try:
+            self._apply_routes_once()
+        finally:
+            tl.on = False
+            self._apply_ms = (time.monotonic() - started) * 1000.0
+
+    def _apply_routes_once(self) -> None:
         self.last_reconcile_at = time.time()
         # 0. 先把"哪台对端最近还在"的证据收齐：desired_senders() 要靠它决定还发不发。
         self._track_peer_liveness()
@@ -1533,7 +1848,8 @@ class WaveLinkNode:
         #    否则一条旧消息会在每个循环里被反复当成新证据，死掉的对端就永远不会被判死。
         try:
             cutoff = time.monotonic() - PEER_SILENCE_GRACE_S
-            for msg in list(self.receiver.control_messages):
+            # 两处都要看：老对端把 T_STATS 发音频端口，新对端发发现层（见 _control_messages）。
+            for msg in self._control_messages():
                 if float(msg.get("_at") or 0.0) <= cutoff:
                     continue
                 src = str(msg.get("_from") or "")
@@ -1608,15 +1924,86 @@ class WaveLinkNode:
         return None
 
     def _link_gains(self, peer_id: str) -> dict[str, Any]:
-        """我和这台对端两条链路的当前增益 + "最后一次改动时刻"（整数毫秒）。"""
+        """我和这台对端两条链路的当前增益 + "最后一次改动时刻"（整数毫秒）。
+
+        ★ 2026-10-16 真机反馈（"有时候听/送两条音量条都自己刷回 1"）：
+        这里原来**不管有没有那条路由**都报 `gain=1.0` —— "没有这条路由"和"音量就是 1.0"
+        在对面看起来一模一样，于是对面会把一个凭空来的 1.00 采纳过去（音量条当场跳回 1）。
+        现在：**没有那条路由就一个字都不报**（不报 = 对面什么都不做，
+        手机端的 `hasGain()` 本来就把缺字段当"老版本/没有值"处理）。有路由才报值。
+        """
         out = self._route_between(peer_id, "out")
         inn = self._route_between(peer_id, "in")
-        return {
-            "gain": round(float((out or {}).get("gain", 1.0)), 3),
-            "gain_ts": int(self._gain_ts.get(str((out or {}).get("id") or ""), 0)),
-            "gain_rx": round(float((inn or {}).get("gain", 1.0)), 3),
-            "gain_rx_ts": int(self._gain_ts.get(str((inn or {}).get("id") or ""), 0)),
-        }
+        gains: dict[str, Any] = {}
+        if out is not None:
+            rid = str(out.get("id") or "")
+            gains["gain"] = round(float(out.get("gain", 1.0)), 3)
+            gains["gain_ts"] = int(self._gain_ts.get(rid, 0))
+        if inn is not None:
+            rid = str(inn.get("id") or "")
+            gains["gain_rx"] = round(float(inn.get("gain", 1.0)), 3)
+            gains["gain_rx_ts"] = int(self._gain_ts.get(rid, 0))
+        return gains
+
+    def _control_messages(self) -> list[dict[str, Any]]:
+        """两处控制消息的合集：音频层（老对端）＋ 发现层（新对端）。
+
+        为什么必须两处都读：老版本对端只会把 T_STATS 发到音频端口（它不知道发现层这条
+        路），新对端发到发现层（那一层一直活着，不受音频接收器启停影响）。只读一处就会
+        漏掉一整类对端 —— 那正是"混跑时一台好一台坏"的来源，也是最难查的一种状态。
+        """
+        out: list[dict[str, Any]] = []
+        try:
+            out.extend(list(self.receiver.control_messages))
+        except Exception:
+            pass
+        beacon = self.beacon
+        if beacon is not None:
+            try:
+                out.extend(list(beacon.control_messages))
+            except Exception:
+                pass
+        return out
+
+    def _ctl_target(self, node_id: str, host: str) -> tuple[str, int] | None:
+        """这台对端能不能收"走发现层"的控制消息？能就给出 (地址, 发现端口)，否则 None。
+
+        判据是它信标里的 `ctl:1`（见 net/discovery.py 开头）。**只有对端支持才改路**：
+        老版本对端不认这层外衣，改过去就等于把控制消息全部打哑（它的接收器只在按需
+        启停时才活着，又收不到发现层的包）。
+        """
+        peer = None
+        try:
+            if node_id:
+                peer = self.registry.get(node_id)
+            if peer is None and host:
+                peer = self.registry.resolve(host)
+        except Exception:
+            peer = None
+        if peer is None or not bool(getattr(peer, "ctl", False)):
+            return None
+        port = int(getattr(peer, "disc_port", 0) or 0)
+        if port <= 0:
+            # 对端报了 ctl 但没报端口（理论上不会有）：按默认发现端口兜底，
+            # 而不是干脆不发 —— 少一条消息比整条链路哑掉难查得多。
+            port = int(self.config.discovery_port or proto.PORT_DISCOVERY)
+        return (str(getattr(peer, "host", "") or host), port)
+
+    def _send_ctl(self, body: dict[str, Any], node_id: str, host: str, port: int) -> None:
+        """把一条控制消息发出去：优先走发现层，对端不支持就退回音频端口（老格式）。"""
+        target = self._ctl_target(node_id, host) if self.beacon is not None else None
+        delivered = False
+        if target is not None:
+            try:
+                delivered = bool(self.beacon.send_control(body, target[0], target[1]))
+            except Exception:
+                delivered = False
+        if delivered:
+            return
+        try:
+            self.receiver.send_control(proto.T_STATS, body, (str(host), int(port)))
+        except Exception:
+            pass
 
     def _send_peer_stats(self, force: bool = False) -> None:
         """给"正在给它发声音"的对端发统计 + 收听请求 + 两条链路的共享增益。
@@ -1624,8 +2011,26 @@ class WaveLinkNode:
         用户要的两件事都搭在这个每 2 秒一次的统计包上：
           · 我点「送给它」→ 对方自动开始收听（want_listen，幂等）；
           · 两端音量条是同一个增益，谁调都以最新为准（gain/gain_rx + 时间戳）。
+
+        2026-10-15 起这条路分两条：对端信标里有 `ctl:1` 就发到它的<b>发现端口</b>
+        （那一层一直活着），否则照旧发<b>音频端口</b>（老版本只有这条路能收到）。
+        见 _ctl_target 与 net/discovery.py 开头的说明。
+
+        ★ 2026-10-15（用户反馈第 3 条「电脑停止送音后手机依旧收音不停止」）：
+        "我停了"这件事也必须送达 —— 停掉之后还要再报 {@link STATS_STOP_GRACE_S} 秒
+        `want_listen=false`。原来这个循环只遍历"还在送的会话"，我这边一停会话就没了，
+        一个包都发不出去，对端（手机）永远不知道我停了，它替自动打开的那条收听就一直开着。
+        （手机端早就为同一个原因加了 30 秒宽限，电脑端一直漏着。）
         """
         now = time.monotonic()
+        # ★ 2026-10-16 用户真机反馈第 3、5 条：「两边的音量调同步太慢了，要反应很久」、
+        #   「跨端自动启停（电脑开始送音→手机自动开收音 / 电脑停送→自动关）同样慢」。
+        #   根因就是下面这条 2 秒节流 —— 而它正是唯一携带 want_listen / gain / gain_rx
+        #   的那条消息。本机刚改过东西（见 push_peer_stats_now）时，这一次不等满 2 秒，
+        #   立刻发：对端看见新值的时间从"最多 2.5 秒"降到"几十毫秒"。
+        if getattr(self, "_ctl_push_pending", False):
+            self._ctl_push_pending = False
+            force = True
         if not force and now - getattr(self, "_last_peer_stats", 0.0) < 2.0:
             return
         self._last_peer_stats = now
@@ -1633,39 +2038,123 @@ class WaveLinkNode:
             sessions = list(self.sender.sessions.values())
         except Exception:
             return
+
+        # 这一轮真正要发给谁：key = node_id（没有就退回地址）。
+        targets: dict[str, dict[str, Any]] = {}
         for session in sessions:
             if int(getattr(session, "packets_sent", 0) or 0) <= 0:
                 continue          # 还没真发出过东西的先不发，免得对端收到"空统计"
             peer_id = str(getattr(session, "node_id", "") or "")
+            key = peer_id or str(getattr(session, "host", "") or "")
+            if not key:
+                continue
+            # ★ 2026-10-16 用户把广播的语义钉死了（原话）：「广播是和路由独立开的…广播就是设备
+            #   想说就说想听就听，但是不能关闭或者开启其他设备的听说…就像 FM 广播一样」。
+            #   所以：频道广播这条线上的目标**不再报 want_listen** —— 那是"我在针对性送给你、
+            #   请你自动打开收听"，会替对端去开它的收听路由（等于替别人开关"听"）。
+            #   电台就是电台：我的声音发出去，想听的人自己调台（对端自己开「听广播」）。
+            #   音频本身照发（这一层不变），变的只是这条控制消息里的那个请求。
+            broadcast_line = str(getattr(session, "route_id", "") or "") == CHANNEL_ROUTE_ID
+            targets[key] = {
+                "node_id": peer_id,
+                "host": str(session.host),
+                "port": int(session.port),
+                "sending": True,
+                "sent": int(getattr(session, "packets_sent", 0) or 0),
+                "bytes": int(getattr(session, "bytes_sent", 0) or 0),
+                "want_listen": not broadcast_line,
+            }
+
+        # 上一轮报过、这一轮不再报的那些 = 刚刚停掉（或失联）的 → 进宽限期继续报"我没送"。
+        for key in list(getattr(self, "_stats_last_keys", ())):
+            if key in targets or key in self._stats_grace:
+                continue
+            known = dict(self._stats_seen.get(key) or {})
+            if not known.get("host"):
+                continue
+            self._stats_grace[key] = dict(known, until=now + STATS_STOP_GRACE_S)
+        for key, info in list(self._stats_grace.items()):
+            if now > float(info.get("until") or 0.0):
+                self._stats_grace.pop(key, None)
+                continue
+            # 又送起来了就不再报"我停了"（targets 里已经有它）
+            targets.setdefault(key, dict(info, sending=False, want_listen=False,
+                                         sent=0, bytes=0))
+        self._stats_last_keys = {k for k, t in targets.items() if t.get("sending")}
+        self._stats_seen = {k: dict(t) for k, t in targets.items()}
+
+        # ★ 把"我从你那儿收了多少"也报回去（2026-10-15 自查发现的缺口）：
+        #   手机端设备卡片上那句「它收 N 包 丢 M 缓冲 Xms」读的就是 recv / lost / buf_ms，
+        #   而电脑端从来只报 sent，没报过这几个 —— 于是手机上永远显示"它收 0 包"，
+        #   明明正在收。跨端排查时这是一条会被当成"包没到"的假证据。
+        rx_by_peer = self._peer_recv_stats()
+
+        for key in targets:
+            info = targets[key]
+            peer_id = str(info.get("node_id") or "")
+            host = str(info.get("host") or "")
+            if not host:
+                continue
             gains = self._link_gains(peer_id) if peer_id else {}
+            rx = rx_by_peer.get(peer_id) or {}
             body = {
                 "t": "stats",
                 "node": self.node_id,
                 "name": self.name,
-                "sending": True,
-                "sent": int(getattr(session, "packets_sent", 0) or 0),
-                "bytes": int(getattr(session, "bytes_sent", 0) or 0),
-                # ★ 请求对方自动收听我（幂等：还在送就一直 true）
-                "want_listen": True,
-                # ★ 两条链路的共享增益，字段名与手机端一致
-                "gain": gains.get("gain", 1.0),
-                "gain_ts": int(gains.get("gain_ts", 0)),
-                "gain_rx": gains.get("gain_rx", 1.0),
-                "gain_rx_ts": int(gains.get("gain_rx_ts", 0)),
+                "sending": bool(info.get("sending")),
+                "sent": int(info.get("sent") or 0),
+                "bytes": int(info.get("bytes") or 0),
+                "recv": int(rx.get("recv") or 0),
+                "lost": int(rx.get("lost") or 0),
+                "buf_ms": int(rx.get("buf_ms") or 0),
+                "streams": int(rx.get("streams") or 0),
+                # ★ 请求对方自动收听我（幂等：还在送就一直 true；停了自然变 false）
+                #   ★ 2026-10-19 用户实测：「无论是否开启智连，设备都自动开启「听」「送」」——
+                #     这条请求原来**无条件**发出去：对端（尤其是旧版本：全局自动接受、默认开着、
+                #     根本没有智连这一层）收到就替它把收听打开 —— 等于**绕过本机的智连，
+                #     替对端开了「听」**。现在只在这张设备的「智连」开着时才发这条请求：
+                #     没开就不发，对端（含旧版本）自然不会被要求自动开收听。
+                "want_listen": bool(info.get("want_listen")) and self._smart_wants_listen(peer_id),
             }
+            # ★ 两条链路的共享增益，字段名与手机端一致。
+            #   没有那条路由时**不写这两个字段**（见 _link_gains 的说明：凭空报 1.0 会让对面
+            #   把音量条刷回 1；缺字段对面就什么都不做）。
+            body.update(gains)
+            self._send_ctl(body, peer_id, host, int(info.get("port") or 0))
+
+    def _peer_recv_stats(self) -> dict[str, dict[str, int]]:
+        """{对端 node_id: 我从它那儿收到的包/丢包/缓冲/流数} —— 回给对端自己看。
+
+        为什么按 node_id 聚合而不是按地址：接收端的流表就是按 node_id 记的
+        （见 rtpaudio.StreamInfo.node_id），一台对端可能有不止一条流（多条路由），
+        对端真正想知道的是"我发出去的总共到了多少"，所以这里做的是求和。
+
+        解析不出来就当空表：这只是"给对方看的一行数字"，绝不能因为它让统计包发不出去。
+        """
+        out: dict[str, dict[str, int]] = {}
+        try:
+            streams = self.receiver.stats().get("streams") or []
+        except Exception:
+            return out
+        for item in streams:
+            pid = str(item.get("node_id") or "")
+            if not pid:
+                continue
+            acc = out.setdefault(pid, {"recv": 0, "lost": 0, "buf_ms": 0, "streams": 0})
+            acc["recv"] += int(item.get("packets") or 0)
+            acc["lost"] += int(item.get("lost") or 0)
             try:
-                self.receiver.send_control(proto.T_STATS, body,
-                                           (str(session.host), int(session.port)))
-            except Exception:
-                pass
+                buffered = int(round(float(item.get("buffered_ms") or 0)))
+            except (TypeError, ValueError):
+                buffered = 0
+            acc["buf_ms"] = max(acc["buf_ms"], buffered)
+            acc["streams"] += 1
+        return out
 
     def _handle_peer_requests(self) -> None:
         """处理对端发来的 T_STATS：① 它请我听它 → 自动建路由（可撤销）；② 共享增益。"""
         now = time.monotonic()
-        try:
-            messages = list(self.receiver.control_messages)
-        except Exception:
-            return
+        messages = self._control_messages()
         for msg in messages:
             if str(msg.get("_type") or "") != "STATS":
                 continue
@@ -1675,9 +2164,29 @@ class WaveLinkNode:
             src = str(msg.get("_from") or "")
             host = src.split(":")[0]
             node_id = str(msg.get("node") or msg.get("node_id") or msg.get("listen_from") or "")
+            # ★ 手机端的 T_STATS 负载里【没有 node 字段】（2026-10-15 实测：它只报
+            #   name / target / want_listen / gain…）。没有 id 会一起踩两个坑：
+            #   ① _grant_listen_request 直接早退 →「手机在送、电脑不接」，
+            #      日志里反复出现 "stream … has no local sink yet"；
+            #   ② 下面两条共享增益也进不去 → 两端音量条对不上。
+            #   手机的发现信标里一直带着 id，所以按来源 IP 从发现表反查即可。
+            #   （手机老版本也能立刻好；新 APK 会自己把 node 报上来，这条只是兜底。）
+            if not node_id:
+                node_id = self._node_id_for_host(host)
             name = str(msg.get("name") or msg.get("listen_name") or host or "对端")
             if bool(msg.get("want_listen")):
                 self._grant_listen_request(node_id, name, host)
+            elif node_id:
+                # ★ ④ 对端自己把「送声音」关了 → 把**我们当初替它自动打开的那条**收听收回来。
+                #   用户真机反馈（2026-10-15）：「手机 WiFi 送声音关闭后，电脑听的选项不会自动关」。
+                #   边界：只撤 auto 建的（created=True）；用户自己建的收听、用户的"永不再自动"
+                #   名单都不碰 —— 撤销不是惩罚，只是把当初替他打开的那一下收回去。
+                self._revoke_auto_listen(node_id)
+            # ★ ④ 对端点「走蓝牙」→ 请**电脑**去连它的蓝牙（用户原话：应当由电脑发送
+            #   蓝牙请求并配对互相连接）。连接要跑几秒 PowerShell，所以丢后台线程，
+            #   绝不能在收包线程上做。
+            if bool(msg.get("want_bt")):
+                self._request_bluetooth(node_id, name)
             # 对端的 gain 是"它→我"这条链路（= 我的「我听它的」）
             if msg.get("gain") is not None and node_id:
                 self._apply_shared_gain(node_id, "in", float(msg["gain"]),
@@ -1688,14 +2197,80 @@ class WaveLinkNode:
                                         self._as_ms(msg.get("gain_rx_ts")))
         self._handled_stats_at = now
 
-    def listen_optout_keys(self) -> set[str]:
-        """用户明确关掉过自动收听的设备（node_id / 名字，小写）。"""
-        return {str(x).strip().lower()
-                for x in (getattr(self.config, "listen_optout", None) or []) if str(x).strip()}
+    def _request_bluetooth(self, node_id: str, name: str) -> None:
+        """对端（手机）点「走蓝牙」：由**电脑这边**去连它的蓝牙。
 
-    def set_listen_optout(self, node_id: str, name: str = "", on: bool = True) -> dict[str, Any]:
-        """把一台设备加进/移出"永不再自动收听"名单（面板上的撤销 / 这次打开）。"""
-        keys = [str(x).strip() for x in (getattr(self.config, "listen_optout", None) or [])
+        用户原话（2026-10-15）：「手机确认走蓝牙后应当由电脑发送蓝牙请求并配对互相连接」。
+
+        为什么必须节流（30 秒一台只试一次）：这条请求会跟着每 2 秒一次的统计包
+        幂等地重复到达，而一次连接要跑几秒 PowerShell 起一个 helper —— 不节流就会
+        反复去连，把用户正握着的音频链路顶掉。
+        """
+        key = str(node_id or name or "")
+        if not key:
+            return
+        now = time.monotonic()
+        if now - float(self._bt_request_at.get(key, 0.0)) < 30.0:
+            return
+        self._bt_request_at[key] = now
+        self._bt_requests[key] = {"name": name, "at": time.time(), "state": "connecting",
+                                 "ok": False}
+        self.note("对端「%s」请求走蓝牙，正在连它…" % name)
+
+        def run() -> None:
+            try:
+                from . import bluetooth as bt
+
+                result = dict(bt.connect_by_name(name) or {})
+            except Exception as exc:
+                result = {"ok": False, "state": "error", "error": str(exc)}
+            result.update({"name": name, "at": time.time()})
+            self._bt_requests[key] = result
+            self.note("蓝牙连接「%s」：%s" % (name, result.get("error") or result.get("state") or "完成"))
+
+        threading.Thread(target=run, name="audiomixing-bt-request", daemon=True).start()
+
+    def bluetooth_requests(self) -> list[dict[str, Any]]:
+        """对端请求过蓝牙的记录（面板 ⑦ 和诊断报告要看）。"""
+        return list(self._bt_requests.values())
+
+    def _node_id_for_host(self, host: str) -> str:
+        """按 IP 从发现表反查对端的 node id；查不到返回空串。
+
+        为什么要它：T_STATS 的负载里可能没有 node 字段（手机端就是如此），而
+        "给谁自动开门""跟谁同步音量"都必须认 id。发现表里的对端记录一直带着 id，
+        按来源 IP 就能对上 —— 也不依赖对端升级。查不到就退回原来的行为（不认领）。
+        """
+        if not host:
+            return ""
+        try:
+            peer = self.registry.resolve(host)
+        except Exception:
+            return ""
+        return str(getattr(peer, "node_id", "") or "")
+
+    def smart_link_keys(self) -> set[str]:
+        """开了「智连」的设备（node_id / 名字，小写）。
+
+        ★ 2026-10-18 用户第 6 条：这张名单取代了原来的两个旧口径
+          （全局总开关 auto_accept_listen + "关过一次就永不再自动"的黑名单 listen_optout）。
+          旧口径正是他报的第 1 条那个 bug 的根因：手机端关过一次收听，之后电脑再怎么点
+          「送给它」，手机都永远不再自动打开收音。现在只有一件事说了算 ——
+          **这台设备你有没有点开「智连」**：开了就一定自动，没开就一定不自动，不存在中间态。
+        """
+        return {str(x).strip().lower()
+                for x in (getattr(self.config, "smart_link", None) or []) if str(x).strip()}
+
+    def smart_link_allows(self, node_id: str, name: str = "") -> bool:
+        """这台设备有没有开「智连」（node_id 或名字命中都算）。"""
+        keys = self.smart_link_keys()
+        if not keys:
+            return False
+        return any(str(v).strip().lower() in keys for v in (node_id, name) if str(v).strip())
+
+    def set_smart_link(self, node_id: str, name: str = "", on: bool = True) -> dict[str, Any]:
+        """把一台设备加进/移出「智连」名单（就是设备卡片上那颗按钮）。"""
+        keys = [str(x).strip() for x in (getattr(self.config, "smart_link", None) or [])
                 if str(x).strip()]
         targets = {k.lower() for k in (node_id, name) if str(k).strip()}
         kept = [k for k in keys if k.lower() not in targets]
@@ -1704,40 +2279,126 @@ class WaveLinkNode:
                 value = str(value).strip()
                 if value and value not in kept:
                     kept.append(value)
-        self.config.listen_optout = kept
+        self.config.smart_link = kept[:16]
         try:
             self.config.save()
         except Exception:
             pass
-        if not on:
-            self._auto_listen_denied.pop(node_id, None)
-        return {"ok": True, "optout": kept, "on": bool(on)}
+        self.note("「智连」%s：%s" % ("已开" if on else "已关", name or node_id))
+        return {"ok": True, "smart_link": kept, "on": bool(on)}
 
-    def _record_listen_denied(self, node_id: str, name: str, reason: str) -> None:
-        self._auto_listen_denied[node_id] = {
-            "node_id": node_id, "name": name, "reason": reason, "at": time.time(),
-        }
-        # 只留最近几条，免得一直堆着
-        if len(self._auto_listen_denied) > 5:
-            oldest = sorted(self._auto_listen_denied.items(), key=lambda kv: kv[1]["at"])[0][0]
-            self._auto_listen_denied.pop(oldest, None)
+    def _revoke_auto_listen(self, node_id: str) -> None:
+        """对端停了送声音 → 收回本机替它自动打开的那条收听路由。
+
+        用户真机反馈（2026-10-15）：「手机 WiFi 送声音关闭后，电脑听的选项不会自动关」。
+        只认"我们建的"（记录里 created=True）：如果那条路由本来就是用户自己建的，
+        当初只是记了一笔，这时绝不能替他删掉 —— 那就变成"程序动了用户的设置"。
+        """
+        record = self._auto_listen_granted.pop(node_id, None)
+        if not record or not record.get("created"):
+            return
+        route_id = str(record.get("route_id") or "")
+        if not route_id:
+            return
+        left = [r for r in self.routes if str(r.get("id") or "") != route_id]
+        if len(left) == len(self.routes):
+            return
+        try:
+            self.set_routes(left)
+            self.note("对方（%s）停了送声音，已收回自动打开的收听" % (record.get("name") or node_id))
+        except Exception as exc:
+            self.note("收回自动收听失败：%s" % exc)
+
+    def _peer_name_of(self, node_id: str) -> str:
+        """node_id → 显示名（注册表里的记录就带着名字）；查不到就回空串。
+
+        为什么不用 webui 里那个 `_name_of`：那是界面层的局部函数，引擎里没有它 —— 直接写
+        `self._name_of` 会被 AttributeError 吞掉（except 里返回 False），表现出来就是
+        "智连开着也不生效"。这个坑 2026-10-19 就是它造成的，测试当场抓到。
+        """
+        try:
+            peer = self.registry.get(node_id)
+            return str(getattr(peer, "name", "") or "")
+        except Exception:
+            return ""
+
+    def _smart_wants_listen(self, node_id: str) -> bool:
+        """要不要请求对端"自动收听本机" —— 只看这张设备的「智连」（默认关）。
+
+        ★ 2026-10-19 用户实测：「无论是否开启智连，设备都自动开启「听」「送」」。
+          根因之一是这条请求（want_listen）原来无条件发出去 —— 对端（旧版本尤其）收到就替
+          它自己开了收听。智连没开就不发这个请求，「自动开听」从源头上就没有了。
+        """
+        try:
+            return self.smart_link_allows(node_id, self._peer_name_of(node_id))
+        except Exception:
+            return False
+
+    def _is_auto_route(self, rule: dict[str, Any]) -> bool:
+        """这条路由是不是"自动建的"。
+
+        ★ 2026-10-19：判据必须**跨版本**成立 —— 对端可能还是旧版本（v1.34 / 没重装的手机），
+          它建的那条自动收听路由里**没有 `auto` 字段**（这个字段是 v1.35 才有的），只看 `auto`
+          会让旧版本推来的自动路由被当成"用户手动建的"，照样收发、按钮照样自动亮（用户实测
+          看到的就是这个）。所以三个特征任一命中就算自动：`auto` 字段 / id 前缀 `auto-listen-` /
+          label 文本（这三样里 id 前缀自 v1.28 就没变过）。
+        """
+        if bool(rule.get("auto")):
+            return True
+        if str(rule.get("id") or "").startswith("auto-listen-"):
+            return True
+        return str(rule.get("label") or "").strip() == AUTO_LISTEN_LABEL
+
+    def _auto_route_unwanted(self, rule: dict[str, Any]) -> bool:
+        """这条自动路由的"对面那台设备"没有开「智连」吗？（两个方向都按这个判）"""
+        if not self._is_auto_route(rule):
+            return False
+        try:
+            for token in list(rule.get("from") or []) + list(rule.get("to") or []):
+                token = str(token or "")
+                if not token or token == "*":
+                    continue
+                if is_self_token(token, self.node_id, self.name):
+                    continue
+                if not self.smart_link_allows(token, self._peer_name_of(token)):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _sweep_unwanted_auto_routes(self) -> None:
+        """清掉"本机没开智连、却被自动建出来"的路由 —— **听、送两个方向都清**。
+
+        ★ 2026-10-19 用户实测：「无论是否开启智连，设备都自动开启「听」「送」」。
+          这类路由留着，卡片上那两颗按钮就会自己亮起来（用户看到的就是这个），
+          所以直接清掉、并记进"已删除"名单挡一段时间（挡住对端把同样的 id 再推回来），
+          让面板如实显示"关着"。等用户真的点了「智连」，对端再请求时才会重新建（那是应该的）。
+        两个来源都在这里收口：
+          · 本机自己曾经替对端建的（现在请求已经不发，这些是历史残留）；
+          · 对端（旧版本）建好推过来的（判据见 _is_auto_route，跨版本认得出来）。
+        """
+        unwanted = [str(r.get("id") or "") for r in self.routes
+                    if r.get("id") and self._auto_route_unwanted(r)]
+        if not unwanted:
+            return
+        gone = set(unwanted)
+        self.set_routes([r for r in self.routes if str(r.get("id") or "") not in gone],
+                        drop=unwanted)
+        self._note_once("清掉了 %d 条「智连没开、却被自动建出来」的路由（听/送两个方向都清）"
+                        % len(unwanted))
 
     def _grant_listen_request(self, node_id: str, name: str, host: str) -> None:
         """对端说"我在给你发声音，请收听我" → 自动建一条 从它到本机 的路由。
 
-        用户要的是"按下发送键，对方自动就能听见"。但【不能静默改别人的设置】：
-        · 这条路由带 auto 标记，面板上明确写"对方请求收听，已自动打开"，并且能一键撤销；
-        · 撤销过的设备进"永不再自动"名单（与手机端同名行为）；
-        · 总开关 auto_accept_listen 可以让用户整体关掉这件事。
+        ★ 2026-10-18 用户第 6 条：判据只剩一条 —— **这台设备有没有开「智连」**。
+          开了就一定自动打开收听；没开就什么都不做（也不再记"被拒"的账：
+          用户明确说那种自动打开的提示/警告不要出现在界面上）。
+          顺带修掉用户第 1 条「电脑主动发送声音手机不会主动接收」——
+          旧口径里那个"关过一次就永不再自动"的黑名单，在手机端就是同一个病根，两端一起拆了。
         """
         if not node_id or node_id == self.node_id:
             return
-        if not bool(getattr(self.config, "auto_accept_listen", True)):
-            self._record_listen_denied(node_id, name, "你已经关掉了「自动接受收听请求」")
-            return
-        keys = self.listen_optout_keys()
-        if node_id.lower() in keys or (name and name.lower() in keys):
-            self._record_listen_denied(node_id, name, "你之前关过它")
+        if not self.smart_link_allows(node_id, name):
             return
         existing = None
         for rule in self.routes:
@@ -1761,6 +2422,18 @@ class WaveLinkNode:
             "source_device": "", "sink_device": "",
             "label": AUTO_LISTEN_LABEL, "origin": node_id, "auto": True,
         }
+        # ★ 2026-10-18 用户第 1 条「电脑主动发送声音手机不会主动接收」的**第二层根因**（自查抓到）：
+        #   这条路由的 id 是**按节点算出来的固定值**（auto-listen-<短id>），而 `set_routes(..., drop=)`
+        #   会把"刚被删掉"的 id 记进 `_dropped_ids`，并在 DROPPED_TTL（120 秒）内拒绝任何同名路由被加回来。
+        #   偏偏我们**自己**会在"对端停了送声音"时调用 `_revoke_auto_listen()` 把这条路由删掉 ——
+        #   于是：电脑送一下 → 自动开；电脑停一下 → 我们自己把它删掉并记进名单；
+        #   电脑再送 → 同名路由在 2 分钟内加不回来 → 症状正是"电脑主动发送、手机不主动接收"。
+        #   那份删除记忆的本意是**尊重别的节点删掉的路由**；这里是我们**故意**为这台设备重新开一条，
+        #   所以必须把自己那笔删除记忆清掉（否则就是被自己挡住）。
+        try:
+            self._dropped_ids.pop(rule["id"], None)
+        except Exception:
+            pass
         try:
             self.set_routes(list(self.routes) + [rule])
         except Exception as exc:
@@ -1772,8 +2445,14 @@ class WaveLinkNode:
         }
         self.note("「%s」请求收听本机 → 已自动加了一条路由（可在面板上一键撤销）" % name)
 
-    def _revoke_auto_listen(self, node_id: str, name: str = "") -> None:
-        """只撤掉【自动建的】那一条，用户自己建的路由不动（面板撤销走的是这条）。"""
+    def _revoke_auto_listen(self, node_id: str) -> None:
+        """只撤掉【自动建的】那一条，用户自己建的路由不动。
+
+        ★ 2026-10-18：这里**不再**顺手把设备写进"永不再自动"名单了。
+          那个动作是单向的、界面看不见的，而它造成的症状正是用户报的第 1 条
+          （对方一旦被记进去，之后对方再怎么送声音都不会再自动打开）。
+          现在"要不要自动"只由设备卡片上的「智连」决定，收回一条路由不改变那个选择。
+        """
         if not node_id:
             return
         auto_ids = [str(r.get("id")) for r in self.routes
@@ -1785,7 +2464,6 @@ class WaveLinkNode:
             except Exception:
                 pass
         self._auto_listen_granted.pop(node_id, None)
-        self.set_listen_optout(node_id, name, on=True)
 
     def _apply_shared_gain(self, peer_id: str, direction: str, value: float, ts: int) -> None:
         """共享增益：对端调了音量条 → 本机对应那条路由跟着变（谁最后动以谁为准）。
@@ -1793,11 +2471,15 @@ class WaveLinkNode:
         两条链路的语义（与手机端一致）：
           direction='in'  → 它→我（我的「我听它的」），对端用 gain/gain_ts 报过来；
           direction='out' → 我→它（我的「我送它的」），对端用 gain_rx/gain_rx_ts 报过来。
-        判新旧的规则：
-          · 时间戳按整数比，大者新；
+        判新旧的规则（★ 2026-10-16 按真机反馈重写）：
           · 值一样就只对齐时间戳、绝不回推（否则两端会互相弹）；
-          · 本机 0.8 秒内刚动过这条 → 不抢（用户正在拖）；
-          · 时钟偏差兜底：本机 5 秒没动过，就采纳对端的值（手机端同规则）。
+          · 本机 **1.2 秒**内刚动过这条 → 不抢（用户正在拖）；
+          · 其余情况**最后到达的为准**。
+        ★ 为什么不再拿时间戳判新旧：两台机器的墙钟本来就对不齐。原来那条
+          「本机 5 秒没动过才采纳对端的值」在真机上的表现正是用户报的两件事 ——
+          拖完音量**对端要等约 5 秒才跟上**，而 5 秒一到又会把一个默认值采纳进来、
+          **两条音量条自己刷回 1.00**。延迟和回弹是同一个原因。
+          时间戳现在只当"我上次改动的时刻"写回去（报给对方看），不参与该不该采纳的决定。
         """
         rule = self._route_between(peer_id, direction)
         if rule is None:
@@ -1809,9 +2491,7 @@ class WaveLinkNode:
             self._gain_ts[rid] = max(my_ts, ts)
             return
         idle = time.monotonic() - self._gain_local_at.get(rid, 0.0)
-        if idle < 0.8:
-            return
-        if not (ts > my_ts or idle > 5.0):
+        if idle < 1.2:
             return
         updated = [dict(r) if str(r.get("id")) == rid else r for r in self.routes]
         for item in updated:
@@ -1836,40 +2516,90 @@ class WaveLinkNode:
         self._gain_local_at[rid] = time.monotonic()
         self._gain_ts[rid] = int(time.time() * 1000)
 
+    def push_peer_stats_now(self) -> None:
+        """本机刚改了路由表 / 音量 → **立刻**把控制消息推给对端，不等那 2 秒一次的周期。
+
+        用户真机反馈（2026-10-16）：
+          · 「两边的音量调同步太慢了，要反应很久」—— 拖完滑块，对端最多要等 2 秒才看见；
+          · 「跨端自动启停同样慢」—— 电脑开始/停止送音，手机那一端要等 2 秒才开/关收音。
+        这两件事都由 `_send_peer_stats` 承载，而它是 2 秒一次的节流循环。
+        这里只做两件事：置一个"这一次别等"的标记，然后叫醒维护循环（它本来就有 wake()）——
+        UDP 仍然由维护线程去发，HTTP 请求线程不会为了一个包去等网络。
+        """
+        self._ctl_push_pending = True
+        self.wake()
+
     def auto_listen_state(self) -> dict[str, Any]:
-        """面板要的那份"自动收听"记录：谁请求的、建了哪条路由、以及被拒的原因。"""
+        """「智连」当前的实况：哪几台设备开了、以及引擎替它们自动建了哪几条收听路由。
+
+        ★ 2026-10-18 改口径：以前这里还回一份"被拒请求 + 原因"（denied），因为那时
+          自动打开是**默认行为**，被挡下来必须让用户看见。现在默认全关、由每台设备的
+          「智连」决定（用户第 6 条），所以没有"被拒"这个概念了 —— 字段一起去掉，
+          省得留一份没人看、又在 /api/status 里撑着旧逻辑的数据。
+        """
         items = []
         for info in self._auto_listen_granted.values():
             rule_id = str(info.get("route_id") or "")
             alive = any(str(r.get("id")) == rule_id for r in self.routes)
             items.append(dict(info, active=alive,
                               age_s=round(time.time() - float(info.get("at") or 0), 1)))
-        denied = [dict(v, age_s=round(time.time() - float(v.get("at") or 0), 1))
-                  for v in self._auto_listen_denied.values()
-                  if time.time() - float(v.get("at") or 0) < 600.0]
-        return {"items": items, "denied": denied, "label": AUTO_LISTEN_LABEL,
-                "auto_accept": bool(getattr(self.config, "auto_accept_listen", True))}
+        return {"items": items, "label": AUTO_LISTEN_LABEL,
+                "smart": sorted(getattr(self.config, "smart_link", None) or [])}
+
+    def smart_link_accepts(self, name: str) -> bool:
+        """这台设备的声音要不要"自动收下并播放" —— 只看它有没有开「智连」。
+
+        ★ 2026-10-18 用户（图2）：「「正在发送的手机自动播放」就是蓝牙的「智连」」——
+          原来那个面板上的全局勾（`config.auto_play`）就是这个判断，现在整块删掉：
+          局域网设备看 `smart_link`（卡片上的「智连」），蓝牙设备看 `autoconnect`
+          （同一张蓝牙卡片上的「智连」）。默认两张名单都是空的 = 一台都不自动。
+        """
+        want = str(name or "").strip().lower()
+        if not want:
+            return False
+        try:
+            if self.smart_link_allows("", want):
+                return True
+        except Exception:
+            pass
+        try:
+            return want in {str(x).strip().lower() for x in (self.config.autoconnect or []) if str(x).strip()}
+        except Exception:
+            return False
 
     def _auto_play_sources(self) -> None:
-        """Adopt a phone the moment it starts sending.
+        """把**已经开了「智连」的那台设备**正在送进来的声音收编成音源（= 自动播放）。
 
-        On a LAN the operator knows what is on the network, and the click that used to
-        be required was exactly the step where the audio went missing. Muted phones are
-        left alone, so the mute button means something.
+        ★ 2026-10-18 用户（图2）：这条原来由一个全局开关（面板上「正在发送的手机自动播放」）
+          无条件打开 —— 现在改成**逐台设备**判断，判据就是那张卡片上的「智连」，默认关。
+          少了这个开关不等于少了能力：没开「智连」的设备仍然可以手动加进「音源」
+          （频道那一页的「加入并开直通」，或者手机上自己点「收听」），只是不替用户做主。
         """
-        if not getattr(self.config, "auto_play", True):
-            return
         from .audio.backends import netmic as netmic_backend
         try:
-            live = [m for m in netmic_backend.active() if not m.muted]
+            names = [m.name for m in netmic_backend.active()
+                     if not m.muted and self.smart_link_accepts(m.name)]
         except Exception:
             return
-        if not live:
+        # ★ 蓝牙进来的手机声音（Windows 那边是一块采集设备「麦克风 (手机名 A2DP SNK)」）：
+        #   同一张蓝牙卡片上的「智连」开了，就同样自动收编它 —— 用户图2 说的就是这件事
+        #   （"「正在发送的手机自动播放」就是蓝牙的「智连」"）。
+        try:
+            for dev in (getattr(self, "devices", None) or []):
+                if getattr(dev, "kind", "") != audio_base.KIND_SOURCE:
+                    continue
+                phone = bt_sink_phone_name(getattr(dev, "name", "") or "")
+                if phone and phone not in names and self.smart_link_accepts(phone):
+                    names.append(phone)
+        except Exception:
+            pass
+        if not names:
             return
         # A name whose phone has been gone for a while is dropped from the sources: it
         # would otherwise accumulate forever (renamed phones, one-off tests), and every
         # stale name is one more thing that can keep the mix from opening. Auto-play
-        # re-adopts the phone the moment it comes back, so nothing is lost.
+        # re-adopts the phone the moment it comes back (while its 「智连」 is on), so
+        # nothing is lost.
         try:
             gone = [m.name for m in netmic_backend.MICS.values()
                     if m.bytes_in > 0 and (time.monotonic() - m.last_push) > PRUNE_AFTER_S]
@@ -1885,13 +2615,13 @@ class WaveLinkNode:
                 except Exception:
                     pass
         current = [str(s).strip() for s in self.config.channel_sources]
-        added = [m.name for m in live if m.name not in current]
+        added = [n for n in names if n not in current]
         if not added:
             return
         self.config.channel_sources = current + added
         if not self.config.local:
             self.config.local = True
-        self._note_once("自动收编正在发送的手机：%s" % "、".join(added))
+        self._note_once("「智连」自动收下正在发送的设备：%s" % "、".join(added))
         try:
             self.config.save()
         except Exception:
@@ -2173,7 +2903,7 @@ class WaveLinkNode:
                 "text": "音源「%s」%s。" % (name, reason),
                 "advice": ("这块设备当前没有声音在播（虚拟声卡空转时就是采不到，"
                            "比如网易 UU 远程的虚拟声卡）；换成你真正的输出设备试试 —— "
-                           "⑥的「音源」里改，或 ⑧ 设置 → 采集设备。"),
+                           "「频道」的「音源」里改，或「设置」。"),
             })
 
         receivers = 0
@@ -2209,7 +2939,7 @@ class WaveLinkNode:
                 "scope": "channel",
                 "level": "bad",
                 "text": "广播没有音源，一个字节都不会发。" + "；".join(blocked),
-                "advice": ("请在⑥的「音源」里选一块本机设备 —— 一般是「扬声器 (...) [loopback]」，"
+                "advice": ("请在「频道」的「音源」里选一块本机设备 —— 一般是「扬声器 (...) [loopback]」，"
                            "也就是这台电脑正在播放的声音。网络上的另一台手机/电脑不是本机的音源："
                            "它必须自己打开「广播我的声音」或「送声音」。"),
             })
@@ -2315,7 +3045,7 @@ class WaveLinkNode:
                 while self._probe_name and time.time() < until:
                     time.sleep(0.2)
 
-        threading.Thread(target=run, name="wavelink-probe-all", daemon=True).start()
+        threading.Thread(target=run, name="audiomixing-probe-all", daemon=True).start()
         return {"started": True, "devices": pending,
                 "note": "正在试采 %d 块候选设备（每块最多 %.0f 秒），大约 %d 秒后点「重新检查」。"
                         % (len(pending), CAPTURE_PROBE_S, int((CAPTURE_PROBE_S + 2) * len(pending)))}
@@ -2336,7 +3066,7 @@ class WaveLinkNode:
         def run() -> None:
             self._probe_result = (name, self._probe_capture(name))
 
-        threading.Thread(target=run, name="wavelink-probe", daemon=True).start()
+        threading.Thread(target=run, name="audiomixing-probe", daemon=True).start()
         return True
 
     def _probe_capture(self, name: str, timeout: float = CAPTURE_PROBE_S) -> dict[str, Any]:
@@ -2837,7 +3567,10 @@ class WaveLinkNode:
                 late = int(stream.get("late") or 0)
                 out.append({
                     "path": "p2p",
-                    "path_label": "点对点/广播",
+                    # ★ 2026-10-20：按真实归属标（具名路由=点对点，落在频道那条=广播），
+                    #   不要再写"点对点/广播"这种让人以为混淆了两种路的东西。
+                    "path_label": ("点对点" if [x for x in str(stream.get("route_id") or "").split(",")
+                                                if x and not x.startswith("channel")] else "广播"),
                     "name": str(stream.get("node_name") or stream.get("source") or ""),
                     "state": "正在接收",
                     "score": int(max(0.0, 100.0 - min(100.0, lost * 5.0 + late * 2.0))),
@@ -3097,6 +3830,143 @@ class WaveLinkNode:
             state["note"] = self._local_note
         return state
 
+    # -- 本机"到底在出声多大声" ---------------------------------------------
+    def enable_output_meter(self) -> bool:
+        """打开「当前输出设备电平直读」。返回是否真的开起来了。
+
+        为什么做成显式开关、而不是 start() 里自动开：这是给**桌面应用**看的显示功能。
+        单元测试（不少用例是 ``simulate=False``）不该因为跑一次测试就去碰真实声卡；
+        真正的服务进程（audiomixing_launcher / ``python -m audiomixing serve``）各调一次。
+        """
+        if self._out_meter is not None:
+            return True
+        if self.simulate or "wasapi" not in audio_base.available_backends():
+            return False
+        meter = _OutputLevelMeter(self._output_meter_spec())
+        meter.start()
+        self._out_meter = meter
+        return True
+
+    def _output_meter_spec(self) -> dict[str, Any]:
+        """要直读哪块输出设备的峰值表：优先按配置的播放设备，否则系统默认。"""
+        sink = self.default_sink_spec()
+        device = str(sink.get("device") or "")
+        if str(sink.get("backend")) != "wasapi" or device.lower() in ("", "null", "default", "@default"):
+            device = "@default"
+        return {"backend": "wasapi", "device": device}
+
+    def output_level(self) -> dict[str, Any]:
+        """本机当前"在出声多大声"，0..1 —— 面板上「声音大小」的唯一口径。
+
+        三个来源取最大，因为它们各自只看得到声音的一部分：
+          * ``meter`` —— 当前输出设备的峰值表：**Windows 直接播放**的那种声音（手机走蓝牙
+            进来就是这一类）只有这里看得到，本工具那条路根本没有数据；
+          * ``local`` —— 本机直通那一路实际写进设备的数据；
+          * ``sink``  —— 我们自己开的播放端实际渲染的数据。
+        三者都沉默时才是真的 0（本机确实没在出声），不会再像以前那样"明明在响却恒为 0"。
+        """
+        candidates: list[tuple[str, float]] = []
+        meter = self._out_meter
+        if meter is not None:
+            candidates.append(("meter", float(meter.peak or 0.0)))
+        if self._loop is not None:
+            candidates.append(("local", float(getattr(self._loop, "peak", 0.0) or 0.0)))
+        for engine in self.sinks.values():
+            candidates.append(("sink", float(getattr(engine, "peak", 0.0) or 0.0)))
+        source, peak = ("none", 0.0)
+        for name, value in candidates:
+            if value > peak:
+                source, peak = name, value
+        out: dict[str, Any] = {
+            "peak": round(min(1.0, max(0.0, peak)), 4),
+            "source": source,
+            "measured": bool(candidates),
+            "meter_on": meter is not None,
+        }
+        if meter is not None:
+            out["device"] = meter.device
+            if meter.error:
+                out["error"] = meter.error
+            # 测不到的时候必须说清是"真的没在出声"还是"这台机器根本没有可直读的设备"，
+            # 面板据此写"测不到"而不是拿一个 0 糊弄用户。
+            out["meter_ok"] = not meter.error
+        return out
+
+    # -- 「设备间信号」（和有没有在传声音无关）--------------------------------
+    def signals_state(self) -> dict[str, dict[str, Any]]:
+        """每台设备的链路信号。**和有没有在传声音没关系**。
+
+        用户原话（2026-10-16）：「虽然二者没有收发声音，但是设备间信号应当存在」——
+        原来这一格只在"正在收它的音频流"时才有分数，两台设备明明互相看得见，
+        卡片上却写着"还没有可测的链路"。那不是一个显示 bug，是这一格的**判据选错了**。
+
+        现在按三种真实证据取值，从最贴近"声音那条路"到最粗糙，取**最差**的那一个
+        （哪条路有毛病都要看得见）：
+          1) ``stream``  —— 正在收它的声音：用那一路的丢包/缓冲算；
+          2) ``rtt``     —— 有 PING/PONG 样本（电脑对电脑）：用往返时延折算；
+          3) ``heartbeat`` —— 只有信标心跳（**手机不回 PING/PONG**，只能走这条）：
+                            用心跳新鲜度 + 间隔抖动折算。
+        三种证据都没有（例如手动填了个 IP、对方从没回过话）才写"没有依据" ——
+        那种情况下界面写"不可测"，绝不拿一个 0 冒充"链路很差"。
+        """
+        signals: dict[str, dict[str, Any]] = {}
+        # 1) 正在收的声音
+        try:
+            for st in (self.receiver.stats().get("streams") or []):
+                node = str(st.get("node_id") or "")
+                if not node:
+                    continue
+                score = _loss_score(st)
+                if score is None:
+                    continue
+                entry = signals.setdefault(node, {})
+                entry["stream_score"] = score
+                entry["packets"] = int(st.get("packets") or 0)
+                entry["lost"] = int(st.get("lost") or 0)
+        except Exception:
+            pass
+        # 2) PING/PONG 往返时延（每秒一轮，和有没有传声音无关）
+        try:
+            for clock in self.receiver.clock_stats():
+                node = str(clock.get("peer") or "")
+                if not node or int(clock.get("samples") or 0) <= 0:
+                    continue
+                rtt = float(clock.get("rtt_ms") or 0.0)
+                entry = signals.setdefault(node, {})
+                entry["rtt_ms"] = round(rtt, 3)
+                entry["rtt_score"] = _rtt_score(rtt)
+        except Exception:
+            pass
+        # 3) 信标心跳（手机也走这一条）
+        try:
+            for peer in self.registry.all():
+                if peer.node_id == self.node_id:
+                    continue
+                jitter = peer.beat_jitter_ms
+                entry = signals.setdefault(peer.node_id, {})
+                entry["age_s"] = round(peer.age_s, 1)
+                entry["online"] = bool(peer.online)
+                if peer.beat_ms is not None:
+                    entry["beat_ms"] = round(peer.beat_ms, 1)
+                if jitter is not None:
+                    entry["beat_jitter_ms"] = jitter
+                if peer.online:
+                    entry["heartbeat_score"] = _heartbeat_score(peer.age_s, jitter)
+        except Exception:
+            pass
+        for entry in signals.values():
+            picked = [(name, entry[key]) for name, key in
+                      (("stream", "stream_score"), ("rtt", "rtt_score"),
+                       ("heartbeat", "heartbeat_score")) if key in entry]
+            if not picked:
+                entry["known"] = False
+                continue
+            source, score = min(picked, key=lambda kv: kv[1])
+            entry["known"] = True
+            entry["source"] = source
+            entry["score"] = int(score)
+        return signals
+
     def _source_spec_for(self, rule: dict[str, Any]) -> dict[str, Any]:
         if rule.get("kind") == "broadcast" and self.config.channel_sources:
             # The channel may mix several inputs - several phones, each on its own
@@ -3199,7 +4069,7 @@ class WaveLinkNode:
             sink=sink,
         )
         engine.started_ns = time.monotonic()
-        engine.thread = threading.Thread(target=self._render_loop, args=(engine,), name="wavelink-sink-%s" % route_id, daemon=True)
+        engine.thread = threading.Thread(target=self._render_loop, args=(engine,), name="audiomixing-sink-%s" % route_id, daemon=True)
         self.sinks[route_id] = engine
         engine.thread.start()
         self.note("opened sink %s on %s" % (route_id, engine.device_selector))
@@ -3316,22 +4186,56 @@ class WaveLinkNode:
         This is the only correct answer to "which of my sinks does this incoming
         stream belong to"; the receiver cannot know it on its own, because the
         audio packet carries no route id.
+
+        ★ 2026-10-16（用户第 6 条「电脑开只听没有声音」，以及他后来钉死的广播语义）：
+        频道收听那条规则的 from 是**通配** `["*"]` —— 它要的是"谁在发就听谁"。
+        所以这里不能只按"认得出身份的发送方"去匹配：解析不出身份的流（手动填的 IP、
+        信标丢了、路由器做了 AP 隔离）也必须落进那条通配规则里，否则包到了也只能在日志里
+        写一句 "has no local sink yet"，用户听到的是静音。
+
+        ★ 但**具名路由优先**：我既开着「听广播」又点名收这一台时，两条规则都能命中同一个
+        发送方 —— 同一声声音会被两个播放端各放一遍（音量直接翻倍）。所以先给具名命中的那条，
+        一条都没有（不认识这个发送方）才落通配的那条。手机端也写着同一句话
+        （「同一台设备的声音如果从两条路都进来，只会播一路、不叠加」）。
         """
         if not node_id:
-            return set()
-        out: set[str] = set()
+            node_id = ""
+        specific: set[str] = set()
+        wildcard: set[str] = set()
         for route_id, entry in self.desired_sinks().items():
-            if any(peer.node_id == node_id for peer in entry["peers"]):
-                out.add(route_id)
-        return out
+            # 按**规则**分，不按"这条规则的 peers 里有没有它"分：频道那条规则的 peers
+            # 里也会列出在线设备（它匹配谁就列谁），照 peers 分会把频道也算成具名那条。
+            if "*" in (entry["rule"].get("from") or []):
+                wildcard.add(route_id)
+            elif any(peer.node_id == node_id for peer in entry["peers"]):
+                specific.add(route_id)
+        return specific or wildcard
+
+    def _sender_is_known(self, node_id: str) -> bool:
+        """这个发送方是不是本机认得出的设备（注册表里有它）？"""
+        nid = str(node_id or "")
+        if not nid:
+            return False
+        try:
+            return self.registry.get(nid) is not None
+        except Exception:
+            return False
 
     def _attach_stream_routes(self, info, addr) -> set[str]:
         """Work out a stream's routes, with a last-resort single-sink fallback."""
         routes = self.routes_for_sender(info.node_id)
-        if not routes and len(self.sinks) == 1:
+        if not routes and len(self.sinks) == 1 and not self._sender_is_known(info.node_id):
             # The sender could not be resolved to a node (a manual peer whose
             # beacon never arrived, say). With exactly one sink there is no
             # ambiguity about where its audio goes.
+            #
+            # ★ 2026-10-19 用户实测的严重串台：「本机只开了"收听某一台电脑"（全表**唯一一条**
+            #   入向路由），手机送声音过来，本机居然也放出了手机的声音」——根因就在这个兜底：
+            #   它本来只该给"**认不出身份**的手动对端"（信标丢了 / 路由器做了 AP 隔离那种），
+            #   结果**认得出身份、但本机根本没有它任何收听路由**的发送方也走了这条路 ——
+            #   音频被挂到了那一台电脑的路由下（监控页上两个流还共用了同一个 route_id，
+            #   那正是这件事的指纹）。真人听得出来就是"串台"。
+            #   现在只给真认不出身份的发送方兜底；认得出的、而本机没给它开收听 → 一个端都不挂。
             routes = set(self.sinks)
         return routes
 
@@ -3401,6 +4305,12 @@ class WaveLinkNode:
             "routes": self.routes,
             "channel": self.channel_state(),
             "local": self.local_state(),
+            # ★ 本机"到底在出声多大声"的唯一口径（当前输出设备的直读表 + 本机直通 +
+            #   我们自己的播放端，三者取最大）。面板上的"声音大小"和几根条都用它。
+            "output": self.output_level(),
+            # ★ 每台设备的「链路信号」：和有没有在传声音无关（用户 2026-10-16：
+            #   「虽然二者没有收发声音，但是设备间信号应当存在」）。
+            "signals": self.signals_state(),
             "senders": self.sender.stats(),
             # 因为"对端已经没了"而停发的那些：面板要说清为什么没声音
             "senders_blocked": self.blocked_senders(),

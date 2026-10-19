@@ -22,14 +22,14 @@ import unittest.mock
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-# 测试会构造真实的 WaveLinkNode，而 set_routes 默认会落盘 ——
+# 测试会构造真实的 AudioMixingNode，而 set_routes 默认会落盘 ——
 # 必须沙箱化，否则会往用户的 %APPDATA% 写测试端口和测试节点名。
 _TEST_SANDBOX = tempfile.mkdtemp(prefix="audiomixing-regress-")
-os.environ["WAVELINK_HOME"] = _TEST_SANDBOX
+os.environ["AUDIOMIXING_HOME"] = _TEST_SANDBOX
 atexit.register(lambda: shutil.rmtree(_TEST_SANDBOX, ignore_errors=True))
 
 from audiomixing.config import Config          # noqa: E402
-from audiomixing.engine import WaveLinkNode    # noqa: E402
+from audiomixing.engine import AudioMixingNode    # noqa: E402
 from audiomixing.audio import base as audio_base  # noqa: E402
 
 
@@ -55,8 +55,8 @@ def config_stub(name: str = "本机", node_id: str = "node-self") -> Config:
     return cfg
 
 
-def make_node(name: str = "本机", node_id: str = "node-self") -> WaveLinkNode:
-    return WaveLinkNode(config_stub(name, node_id),
+def make_node(name: str = "本机", node_id: str = "node-self") -> AudioMixingNode:
+    return AudioMixingNode(config_stub(name, node_id),
                         audio_port=free_udp_port(),
                         discovery_port=free_udp_port(),
                         simulate=True)
@@ -148,7 +148,7 @@ class DeletedRouteTests(unittest.TestCase):
         # 把删除时间往前拨，模拟过了有效期
         import time as _time
 
-        self.node._dropped_ids["r-ttl"] = _time.time() - (WaveLinkNode.DROPPED_TTL + 1.0)
+        self.node._dropped_ids["r-ttl"] = _time.time() - (AudioMixingNode.DROPPED_TTL + 1.0)
 
         self.node.set_routes([route("r-ttl", "node-a", "node-b")],
                              persist=False, author_id="node-a", author_name="甲")

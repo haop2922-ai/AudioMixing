@@ -7,14 +7,14 @@
 * **WASAPI Loopback**：对默认渲染端点（扬声器/耳机）请求一个捕获客户端，就能拿到这台机器
   *正在播放* 的所有声音（含系统提示音、浏览器、会议软件）。
   不需要虚拟声卡，不需要管理员权限，不需要安装驱动。
-* 实现方式：`wavelink/audio/backends/wasapi_com.py` 用 ctypes 手写 COM 调用
+* 实现方式：`audiomixing/audio/backends/wasapi_com.py` 用 ctypes 手写 COM 调用
   （`IMMDeviceEnumerator` / `IAudioClient` / `IAudioCaptureClient` / `IAudioRenderClient`），
   零第三方依赖。共享模式格式（通常是 48 kHz float32）在边界处转成本项目统一的
   48 kHz float32 交错格式，其余代码完全平台无关。
 * **单进程采集**（只抓某个 App，比如只要微信不要网易云）：Windows 10 2004+ 提供
   Process Loopback（`ActivateAudioInterfaceAsync` + `AUDIOCLIENT_ACTIVATION_PARAMS`
   指定进程树）。接口位置已在 `wasapi.py` 的 `loopback` 分支预留，未实现。
-  现阶段替代方案：把该 App 的输出设备设成虚拟声卡（VB-CABLE），WaveLink 采集那块虚拟声卡。
+  现阶段替代方案：把该 App 的输出设备设成虚拟声卡（VB-CABLE），Audio Mixing 采集那块虚拟声卡。
 * 采样率不是 48 kHz 的设备：用 `audio/format.py` 的窗函数 sinc 重采样器处理，
   已测 44.1k↔48k 往返相关性 0.9999。
 
@@ -22,7 +22,7 @@
 
 * PulseAudio：`pactl list short sources` 里形如 `*monitor` 的就是「系统声音」源，直接能读；
   PipeWire 时代用 `pw-record --target=<monitor>` 或 `parec`。
-* 计划实现：`wavelink/audio/backends/pipewire.py`，用子进程（`parec`/`pw-record`）采集、
+* 计划实现：`audiomixing/audio/backends/pipewire.py`，用子进程（`parec`/`pw-record`）采集、
   `pacat`/`pw-play` 播放，统一转成本项目的 float32@48k 格式。不需要 ctypes，实现成本低。
 * 如果只想快速验证，也可以先 `arecord | python -m audiomixing send <host>` 走标准输入。
 
@@ -30,7 +30,7 @@
 
 * macOS 不允许普通 App 捕获其它 App 的输出。要采集系统声音，业界通用做法是安装
   虚拟音频设备（**BlackHole** 免费、Loopback 商业），把系统输出路由到虚拟设备，
-  WaveLink 再采集该设备。
+  Audio Mixing 再采集该设备。
 * macOS 13+ 的 ScreenCaptureKit 提供系统音频捕获（需用户授权“屏幕录制”权限），
   可以做成无虚拟声卡的方案，但需要 ObjC/Swift 桥接。
 * 播放侧（CoreAudio / AudioQueue）没有限制。
@@ -42,7 +42,7 @@
   ③ 受 DRM 保护的内容永远抓不到。
 * **MediaProjection + AudioRecord**：授权一次可以持续采集整机可捕获音频，是主流做法
   （Scrcpy、AudioRelay 等都走这条路）。
-* 因此手机端的产品形态是：打开 App → 点「开始投射」→ 系统弹窗授权 → 之后的音频走 WaveLink
+* 因此手机端的产品形态是：打开 App → 点「开始投射」→ 系统弹窗授权 → 之后的音频走 Audio Mixing
   协议发到目标节点。**无法做到“装完就静默后台采集”**，这是 Android 隐私策略，不是实现问题。
 * 实现路线建议（工作量从大到小）：
   1. 用 Kotlin 写一个最小 App：MediaProjection → AudioRecord(48k, stereo, PCM16) →
@@ -67,4 +67,4 @@
    （默认 47831），包头字段 `ssrc/seq/samples/ts_ns` 必须填对（`ts_ns` 用 Unix epoch 纳秒）；
 3. **播放**（可选）：AudioTrack 播放收到的流，就成了一个「音响设备」。
 
-协议是自描述的、没有握手要求，所以一个 200 行的原生客户端就能成为合法的 WaveLink 节点。
+协议是自描述的、没有握手要求，所以一个 200 行的原生客户端就能成为合法的 Audio Mixing 节点。

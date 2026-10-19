@@ -25,7 +25,14 @@
     -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
-    <application android:label="Audio Mixing" android:theme="@android:style/Theme.Material.NoActionBar">
+    <!--
+      android:icon：★ 2026-10-17 用户（图3）反馈「应用app内外不一致，我喜欢里面这个蓝色的感觉」。
+      应用内 LogoView 画的是蓝色渐变圆角方块 + 白字，而安装到桌面上的图标还是系统默认那个
+      绿色安卓小人 —— 里外两个样子。这里挂上资源目录里那套同款图标（mipmap-*/ic_launcher.png：
+      蓝色渐变 140deg（#38bdf8 → #6366f1）圆角方块 + 白色，四角透明、四周留 8% 边距）。
+    -->
+    <application android:label="Audio Mixing" android:icon="@mipmap/ic_launcher"
+                 android:theme="@android:style/Theme.Material.NoActionBar">
         <activity android:name=".MainActivity" android:exported="true"
                   android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>

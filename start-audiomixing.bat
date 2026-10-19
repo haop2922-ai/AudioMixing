@@ -1,6 +1,6 @@
 @echo off
 rem ===========================================================================
-rem  WaveLink launcher - double-click to start the service.
+rem  Audio Mixing launcher - double-click to start the service.
 rem
 rem  Default: opens the desktop window (the full panel lives inside it).
 rem  Optional: pass "web" to start headless and open the web panel in a browser.
@@ -17,15 +17,15 @@ cd /d "%~dp0"
 if /i "%~1"=="web" goto :web
 
 if exist "%~dp0dist\AudioMixing.exe" (
-  echo [WaveLink] Starting dist\AudioMixing.exe ...
+  echo [Audio Mixing] Starting dist\AudioMixing.exe ...
   start "" "%~dp0dist\AudioMixing.exe"
   exit /b 0
 )
 
 where python >nul 2>&1
 if errorlevel 1 (
-  echo [WaveLink] Not found: dist\AudioMixing.exe
-  echo [WaveLink] Python is not installed either.
+  echo [Audio Mixing] Not found: dist\AudioMixing.exe
+  echo [Audio Mixing] Python is not installed either.
   echo.
   echo   Either build the exe:   python tools\build_exe.py
   echo   or install Python 3.9+  and run:  python audiomixing_launcher.py
@@ -34,8 +34,8 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [WaveLink] dist\AudioMixing.exe not found - running from source with Python.
-echo [WaveLink] The desktop window will open.
+echo [Audio Mixing] dist\AudioMixing.exe not found - running from source with Python.
+echo [Audio Mixing] The desktop window will open.
 start "" pythonw "%~dp0audiomixing_launcher.py"
 exit /b 0
 
@@ -43,12 +43,12 @@ exit /b 0
 rem Headless node plus the web panel in the default browser. Useful on a machine
 rem without a desktop, and for checking the browser compatibility of the panel.
 if exist "%~dp0dist\AudioMixing.exe" (
-  echo [WaveLink] Starting dist\AudioMixing.exe serve ...
+  echo [Audio Mixing] Starting dist\AudioMixing.exe serve ...
   start "" "%~dp0dist\AudioMixing.exe" serve --open-browser
   exit /b 0
 )
-echo [WaveLink] Starting from source in web mode.
+echo [Audio Mixing] Starting from source in web mode.
 python -m audiomixing serve --open-browser
 echo.
-echo [WaveLink] Stopped.
+echo [Audio Mixing] Stopped.
 pause
