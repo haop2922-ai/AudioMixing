@@ -64,3 +64,6 @@ tools/adb-logs/
 # UI 目录里误放的安装包、安装器载荷里的逐版 APK（走 Release，不进仓库）
 audiomixing/ui/*.apk
 tools/installer_payload/*.apk
+
+# 真实渲染自检截图：含本机 IP / 主机名 / MAC / Windows 用户名，不进公开仓库
+docs/selfcheck/
