@@ -2,6 +2,7 @@
 
     python tools/verify_exe.py          # full check (also runs `doctor`, ~40 s)
     python tools/verify_exe.py --quick  # just the critical paths, ~10 s
+    python tools/verify_exe.py --exe "C:\...\Audio Mixing v2.32.exe"   # 指定要验的那一颗
 
 Checks, in order:
   1. `net`            - bundle starts, LAN detection works
@@ -29,9 +30,18 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 # ★ 2026-10-15：打包早就只剩 Nuitka 这一条了（tools/build_nuitka.py → dist_nuitka/），
 #   这里却一直只看 PyInstaller 时代的 dist/ —— 于是这个工具在现在这台机器上永远
 #   跑不起来（"找不到 dist/AudioMixing.exe"），等于没有。两个位置都认。
-EXE = next((p for p in (ROOT / "dist_nuitka" / "AudioMixing.exe",
+# ★ 2026-11-08：build_nuitka --onedir 的成品在 audiomixing_launcher.dist\ 下，
+#   优先验它；dist_nuitka\AudioMixing.exe 只是历史 onefile 残留（实测会验到旧包）。
+EXE = next((p for p in (ROOT / "dist_nuitka" / "audiomixing_launcher.dist" / "AudioMixing.exe",
+                        ROOT / "dist_nuitka" / "AudioMixing.exe",
                         ROOT / "dist" / "AudioMixing.exe") if p.is_file()),
-           ROOT / "dist_nuitka" / "AudioMixing.exe")
+           ROOT / "dist_nuitka" / "audiomixing_launcher.dist" / "AudioMixing.exe")
+# ★ 2026-11-08：同时存在 onedir 与 onefile 时，光靠"默认优先"会验错对象。
+#   显式 `--exe <路径>` 指向要验的那一颗（交付前验单文件版必须用它）。
+if "--exe" in sys.argv:
+    _i = sys.argv.index("--exe")
+    if _i + 1 < len(sys.argv):
+        EXE = pathlib.Path(sys.argv[_i + 1]).resolve()
 QUICK = "--quick" in sys.argv
 
 WEB_PORT = 17991

@@ -36,6 +36,8 @@ if not exist "%DST%" (
 
 echo   [1/4] copying files ...
 xcopy "%SRC%AudioMixing.exe" "%DST%\" /Y /Q >nul 2>&1
+rem ★ 2026-11-04（第 6 条）：交付 APK 名字带版本号；先按通配符拷，再兜底老名字。
+for %%F in ("%SRC%Audiomixing-手机版-v*.apk" "%SRC%AudioMixing-手机版-v*.apk") do xcopy "%%~fF" "%DST%\" /Y /Q >nul 2>&1
 if exist "%SRC%AudioMixing-mic.apk" xcopy "%SRC%AudioMixing-mic.apk" "%DST%\" /Y /Q >nul 2>&1
 if exist "%SRC%*.md" xcopy "%SRC%*.md" "%DST%\" /Y /Q >nul 2>&1
 if not exist "%DST%\AudioMixing.exe" (

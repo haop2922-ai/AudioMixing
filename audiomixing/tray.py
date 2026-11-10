@@ -12,10 +12,12 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 from ctypes import wintypes
 
@@ -39,6 +41,8 @@ ID_OPEN_PANEL = 1002
 ID_DIAGNOSE = 1005
 ID_FIREWALL = 1004
 ID_QUIT = 1003
+ID_BUNDLE = 1006
+ID_RECOVER = 1007
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
@@ -127,6 +131,57 @@ def _open_url(url: str) -> None:
         pass
 
 
+_PANEL_OPENER = None
+
+
+def set_panel_opener(opener) -> None:
+    """由启动器注入 `open_monitor`。
+
+    ★ 2026-10-26：冻结包里 `__main__` 不一定能拿到启动器的函数，
+      `import audiomixing_launcher` 也不一定成立。直接注入函数最稳，
+      保证托盘和启动器走**同一套**去重逻辑。
+    """
+    global _PANEL_OPENER
+    _PANEL_OPENER = opener
+
+
+def _resolve_panel_opener():
+    """拿启动器里的 `open_monitor`（带去重/提窗）；拿不到就返回 None。"""
+    if callable(_PANEL_OPENER):
+        return _PANEL_OPENER
+    try:
+        import __main__ as main_module
+
+        opener = getattr(main_module, "open_monitor", None)
+        if callable(opener):
+            return opener
+    except Exception:
+        pass
+    try:
+        from audiomixing_launcher import open_monitor as opener
+
+        return opener
+    except Exception:
+        return None
+
+
+def _open_panel(address: str, page: str = "monitor") -> None:
+    """托盘打开监控/控制台：必须走和启动器同一套去重逻辑。
+
+    ★ 2026-10-26 用户反馈：窗口无限开仍存在。根因是托盘双击和菜单直接调
+      `_open_url`，每次都 `Edge --app` 开一个新窗，完全绕过启动器的互斥体。
+      这里统一改成调用启动器的 `open_monitor()`：已有窗口就提窗，不再新开。
+    """
+    opener = _resolve_panel_opener()
+    if opener is not None:
+        try:
+            opener(address, page)
+            return
+        except Exception:
+            pass
+    _open_url(address.rstrip("/") + ("/" + page.lstrip("/") if page else "/"))
+
+
 # HWHHYN 用 DEEPSEEK 制作
 def _real_exe() -> str:
     """这次运行"到底是哪个程序"—— 用户双击的那颗 exe，源码运行时是入口 .py。
@@ -181,19 +236,17 @@ def add_firewall_rules() -> str:
     # 不带 chcp：批处理文件用系统编码写，控制台保持系统编码，中文路径才不会变乱码
     lines = ["@echo off"]
 
-    # ★ 2026-10-15 自查发现的两件事，都塞进这一次放行里做掉（用户点一次就够了）：
-    #   ① 规则是绑**程序路径**的，所以每换一版 exe 就要重新放行，旧规则会一直堆着 ——
-    #      这台机器上已经堆到 50 条，其中约 38 条指向早就删掉的 exe（连"某个 Nuitka 解包
-    #      临时目录里的 .py"都在里面）。死规则什么也不放行，只会让人对着列表看糊涂。
-    #   ② 当前这份 exe 常常**一条规则都没有**（上次点放行的是上一版）→ 入站 TCP/UDP 被
-    #      Windows 直接拦掉，手机连不上。这也是"设备看得见、却连不通"的一种成因。
-    #   判据只有一条：**规则指向的文件已经不存在** 就删。指向别的副本、文件还在的规则一律不碰。
+    # ★ 2026-10-15 自查发现：规则绑**程序路径**，每换一版 exe 就要重新放行，旧规则会一直堆着。
+    #   2026-10-27 用户明确要求「直接清理旧版本规则」：机器上大量 v1.11/v1.12/版本备份 的
+    #   exe 都还在，旧逻辑只删“文件已不存在”的规则，于是列表堆到几百条。
+    #   现在点一次「放行防火墙」= 清掉所有 Audio Mixing*/WaveLink* 旧规则，再为当前 exe
+    #   重建 TCP/UDP（入站+出站）。只匹配我们自己的显示名，不碰其它软件。
     #   刻意只用单引号（cmd 里双引号要转义，这个工程为引号踩过坑 —— 见上面那段说明）。
+    lines.append("echo 正在清理旧版本防火墙规则，并为当前程序重建 TCP/UDP ...")
     lines.append('powershell -NoProfile -ExecutionPolicy Bypass -Command '
-                 '"Get-NetFirewallRule | Get-NetFirewallApplicationFilter | '
-                 "Where-Object { $_.Program -and -not (Test-Path $_.Program) "
-                 "-and ($_.Program -match 'wavelink|audiomixing|audio mixing') } | "
-                 'ForEach-Object { Remove-NetFirewallRule -Name $_.InstanceID }"')
+                 '"Get-NetFirewallRule -DisplayName \'Audio Mixing*\',\'WaveLink*\' '
+                 '-ErrorAction SilentlyContinue | ForEach-Object { '
+                 'Remove-NetFirewallRule -Name $_.InstanceID -ErrorAction SilentlyContinue }"')
     for proto in ("TCP", "UDP"):
         name = "Audio Mixing " + proto
         lines.append('netsh advfirewall firewall delete rule name="%s" >nul 2>&1' % name)
@@ -243,7 +296,58 @@ def open_diagnose(address: str) -> None:
     try:
         os.startfile(path)          # noqa: S606 - 用户自己点开的菜单
     except Exception:
-        _open_url(address.rstrip("/") + "/monitor")
+        _open_panel(address, "monitor")
+
+
+def _message_box(text: str, title: str = "Audio Mixing") -> None:
+    try:
+        ctypes.windll.user32.MessageBoxW(None, str(text), title, 0x40)
+    except Exception:
+        pass
+
+
+def export_diagnose_bundle(address: str) -> None:
+    """托盘「导出诊断包」：下载 zip 到本机并选中它。
+
+    ★ 2026-10-26 用户：「下次直接生成诊断包吧，老是复制好麻烦」。
+      托盘也能直接出包：不打开网页、不选文字，保存后资源管理器会定位到文件。
+    """
+    url = address.rstrip("/") + "/api/diagnose/bundle"
+    base = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "Audio Mixing")
+    path = os.path.join(base, "AudioMixing-诊断包-%s.zip" % time.strftime("%Y%m%d-%H%M%S"))
+    try:
+        os.makedirs(base, exist_ok=True)
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            data = resp.read()
+        with open(path, "wb") as fh:
+            fh.write(data)
+    except Exception as exc:
+        _message_box("导出诊断包失败：%s\n\n可打开控制台 → 诊断页手动下载。" % exc)
+        return
+    try:
+        subprocess.Popen(["explorer", "/select,", path])
+    except Exception:
+        pass
+    _message_box("诊断包已保存：\n%s\n\n把这个 zip 发回去即可。" % path)
+
+
+def recover_audio(address: str) -> None:
+    """托盘「恢复声音」：重开全部播放端（等同切换一次 Windows 输出）。"""
+    url = address.rstrip("/") + "/api/audio/recover"
+    try:
+        req = urllib.request.Request(url, data=b"{}", method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8") or "{}")
+    except Exception as exc:
+        _message_box("恢复声音失败：%s" % exc)
+        return
+    if data.get("ok"):
+        _message_box("已重开 %s 路播放端%s。"
+                     % (data.get("restarted") or 0,
+                        "，本机直通也重建了" if data.get("loop_stopped") else ""))
+    else:
+        _message_box("恢复声音失败：%s" % (data.get("error") or "未知"))
 
 
 
@@ -318,18 +422,24 @@ class Tray:
         def handler(hwnd, msg, wparam, lparam):
             if msg == WM_TRAY:
                 if lparam == WM_LBUTTONDBLCLK:
-                    _open_url(self.address + "/monitor")
+                    _open_panel(self.address, "monitor")
                 elif lparam == WM_RBUTTONUP:
                     self._show_menu(hwnd)
                 return 0
             if msg == WM_COMMAND:
                 cmd = wparam & 0xFFFF
                 if cmd == ID_OPEN_MONITOR:
-                    _open_url(self.address + "/monitor")
+                    _open_panel(self.address, "monitor")
                 elif cmd == ID_OPEN_PANEL:
-                    _open_url(self.address + "/")
+                    _open_panel(self.address, "")
                 elif cmd == ID_DIAGNOSE:
                     open_diagnose(self.address)
+                elif cmd == ID_BUNDLE:
+                    threading.Thread(target=export_diagnose_bundle,
+                                     args=(self.address,), daemon=True).start()
+                elif cmd == ID_RECOVER:
+                    threading.Thread(target=recover_audio,
+                                     args=(self.address,), daemon=True).start()
                 elif cmd == ID_FIREWALL:
                     add_firewall_rules()
                 elif cmd == ID_QUIT:
@@ -396,8 +506,10 @@ class Tray:
         menu = self.user32.CreatePopupMenu()
         self.user32.AppendMenuW(menu, MF_STRING, ID_OPEN_MONITOR, "打开监控")
         self.user32.AppendMenuW(menu, MF_STRING, ID_OPEN_PANEL, "打开控制台")
-        self.user32.AppendMenuW(menu, MF_STRING, ID_DIAGNOSE, "生成诊断报告")
-        self.user32.AppendMenuW(menu, MF_STRING, ID_FIREWALL, "放行防火墙（需管理员）")
+        self.user32.AppendMenuW(menu, MF_STRING, ID_DIAGNOSE, "查看诊断报告")
+        self.user32.AppendMenuW(menu, MF_STRING, ID_BUNDLE, "导出诊断包（zip）")
+        self.user32.AppendMenuW(menu, MF_STRING, ID_RECOVER, "恢复声音（重开播放端）")
+        self.user32.AppendMenuW(menu, MF_STRING, ID_FIREWALL, "放行防火墙并清理旧规则（需管理员）")
         self.user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         self.user32.AppendMenuW(menu, MF_STRING, ID_QUIT, "停止服务并退出")
         point = wintypes.POINT()

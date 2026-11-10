@@ -42,6 +42,9 @@ import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PKG = ROOT / "audiomixing"
+# 审计脚本要从仓库根导入合成身份判定（与运行时代码同一份规则，避免两处清单漂移）。
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 findings: list[tuple[str, str, str]] = []   # (severity, area, message)
 FIX = False
@@ -60,6 +63,33 @@ def report(severity: str, area: str, message: str, fixable: bool = False, fix=No
 
 
 # ---------------------------------------------------------------- environment
+
+def identity_findings(cfg: dict) -> tuple[list[str], list[str]]:
+    """配置里明显的测试身份：返回 (身份命中, 路由命中)。
+
+    只报告，不修改 —— 用户可能正在用这台机器的身份跑，审计工具无权替他改名。
+    """
+    from audiomixing.config import _is_synthetic_node_id
+
+    identity_hits: list[str] = []
+    route_hits: list[str] = []
+    if _is_synthetic_node_id(str(cfg.get("node_id") or "")):
+        identity_hits.append("node_id=%r" % cfg.get("node_id"))
+    for value in cfg.get("smart_link") or []:
+        if _is_synthetic_node_id(str(value)):
+            identity_hits.append("smart_link 里有 %r" % value)
+    for route in cfg.get("routes") or []:
+        if not isinstance(route, dict):
+            continue
+        rid = str(route.get("id") or "")
+        if _is_synthetic_node_id(str(route.get("origin") or "")):
+            route_hits.append("%s 的 origin=%r" % (rid, route.get("origin")))
+        for key in ("from", "to"):
+            for value in route.get(key) or []:
+                if _is_synthetic_node_id(str(value)):
+                    route_hits.append("%s 的 %s 里 %r" % (rid, key, value))
+    return identity_hits, route_hits
+
 
 def audit_environment() -> None:
     print("=" * 74)
@@ -115,25 +145,52 @@ def audit_environment() -> None:
         except (OSError, json.JSONDecodeError) as exc:
             report("ERROR", "config", "unreadable config: %s" % exc)
             cfg = {}
-        defaults = {"web_port": 17800, "audio_port": 47831, "discovery_port": 47830}
+        defaults = {"web_port": 17800, "audio_port": 47831, "discovery_port": 17830}
         off = {k: cfg.get(k) for k, v in defaults.items() if cfg.get(k) not in (None, v)}
         if off:
-            report("WARN", "config",
-                   "ports differ from defaults %s (a previous test run saved them; "
-                   "the phone/other PC must use the port shown in the black window)" % off,
-                   fixable=True, fix=lambda: cfg_path.unlink())
+            # 端口是用户可以在「设置」里改的，也可能是启动时自动避开冲突选出来的；
+            # 这里只提示，绝不能当成测试残留把整份配置删掉（那会丢路由和设置）。
+            print("[i ] config     ports are non-default %s (user-custom or auto-selected; "
+                  "keep unless you know a test run wrote them)" % off)
         peers = cfg.get("manual_peers") or []
         testish = [p.get("host") for p in peers if str(p.get("host", "")).startswith(("192.168.10.", "192.168.1.", "10.0.0."))]
         if testish:
-            report("WARN", "config", "manual peers that look like test data: %s" % testish,
-                   fixable=True, fix=lambda: cfg_path.unlink())
+            report("WARN", "config", "manual peers that look like test data: %s" % testish)
         routes = cfg.get("routes") or []
-        suspicious = [r.get("id") for r in routes if str(r.get("id", "")).startswith(("exe", "w1", "r1", "rec", "in-", "many", "one-to", "wild", "both", "self2"))]
+
+        def _looks_like_test(route: dict) -> bool:
+            rid = str(route.get("id", ""))
+            label = str(route.get("label") or "").strip().lower()
+            return (rid.startswith(("exe", "w1", "r1", "rec", "in-", "many", "one-to",
+                                    "wild", "both", "self2"))
+                    or "test" in label or "测试" in label)
+
+        suspicious = [r.get("id") for r in routes if _looks_like_test(r)]
+
+        def _drop_test_routes() -> None:
+            # 只删测试路由，保留用户自己的端口/路由/设置。
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            data["routes"] = [r for r in (data.get("routes") or []) if not _looks_like_test(r)]
+            cfg_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
         if suspicious:
             report("WARN", "config", "routes left over from tests: %s" % suspicious,
-                   fixable=True, fix=lambda: cfg_path.unlink())
-        if not off and not testish and not suspicious:
-            print("[ok] config     ports=defaults, no test peers/routes")
+                   fixable=True, fix=_drop_test_routes)
+        # ★ 2026-11-03（Q1）：以前只查 manual_peers 和路由前缀，于是 node_id="self-node"、
+        #   smart_link=["peer-1"] 这种**测试身份**明明写在用户配置里，工具却打印
+        #   `[ok] no test peers/routes` —— 假 PASS，让幽灵设备排查被误导很久。
+        #   这里把合成身份全部找出来，但**只 WARN、不自动删**：动身份=改用户的设备身份，
+        #   动 smart_link=改用户明确勾过的设备，审计工具没有资格替用户决定。
+        #   启动时 Config.load() 会先备份 config，再把身份迁成真 UUID、把测试名单去掉。
+        identity_hits, route_hits = identity_findings(cfg)
+        if identity_hits:
+            report("WARN", "identity", "test identity in config (启动时会备份并迁移，本次不自动改): %s"
+                   % ", ".join(identity_hits))
+        if route_hits:
+            report("WARN", "identity", "routes reference test identities (启动时原地改写，不删路由): %s"
+                   % ", ".join(route_hits))
+        if not testish and not suspicious and not identity_hits and not route_hits:
+            print("[ok] config     no test peers/routes/identities")
     else:
         print("[ok] config     no saved config (defaults will be used)")
 
@@ -166,18 +223,32 @@ def audit_environment() -> None:
     # 新名 + 旧名都扫：v1.22 及更早版本建的临时目录叫 wavelink-*，
     # 它们可能还躺在 %TEMP% 里，顺手一起清掉。
     leftovers = []
-    for _prefix in ("audiomixing-verify-", "audiomixing-check-", "audiomixing-selftest-",
-                    "audiomixing-diag-", "wavelink-verify-", "wavelink-check-",
-                    "wavelink-selftest-", "wavelink-diag-"):
+    # 测试与验证脚本用过的所有前缀（含各测试类自己的 am-* 沙箱）。
+    for _prefix in ("audiomixing-", "wavelink-", "am-blocked-", "am-beacon",
+                    "am-ports-", "am-mig-", "am-home-", "am-p2p-"):
         leftovers += [p for p in tmp.glob(_prefix + "*")]
+    # 构建/页面脚本留下的日志与导出的脚本文件。
+    for _pattern in ("audiomixing-build-*.log", "audiomixing-page-*.js",
+                     "wavelink-page-*.js", "wavelink-firewall.bat"):
+        leftovers += [p for p in tmp.glob(_pattern)]
     if leftovers:
-        report("INFO", "temp", "%d verification sandbox dirs in %s" % (len(leftovers), tmp),
-               fixable=True, fix=lambda: [shutil.rmtree(p, ignore_errors=True) for p in leftovers])
+        def _drop_temp() -> None:
+            for p in leftovers:
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+        report("INFO", "temp", "%d test/verification leftovers in %s" % (len(leftovers), tmp),
+               fixable=True, fix=_drop_temp)
     else:
-        print("[ok] temp       no verification sandbox dirs")
+        print("[ok] temp       no test/verification leftovers")
 
     # 5. dev scratch dirs inside the repo
-    for name in ("_t", "_t2", "_t3", "_t4", "_t5", "_nc", "_deltest", "_preview_home", "build"):
+    for name in ("_t", "_t2", "_t3", "_t4", "_t5", "_nc", "_deltest", "_preview_home",
+                 ".tmp", "build"):
         p = ROOT / name
         if p.exists():
             fixable = name != "build"
@@ -242,8 +313,27 @@ def audit_project() -> None:
             continue
         mod = ".".join(p.relative_to(ROOT).with_suffix("").parts)
         modules[mod] = p
-    sources = {p: p.read_text(encoding="utf-8", errors="replace") for p in ROOT.rglob("*.py")}
-    sources.update({p: p.read_text(encoding="utf-8", errors="replace") for p in ROOT.rglob("*.js")})
+
+    def _scan_sources(pattern: str) -> dict[pathlib.Path, str]:
+        """读源码做引用扫描；跳过第三方/历史备份目录，读不了的文件也跳过。
+
+        promo/node_modules 这类目录里有权限受限的文件，以前这里直接 PermissionError
+        把整个审计工具崩掉 —— 门禁跑不完比漏报更糟。
+        """
+        skip_dirs = {"promo", "版本备份", "release", "dist_nuitka", ".git",
+                     "node_modules", "__pycache__", ".screenshots"}
+        out: dict[pathlib.Path, str] = {}
+        for p in ROOT.rglob(pattern):
+            if any(part in skip_dirs for part in p.parts):
+                continue
+            try:
+                out[p] = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+        return out
+
+    sources = _scan_sources("*.py")
+    sources.update(_scan_sources("*.js"))
     for mod, path in sorted(modules.items()):
         short = mod.split(".")[-1]
         referenced = False

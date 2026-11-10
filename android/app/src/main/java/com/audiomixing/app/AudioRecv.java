@@ -90,6 +90,23 @@ public final class AudioRecv {
         statsListener = l;
     }
 
+    /**
+     * 实际绑定的音频端口和请求值不同时回调。
+     *
+     * <p>★ 2026-11-02：默认音频端口被别的 App 占用时，原来只记一句日志就退出，
+     * 信标里还公布旧端口，对端按旧端口发来的包全丢。现在这里换空闲口重试，
+     * 并把实际端口交给 Engine 同步到信标。
+     */
+    public interface PortListener {
+        void onPortChanged(int oldPort, int newPort);
+    }
+
+    private volatile PortListener portListener;
+
+    public void setPortListener(PortListener l) {
+        portListener = l;
+    }
+
     /** 收包统计，给界面"详情"用。 */
     public static final class Stats {
         public long received;
@@ -159,11 +176,18 @@ public final class AudioRecv {
         public long samplesMismatch;
         /** 这件事最近一次的现场（人话）。 */
         public String lastSamplesNote = "";
+        /** ★ 2026-11-04（B 第一阶段）：自回声丢弃 / 超跳丢弃（诊断页要显示）。 */
+        public long echoDropped;
+        public long hopDropped;
 
         @Override
         public String toString() {
-            return "收 " + received + " 丢 " + lost + " 迟到 " + late + " 坏包 " + badPackets
+            String s = "收 " + received + " 丢 " + lost + " 迟到 " + late + " 坏包 " + badPackets
                     + " 流 " + streamCount + " 缓冲 " + bufferedMs + "ms";
+            if (echoDropped > 0 || hopDropped > 0) {
+                s += " · 自回声丢弃 " + echoDropped + " · 超跳丢弃 " + hopDropped;
+            }
+            return s;
         }
     }
 
@@ -227,6 +251,10 @@ public final class AudioRecv {
     private WifiManager.WifiLock wifiLock;
 
     private volatile int targetMs = DEFAULT_TARGET_MS;
+    // ★ 2026-11-04（B 第一阶段）：本机 originId（device_id 哈希），用于丢"绕回来的自回声"。
+    private volatile int selfOriginId = 0;
+    private volatile long echoDropped;
+    private volatile long hopDropped;
     private volatile float gain = 1f;
     private volatile float peak;
     private volatile String lastError = "";
@@ -427,6 +455,11 @@ public final class AudioRecv {
         return targetMs;
     }
 
+    /** ★ 2026-11-04（B 第一阶段）：本机 originId；和电脑端 Receiver 的 self_origin_id 同义。 */
+    public void setSelfOriginId(int originId) {
+        this.selfOriginId = originId;
+    }
+
     public void setTargetBufferMs(int ms) {
         targetMs = Math.max(MIN_TARGET_MS, Math.min(MAX_TARGET_MS, ms));
     }
@@ -466,6 +499,8 @@ public final class AudioRecv {
             st.badVersion = counters[10];
             st.badCodec = counters[11];
             st.badFrames = counters[12];
+            st.echoDropped = echoDropped;
+            st.hopDropped = hopDropped;
             // ★ 坏包来源前 3 名：把"某一台在乱发"和"整个网段的噪声"分开。
             if (!badBySource.isEmpty()) {
                 java.util.List<Map.Entry<String, Long>> list = new ArrayList<>(badBySource.entrySet());
@@ -556,27 +591,69 @@ public final class AudioRecv {
                 // 被占了，试下一个
             }
         }
-        return start;
+        return -1;      // ★ 一个都没找到：调用方必须如实报错，不能假装用的是 preferred
     }
 
     // -------------------------------------------------------------- 收包线程
 
     private void rxLoop() {
         acquireWifiLock();
-        DatagramSocket s;
-        try {
-            s = new DatagramSocket(null);      // 先建不绑，才能先设 reuse/缓冲再绑
-            s.setReuseAddress(true);
+        DatagramSocket s = null;
+        IOException lastBindError = null;
+        int want = port;
+        // 默认端口可能被别的 App 占着：逐個试下一个空闲口（最多 6 次）。
+        // 不在这里退出 —— 退出的表现是"界面显示已收听、但 0 个流"，最难查。
+        for (int attempt = 0; attempt < 6 && running; attempt++) {
+            DatagramSocket cand = null;
             try {
-                s.setReceiveBufferSize(256 * 1024);   // 一次 GC/调度停顿可能积压几十个包，内核缓冲要大
-            } catch (IOException ignored) {
+                cand = new DatagramSocket(null);   // 先建不绑，才能先设 reuse/缓冲再绑
+                cand.setReuseAddress(true);
+                try {
+                    cand.setReceiveBufferSize(256 * 1024);   // 一次 GC/调度停顿可能积压几十个包
+                } catch (IOException ignored) {
+                }
+                cand.bind(new InetSocketAddress(want));
+                s = cand;
+                lastBindError = null;
+                if (want != port) {
+                    int old = port;
+                    port = want;
+                    Log.i(TAG, "音频端口 " + old + " 被占用，改用 " + want);
+                    PortListener l = portListener;
+                    if (l != null) {
+                        try {
+                            l.onPortChanged(old, want);
+                        } catch (Throwable t) {
+                            Log.w(TAG, "通知新音频端口失败：" + t);
+                        }
+                    }
+                }
+                break;
+            } catch (IOException e) {
+                lastBindError = e;
+                if (cand != null) {
+                    try {
+                        cand.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+                int next = want + 1;
+                int free = pickFreePort(next);
+                if (free < 0) {
+                    break;
+                }
+                want = free;
             }
-            s.bind(new InetSocketAddress(port));
-            s.setSoTimeout(500);
-        } catch (IOException e) {
-            note("音频端口 " + port + " 打不开（被占用？）：" + e);
+        }
+        if (s == null) {
+            note("音频端口 " + port + " 打不开（被占用？）：" + lastBindError);
             running = false;
+            releaseWifiLock();       // ★ 绑定失败也要放锁，不能把 Wi-Fi 锁留在后台
             return;
+        }
+        try {
+            s.setSoTimeout(500);
+        } catch (IOException ignored) {
         }
         socket = s;
         if (running) {
@@ -645,6 +722,23 @@ public final class AudioRecv {
             bumpBad(0, host, len);
             sampleBad(0, buf, len, from, "包头能认出来但解码失败");
             return;
+        }
+        // ★ 2026-11-04（B 第一阶段）防自环，先于任何流/白名单判据：
+        //   ① originId == 本机 → 这是自己的声音绕了一圈回来，绝不能播，计数后丢弃；
+        //   ② hop > MAX_HOP → 已经在网里转了太多跳，继续传只会放大环。
+        //   老电脑没有扩展段（originId=0）→ 两条都不触发，老路径原样。
+        if (pkt.type == Proto.T_AUDIO && pkt.originId != 0) {
+            if (selfOriginId != 0 && pkt.originId == selfOriginId) {
+                echoDropped++;
+                if (echoDropped % 50 == 1) {
+                    note("丢弃自回声帧（originId == 本机）累计 " + echoDropped + " 个");
+                }
+                return;
+            }
+            if (pkt.hop > Proto.MAX_HOP) {
+                hopDropped++;
+                return;
+            }
         }
         if (pkt.type != Proto.T_AUDIO) {
             bump(6);   // PING/PONG/BYE 之类的控制包，先计数

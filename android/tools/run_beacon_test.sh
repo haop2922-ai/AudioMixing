@@ -194,7 +194,7 @@ EOF
 cat > "$S/com/audiomixing/app/BuildConfig.java" <<'EOF'
 package com.audiomixing.app;
 public final class BuildConfig {
-    public static final String VERSION_NAME = "2.1";
+    public static final String VERSION_NAME = "2.12";
 }
 EOF
 

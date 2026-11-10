@@ -2,6 +2,8 @@ package com.audiomixing.app;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.util.zip.CRC32;
 
 /**
  * 28 字节包头（小端）。字段顺序、偏移、类型与电脑端 audiomixing/proto.py 的
@@ -48,6 +50,30 @@ public final class Proto {
     public static final int CODEC_PCM_F32 = 1, CODEC_PCM_S16 = 2, CODEC_OPUS = 3;
 
     public static final int FLAG_DISCONTINUITY = 0x01, FLAG_LAST = 0x02, FLAG_SILENCE = 0x04;
+    /**
+     * ★ 2026-11-04（B 第一阶段）：可选扩展段。**包头仍是 28 字节**，只有置了这一位，
+     * 包头与负载之间才多 8 字节：uint32 originId（原始声音主人的稳定哈希，全程不变）
+     * + uint8 hop（每转发一跳 +1，超过 {@link #MAX_HOP} 丢）+ 3 字节保留。
+     *
+     * 为什么用"可选扩展段"而不是新版本号：老端的 decode 只认 VERSION==1，
+     * 改版本号会让整条音频链路直接断；而扩展段只在**对端信标声明 ext:1** 时才发
+     * （见 Discovery.buildBeacon / AudioSend），老端永远收不到带扩展段的包。
+     */
+    public static final int FLAG_EXT = 0x08;
+    public static final int EXT_SIZE = 8;
+    public static final int MAX_HOP = 8;
+
+    /** device_id/node_id → 32 位稳定标识，和电脑端 proto.origin_id_of 完全一致（CRC32）。 */
+    public static int originIdOf(String value) {
+        String text = value == null ? "" : value.trim();
+        CRC32 crc = new CRC32();
+        // 电脑端是对 UTF-8 字节做 CRC32（zlib.crc32）；这里必须完全一样。
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        crc.update(bytes, 0, bytes.length);
+        long v = crc.getValue() & 0xFFFFFFFFL;
+        int id = (int) v;
+        return id == 0 ? 1 : id;   // 0 保留 = "没有 origin 信息"
+    }
 
     public static final int SAMPLE_RATE = 48000;
     public static final int CHANNELS = 2;
@@ -57,7 +83,17 @@ public final class Proto {
     public static final int GAIN_ONE = 16384;
 
     public static final int DEFAULT_AUDIO_PORT = 47831;
-    public static final int DEFAULT_DISCOVERY_PORT = 47830;
+    /**
+     * ★ 2026-11-01 用户：两端默认发现端口统一为 17830。
+     * 这个值必须和电脑端 {@code audiomixing/proto.py} 的 {@code PORT_DISCOVERY} 一致 —
+     * 它是两端**唯一**需要手填的端口；音频端口由信标协商，不需要管。
+     */
+    public static final int DEFAULT_DISCOVERY_PORT = 17830;
+    /**
+     * 旧默认发现端口。升级时把"从没改过"的 47830 自动搬到 17830
+     * （见 {@link Engine#configuredDiscoveryPort()}）；用户自己填过的其它值一律不动。
+     */
+    public static final int LEGACY_DISCOVERY_PORT = 47830;
     public static final String DISCOVERY_GROUP = "239.255.77.120";
 
     private Proto() {
@@ -74,6 +110,9 @@ public final class Proto {
         public long tsNs;
         public int gainQ14 = GAIN_ONE;
         public byte[] payload = new byte[0];
+        /** 扩展段字段（仅 FLAG_EXT 时存在；0 = 老端/未协商）。 */
+        public int originId = 0;
+        public int hop = 0;
 
         public Pkt(int type) {
             this.type = type;
@@ -83,13 +122,18 @@ public final class Proto {
     /** 编成一个可以直接 send 的字节数组。 */
     public static byte[] encode(Pkt p) {
         byte[] payload = p.payload != null ? p.payload : new byte[0];
-        ByteBuffer b = ByteBuffer.allocate(HEADER_SIZE + payload.length);
+        int flags = p.flags & 0xFF;
+        boolean ext = p.originId != 0;
+        if (ext) {
+            flags |= FLAG_EXT;
+        }
+        ByteBuffer b = ByteBuffer.allocate(HEADER_SIZE + (ext ? EXT_SIZE : 0) + payload.length);
         // 必须显式指定小端：Java 默认是大端，而我们的协议是网络里跑的小端布局。
         b.order(ByteOrder.LITTLE_ENDIAN);
         b.putShort((short) MAGIC);
         b.put((byte) VERSION);
         b.put((byte) (p.type & 0xFF));
-        b.put((byte) (p.flags & 0xFF));
+        b.put((byte) flags);
         b.put((byte) (p.codec & 0xFF));
         b.putShort((short) (p.seq & 0xFFFF));
         b.putInt(p.ssrc);
@@ -97,6 +141,13 @@ public final class Proto {
         b.putLong(p.tsNs);
         b.putShort((short) (p.gainQ14 & 0xFFFF));
         b.putShort((short) (payload.length & 0xFFFF));
+        if (ext) {
+            b.putInt(p.originId);
+            b.put((byte) (p.hop & 0xFF));
+            b.put((byte) 0);
+            b.put((byte) 0);
+            b.put((byte) 0);
+        }
         b.put(payload);
         return b.array();
     }
@@ -124,7 +175,17 @@ public final class Proto {
         p.tsNs = b.getLong();
         p.gainQ14 = b.getShort();          // 有符号：音量可以是负的
         int plen = b.getShort() & 0xFFFF;
-        int available = len - HEADER_SIZE;
+        int offset = HEADER_SIZE;
+        if ((p.flags & FLAG_EXT) != 0) {
+            if (len < HEADER_SIZE + EXT_SIZE) {
+                return null;               // 扩展段被截断：这包不可信，丢掉
+            }
+            p.originId = b.getInt();
+            p.hop = b.get() & 0xFF;
+            b.get(); b.get(); b.get();     // 3 字节保留
+            offset += EXT_SIZE;
+        }
+        int available = len - offset;
         if (plen > available) {
             plen = available;              // 包被截断也不要崩，取能拿到的部分
         }

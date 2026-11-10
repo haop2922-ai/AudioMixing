@@ -170,7 +170,7 @@ const qs = new URLSearchParams(location.search);
 const pathMode = /(^|\/)(mic|microphone)(\.html)?$/.test(location.pathname) ? 'mic' : 'listen';
 const qMode = qs.get('mode');
 let mode = (qMode === 'mic' || qMode === 'listen') ? qMode : pathMode;
-const PHONE_NAME = qs.get('name') || '手机';
+const PHONE_NAME = (qs.get('name') || '手机').slice(0, 32) || '手机';
 
 let ws = null, ctx = null, gainNode = null, playAt = 0, running = false, busy = false;
 let lost = 0, recv = 0, rate = 24000, ch = 1, backlog = 0;
@@ -224,7 +224,15 @@ function setState(text, cls){
   $('ring').className = 'ring' + (cls === 'on' ? ' live' : cls === 'busy' ? ' busy' : cls === 'err' ? ' bad' : '');
 }
 function kv(pairs){
-  $('kv').innerHTML = pairs.map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join('');
+  // 用 textContent 而不是 innerHTML：?name= 之类的值来自 URL，拼进 HTML 就是
+  // 一个现成的脚本注入点。
+  const box = $('kv');
+  box.innerHTML = '';
+  for(const [k, v] of pairs){
+    const a = document.createElement('span'); a.textContent = k;
+    const b = document.createElement('b'); b.textContent = v;
+    box.appendChild(a); box.appendChild(b);
+  }
 }
 
 function modeUI(){

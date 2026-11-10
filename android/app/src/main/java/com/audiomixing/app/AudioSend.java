@@ -17,6 +17,7 @@ import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.util.Locale;
 import java.util.Arrays;
 
 /**
@@ -118,6 +119,37 @@ public final class AudioSend {
     private WifiManager.WifiLock wifiLock;
 
     private volatile int gainQ14 = Proto.GAIN_ONE;
+    // ★ v2.28（用户第 2 条）：系统媒体音量必须由手机自己乘进 PCM。
+    //   采集点（AudioPlaybackCapture）在系统音量之前，不乘的话电脑端听到的音量
+    //   和手机音量旋钮完全无关（v2.27 就是这么"修"坏的）。这里 400ms 读一次，
+    //   和 gainQ14 合成一个 Q14 再套到每一帧上——只衰减一次，电脑端不再乘。
+    private volatile int mediaVolQ14 = Proto.GAIN_ONE;
+    private long lastMediaVolMs;
+    // ★ 2026-11-08（用户方案）：媒体音量乘数绑在"送声档位"上，不再有用户可见的
+    //   system/capture/auto 三档：
+    //   · 外放档（sendMode=1）：乘 STREAM_MUSIC（原行为）；
+    //   · 静音档（sendMode=2）：STREAM_MUSIC 被我们锁 0，这个 0 无信息量 → 默认不乘；
+    //     策略 last_nonzero 才沿用进入静音前最后一次非零音量。
+    //   电脑端只读档位声明、系数恒 1.0 —— 两端合计只乘一次。
+    private volatile int sendMode = 1;
+    private volatile String silentVolPolicy = SendVolume.POLICY_INTERNAL;
+    private volatile String volSource = SendVolume.MODE_EXTERNAL;
+    private volatile int systemVolQ14 = Proto.GAIN_ONE;
+    // ★ 2026-11-06（第 2 条取证）：把"这一层到底乘了多少"随统计包报给电脑。
+    //   用户实测调视频 App 音量"纹丝不动"，光靠电脑端一个 vol 数值分辨不出
+    //   "手机没乘"还是"乘了但被抹平"。这里同时报乘数（Q14）和增益前后的峰值，
+    //   电脑端点开「诊断」就能看到 原始峰值 → 增益后峰值 是否按 Q14 比例变化。
+    private volatile int diagGainQ14 = Proto.GAIN_ONE;
+    private volatile int diagMediaQ14 = Proto.GAIN_ONE;
+    private volatile int diagTotalQ14 = Proto.GAIN_ONE;
+    private volatile float diagRawPeak;
+    private volatile float diagPostPeak;
+    // ★ 2026-11-04（B 第一阶段）：originId/hop 扩展段。
+    //   · originId 固定为本机 device_id 的哈希（原始声音主人，全程不改）；
+    //   · extEnabled 只有在**所有当前目标都声明 ext:1** 时才为真 —— 目标里只要有一台
+    //     老电脑，就整条链路发老包，避免老电脑把多出来的 8 字节当音频听成噪音。
+    private volatile int selfOriginId = 0;
+    private volatile boolean extEnabled = false;
     private volatile float peak;
     private volatile long packetsSent;
     private volatile long bytesSent;
@@ -218,6 +250,84 @@ public final class AudioSend {
 
     public boolean isRunning() {
         return running;
+    }
+
+    /**
+     * ★ 2026-11-06（第 2 条取证）：随 T_STATS 上报的增益取证片段（JSON 键值，不含大括号）。
+     *
+     * <p>电脑端用它回答"乘法到底有没有生效"：
+     * <ul>
+     *   <li>{@code vol_q14} —— 这一层读到的媒体/App 音量（Q14，16384=1.00）；</li>
+     *   <li>{@code gain_q14} —— 用户「送声音」那条增益（Q14）；</li>
+     *   <li>{@code total_q14} —— 真正套到 PCM 上的合成乘数（Q14）；</li>
+     *   <li>{@code raw_peak/post_peak} —— 增益前/后的电平。两者之比应接近
+     *       {@code total_q14/16384}；如果 post 恒等于 raw，说明乘法被后续环节抹平。</li>
+     * </ul>
+     * 老电脑会把这些键当未知字段忽略，不影响新旧混跑。
+     */
+    public String diagJson() {
+        if (!running) return "";
+        return String.format(Locale.US,
+                ",\"vol_q14\":%d,\"gain_q14\":%d,\"total_q14\":%d,\"raw_peak\":%.4f,\"post_peak\":%.4f",
+                diagMediaQ14, diagGainQ14, diagTotalQ14, diagRawPeak, diagPostPeak);
+    }
+
+    // ------------------------------------------------------------ ★ 送声档位音量
+
+    /**
+     * ★ 2026-11-08：档位变化时更新媒体乘数（不重建采集，声音一秒都不断）。
+     *
+     * @param mode 1 = 外放档（乘 STREAM_MUSIC）；2 = 静音档（默认不乘）
+     */
+    public void setSendMode(int mode) {
+        int m = mode >= 2 ? 2 : 1;
+        if (m == sendMode) {
+            return;
+        }
+        sendMode = m;
+        applyVolumePolicy();
+        Log.i(TAG, "送声档位 → " + SendVolume.text(m, silentVolPolicy, mediaVolQ14)
+                + "（vol_source=" + volSource + "）");
+    }
+
+    /**
+     * 静音档乘数策略：{@code internal_only}（默认，1.0）｜{@code last_nonzero}。
+     * 只影响静音档；外放档永远乘当前系统媒体音量。
+     */
+    public void setSilentVolPolicy(String policy) {
+        String p = SendVolume.normalizePolicy(policy);
+        if (p.equals(silentVolPolicy)) {
+            return;
+        }
+        silentVolPolicy = p;
+        applyVolumePolicy();
+        Log.i(TAG, "静音档乘数策略 → " + SendVolume.policyText(p)
+                + "（media=" + String.format(Locale.US, "%.2f", mediaVolQ14 / (float) SendVolume.ONE) + "）");
+    }
+
+    /** 当前档位（1 外放 / 2 静音）。 */
+    public int sendMode() {
+        return sendMode;
+    }
+
+    /** 真正生效的档位名（external/silent）—— 统计包和电脑端都用它。 */
+    public String volumeSource() {
+        return volSource;
+    }
+
+    /** 静音档乘数策略（internal_only / last_nonzero）。 */
+    public String silentVolPolicy() {
+        return silentVolPolicy;
+    }
+
+    /** 重算"这一层乘多少"。档位/策略/系统音量的任何变化都走这里。 */
+    private void applyVolumePolicy() {
+        float vol = Engine.mediaVolumeRatioFor(appCtx);
+        systemVolQ14 = SendVolume.q14(vol);
+        // mediaVolumeRatioFor() 在"静音已生效"时会返回进静音前最后一次设定值，
+        // 正好就是 last_nonzero 语义；没有可用值时 mediaQ14 内部会退回 1.0。
+        mediaVolQ14 = SendVolume.mediaQ14(sendMode, silentVolPolicy, systemVolQ14, systemVolQ14);
+        volSource = SendVolume.modeName(sendMode);
     }
 
     // ------------------------------------------------------------ ★ 音源切换
@@ -347,6 +457,16 @@ public final class AudioSend {
      *
      * @param endpoints "host:port" 列表（Engine 按发现列表 + 用户勾选算出来）
      */
+    /** ★ 2026-11-04：设置本机 originId（device_id 的稳定哈希，来自 Engine/Discovery）。 */
+    public void setSelfOriginId(int originId) {
+        this.selfOriginId = originId;
+    }
+
+    /** ★ 2026-11-04：当前所有目标是否都支持扩展段（都支持才发 originId/hop）。 */
+    public void setExtEnabled(boolean enabled) {
+        this.extEnabled = enabled;
+    }
+
     public void setTargets(java.util.List<String> endpoints) {
         fanout.setTargets(endpoints);
         if (endpoints != null && !endpoints.isEmpty()) {
@@ -491,7 +611,20 @@ public final class AudioSend {
                 // 静音观察用的是【加音量之前】的电平：用户把"我们这一层的音量"拖到 0 不该被当成
                 // "采不到声音"（那会指向完全错误的排查方向）。
                 float rawPeak = rawPeak(frame);
-                float p = applyGain(frame, gainQ14);
+                long nowMs = SystemClock.elapsedRealtime();
+                if (lastMediaVolMs == 0 || nowMs - lastMediaVolMs >= 400) {
+                    lastMediaVolMs = nowMs;
+                    applyVolumePolicy();
+                }
+                int totalQ14 = (int) Math.min((long) Proto.GAIN_ONE * 2,
+                        ((long) gainQ14 * mediaVolQ14) / Proto.GAIN_ONE);
+                float p = applyGain(frame, totalQ14);
+                // ★ 2026-11-06（第 2 条取证）：记下乘数和增益前后的电平（供统计包上报）。
+                diagGainQ14 = gainQ14;
+                diagMediaQ14 = mediaVolQ14;
+                diagTotalQ14 = totalQ14;
+                diagRawPeak = rawPeak;
+                diagPostPeak = p;
                 if (rawPeak > SILENCE_LEVEL) {
                     lastLoudMs = SystemClock.elapsedRealtime();
                     everLoud = true;
@@ -500,6 +633,10 @@ public final class AudioSend {
                 peak = p >= peak ? p : peak * 0.82f;
 
                 pkt.seq = seq++ & 0xFFFF;                       // uint16 回绕
+                // ★ 扩展段只在协商成功时写；否则 originId=0，encode() 不会加 FLAG_EXT，
+                //   老电脑收到的字节数、偏移、音频都和以前一模一样。
+                pkt.originId = extEnabled ? selfOriginId : 0;
+                pkt.hop = 0;
                 pkt.tsNs = System.currentTimeMillis() * 1_000_000L;
                 pkt.gainQ14 = gainQ14;
                 // ★ 一包只编码一次，然后分发给所有目标（所有人收到的字节完全一样）。

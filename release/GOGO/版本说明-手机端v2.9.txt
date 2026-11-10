@@ -1,0 +1,51 @@
+Audio Mixing 手机端 v2.9 —— 版本说明（配套电脑端 2.19）
+构建时间：2026-11-02 09:05
+versionCode 23 / versionName 2.9
+
+━━━ 这一版改了什么 ━━━
+
+① 电脑在手机/别的电脑上显示成「本机」→ 电脑端 2.19 修（老配置的默认名迁移成主机名 2024TSJ）。
+   手机端不需要改代码，装 2.9 只是配套确认版本。
+
+② 手机音量面板里的「App 音量」：开始收听时创建 MediaSession
+   - 音量面板分「手机音量 / App 音量」；本应用原来不出现在右侧。
+   - 原因：播放用 AudioTrack（USAGE_MEDIA）但没有 MediaSession，系统只给一条总媒体音量。
+   - 修法：Engine.ensureReceiver 末尾建一个本地播放的 MediaSession
+     （USAGE_MEDIA / CONTENT_TYPE_MUSIC，STATE_PLAYING），停止收听时 setActive(false)+release()。
+   - 这个会话只用于让系统把本应用识别成"正在放媒体的 App"，不接管播放/暂停按键；
+     也不会在送声音时常驻。
+   - 实际音量仍是三层：系统/分应用音量 × AudioTrack.setVolume × 每路 PCM 增益。
+
+③ 仍保留 setVolumeControlStream(STREAM_MUSIC)：硬件音量键有媒体会话时跟着会话走。
+
+━━━ 用户该测什么 ━━━
+
+1. 装 2.9，确认「详细」页显示 2.9。
+2. 让手机实际在收听（电脑送声音或手机点「收听」），展开系统音量面板：
+   应能在「App 音量」那一栏看到 Audio Mixing（图标/应用名）。
+   调整它，声音大小应变化；「手机音量」那一栏仍能整体调。
+3. 若右侧仍只显示别的 App：点一下音量面板右侧的 App 图标，看列表里有没有 Audio Mixing；
+   把结果和手机型号/ROM 发回来。
+4. 电脑设备卡片标题应显示 2024TSJ（电脑端 2.19 启动后自动迁移），不再是「本机」。
+
+━━━ 文件 ━━━
+
+  AudioMixing-手机版.apk
+    158,103 字节
+    versionCode 23 / versionName 2.9（minSdk 24 / targetSdk 34）
+    sha256  3005946f1c70f53be42843ecec74fcac65ccf5010d8ad681e0917fd6af333ed3
+    稳定 debug 签名；覆盖安装不需要卸载。
+
+  同一份 APK：
+    release\GOGO\AudioMixing-手机版.apk
+    release\AudioMixing-mic.apk
+    tools\installer_payload\AudioMixing-mic.apk
+    版本备份\电脑端\v2.19-20261102-0905\成品\AudioMixing-手机版.apk
+    v2.19 EXE 内部
+
+━━━ 验证基线 ━━━
+
+  gradle clean assembleDebug BUILD SUCCESSFUL；check_apk PASS（2.9 / 23）；
+  七条 Android 离线门禁仍 PASS（beacon 28 / fanout 36 / jitter 31 / policy 72 /
+  recv 39 / resampler 18 / source 22）。
+  真机：App 音量是否出现 —— 需要你按上面 2/3 验；不同 ROM 的分应用音量实现可能不同。

@@ -68,6 +68,21 @@ HOLD_FADE_BLOCKS = 5
 
 MICS: dict[str, "NetMic"] = {}
 _LOCK = threading.Lock()
+# 上限：名字来自局域网上的任何设备，不能让它无限建槽位（旧版 900 秒才回收，
+# 几千个不同名字就能把内存顶起来）。32 个同时送声音的手机足够用了。
+MAX_MICS = 32
+MIN_RATE = 8000
+MAX_RATE = 192000
+
+
+def _safe_rate(rate: int) -> int:
+    try:
+        value = int(rate or SAMPLE_RATE)
+    except (TypeError, ValueError):
+        return SAMPLE_RATE
+    if not MIN_RATE <= value <= MAX_RATE:
+        return SAMPLE_RATE
+    return value
 
 
 def open_mic(name: str, rate: int = SAMPLE_RATE) -> "NetMic":
@@ -78,13 +93,18 @@ def open_mic(name: str, rate: int = SAMPLE_RATE) -> "NetMic":
     reader holding a stopped mic, and the audio stayed silent until the configuration
     happened to be rebuilt.
     """
-    name = (name or "").strip() or "手机"
+    name = (name or "").strip()[:64] or "手机"
+    rate = _safe_rate(rate)
+    # 先回收长期不用的槽位，再谈"满了"。
+    reap()
     with _LOCK:
         mic = MICS.get(name)
         if mic is None:
+            if len(MICS) >= MAX_MICS:
+                raise ValueError("网络音源最多 %d 个；请先在面板里断开不用的设备" % MAX_MICS)
             mic = NetMic(name, rate)
             MICS[name] = mic
-        elif mic.device_rate != (int(rate) or SAMPLE_RATE):
+        elif mic.device_rate != rate:
             mic.set_rate(rate)
         return mic
 
@@ -144,7 +164,7 @@ class NetMic:
         self.origin = origin
         self.sample_rate = SAMPLE_RATE  # what we hand the engine
         self.channels = CHANNELS
-        self.device_rate = int(rate) or SAMPLE_RATE
+        self.device_rate = _safe_rate(rate)
         # A Condition, not a plain Lock: the reader waits for the phone here instead
         # of fading the audio out the moment the queue looks empty.
         self._lock = threading.Condition()
@@ -185,7 +205,7 @@ class NetMic:
         rebuilt - so whoever is reading it keeps reading the right thing.
         """
         with self._lock:
-            self.device_rate = int(rate) or SAMPLE_RATE
+            self.device_rate = _safe_rate(rate)
             self._resampler = Resampler(self.device_rate, SAMPLE_RATE, 1)
             self._mono.clear()
             self._queued = 0

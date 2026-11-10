@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import struct
 import time
+import zlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -55,6 +56,23 @@ CODEC_BY_NAME = {v: k for k, v in CODEC_NAMES.items()}
 FLAG_DISCONTINUITY = 0x01
 FLAG_LAST = 0x02
 FLAG_SILENCE = 0x04
+# ★ 2026-11-04（B 第一阶段）：可选扩展段。
+#   **包头仍是 28 字节**，只有发了这个位才在包头和负载之间多 8 字节：
+#       uint32 origin_id  （原始声音主人的稳定哈希，全程不变）
+#       uint8  hop        （每转发一跳 +1，超过上限直接丢）
+#       3 字节保留（写 0）
+#   为什么不用新版本号：老端 `decode()` 只认 version==1，改版本号会让整条音频
+#   链路直接断。扩展段只发给"信标里声明 ext:1"的对端（见 build_beacon / engine），
+#   老端永远收不到带扩展段的包，所以既不报错也不拒流。
+FLAG_EXT = 0x08
+EXT_SIZE = 8
+EXT = struct.Struct("<IB3x")
+MAX_HOP = 8
+# 扩展段里 0 表示"没有 origin 信息"（老端 / 未协商），所以哈希结果不能是 0。
+def origin_id_of(value: str) -> int:
+    """node_id / device_id → 32 位稳定标识（跨重启、跨两端一致）。"""
+    text = str(value or "").strip()
+    return (zlib.crc32(text.encode("utf-8")) & 0xFFFFFFFF) or 1
 
 HEADER_FIELDS = (
     ("magic", "H"),  # 0x574C == "WL"
@@ -86,7 +104,11 @@ SAMPLE_RATE = 48000
 CHANNELS = 2
 
 # Default ports.
-PORT_DISCOVERY = 47830
+# ★ 2026-11-01 用户：两端默认发现端口统一为 17830（手机 Proto.DEFAULT_DISCOVERY_PORT 同值）。
+#   发现端口是**唯一**需要两端手填一致的端口；音频端口由信标协商，不需要用户管。
+PORT_DISCOVERY = 17830
+# 旧默认发现端口：升级时把"从没改过"的 47830 搬到 17830（见 Config.load）。
+LEGACY_PORT_DISCOVERY = 47830
 PORT_AUDIO = 47831
 PORT_WEB = 17800
 DISCOVERY_GROUP = "239.255.77.120"
@@ -118,6 +140,9 @@ class Packet:
     samples: int = 0
     ts_ns: int = 0
     gain_q14: int = 10000
+    # 扩展段（只有 origin_id 非 0 时才写进包里；见 FLAG_EXT 的说明）。
+    origin_id: int = 0
+    hop: int = 0
 
     # ---- encoding --------------------------------------------------------
     def encode(self) -> bytes:
@@ -125,11 +150,16 @@ class Packet:
             raise ValueError("payload too large for one datagram: %d" % len(self.payload))
         if not 0 <= self.ts_ns < (1 << 63):
             raise ValueError("ts_ns out of range for the wire format: %d" % self.ts_ns)
+        flags = self.flags & 0xFF
+        ext = b""
+        if self.origin_id:
+            flags |= FLAG_EXT
+            ext = EXT.pack(self.origin_id & 0xFFFFFFFF, max(0, int(self.hop)) & 0xFF)
         return HEADER.pack(
             MAGIC_U16,
             VERSION,
             self.type & 0xFF,
-            self.flags & 0xFF,
+            flags,
             self.codec & 0xFF,
             self.seq & 0xFFFF,
             self.ssrc & 0xFFFFFFFF,
@@ -137,7 +167,7 @@ class Packet:
             self.ts_ns & MASK64,
             self.gain_q14,
             len(self.payload),
-        ) + self.payload
+        ) + ext + self.payload
 
     # ---- JSON helpers ----------------------------------------------------
     def json(self) -> dict[str, Any]:
@@ -180,11 +210,19 @@ def decode(buf: bytes) -> Packet | None:
     magic, version, ptype, flags, codec, seq, ssrc, samples, ts_ns, gain, plen = HEADER.unpack_from(buf, 0)
     if magic != MAGIC_U16 or version != VERSION:
         return None
-    if HEADER_SIZE + plen > len(buf):
+    offset = HEADER_SIZE
+    origin_id = 0
+    hop = 0
+    if flags & FLAG_EXT:
+        if HEADER_SIZE + EXT_SIZE > len(buf):
+            return None
+        origin_id, hop = EXT.unpack_from(buf, HEADER_SIZE)
+        offset += EXT_SIZE
+    if offset + plen > len(buf):
         return None
     return Packet(
         type=ptype,
-        payload=bytes(buf[HEADER_SIZE : HEADER_SIZE + plen]),
+        payload=bytes(buf[offset : offset + plen]),
         codec=codec,
         flags=flags,
         seq=seq,
@@ -192,6 +230,8 @@ def decode(buf: bytes) -> Packet | None:
         samples=samples,
         ts_ns=ts_ns,
         gain_q14=gain,
+        origin_id=origin_id,
+        hop=hop,
     )
 
 
@@ -278,6 +318,16 @@ def clock_sample(pong: Packet, t3: int) -> tuple[float, float, float] | None:
 class ClockSync:
     """Keeps a best-effort estimate of `remote_clock - local_clock`."""
 
+    # ★ 2026-11-04（审计 A2）：offset 原来只在"RTT ≤ 历史最小值"的样本上更新，
+    #   而 `_best_rtt` 只减不增 —— 采集过几轮之后，后续样本几乎永远不再命中，
+    #   offset 就被冻死了。对端墙钟发生校时跳变（NTP / 用户改时间）时，
+    #   本机仍按旧 offset 排播放头，表现为整段延迟或持续溢出，直到重启。
+    #   现在：① 常规样本允许在 best_rtt 的 1.5 倍窗口内更新（仍偏好低 RTT 样本）；
+    #        ② offset 跳变超过 250ms 时视为对端校时，直接重锚并重置 best_rtt。
+    RTT_WINDOW = 1.5
+    RESYNC_NS = 250_000_000.0
+    RESYNC_RTT_GUARD = 3.0
+
     def __init__(self, name: str = "peer") -> None:
         self.name = name
         self.offset_ns: float = 0.0
@@ -294,10 +344,18 @@ class ClockSync:
         if s is None:
             return False
         offset, rtt, _ = s
-        # Prefer the sample with the smallest RTT: it has the least asymmetric error.
-        if rtt <= self._best_rtt or self.samples == 0:
+        first = self.samples == 0
+        jumped = (not first and abs(offset - self.offset_ns) > self.RESYNC_NS
+                  and rtt <= max(self._best_rtt * self.RESYNC_RTT_GUARD, 50_000_000.0))
+        if first or jumped:
+            # 第一次采样，或对端墙钟刚跳了一大截：直接采用，并让 best_rtt 跟着重置，
+            # 否则旧的最小 RTT 会把后面正常的样本一直挡在门外。
+            self.offset_ns = offset
+            self._best_rtt = rtt
+        elif rtt <= self._best_rtt * self.RTT_WINDOW:
+            # Prefer the sample with the smallest RTT: it has the least asymmetric error.
             alpha = 0.5 if self.samples < 4 else 0.15
-            self.offset_ns = offset if self.samples == 0 else (1 - alpha) * self.offset_ns + alpha * offset
+            self.offset_ns = (1 - alpha) * self.offset_ns + alpha * offset
             self._best_rtt = min(self._best_rtt, rtt)
         self.rtt_ns = rtt
         self.samples += 1

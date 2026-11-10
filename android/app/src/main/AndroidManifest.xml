@@ -47,7 +47,11 @@
           三个都要声明：targetSdk 34 起，startForeground 带的类型必须与清单一致，
           缺一个就在那一条路上抛 SecurityException。
         -->
+        <!-- android:stopWithTask="true"：用户从最近任务里划掉 App 时，
+             系统直接把服务停掉，而不是让 START_STICKY 的服务继续活着、
+             一直攥着 MediaProjection（系统会显示「正在获取屏幕」）。 -->
         <service android:name=".MixService" android:exported="false"
+                 android:stopWithTask="true"
                  android:foregroundServiceType="mediaPlayback|microphone|mediaProjection"/>
     </application>
 </manifest>

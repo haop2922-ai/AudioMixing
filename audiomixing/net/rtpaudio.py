@@ -53,8 +53,14 @@ JITTER_START_MS = 55.0
 # Latency trimming: above `target + slack`, the oldest frames are skipped until
 # the delay is back where it belongs. A read only ever consumes one block, so
 # without this a single burst of arrivals leaves the stream permanently deep.
-JITTER_TRIM_SLACK_MS = 60.0
-JITTER_TRIM_STEP_MS = 20.0
+#
+# ★ 2026-11-03 用户（图3）：「缓冲 60.0 毫秒，目标 25.0 毫秒」两者互相矛盾。
+#   自适应把 target 压到下限 25ms 后，trim 的阈值却是 target + 60 = 85ms ——
+#   60ms 的实际深度**永远低于阈值**，于是 target 一路显示 25ms，缓冲却永远停在 60ms。
+#   slack 收紧到 20ms、单次步长 10ms：阈值降到 45ms，实际深度会跟着目标收敛，
+#   同时仍留 20ms 余量吸收 Wi-Fi 抖动（不会为了对齐显示而制造欠载/爆音）。
+JITTER_TRIM_SLACK_MS = 20.0
+JITTER_TRIM_STEP_MS = 10.0
 # ★ 2026-10-19 用户：「音频质量出现了下降，存在短小杂音」。
 #   一个块只差**几个采样**（网络抖动让这一包晚到几毫秒）时，原来直接补静音 ——
 #   波形被硬切到 0 再跳回来，那就是一声"咔"。缺口不超过这个宽度就改成**保持最后一个采样**
@@ -167,6 +173,25 @@ class JitterBuffer:
         self._dbg_last_bucket = -1
         self._primed_wait_ns = 0
         self._last_underruns = 0
+        # ★ 2026-11-03（Q2）：自适应要看的每秒增量。`_last_late/_last_overflow` 是上一秒
+        #   的累计值，差值才是"这一秒又晚到/溢出多少"；只看累计值会让一次旧事件永远
+        #   把目标往上推。
+        self._last_late = 0
+        self._last_overflow = 0
+        self._last_written = 0
+        # ★ 2026-11-04（Q1）：自适应不能再用"这一秒只要出现过一次欠载就涨"。
+        #   用户现场的 5982 秒里欠载 2945 次 ≈ 0.5%/块，但按"每秒 > 0"判，
+        #   几乎每秒都涨 5ms，目标被钉死在 150ms 上限 —— 欠载并没有因此消失。
+        #   这里改为算**欠载率**（欠载 / 本秒读块数），并给收缩加"连续干净"条件，
+        #   避免目标在 25~150 之间来回震荡。
+        self._reads = 0
+        self._last_reads = 0
+        self._clean_s = 0
+        # ★ 2026-11-04（Q1）：这条流播出来时还要乘多少（0..1）。
+        #   为什么不能只乘在播放端的 `gain` 上：频道收听那条路由的 `from` 是通配 `["*"]`，
+        #   一个播放端里可能同时混着**多台来源**，一台手机的音量不能去改整条路由的增益。
+        #   所以"来源音量"按流来乘（由引擎在每次 apply_routes 里写），播放端只负责路由增益。
+        self.source_gain = 1.0
 
     # -- write side --------------------------------------------------------
     def write(
@@ -176,6 +201,7 @@ class JitterBuffer:
         offset_ns: float = 0.0,
         discontinuity: bool = False,
         seq: int | None = None,
+        count_late: bool = True,
     ) -> None:
         """Queue `samples` (interleaved float32) captured at remote clock `ts_ns`.
 
@@ -218,9 +244,13 @@ class JitterBuffer:
             elif drift_ns > 200_000_000:
                 self._play_at = desired
                 self.resyncs += 1
-        if self._primed and desired + int(n * 1_000_000_000 / SAMPLE_RATE) < now:
+        if count_late and self._primed and desired + int(n * 1_000_000_000 / SAMPLE_RATE) < now:
             # The whole packet is already due (arrived very late): count it but do
             # not touch the playhead, the samples simply play as soon as possible.
+            #
+            # ★ 2026-11-04（Q1）：只有在**时钟已同步**时才允许计"晚到"。offset 为 0 时
+            #   `desired` 根本不在本机时间轴上（手机墙钟与电脑差 1.17 秒，现场
+            #   597844 / 597850 包全被判晚到），这是计数口径错，不是链路差。
             self.dropped_late += 1
         # Drop the oldest frames if this packet would overflow the ring.
         if self._count + n > self.capacity:
@@ -282,6 +312,13 @@ class JitterBuffer:
                 return out
             self._primed = True
             self.underruns = 0
+            # ★ 2026-11-03（Q2）：预滚阶段收进来的包还没有真正开始播，这期间的
+            #   溢出/晚到只是"还没开播"的副作用，不能永久挂在面板上误导判断。
+            #   真正开始播放的这一刻清零一次，之后再累计就都是播放期间的真实事件。
+            self.dropped_late = 0
+            self.dropped_overflow = 0
+            self._last_late = 0
+            self._last_overflow = 0
         if not self._have_timeline:
             self.underruns += 1
             return out
@@ -334,6 +371,8 @@ class JitterBuffer:
                 self.underruns += 1
         self._play_at = max(self._play_at + take * step_ns, now - target_ns)
         self.max_depth_ms = max(self.max_depth_ms, self.depth_ms())
+        # 自适应按"块"算比率：欠载次数 / 本秒读块数，和晚到包的比率同一量纲。
+        self._reads += 1
         self._adapt(now)
         if DEBUG_JITTER and (self.samples_played // (frames * 20) != self._dbg_last_bucket):
             self._dbg_last_bucket = self.samples_played // (frames * 20)
@@ -383,12 +422,19 @@ class JitterBuffer:
     def _adapt(self, now: float) -> None:
         """Tune the pre-roll depth from what the link is actually doing.
 
-        Growth is driven by **underruns only** — the real symptom of too little
-        buffer. Growing on the *peak queue depth* instead (what this used to do)
-        is self-reinforcing: one burst raises the target, the higher target keeps
-        the queue deep, and the next peak raises it again, until the buffer parks
-        at JITTER_MAX_MS for the rest of the session. Shrinking is deliberately
-        slower than growing so the loop cannot oscillate.
+        Growth is driven by **underruns** (the real symptom of too little buffer)
+        and by **late packets** (★ 2026-11-03 Q2: 迟到比例 > 10% 说明 25ms 下限根本
+        不够用 —— 包到了但已经"过期"，样本照播、时间线错位，听感上是间隙/跳动).
+        Growing on the *peak queue depth* instead (what this used to do) is
+        self-reinforcing: one burst raises the target, the higher target keeps the
+        queue deep, and the next peak raises it again, until the buffer parks at
+        JITTER_MAX_MS for the rest of the session. Shrinking is deliberately slower
+        than growing so the loop cannot oscillate.
+
+        **Overflow never grows the target**: it means the ring is already too deep
+        (or playback stalled), so growing would make it worse. The per-second delta
+        is consumed (baseline reset) and reported through the counters; at most we
+        fall through to the slow shrink below.
         """
         if now - self._last_adjust_ns < 1_000_000_000:
             return
@@ -397,20 +443,58 @@ class JitterBuffer:
         target_ms = _frames_to_ms(self.target_frames)
         underruns = self.underruns - getattr(self, "_last_underruns", 0)
         self._last_underruns = self.underruns
-        if underruns > 0:
-            if target_ms < JITTER_MAX_MS:
-                self.target_frames = min(_ms_to_frames(JITTER_MAX_MS), self.target_frames + _ms_to_frames(5.0))
+        late = self.dropped_late - self._last_late
+        self._last_late = self.dropped_late
+        overflow = self.dropped_overflow - self._last_overflow
+        self._last_overflow = self.dropped_overflow
+        written = self.samples_written - self._last_written
+        self._last_written = self.samples_written
+        reads = self._reads - self._last_reads
+        self._last_reads = self._reads
+        # 每秒写了多少"包"：按标准 10ms 包长折算。迟到的分子也是"包数"，
+        # 两者同单位，比例才有意义。样本不足一包时按 0 处理，避免除零。
+        packets = written / float(PCM_FRAMES_PER_PACKET)
+        late_ratio = (late / packets) if packets >= 1.0 else 0.0
+        # 欠载率：模糊的单次欠载很常见（用户现场 0.5%/块），不该把目标一路推到上限。
+        underrun_ratio = (underruns / float(reads)) if reads >= 1 else 0.0
+        if overflow > 0:
+            # 溢出说明缓冲已经太深/播放端停顿，再涨目标只会更糟；不涨。
+            grow_needed = False
+        else:
+            # 涨：真的缺缓冲才涨。欠载 > 2% 或晚到 > 10% 才算"缺"；
+            # 更严重的（欠载 > 5% / 晚到 > 25%）一次涨 10ms，否则 5ms。
+            grow_needed = underrun_ratio > 0.02 or late_ratio > 0.10
+        if grow_needed and target_ms < JITTER_MAX_MS:
+            step_ms = 10.0 if (underrun_ratio > 0.05 or late_ratio > 0.25) else 5.0
+            grow = min(_ms_to_frames(step_ms),
+                       _ms_to_frames(JITTER_MAX_MS) - self.target_frames)
+            if grow > 0:
+                self.target_frames += grow
                 # A deeper target means the playhead starts later, so hand the extra
                 # depth over immediately instead of waiting for it to accumulate.
-                self._play_at += _ms_to_frames(5.0) * (1_000_000_000 // SAMPLE_RATE)
+                self._play_at += grow * (1_000_000_000 // SAMPLE_RATE)
+            self._clean_s = 0
             return
-        if target_ms > JITTER_MIN_MS:
-            self.target_frames = max(_ms_to_frames(JITTER_MIN_MS), int(self.target_frames * 0.97))
+        # 收要慢：连续 5 秒完全没有欠载/晚到/溢出才允许收缩，且每秒只收 2%。
+        # 这样偶发抖动不会触发收缩，收缩后也不会立刻反弹 → 不会在 25~150 之间震荡。
+        if underruns == 0 and late == 0 and overflow == 0:
+            self._clean_s += 1
+        else:
+            self._clean_s = 0
+        if self._clean_s >= 5 and target_ms > JITTER_MIN_MS:
+            self.target_frames = max(_ms_to_frames(JITTER_MIN_MS), int(self.target_frames * 0.98))
 
     def stats(self) -> dict[str, Any]:
+        age_s = max(0.0, (now_ns() - float(self.last_packet_ns or 0.0)) / 1e9)
         return {
             # 「收」音量条：这一路收到多大声（0..1）。
             "peak": round(float(self.peak), 4),
+            # ★ 2026-11-03：这一路"现在还在不在收"。前端条子和文字都只看这个，
+            #   不再用"峰值有没有衰减"这种间接推断（断流后 peak 会冻在旧值上）。
+            "receiving": bool(self.samples_written and age_s < 3.0),
+            "age_s": round(age_s, 2),
+            # 统计口径：除 age_s 外，下面所有计数器都是"这一路从开始到现在"的累计值。
+            "seconds": round(max(0.0, (now_ns() - float(self.started_ns or 0.0)) / 1e9), 1),
             "buffered_ms": round(self.buffered_ms, 1),
             "depth_ms": round(self.depth_ms(), 1),
             "target_ms": round(_frames_to_ms(self.target_frames), 1),
@@ -424,6 +508,12 @@ class JitterBuffer:
             "overflow": self.dropped_overflow,
             "trimmed": self.trimmed,
             "resyncs": self.resyncs,
+            # ★ 2026-11-04（Q1）：给面板/诊断一个"比率"，用户不必自己拿 597844 去除
+            #   5960 秒。分母分别是累计包数和累计读块数，与分子同量纲。
+            "late_pct": (round(100.0 * self.dropped_late / (self.samples_written / float(PCM_FRAMES_PER_PACKET)), 2)
+                         if self.samples_written >= PCM_FRAMES_PER_PACKET else 0.0),
+            "underrun_pct": (round(100.0 * self.underruns / float(self._reads), 2)
+                             if self._reads else 0.0),
         }
 
 
@@ -474,10 +564,15 @@ class StreamInfo:
     source_name: str = ""
     codec: int = CODEC_PCM_S16
     started_ns: int = field(default_factory=now_ns)
+    # ★ 2026-11-04（审计 A1）：发送方的 IP。准入兜底只认"用户手动添加的对端"时要用它，
+    #   不能只看 node_id（信标丢了就只剩地址这一个身份）。
+    host: str = ""
     packets: int = 0
     bytes: int = 0
     last_seq: int | None = None
     lost: int = 0
+    # ★ 2026-11-04（审计 A3）：重复包（同一 seq 又来一遍）单独计数，且不再写进缓冲。
+    duplicates: int = 0
     route_id: str = ""
 
 
@@ -491,9 +586,20 @@ class Receiver:
         *,
         on_first_packet: Callable[[StreamInfo, tuple[str, int]], None] | None = None,
         accept_source: Callable[[str], bool] | None = None,
+        resolve_source: Callable[[str], str] | None = None,
         bind_host: str = "0.0.0.0",
+        self_origin_id: int = 0,
+        max_hop: int = proto.MAX_HOP,
     ) -> None:
         self.node_id = node_id
+        # ★ 2026-11-04（B 第一阶段）：防自环。`self_origin_id` 是本机 device_id 的稳定哈希；
+        #   收到 origin_id == 自己的帧，说明这台机器自己的声音绕了一圈又回来了 —— 立刻丢，
+        #   并且单独计数（诊断页要显示"自回声丢弃 N"）。`max_hop` 是转发上限。
+        #   老端没有扩展段（origin_id == 0），这两个判据都不触发，走老路径。
+        self.self_origin_id = int(self_origin_id or 0)
+        self.max_hop = int(max_hop or proto.MAX_HOP)
+        self.packets_echo_dropped = 0
+        self.packets_hop_dropped = 0
         self.port = port
         self.bind_host = bind_host
         self.streams: dict[int, StreamInfo] = {}
@@ -507,8 +613,13 @@ class Receiver:
         self._sock: socket.socket | None = None
         self.on_first_packet = on_first_packet
         self.accept_source = accept_source
+        self.resolve_source = resolve_source
         self.packets_received = 0
         self.packets_rejected = 0
+        # ★ 2026-11-04（Q2）：被准入规则挡下的包（未经接受的点对点单播）。
+        #   单独计数，且**不计入** packets_received / bytes_received —— 否则用户会在
+        #   监控页看到"正在接收"和一条根本不让他听的流，统计也就失去意义了。
+        self.packets_denied = 0
         self.handle_errors = 0
         self.bytes_received = 0
         self.last_error = ""
@@ -516,6 +627,10 @@ class Receiver:
         self.mix_rms = 0.0
         self.control_messages: list[dict[str, Any]] = []
         self._owners: dict[int, str] = {}
+        # ★ 2026-11-03 用户（图3）：路由行「数据量 9.2 MB，速率 0 KB/s」。
+        #   根因是 Receiver.stats 从来没算过速率（SenderSession 有 kbps、接收流没有），
+        #   前端 `stream.get("kbps")` 永远是 0。这里按真实字节增量算一个每秒窗口。
+        self._rate_prev: dict[int, tuple[float, int, float]] = {}
 
     # HWHHYN 用 DEEPSEEK 制作
     # -- lifecycle ---------------------------------------------------------
@@ -563,6 +678,12 @@ class Receiver:
             if pkt is None:
                 self.packets_rejected += 1
                 continue
+            # ★ 2026-11-04（Q2）：接收准入。通配"只听"以前会接住所有进来的流，
+            #   包括**本机没有接受的**点对点单播。这里在进入任何流表/计数器之前先判：
+            #   认得出来源、且本机不接受它 → 直接丢包（packets_denied 单独计）。
+            if not self._admitted(pkt, addr[0]):
+                self.packets_denied += 1
+                continue
             self.packets_received += 1
             self.bytes_received += len(data)
             try:
@@ -575,6 +696,32 @@ class Receiver:
                     import traceback
 
                     traceback.print_exc()
+
+    def _admitted(self, pkt: Packet, host: str) -> bool:
+        """这条包能不能进流表（Q2 的接收准入）。
+
+        只拦**音频包**，而且只在认得出来源时才拦 —— 认不出来的（手动 IP、信标丢了）
+        仍然按频道处理，保持老行为；没有注入回调时也一律放行。
+        """
+        if pkt.type != proto.T_AUDIO:
+            return True
+        # ★ 防自环（B 第一阶段）：先于任何路由/频道判据执行。
+        #   ① 原始声音是我自己 → 这是绕回来的自回声，绝不能播放（否则声音会一直绕圈）。
+        #   ② hop 超过上限 → 这条帧已经在网里转了太多跳，继续传只会放大环。
+        #   两个计数都要能在诊断里看到；老端 origin_id=0 不会命中。
+        if (getattr(pkt, "origin_id", 0) and self.self_origin_id
+                and pkt.origin_id == self.self_origin_id):
+            self.packets_echo_dropped += 1
+            return False
+        if getattr(pkt, "hop", 0) > self.max_hop:
+            self.packets_hop_dropped += 1
+            return False
+        if self.accept_source is None or self.resolve_source is None:
+            return True
+        node_id = self.resolve_source(host)
+        if not node_id:
+            return True
+        return bool(self.accept_source(node_id))
 
     def _handle(self, pkt: Packet, addr: tuple[str, int]) -> None:
         if pkt.type == proto.T_AUDIO:
@@ -614,6 +761,10 @@ class Receiver:
             body["_at"] = time.monotonic()
             with self._lock:
                 self.control_messages.append(body)
+                # ★ 2026-11-02：统计包每 2 秒一条、永不停止；原来只给 HELLO 限长，
+                #   这里无上限地长跑会让列表越积越大，引擎每 0.5s 还要全量遍历一次。
+                if len(self.control_messages) > 200:
+                    del self.control_messages[:100]
             return
         if pkt.type == proto.T_ROUTE:
             body = pkt.json()
@@ -621,6 +772,8 @@ class Receiver:
             body["_type"] = "ROUTE"
             with self._lock:
                 self.control_messages.append(body)
+                if len(self.control_messages) > 200:
+                    del self.control_messages[:100]
 
     def _handle_audio(self, pkt: Packet, addr: tuple[str, int]) -> None:
         ssrc = pkt.ssrc
@@ -637,11 +790,16 @@ class Receiver:
                     self.on_first_packet(info, addr)
                 self._owners[ssrc] = info.node_id or ("%s:%d" % addr)
                 self._evict_superseded(ssrc)
+            elif info.codec != pkt.codec:
+                # ★ 2026-11-04（审计 B2，第 3 轮）：同一个 ssrc 换了编码（面板改编码，
+                #   或发送端用同一条路由重启并换了编码 —— ssrc 由 node_id|route_id 派生，
+                #   重启后不变）时，解码器必须跟着换。改前 `_decoders[ssrc]` 只在首包建
+                #   一次，之后拿旧解码器解新负载：整条流变成噪声/无声，`info.codec` 还
+                #   一直显示旧值，直到这条流被回收。
+                info.codec = pkt.codec
+                self._decoders[ssrc] = make_decoder(pkt.codec)
             node_id = info.node_id or ("%s:%d" % addr)
-            cs = self._clock.get(node_id)
-            if cs is None:
-                cs = proto.ClockSync(node_id)
-                self._clock[node_id] = cs
+            cs = self._clock_for(node_id, addr)
         decoder = self._decoders.get(ssrc)
         if decoder is None:
             self.packets_rejected += 1
@@ -655,15 +813,57 @@ class Receiver:
         if DEBUG_JITTER and self.packets_received % 40 == 0:
             _jdbg("audio pkt node_id=%r cs=%r offset_ms=%.3f" % (info.node_id, cs.name, offset / 1e6))
         buf = self.buffers[ssrc]
+        duplicate = False
         with self._lock:
             info.packets += 1
             info.bytes += len(pkt.payload)
             if info.last_seq is not None:
                 delta = (pkt.seq - info.last_seq) & 0xFFFF
-                if 0 < delta < 0x8000 and delta > 1:
-                    info.lost += delta - 1
-            info.last_seq = pkt.seq
-        buf.write(samples, pkt.ts_ns, offset, bool(pkt.flags & FLAG_DISCONTINUITY), pkt.seq)
+                if delta == 0:
+                    # ★ 2026-11-04（审计 A3）：同一 seq 的重复包。原来照样写进抖动缓冲，
+                    #   于是这 10ms 音频被播第二遍、缓冲深度也凭空涨 10ms。
+                    info.duplicates += 1
+                    duplicate = True
+                elif delta > 0x8000:
+                    # ★ 2026-11-04（审计 A3）：乱序旧包。音频照收（晚到也能用），
+                    #   **但不许把 last_seq 退回去** —— 原来无条件覆盖，下一个正常包
+                    #   就会被算成"丢了几十个"，诊断页的丢包数据此虚高。
+                    pass
+                else:
+                    if delta > 1:
+                        info.lost += delta - 1
+                    info.last_seq = pkt.seq
+            else:
+                info.last_seq = pkt.seq
+        if duplicate:
+            return
+        # ★ 2026-11-04（Q1）：时钟没锁定时 offset=0，包时间戳不在本机时间轴上，
+        #   此时"晚到"没有意义（现场因此把 99.99% 的包都算成晚到）。只在 ready 时计数。
+        buf.write(samples, pkt.ts_ns, offset, bool(pkt.flags & FLAG_DISCONTINUITY),
+                  pkt.seq, count_late=cs.ready)
+
+    # ★ 2026-11-04（Q1）：时钟同步样本被记在「地址」名下，而音频流按「node_id」找它。
+    #   用户现场的 `clocks` 就是两条：node_id 那条 samples=0，IP 那条 samples=8752、
+    #   offset=-1173.839ms。音频流按 node_id 查 → 拿到 0 样本的时钟 → offset=0 →
+    #   597844 / 597850 包（99.99%）全被判"晚到"。这里按 node_id → IP 顺序回退，
+    #   并把 IP 的时钟登记到 node_id 名下（后面 stats 也就能看见真实偏移）。
+    def _clock_for(self, node_id: str, addr: tuple[str, int] | None) -> proto.ClockSync:
+        with self._lock:
+            cs = self._clock.get(node_id)
+            if cs is not None and cs.ready:
+                return cs
+            host = addr[0] if addr else ""
+            alt = self._clock.get(host)
+            if alt is not None and alt.ready:
+                if node_id:
+                    self._clock[node_id] = alt
+                return alt
+            if cs is not None:
+                return cs
+            cs = proto.ClockSync(node_id)
+            if node_id:
+                self._clock[node_id] = cs
+            return cs
 
     def assign_routes(self, ssrc: int, route_ids: Iterable[str]) -> None:
         """Tell a stream which local sinks want it.
@@ -792,6 +992,14 @@ class Receiver:
             if not buf.samples_written:
                 continue
             block = buf.read(frames)
+            # ★ 2026-11-04（Q1）：来源音量按流乘一次，且只在这里乘一次。
+            #   具名路由的播放端增益里已经乘过 vol（用户要的 `路由gain × vol`），
+            #   所以那种流的 `source_gain` 由引擎写成 1.0；只有通配路由
+            #   （`from=["*"]`，一个播放端混多台）才把 vol 乘在流上，避免平方衰减。
+            gain = getattr(buf, "source_gain", 1.0)
+            gain = 1.0 if gain is None else float(gain)
+            if gain != 1.0:
+                block = block * gain
             # One read feeds every route this stream belongs to; a copy is needed
             # when several sinks share it, because each output block is clipped
             # in place and summed into independently.
@@ -814,9 +1022,19 @@ class Receiver:
 
     def clock_stats(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [cs.stats() for cs in self._clock.values()]
+            # node_id 与 IP 可能指向同一个 ClockSync（见 `_clock_for`），这里按对象去重，
+            # 否则面板会把同一台设备显示成两条时钟。
+            seen: set[int] = set()
+            out: list[dict[str, Any]] = []
+            for cs in self._clock.values():
+                if id(cs) in seen:
+                    continue
+                seen.add(id(cs))
+                out.append(cs.stats())
+            return out
 
     def stats(self) -> dict[str, Any]:
+        now = time.monotonic()
         with self._lock:
             stream_stats = []
             for ssrc, info in self.streams.items():
@@ -827,6 +1045,17 @@ class Receiver:
                     lost=info.lost,
                 )
                 snap = buf.stats() if buf is not None else {}
+                # ★ 2026-11-03：接收速率 = 两次 status 之间真实收到的字节 / 时间。
+                #   窗口太短（同一秒内被轮询两次）就沿用上一次的速率，避免 0.1ms 的
+                #   dt 把结果放大成天文数字。
+                clock = self._clock.get(info.node_id) if info.node_id else None
+                prev = self._rate_prev.get(ssrc)
+                rate = float(prev[2]) if prev else 0.0
+                if prev is not None:
+                    dt = now - prev[0]
+                    if dt >= 0.2:
+                        rate = max(0.0, (float(info.bytes) - float(prev[1])) / 1000.0 / dt)
+                self._rate_prev[ssrc] = (now, int(info.bytes), rate)
                 stream_stats.append(
                     {
                         "ssrc": ssrc,
@@ -836,15 +1065,43 @@ class Receiver:
                         "codec": CODEC_NAMES.get(info.codec, str(info.codec)),
                         "packets": info.packets,
                         "lost": info.lost,
+                        # ★ 2026-11-04（审计 A3）：重复包单独一列，和丢包分开看。
+                        "duplicates": info.duplicates,
+                        # 累计字节（整个这一路生命周期），和下面 kbps 的"每秒窗口"分开标注。
                         "bytes": info.bytes,
+                        "kbps": round(rate, 1),
                         "route_id": (",".join(sorted(buf.route_ids)) if buf is not None and buf.route_ids else info.route_id),
                         **snap,
+                        # ★ 2026-11-04（Q1）：这一路的包时间戳到底有没有被换算到本机时间。
+                        #   `clock_ready=False` 时"晚到"一律不计（见 `_handle_audio`），
+                        #   面板要写明原因，否则用户只看到一个永远 0 的计数器。
+                        "clock_ready": bool(clock.ready) if clock is not None else False,
+                        "clock_ms": (round(float(clock.offset_ns) / 1e6, 1)
+                                     if clock is not None and clock.ready else None),
+                        "clock_samples": int(clock.samples) if clock is not None else 0,
+                        # 用**这个流的真实包数**做分母（Opus 是 20ms 包，不能用 480 帧估算）。
+                        "late_pct": (round(100.0 * float(snap.get("late", 0)) / float(info.packets), 2)
+                                     if info.packets else 0.0),
+                        # ★ 2026-11-04（Q1）：这一路在混音时被乘上的来源音量。
+                        #   频道路由（from=["*"]）只能按流乘，播放端那行的
+                        #   "手机音量"查不到具体来源，用户要从这里看。
+                        "media_vol": (round(float(getattr(buf, "source_gain", 1.0)), 3)
+                                      if buf is not None else 1.0),
                     }
                 )
+            for ssrc in list(self._rate_prev):
+                if ssrc not in self.streams:
+                    self._rate_prev.pop(ssrc, None)
         return {
             "port": self.port,
             "packets_received": self.packets_received,
             "packets_rejected": self.packets_rejected,
+            "packets_denied": self.packets_denied,
+            # ★ 2026-11-04（B 第一阶段）防自环的两个独立计数（诊断页/报告要用）。
+            "echo_dropped": self.packets_echo_dropped,
+            "hop_dropped": self.packets_hop_dropped,
+            "max_hop": self.max_hop,
+            "self_origin_id": self.self_origin_id,
             "bytes_received": self.bytes_received,
             "active_streams": self.active_stream_count(),
             "streams": stream_stats,
@@ -888,6 +1145,8 @@ class SenderSession:
         frames_per_packet: int = PCM_FRAMES_PER_PACKET,
         on_stats: Callable[[dict[str, Any]], None] | None = None,
         loopback_echo: bool = False,
+        origin_id: int = 0,
+        hop: int = 0,
     ) -> None:
         self.source = source
         self.host = host
@@ -902,6 +1161,10 @@ class SenderSession:
         self.frames_per_packet = frames_per_packet
         self.on_stats = on_stats
         self.loopback_echo = loopback_echo
+        # ★ 2026-11-04（B 第一阶段）：原始声音主人 + 已转跳数。只有对端声明 ext:1
+        #   时才由引擎传非 0 的 origin_id；老端保持 0 = 不发扩展段（向后兼容）。
+        self.origin_id = int(origin_id or 0)
+        self.hop = int(hop or 0)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._sock: socket.socket | None = None
@@ -916,6 +1179,11 @@ class SenderSession:
         self.started_ns = 0
         self.last_send_ns = 0
         self.started_at = time.time()
+        # ★ 2026-11-03（图2：「送」条亮着却写"没有在送"）：速率/在线状态要按
+        #   "最近一秒有没有真的发出去"算，不能拿整个会话的平均值冒充实时值。
+        self._rate_at = 0.0
+        self._rate_bytes = 0
+        self._rate_kbps = 0.0
 
     @property
     def supported(self) -> bool:
@@ -1008,13 +1276,14 @@ class SenderSession:
         payload = self._encoder(chunk)
         if payload is None:
             return
+        # ★ 2026-11-02：这条链路的共享增益**只在接收端乘一次**。
+        #   以前发送端也按 route.gain 缩放（session.gain），接收端的 sink 又按同一个
+        #   route.gain 再缩一次：两端显示 0.40 时，真正听到的只有 0.16，滑杆像"没效果"。
+        #   发送端仍把 gain_q14 写进包头（如实描述这条流的音量），但不再改样本。
         level_source = chunk
-        if self.gain != 1.0:
-            scaled = array.array("f", (s * self.gain for s in chunk))
-            payload = self._encoder(scaled)
-            level_source = scaled
-        # ★「送」音量条：这是我们**实际发出去**的那份声音有多大声（含我们这一层的增益）。
-        self.peak = max(_chunk_peak(level_source), self.peak * 0.85)
+        # 「送」电平仍按"这条链路最终会听到的大小"显示：样本不在发送端缩放，
+        # 但电平平移了接收端要乘的那个共享增益（与原来 0.3×2.0=0.6 的口径一致）。
+        self.peak = max(min(1.0, _chunk_peak(level_source) * self.gain), self.peak * 0.85)
         ts = now_ns()
         seq = self.sequence & 0xFFFF
         frames_here = len(chunk) // CHANNELS
@@ -1027,6 +1296,8 @@ class SenderSession:
             samples=frames_here & 0xFFFFFFFF,
             ts_ns=ts,
             gain_q14=int(self.gain * 10000),
+            origin_id=self.origin_id,
+            hop=self.hop,
         )
         try:
             self._sock.send(pkt.encode())
@@ -1039,8 +1310,23 @@ class SenderSession:
         self.last_send_ns = time.monotonic_ns()
 
     def stats(self) -> dict[str, Any]:
-        elapsed = max(1e-6, time.monotonic() - (self.started_ns / 1e9 if self.started_ns else time.monotonic()))
-        kbps = self.bytes_sent * 8 / max(0.001, time.time() - self.started_at) / 1000.0
+        now = time.monotonic()
+        running = self._thread is not None and self._thread.is_alive()
+        age_s = (now - self.last_send_ns / 1e9) if self.last_send_ns else float("inf")
+        # 1.5 秒 ≈ 150 个音频包；丢几个包不至于把"在送"判成"没在送"。
+        # 还没开始发的会话（last_send_ns==0）不按"断流"处理，否则测试/启动瞬间
+        # 的峰值会被清成 0；只有"发过、又停了"才清零。
+        sending = bool((running or self._thread is None)
+                       and (age_s < 1.5 or (not self.last_send_ns and self.peak > 0)))
+        if self._rate_at:
+            dt = now - self._rate_at
+            if dt >= 0.2:
+                self._rate_kbps = max(0.0, (self.bytes_sent - self._rate_bytes) / 1000.0 / dt)
+                self._rate_at = now
+                self._rate_bytes = self.bytes_sent
+        else:
+            self._rate_at = now
+            self._rate_bytes = self.bytes_sent
         return {
             "route_id": self.route_id,
             "ssrc": self.ssrc,
@@ -1051,11 +1337,13 @@ class SenderSession:
             "packets": self.packets_sent,
             "bytes": self.bytes_sent,
             "frames": self.frames_sent,
-            # 「送」音量条：我们送出去的那份声音多大声（0..1）。
-            "peak": round(float(self.peak), 4),
-            "kbps": round(kbps, 1),
+            # 「送」音量条：只有真的还在送才给电平；断流后 peak 会冻在旧值上，
+            # 那就成了"条子亮着、文字写没有在送"的矛盾（用户图2）。
+            "peak": round(float(self.peak) if sending else 0.0, 4),
+            "kbps": round(self._rate_kbps, 1),
+            "sending": sending,
             "gain": self.gain,
-            "running": self._thread is not None and self._thread.is_alive(),
+            "running": running,
             "error": self.error,
             "seconds": round(time.time() - self.started_at, 1),
         }
