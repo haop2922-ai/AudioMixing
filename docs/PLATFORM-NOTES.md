@@ -61,7 +61,7 @@
 
 手机端只需要实现三件事：
 
-1. **发现**：监听/发送 `net/discovery.py` 的 JSON 信标（UDP 47830，组播 239.255.77.120 +
+1. **发现**：监听/发送 `net/discovery.py` 的 JSON 信标（UDP 17830，组播 239.255.77.120 +
    广播），或者手动填目标 IP；
 2. **发送**：48 kHz、双声道、PCM16 或 Opus，按 `proto.py` 打包，UDP 发到目标节点的音频端口
    （默认 47831），包头字段 `ssrc/seq/samples/ts_ns` 必须填对（`ts_ns` 用 Unix epoch 纳秒）；

@@ -18,6 +18,8 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.util.Log;
 
+import java.io.File;
+
 /**
  * 前台服务：让「引擎」活在界面之外。
  *
@@ -79,6 +81,25 @@ public class MixService extends Service {
             }
             updateNotification();
             handler.postDelayed(this, TICK_MS);
+        }
+    };
+
+    /**
+     * ★ 2026-11-02（第二版）：卸载监视单独一条 1 秒循环。
+     *
+     * <p>卸载时系统可能先删包、后杀进程，中间的窗口里 {@code getPackageInfo} 仍可能命中
+     * 进程内的旧缓存。只看包名不够，还要看 apk 文件是否已被删除；周期也从 3 秒缩到 1 秒，
+     * 让「屏幕共享中」尽快消失。
+     */
+    private final Runnable installWatch = new Runnable() {
+        @Override
+        public void run() {
+            if (!stillInstalled()) {
+                Log.w(TAG, "检测到本应用已被卸载（apk 文件已不存在），立即停止采集并释放投屏授权");
+                shutdownNow();
+                return;
+            }
+            handler.postDelayed(this, 1000L);
         }
     };
 
@@ -144,6 +165,7 @@ public class MixService extends Service {
         engine = Engine.get(this);
         engine.start();          // 幂等：界面已经启动过就是空操作
         createChannel();
+        handler.post(installWatch);
     }
 
     @Override
@@ -188,12 +210,85 @@ public class MixService extends Service {
     }
 
     @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        // ★ 2026-11-01 真机：从最近任务里划掉 App 后，系统仍显示
+        //   「Audio Mixing 正在获取屏幕」。前台服务是 START_STICKY，任务被移除时
+        //   系统默认不会停它，引擎和 MediaProjection 就一直活着。
+        //   这里明确收尾：先停引擎（内部会 stop 投屏授权），再摘前台/通知、停服务。
+        if (engine != null) {
+            engine.stop();
+        }
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+        } catch (Throwable t) {
+            Log.w(TAG, "任务移除时停前台状态失败", t);
+        }
+        foreground = false;
+        removeNotification();
+        handler.removeCallbacks(tick);
+        stopSelf();
+        super.onTaskRemoved(rootIntent);
+    }
+
+    @Override
     public void onDestroy() {
         handler.removeCallbacks(tick);
+        handler.removeCallbacks(installWatch);
         if (engine != null) {
             engine.stop();       // 服务没了就没有"后台常驻"的意义了，释放采集、端口与投屏授权
         }
         super.onDestroy();
+    }
+
+    /**
+     * 本应用现在还在已安装列表里吗？
+     *
+     * <p>卸载后包管理器会抛 {@link PackageManager.NameNotFoundException}。进程如果还活着，
+     * 这里是唯一能主动发现"我已经被卸载"并释放 MediaProjection 的地方（系统不会给
+     * 被卸载的应用发自己的 PACKAGE_REMOVED）。查询失败的其他异常按"还在"处理，
+     * 绝不因为一次读取失败就把正常服务停掉。
+     */
+    private boolean stillInstalled() {
+        try {
+            android.content.pm.PackageInfo pi =
+                    getPackageManager().getPackageInfo(getPackageName(), 0);
+            // ★ 只看 getPackageInfo 不够：卸载后系统可能先删 apk、后清 PackageManager，
+            //   进程内的旧缓存仍可能返回成功。apk 文件消失是更硬的证据。
+            String apk = (pi != null && pi.applicationInfo != null)
+                    ? pi.applicationInfo.sourceDir : getPackageCodePath();
+            if (apk != null && !apk.isEmpty()) {
+                File f = new File(apk);
+                if (!f.exists()) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (PackageManager.NameNotFoundException e) {
+            return false;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /** 卸载/收尾：先停引擎（会 stop 投屏授权），再摘前台通知，最后停服务。 */
+    private void shutdownNow() {
+        if (engine != null) {
+            try {
+                engine.stop();
+            } catch (Throwable t) {
+                Log.w(TAG, "收尾时停止引擎失败", t);
+            }
+        }
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE);
+        } catch (Throwable t) {
+            Log.w(TAG, "收尾时停前台状态失败", t);
+        }
+        foreground = false;
+        removeNotification();
+        handler.removeCallbacks(tick);
+        handler.removeCallbacks(installWatch);
+        stopSelf();
     }
 
     // ────────────────────── ★ 采本机声音的授权（Android 10+） ──────────────────────

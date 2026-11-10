@@ -16,6 +16,7 @@ Two things matter here and both are easy to get wrong:
 from __future__ import annotations
 
 import ctypes
+import sys
 import threading
 import time
 from array import array
@@ -194,6 +195,88 @@ def _mix_format_of(dev: wc.IMMDevice) -> dict:
         client.release()
 
 
+def _name_key(text: str) -> str:
+    """把设备名压成用于比较的键：忽略空白、全/半角括号与连字符差异。
+
+    ★ 2026-11-06（第 3 条）：Windows 的「声音」面板显示 `2- C34CHR (...)`，
+      而 WASAPI 的 friendly name 是 `2 - C34CHR (...)`（`-` 两边有空格）。
+      原来直接 `low in name.lower()`（或精确相等）都对不上，用户从系统面板抄来的
+      名字就永远打不开端点。比较前统一归一化，两边都按同一个键匹配。
+    """
+    import unicodedata
+
+    s = unicodedata.normalize("NFKC", str(text or "")).lower()
+    s = (s.replace("（", "(").replace("）", ")")
+          .replace("－", "-").replace("–", "-").replace("—", "-"))
+    return "".join(s.split())
+
+
+def _a2dp_registry_endpoint_id(selector: str, data_flow: int) -> str:
+    """按注册表里的 A2DP/SNK 端点名，拼出完整 MMDevice id。
+
+    ★ 2026-10-26 用户：「部分 inter（Intel）电脑蓝牙没声音」。
+      实际排查发现：A2DP SNK 端点在 MMDevices 注册表里 DeviceState=1（active），
+      但 WASAPI 的 `enum_audio_endpoints(..., DEVICE_STATE_ACTIVE)` 根本不返回它。
+      这时按名字枚举会失败，但这块端点仍然可以按 `IMMDeviceEnumerator.GetDevice(id)`
+      直接打开。id 由注册表 GUID 拼出来：Capture 是 `{0.0.1.00000000}.{guid}`，
+      Render 是 `{0.0.0.00000000}.{guid}`。
+    """
+    if sys.platform != "win32":
+        return ""
+    want = _name_key(selector)
+    if not want:
+        return ""
+    try:
+        import winreg
+    except ImportError:
+        return ""
+    flow = "Capture" if data_flow == eCapture else "Render"
+    prefix = "{0.0.1.00000000}." if data_flow == eCapture else "{0.0.0.00000000}."
+    base = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\%s" % flow
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as root:
+            index = 0
+            while True:
+                try:
+                    guid = winreg.EnumKey(root, index)
+                except OSError:
+                    break
+                index += 1
+                try:
+                    with winreg.OpenKey(root, guid) as dev:
+                        try:
+                            state, _ = winreg.QueryValueEx(dev, "DeviceState")
+                        except OSError:
+                            continue
+                        if int(state) != 1:
+                            continue
+                        friendly = ""
+                        try:
+                            with winreg.OpenKey(dev, "Properties") as props:
+                                try:
+                                    friendly, _ = winreg.QueryValueEx(
+                                        props, "{b3f8fa53-0004-438e-9003-51a46e139bfc},6")
+                                except OSError:
+                                    pass
+                        except OSError:
+                            pass
+                except OSError:
+                    continue
+                text = str(friendly or "")
+                norm = _name_key(text)
+                if not norm or want not in norm:
+                    continue
+                # ★ 2026-11-06（第 3 条）：渲染端点（送声/回环）不需要名字里带 A2DP/SNK。
+                #   蓝牙耳机在 Windows 里的渲染端点常叫「耳机 (某蓝牙耳机)」；
+                #   原来只认 A2DP/SNK，导致蓝牙渲染端点不在 ACTIVE 枚举里时永远回落不到。
+                if data_flow == eCapture and "a2dp" not in norm and "snk" not in norm:
+                    continue
+                return prefix + guid
+    except OSError:
+        return ""
+    return ""
+
+
 def _find_endpoint(selector: str, data_flow: int, kind: str) -> wc.IMMDevice:
     """Resolve a user selector (device id, exact name, or substring) to an endpoint.
 
@@ -231,18 +314,32 @@ def _find_endpoint(selector: str, data_flow: int, kind: str) -> wc.IMMDevice:
                     continue
                 names.append((dev, name, dev_id))
 
-            low = selector.lower()
+            low = _name_key(selector)
+            if not low:
+                raise OSError("设备名是空的，无法定位端点")
             for dev, name, _dev_id in names:
-                if name.lower() == low:
+                if _name_key(name) == low:
                     chosen = dev
                     break
             if chosen is None:
                 for dev, name, dev_id in names:
-                    if low in name.lower() or low in dev_id.lower():
+                    if low in _name_key(name) or low in _name_key(dev_id):
                         chosen = dev
                         break
             if chosen is None:
-                raise OSError("no WASAPI endpoint matching %r (data flow %s)" % (selector, data_flow))
+                # ★ 2026-10-26：A2DP SNK 在注册表 active、但 WASAPI ACTIVE 枚举里没有。
+                #   按注册表 GUID 拼 id，直接 GetDevice；这条路在 Intel/Realtek 驱动上实测可用。
+                registry_id = _a2dp_registry_endpoint_id(selector, data_flow)
+                if registry_id:
+                    try:
+                        dev = enum.get_device(registry_id)
+                        if dev.valid:
+                            return dev
+                        dev.release()
+                    except OSError:
+                        pass
+                flow = "输出/回环" if data_flow == eRender else "采集"
+                raise OSError("找不到%s端点 %r：它现在可能没连上/被禁用，或名字和系统里的不一致" % (flow, selector))
 
             # Hold a reference for the caller, drop the rest.
             chosen.call("AddRef")
@@ -422,6 +519,10 @@ class WasapiSink:
         # had to be thrown away when a stalled endpoint let the backlog grow.
         self._out = array("f")
         self.dropped_frames = 0
+        # ★ 2026-10-26：真正的"声卡已经放空"次数。原来的 underruns 统计的是
+        #   "这次没把整块塞进声卡"（余量还在 _out 里），稳态下经常发生，**不是断音**；
+        #   这个计数只在两次写入之间设备缓冲真的归零时 +1，才是听得到的断档证据。
+        self.starvations = 0
         self.target_ms = float(spec.get("target_ms", 40.0))
 
     def start(self) -> None:
@@ -498,6 +599,15 @@ class WasapiSink:
             self._out = array("f")
         total_frames = len(samples) // CHANNELS
         written = 0
+        # 写之前先看一眼设备缓冲：已经归零 = 上一块放完到这一块之间有一小段空气，
+        # 这才是"卡一下"的直接证据。启动前/还没喂过数据时不算。
+        try:
+            if (self._client.get_current_padding() <= 0
+                    and self._frames_submitted >= self._buffer_frames
+                    and not self._stop.is_set()):
+                self.starvations += 1
+        except OSError:
+            pass
         while written < total_frames and not self._stop.is_set():
             try:
                 padding = self._client.get_current_padding()
@@ -573,10 +683,13 @@ class WasapiSink:
             "buffer_frames": self._buffer_frames,
             "frames_submitted": self._frames_submitted,
             "underruns": self.underruns,
+            "starvations": self.starvations,
             "dropped_frames": self.dropped_frames,
             "backlog_frames": len(self._out) // CHANNELS,
             "resampled": self._resampler is not None and self._resampler.enabled,
+            # buffer_ms 是"现在攒了多少毫秒"；capacity_ms 才是这块声卡的缓冲总时长。
             "buffer_ms": round(self.buffered_frames() * 1000.0 / SAMPLE_RATE, 2),
+            "capacity_ms": round(self._buffer_frames * 1000.0 / SAMPLE_RATE, 2),
         }
 
 

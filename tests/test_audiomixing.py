@@ -7,10 +7,13 @@
 from __future__ import annotations
 
 import atexit
+import importlib.util
+import json
 import math
 import os
 import pathlib
 import shutil
+import socket
 import struct
 import sys
 import tempfile
@@ -18,6 +21,8 @@ import threading
 import time
 import types
 import unittest
+import urllib.error
+import urllib.request
 from array import array
 from unittest import mock
 
@@ -27,9 +32,27 @@ sys.path.insert(0, str(ROOT))
 # The tests build real AudioMixingNode objects, and `set_routes()` persists by default,
 # so without this they wrote test ports and a test node name ("node-self"/"本机")
 # into the user's %APPDATA%\AudioMixing\config.json. Sandbox it, and clean up after.
-_TEST_SANDBOX = tempfile.mkdtemp(prefix="audiomixing-tests-")
-os.environ["AUDIOMIXING_HOME"] = _TEST_SANDBOX
-atexit.register(lambda: shutil.rmtree(_TEST_SANDBOX, ignore_errors=True))
+#
+# ★ 所有测试用临时目录统一走 _mkdtemp()：以前各处直接 tempfile.mkdtemp()，
+#   每跑一轮就在 %TEMP% 里留一堆 am-blocked- / am-ports- / am-mig- 目录。
+_SANDBOXES: list[pathlib.Path] = []
+
+
+def _mkdtemp(prefix: str = "") -> pathlib.Path:
+    """建一个测试沙箱，并登记到退出时统一删除。"""
+    path = pathlib.Path(tempfile.mkdtemp(prefix=prefix))
+    _SANDBOXES.append(path)
+    return path
+
+
+def _cleanup_sandboxes() -> None:
+    for path in _SANDBOXES:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+atexit.register(_cleanup_sandboxes)
+_TEST_SANDBOX = _mkdtemp(prefix="audiomixing-tests-")
+os.environ["AUDIOMIXING_HOME"] = str(_TEST_SANDBOX)
 
 import numpy as np  # noqa: E402
 
@@ -49,6 +72,12 @@ from audiomixing.audio.format import (  # noqa: E402
     signal_report,
 )
 from audiomixing.engine import SinkEngine, AudioMixingNode  # noqa: E402
+
+# ★ 2026-11-02：单元测试不能去"拉取对端路由表"。
+#   测试节点会对自己加的手动对端发 HTTP /api/routes；如果用户此时正开着真实
+#   Audio Mixing（监听 17800），测试就会把用户真实路由拉进沙箱，出现
+#   "点对点发送端凭空消失"这种假失败。隔离掉这条网络路径。
+AudioMixingNode._pull_peer_routes = lambda self: None  # noqa: E731
 from audiomixing.net.discovery import BeaconService, DiscoveryRegistry, build_beacon  # noqa: E402
 from audiomixing.net.rtpaudio import JitterBuffer, Receiver, SenderSession, StreamInfo, stable_ssrc  # noqa: E402
 
@@ -572,6 +601,62 @@ class TestJitterBuffer(unittest.TestCase):
             buf.write(make_tone(500.0, BLOCK, 0.3, CHANNELS), t0 + i * 10_000_000, 0.0)
         self.assertLessEqual(buf._count, buf.capacity)
         self.assertGreater(buf.dropped_overflow, 0)
+
+    def test_late_packet_ratio_above_ten_percent_raises_the_target(self):
+        """★ 2026-11-03（Q2）：目标 25ms 却持续晚到，说明下限不够，自适应要看迟到比例。
+
+        数据来自用户截图：9.2MB ≈ 48 秒 ≈ 4800 包，迟到 4670 —— 大部分包都晚到。
+        迟到比例 50% 时按 +10ms 涨；只涨到 JITTER_MAX_MS 为止。
+        """
+        from audiomixing.net import rtpaudio
+
+        buf = JitterBuffer()
+        buf.target_frames = rtpaudio._ms_to_frames(25.0)
+        buf._last_adjust_ns = 0
+        buf.samples_written = 480 * 100        # 这一秒 100 个 10ms 包
+        buf.dropped_late = 50                  # 其中 50 个晚到 = 50%
+        buf._adapt(10 ** 18)
+        self.assertAlmostEqual(buf.stats()["target_ms"], 35.0, places=0,
+                               msg="迟到一半的包，目标应涨 10ms")
+
+    def test_a_handful_of_late_packets_does_not_inflate_the_target(self):
+        from audiomixing.net import rtpaudio
+
+        buf = JitterBuffer()
+        buf.target_frames = rtpaudio._ms_to_frames(25.0)
+        buf._last_adjust_ns = 0
+        buf.samples_written = 480 * 100
+        buf.dropped_late = 5                   # 5%，低于 10% 阈值
+        buf._adapt(10 ** 18)
+        self.assertAlmostEqual(buf.stats()["target_ms"], 25.0, places=0,
+                               msg="偶发几包晚到不该把缓冲撑大")
+
+    def test_overflow_never_raises_the_target(self):
+        """溢出 = 队列已经太深/播放端停顿；此时涨目标只会更糟，只记录不涨。"""
+        from audiomixing.net import rtpaudio
+
+        buf = JitterBuffer()
+        buf.target_frames = rtpaudio._ms_to_frames(25.0)
+        buf._last_adjust_ns = 0
+        buf.samples_written = 480 * 100
+        buf.dropped_late = 80                  # 大量晚到
+        buf.dropped_overflow = 480 * 30        # 同时溢出
+        buf._adapt(10 ** 18)
+        self.assertAlmostEqual(buf.stats()["target_ms"], 25.0, places=0,
+                               msg="溢出这一秒不能涨目标")
+
+    def test_pre_roll_overflow_does_not_stay_on_the_panel(self):
+        """★ 2026-11-03（Q2）：还没开始播放时积压的溢出，开播那一刻清零一次。"""
+        buf = JitterBuffer()
+        t0 = proto.now_ns()
+        for i in range(120):                   # 1.2 秒的包塞进 400ms 的环 → 必然溢出
+            buf.write(make_tone(1000.0, BLOCK, 0.3, CHANNELS), t0 + i * 10_000_000, 0.0)
+        self.assertGreater(buf.dropped_overflow, 0, "前提：预滚阶段真的溢出了")
+        self.assertFalse(buf._primed)
+        buf.read(BLOCK)                        # 开始播放
+        self.assertTrue(buf._primed)
+        self.assertEqual(buf.dropped_overflow, 0, "开播前的溢出不能永久挂在面板上")
+        self.assertEqual(buf.dropped_late, 0)
 
 
 # --------------------------------------------------------------------------
@@ -1509,9 +1594,11 @@ class TestStreamRouteAttach(unittest.TestCase):
         )
 
     def test_two_sinks_for_one_source_are_both_found(self):
+        # ★ v2.27：同端点、同输出设备的两条路由会被收敛成一条（重复播放的根因），
+        #   所以这里用**两个不同的输出设备**表达"一台设备的声给两个喇叭"。
         self.node.set_routes([
-            {"id": "r1", "from": ["node-b"], "to": ["self"]},
-            {"id": "r2", "from": ["node-b"], "to": ["self"]},
+            {"id": "r1", "from": ["node-b"], "to": ["self"], "sink_device": "speaker-a"},
+            {"id": "r2", "from": ["node-b"], "to": ["self"], "sink_device": "speaker-b"},
         ], persist=False)
         self.assertEqual(self.node.routes_for_sender("node-b"), {"r1", "r2"})
         self.assertEqual(self.node.routes_for_sender("node-unknown"), set())
@@ -1591,6 +1678,42 @@ class TestRenderLoop(unittest.TestCase):
         expected = np.repeat(np.arange(len(written) // CHANNELS, dtype=np.float32), CHANNELS)
         first_bad = int(np.argmax(written != expected)) if bool(np.any(written != expected)) else -1
         self.assertEqual(first_bad, -1, "render loop lost samples the device had not accepted (first mismatch at %d)" % first_bad)
+
+
+class TestAudioRecovery(unittest.TestCase):
+    """★ 2026-10-26 老问题：其他终端连上后没声音，Windows 里切换几次输出才恢复。
+
+    自动看门狗负责“端点打开着但不再消费”的僵死；这里钉住手动兜底：
+    `recover_audio()` 必须真的停掉每一路播放端并重新按当前默认输出打开。
+    """
+
+    def test_recover_audio_stops_every_sink(self) -> None:
+        node = AudioMixingNode(_config_stub(name="t", node_id="node-recover"),
+                               audio_port=free_udp_port(),
+                               discovery_port=free_udp_port(), simulate=True)
+
+        class _FakeSink:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def stop(self) -> None:
+                self.stopped = True
+
+        fake = _FakeSink()
+        node.sinks["r1"] = SinkEngine(route_id="r1", device_selector="d", sink=fake)
+        result = node.recover_audio()
+        self.assertTrue(result["ok"])
+        self.assertIn("r1", result["stopped"])
+        self.assertTrue(fake.stopped, "恢复声音必须真的关掉旧的 audio client")
+        self.assertEqual(node.sinks, {}, "旧的播放端不能留在表里冒充还在工作")
+
+    def test_the_watchdog_evidence_is_in_the_sink_status(self) -> None:
+        engine = SinkEngine(route_id="r1", device_selector="d")
+        engine.recoveries = 2
+        engine.last_reopen_reason = "设备 3.2 秒没有收下任何音频"
+        out = engine.describe()
+        self.assertEqual(out["recoveries"], 2)
+        self.assertIn("3.2", out["last_reopen_reason"])
 
 
 class TestPhoneTap(unittest.TestCase):
@@ -1716,7 +1839,7 @@ class TestBluetoothBridge(unittest.TestCase):
         original_run, original_dir = bt._run, bt._STATE_DIR
         try:
             bt._run = lambda *a, **k: _json.dumps(device)
-            bt._STATE_DIR = pathlib.Path(tempfile.mkdtemp())
+            bt._STATE_DIR = _mkdtemp()
             key = bt._key(device["id"])
             (bt._STATE_DIR / ("%s.keep" % key)).write_text("1", encoding="utf-8")
             (bt._STATE_DIR / ("%s.pid" % key)).write_text("999999", encoding="utf-8")
@@ -1730,6 +1853,40 @@ class TestBluetoothBridge(unittest.TestCase):
                              "stale files must be cleaned up, not left to mislead")
         finally:
             bt._run, bt._STATE_DIR = original_run, original_dir
+
+    def test_open_sink_without_the_phone_media_endpoint_is_waiting(self):
+        """2026-10-21 现场：面板写「正在接收手机声音」，实际一点声音都没有。
+
+        helper 的 `open:Opened` 只说明电脑这边把 A2DP sink 打开了；手机可能只挂着
+        连接/控制通路，Windows 的 `麦克风 (<手机> A2DP SNK)` 采集端点还没起来
+        （endpoint=False）。这时必须是 waiting（黄色提示），不能是 connected。
+        """
+        from audiomixing import bluetooth as bt
+
+        device = {"id": r"\\?\BTHENUM#x\SNK", "name": "手机A", "state": "open:Opened",
+                  "endpoint": False, "held": True}
+        original_dir = bt._STATE_DIR
+        sandbox = pathlib.Path(tempfile.mkdtemp(prefix="audiomixing-bt-test-"))
+        try:
+            bt._STATE_DIR = sandbox
+            key = bt._key(device["id"])
+            (sandbox / (key + ".keep")).write_text("1", encoding="utf-8")
+            (sandbox / (key + ".pid")).write_text(str(os.getpid()), encoding="utf-8")
+            (sandbox / (key + ".status")).write_text("open:Opened", encoding="utf-8")
+
+            row = bt._apply_live_states([dict(device)])[0]
+            self.assertEqual(row["link"], "waiting",
+                             "sink 打开但手机媒体端点没起来 → 不能报 connected")
+            self.assertTrue(row["held"])
+            self.assertFalse(row["endpoint"])
+
+            device["endpoint"] = True
+            row = bt._apply_live_states([dict(device)])[0]
+            self.assertEqual(row["link"], "connected",
+                             "手机媒体端点也起来了 → 才是 connected")
+        finally:
+            bt._STATE_DIR = original_dir
+            shutil.rmtree(sandbox, ignore_errors=True)
 
     def test_connect_without_an_id_is_refused(self):
         from audiomixing import bluetooth as bt
@@ -2432,7 +2589,7 @@ class TestChannelSourceSafety(unittest.TestCase):
         """让局域网里出现一台叫 name 的其它设备（真实场景：他的手机 M332BF）。"""
         self.node.registry.update(
             {"wl": 1, "id": "peer-" + name, "name": name, "audio_port": 47831,
-             "web_port": 8080}, "192.168.0.101")
+             "web_port": 8080}, "198.51.100.10")
 
     def _fake_capture(self, name: str, blocks: int = 9512, age: float | None = 145.5,
                       alive: float = 253.8) -> None:
@@ -2603,7 +2760,7 @@ class TestChannelSourceSafety(unittest.TestCase):
         self.node.config.broadcast = False
         self.node.config.listen = True
         self.node.registry.update({"wl": 1, "id": "peer-1", "name": "手机", "audio_port": 47831,
-                                   "web_port": 0}, "192.168.0.101")
+                                   "web_port": 0}, "198.51.100.10")
         self.node.set_routes([{"id": "named", "from": ["peer-1"],
                                "to": [self.node.config.node_id]}], persist=False)
         self.assertEqual(self.node.routes_for_sender("peer-1"), {"named"},
@@ -2625,7 +2782,7 @@ class TestChannelSourceSafety(unittest.TestCase):
             host = "127.0.0.1"
             port = 0
             node_id = "peer-1"
-            route_id = "channel"
+            route_id = "channel|peer-1"
             packets_sent = 42
             bytes_sent = 80640
 
@@ -2634,7 +2791,7 @@ class TestChannelSourceSafety(unittest.TestCase):
         sock.settimeout(0.3)
         _FakeSession.port = sock.getsockname()[1]
         self.node.registry.update({"wl": 1, "id": "peer-1", "name": "手机", "audio_port": 47831,
-                                   "web_port": 0}, "192.168.0.101")
+                                   "web_port": 0}, "198.51.100.10")
         self.node.sender.sessions["channel|peer-1"] = _FakeSession()   # type: ignore[assignment]
         self.node.routes = []
         self.node.receiver._sock = sock
@@ -2649,6 +2806,9 @@ class TestChannelSourceSafety(unittest.TestCase):
         # 换成点对点那条 + 这张设备开着「智连」：必须请对端自动收听
         # （★ 2026-10-19 用户口径：智连没开就不许自动开关对端的「听」，所以这里要开着才验得出来）
         _FakeSession.route_id = "r1"
+        # ★ 2026-11-04（A 硬规则）：广播模式不允许和智连组合；要点对点验"请对端自动收听"，
+        #   必须先关广播。广播开着时 want_listen 必须为 False（见上一条断言）。
+        self.node.config.broadcast = False
         self.node.config.smart_link = ["peer-1"]
         sock2 = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
         sock2.bind(("127.0.0.1", 0))
@@ -2668,6 +2828,174 @@ class TestChannelSourceSafety(unittest.TestCase):
                         "点对点那条仍然要请对端自动收听（既有约定，用户点名要过）")
 
 
+    def test_stats_go_to_a_peer_we_only_listen_to(self) -> None:
+        """★ 2026-11-01 用户截图：电脑只在听手机时，两端音量条 1.00 / 0.59 对不上。
+
+        根因：`_send_peer_stats` 原来只遍历"我正在送声音的会话"，电脑单纯收听时
+        一个统计包都不发 —— 手机永远收不到电脑的 `gain_rx`，它的「我送它的」
+        就只能停在本地值。手机端一直会对"收听目标"回话，电脑这里补齐。
+        """
+        import socket as _socket
+
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.settimeout(0.3)
+        port = sock.getsockname()[1]
+        self.node.registry.update({"wl": 1, "id": "peer-1", "name": "手机",
+                                   "audio_port": port, "web_port": 0}, "127.0.0.1")
+        self.node.sender.sessions.clear()
+        self.node.routes = [{"id": "in1", "from": ["peer-1"],
+                             "to": [self.node.config.node_id], "gain": 0.75}]
+        self.node.receiver._sock = sock
+        try:
+            self.node._send_peer_stats(force=True)
+            data, _addr = sock.recvfrom(4096)
+        finally:
+            sock.close()
+        body = proto.decode(data).json()
+        self.assertFalse(body["sending"], "单纯收听时不能谎报『我在送声音』")
+        self.assertAlmostEqual(float(body["gain_rx"]), 0.75, places=3,
+                               msg="电脑的『我听它的』必须报给手机，否则两端音量条永远对不上")
+
+    def test_stats_go_to_a_peer_with_a_route_but_no_audio_yet(self) -> None:
+        """★ 2026-11-01「电脑端修改音量手机不同步」的另一个成因。
+
+        `_send_peer_stats` 原来的收件人只来自 `sender.sessions`，且要求
+        `packets_sent > 0`。用户先调音量、后开声音（或采集刚好空转）时，这条
+        唯一携带 `gain` 的消息一个都不发，手机只能停在旧值 / 滑杆写「—」。
+        路由存在就已经说明"这条链路存在" —— 必须把共享增益报过去。
+        """
+        import socket as _socket
+
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.settimeout(0.3)
+        port = sock.getsockname()[1]
+        self.node.registry.update({"wl": 1, "id": "peer-1", "name": "手机",
+                                   "audio_port": port, "web_port": 0}, "127.0.0.1")
+        self.node.sender.sessions.clear()          # 还没有任何发送会话
+        self.node.routes = [{"id": "out1", "from": [self.node.config.node_id],
+                             "to": ["peer-1"], "gain": 1.56}]
+        self.node.receiver._sock = sock
+        try:
+            self.node._send_peer_stats(force=True)
+            data, _addr = sock.recvfrom(4096)
+        finally:
+            sock.close()
+        body = proto.decode(data).json()
+        self.assertFalse(body["sending"], "没发出过音频时不能谎报『正在送』")
+        self.assertAlmostEqual(float(body["gain"]), 1.56, places=3,
+                               msg="电脑的『我送它的』必须在还没出声时也能同步给手机")
+
+    def test_a_remote_gain_burst_lands_on_the_last_value(self) -> None:
+        """★ 2026-11-01 真机自测：快速拖动手机滑杆，电脑停在中间值 1.45，松手值 0.51 丢了。
+
+        原因：`_apply_shared_gain` 采纳一次**远端**值后也写 `_gain_local_at`，
+        接下来 1.2 秒的远端更新全被"本机用户正在拖"那条 hold 挡掉。
+        这条 hold 只该由本机 UI 真正拖动（`note_local_gain_change`）写入。
+        """
+        self.node.registry.update({"wl": 1, "id": "peer-1", "name": "手机",
+                                   "audio_port": 47831, "web_port": 0}, "198.51.100.10")
+        self.node.routes = [{"id": "out1", "from": [self.node.config.node_id],
+                             "to": ["peer-1"], "gain": 1.56}]
+        # 模拟一次拖动：远端连续发来中间值，最后松手在 0.50
+        for value in (1.45, 0.50):
+            self.node._apply_shared_gain("peer-1", "out", value, 1)
+        rule = [r for r in self.node.routes if str(r.get("id")) == "out1"][0]
+        self.assertAlmostEqual(float(rule["gain"]), 0.50, places=3,
+                               msg="一次拖动的最后一个值必须落地，不能被 1.2 秒 hold 挡掉")
+
+    def test_a_mirror_echo_never_undoes_the_local_volume_change(self) -> None:
+        """★ 2026-11-01 用户：「电脑端调节音量条手机端不同步」（电脑自己还弹回旧值）。
+
+        对端每 2 秒把它那份"我听它的"（gain_rx）照回来 —— 那就是本机「我送它的」的
+        **镜像回声**。旧逻辑按"最后到达的为准"采纳，于是电脑刚拖到 1.05，下一包回声
+        1.30 又把路由改回 1.30；手机端看到的永远是旧值。
+        这里钉住两件事：
+          · 最近报出去的那个值回来 → 只当回声，不采纳；
+          · 真正不同的值（对端用户自己拖的，例如 0.51）仍然照常落地。
+        """
+        self.node.registry.update({"wl": 1, "id": "peer-1", "name": "手机",
+                                   "audio_port": 47831, "web_port": 0}, "198.51.100.10")
+        self.node.routes = [{"id": "out1", "from": [self.node.config.node_id],
+                             "to": ["peer-1"], "gain": 1.30}]
+        # 本机曾经把 1.30 报给对端（_link_gains 会记下"最近报出去的值"）
+        self.node._link_gains("peer-1")
+        # 本机用户刚把滑杆拖到 1.05，而且已经过了 1.2 秒防抢 hold
+        self.node.note_local_gain_change("out1")
+        self.node._gain_local_at["out1"] = time.monotonic() - 2.0
+        self.node.routes = [{"id": "out1", "from": [self.node.config.node_id],
+                             "to": ["peer-1"], "gain": 1.05}]
+        self.node._apply_shared_gain("peer-1", "out", 1.30, 1)
+        rule = [r for r in self.node.routes if str(r.get("id")) == "out1"][0]
+        self.assertAlmostEqual(float(rule["gain"]), 1.05, places=3,
+                               msg="对端照回来的旧值（镜像回声）不能把本机刚改的音量顶回去")
+        # 对端用户真的拖到 0.51：这个值本机没报过，必须照常采纳
+        self.node._apply_shared_gain("peer-1", "out", 0.51, 2)
+        rule = [r for r in self.node.routes if str(r.get("id")) == "out1"][0]
+        self.assertAlmostEqual(float(rule["gain"]), 0.51, places=3,
+                               msg="对端用户改的新值仍然要同步过来")
+
+    def test_the_panel_volume_slider_stamps_a_local_change(self) -> None:
+        """拖面板滑杆走的是 /api/routes/update —— 它必须记"本机刚动过"。
+
+        旧实现只在 /api/routes（整表保存）里记，而且那里的 `route_id` 根本没定义
+        （payload 一 gain 就 NameError）。结果：电脑拖完音量没有任何本地保护，
+        对端下一包回声就把值改回去。
+        """
+        self.node.routes = [{"id": "out1", "from": [self.node.config.node_id],
+                             "to": ["peer-1"], "gain": 1.30}]
+        result = self.api.update_route({"id": "out1", "gain": 1.05})
+        self.assertTrue(result["ok"])
+        self.assertIn("out1", self.node._gain_local_at,
+                      "面板拖滑杆必须写本地 hold（否则对端可以立刻抢回音量）")
+        rule = [r for r in self.node.routes if str(r.get("id")) == "out1"][0]
+        self.assertAlmostEqual(float(rule["gain"]), 1.05, places=3)
+
+    def test_smart_capable_peer_decides_the_request_not_this_pc(self) -> None:
+        """★ 2026-11-01 用户：手机开了智连、电脑没开，电脑送声音时手机不会自动收听。
+
+        根因：`want_listen` 被**电脑自己的**「智连」挡掉了。新手机信标里有 `smart:1`
+        → 请求必须照发，由手机自己的开关决定（请求 ≠ 命令）；旧手机没这个键时
+        继续用保守口径（本机没开智连就不发），免得它收到就替自己打开收听。
+        """
+        import socket as _socket
+
+        class _FakeSession:
+            host = "127.0.0.1"
+            port = 0
+            node_id = "peer-1"
+            route_id = "r1"
+            packets_sent = 42
+            bytes_sent = 80640
+
+        def send_once(peer_payload: dict) -> bool:
+            sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            sock.bind(("127.0.0.1", 0))
+            sock.settimeout(0.3)
+            _FakeSession.port = sock.getsockname()[1]
+            self.node.registry.update(peer_payload, "198.51.100.10")
+            self.node.receiver._sock = sock
+            self.node._send_peer_stats(force=True)
+            try:
+                data, _addr = sock.recvfrom(4096)
+            finally:
+                sock.close()
+            return bool(proto.decode(data).json().get("want_listen"))
+
+        self.node.config.smart_link = []            # 电脑这张卡片没开智连
+        self.node.routes = [{"id": "r1", "from": [self.node.config.node_id],
+                             "to": ["peer-1"], "gain": 1.0}]
+        self.node.sender.sessions["r1|peer-1"] = _FakeSession()   # type: ignore[assignment]
+        self.assertTrue(send_once({"wl": 1, "id": "peer-1", "name": "手机",
+                                   "audio_port": _FakeSession.port, "web_port": 0,
+                                   "smart": 1}),
+                        "对端支持智连时，请求要照发 —— 收不收由它自己决定")
+        self.assertFalse(send_once({"wl": 1, "id": "peer-1", "name": "手机",
+                                    "audio_port": _FakeSession.port, "web_port": 0,
+                                    "smart": 0}),
+                         "旧对端没有智连能力时，本机没开智连就不该请求（保守口径）")
+
     def test_without_listening_an_unknown_sender_is_not_played(self) -> None:
         """反向：没开「只听」时，认不出身份的流绝不能被随便放进播放端（那是乱收别人的声音）。"""
         self.node.config.broadcast = False
@@ -2686,6 +3014,350 @@ class TestChannelSourceSafety(unittest.TestCase):
         self.assertEqual(html.count("async function loadChannelSources("), 1)
         # 候选清单必须按"现在真的能采到"过滤（netmic 只在正在送声音时才算设备）
         self.assertIn("x.extra && x.extra.live", html)
+
+
+class TestCustomPorts(unittest.TestCase):
+    """v2.10：自定义端口只出现在「设置」页；保存只落盘，重启才生效。"""
+
+    def setUp(self) -> None:
+        import tempfile as _tempfile
+
+        from audiomixing.config import Config
+        from audiomixing.engine import AudioMixingNode
+        from audiomixing.webui import AudioMixingApi
+
+        cfg = Config()
+        cfg.web_port = 17800
+        cfg.audio_port = 47831
+        cfg.discovery_port = 47830
+        self.node = AudioMixingNode(cfg, audio_port=47831, discovery_port=47830)
+        self.node.devices = []
+        self.api = AudioMixingApi(self.node)
+        self.cfg_file = _mkdtemp(prefix="am-ports-") / "config.json"
+        # 注入保存路径：测试不能写进用户真正的 config.json
+        self.api.config_save_path = self.cfg_file
+        self._real_list_all = audio_base.list_all_devices
+        audio_base.list_all_devices = lambda: []
+
+    def tearDown(self) -> None:
+        audio_base.list_all_devices = self._real_list_all
+        try:
+            self.node.stop()
+        except Exception:
+            pass
+
+    def test_legacy_default_name_migrates_to_hostname(self) -> None:
+        """★ 2026-11-02 用户：电脑在别人设备上显示成「本机」。
+
+        老配置把默认名存成了「本机」；新默认是主机名（2024TSJ）。
+        只有"从没改过"的旧默认值才迁移，用户自己起的名字必须原样保留。
+        """
+        import json as _json
+
+        from audiomixing.config import Config, default_node_name
+
+        def load_with(name: str) -> str:
+            p = _mkdtemp(prefix="am-name-") / "config.json"
+            p.write_text(_json.dumps({"name": name, "node_id": "n1",
+                                      "discovery_port": 17830,
+                                      "audio_port": 47831, "web_port": 17800},
+                                     ensure_ascii=False), encoding="utf-8")
+            cfg = Config.load(p)
+            saved = _json.loads(p.read_text(encoding="utf-8"))
+            self.assertEqual(saved["name"], cfg.name, "迁移必须落盘，下一次启动才是新名字")
+            return cfg.name
+
+        host = default_node_name()
+        self.assertEqual(load_with("本机"), host, "旧默认「本机」必须迁成主机名")
+        self.assertEqual(load_with("我的电脑"), host, "旧默认「我的电脑」必须迁成主机名")
+        self.assertEqual(load_with("客厅电脑"), "客厅电脑", "用户自己起的名字一律不动")
+
+    def test_old_default_discovery_port_migrates_but_custom_stays(self) -> None:
+        """★ 2026-11-01 用户：两端默认发现端口改为 17830。
+
+        老配置里的 47830 是"从没改过"的默认值 → 升级时自动搬；用户自己填的
+        17930 之类不能动，否则会把人家特意避开冲突的设置改掉。
+        """
+        import json as _json
+        import tempfile as _tempfile
+
+        from audiomixing.config import Config
+
+        def load_with(port: int) -> int:
+            p = _mkdtemp(prefix="am-mig-") / "config.json"
+            p.write_text(_json.dumps({"discovery_port": port, "audio_port": 47831,
+                                      "web_port": 17800}), encoding="utf-8")
+            cfg = Config.load(p)
+            saved = _json.loads(p.read_text(encoding="utf-8"))
+            self.assertEqual(saved["discovery_port"], cfg.discovery_port,
+                             "迁移必须落盘，下一次启动才是新默认")
+            return cfg.discovery_port
+
+        self.assertEqual(load_with(47830), 17830, "旧默认必须迁到 17830")
+        self.assertEqual(load_with(17930), 17930, "用户自定义端口一律不动")
+
+    def test_ports_are_saved_and_need_restart(self) -> None:
+        result = self.api.set_settings({"web_port": 18001, "audio_port": 18031,
+                                        "discovery_port": 18030})
+        self.assertTrue(result["restart_required"],
+                        "端口是启动时绑死的，保存后必须如实返回'要重启'")
+        self.assertFalse(result["restart_scheduled"],
+                         "源码/测试模式绝不能自动重启调用者进程")
+        self.assertEqual(result["restart_blocked"], "not-enabled")
+        self.assertIn("手动重启", result["restart_note"])
+        # 运行中的这份不能改：信标/横幅还在用旧端口，改了就会广播一个没在听的端口
+        self.assertEqual(self.node.config.web_port, 17800)
+        self.assertEqual(result["pending_ports"]["web_port"], 18001)
+        import json as _json
+        saved = _json.loads(self.cfg_file.read_text(encoding="utf-8"))
+        self.assertEqual(saved["web_port"], 18001)
+        self.assertEqual(saved["audio_port"], 18031)
+        self.assertEqual(saved["discovery_port"], 18030)
+
+    def test_saving_the_same_ports_does_not_restart(self) -> None:
+        """★ 2026-11-01：页面每次保存都会带三个端口；原样点一下不能把程序重启一遍。"""
+        result = self.api.set_settings({"web_port": 17800, "audio_port": 47831,
+                                        "discovery_port": 47830})
+        self.assertFalse(result["restart_required"])
+        self.assertFalse(result["restart_scheduled"])
+        self.assertEqual(result["changed"], [], "端口没变时不要报成已修改")
+        self.assertEqual(result["restart_note"], "端口没有变化。")
+
+    def test_port_args_are_dropped_for_the_restart_command_line(self) -> None:
+        """自动重启时 `serve` 的命令行必须去掉三个端口，改从新配置读。"""
+        from audiomixing.webui import AudioMixingApi
+
+        self.assertEqual(
+            AudioMixingApi._strip_port_args(
+                ["serve", "--host", "127.0.0.1", "--web-port", "50930",
+                 "--audio-port=50931", "--discovery-port", "50932", "--simulate"]),
+            ["serve", "--host", "127.0.0.1", "--simulate"])
+
+    def test_the_restart_helper_is_reachable_when_frozen(self) -> None:
+        """★ 2026-11-01 真机自测抓到的回归：`_is_frozen` 是 AudioMixingApi 的方法。
+
+        写成 `WebUI._is_frozen()` 会 AttributeError，被 except 吞成 `not-frozen`，
+        表现就是"端口保存成功但从不自动重启"。这里把 frozen 伪装成 True，
+        并 mock 掉真正拉起进程 / 退出进程的两步，只钉住判断链。
+        """
+        import sys as _sys
+        from unittest import mock
+
+        from audiomixing.webui import AudioMixingApi
+
+        api = AudioMixingApi(self.node, restart_argv=["serve", "--host", "127.0.0.1"])
+        api._is_frozen = lambda: True          # type: ignore[assignment]
+        with mock.patch("audiomixing.tray._real_exe", return_value=_sys.executable), \
+                mock.patch("subprocess.Popen") as popen, \
+                mock.patch("threading.Thread") as thread:
+            ok, blocked = api._schedule_restart()
+        self.assertTrue(ok, "打包形态 + 给了 restart_argv 时必须能调度重启")
+        self.assertEqual(blocked, "")
+        popen.assert_called_once()
+        script = popen.call_args[0][0][-1]
+        self.assertIn("Start-Process", script)
+        thread.assert_called_once()
+
+    def test_port_equal_to_web_plus_one_is_rejected(self) -> None:
+        from audiomixing.webui import ApiError
+
+        with self.assertRaises(ApiError) as ctx:
+            self.api.set_settings({"audio_port": 17801})   # 面板端口 +1 是手机长连接口
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_out_of_range_port_is_rejected(self) -> None:
+        from audiomixing.webui import ApiError
+
+        with self.assertRaises(ApiError) as ctx:
+            self.api.set_settings({"web_port": 80})
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_unwritable_config_is_reported_not_faked(self) -> None:
+        """磁盘写不进去时必须报错，不能回一个“已保存”。"""
+        from audiomixing.webui import ApiError
+
+        blocker = _mkdtemp(prefix="am-blocked-") / "blocker"
+        blocker.write_text("x", encoding="utf-8")
+        self.api.config_save_path = blocker / "config.json"   # 父路径是个文件
+        with self.assertRaises(ApiError) as ctx:
+            self.api.set_settings({"web_port": 18002})
+        self.assertEqual(ctx.exception.status, 500)
+        # 运行中的端口不能被改坏
+        self.assertEqual(self.node.config.web_port, 17800)
+
+    def test_launcher_reads_port_from_config(self) -> None:
+        """启动器不能还写死 17800：改端口后再双击必须找到同一个实例。"""
+        from audiomixing.config import Config
+
+        home = _mkdtemp(prefix="am-home-")
+        cfg = Config()
+        cfg.web_port = 18010
+        cfg.save(home / "config.json")
+        old = os.environ.get("AUDIOMIXING_HOME")
+        os.environ["AUDIOMIXING_HOME"] = str(home)
+        try:
+            import audiomixing_launcher as launcher
+            self.assertEqual(launcher._configured_web_port(), 18010)
+        finally:
+            if old is None:
+                os.environ.pop("AUDIOMIXING_HOME", None)
+            else:
+                os.environ["AUDIOMIXING_HOME"] = old
+
+
+def _free_tcp_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+    finally:
+        s.close()
+
+
+def _free_tcp_pair() -> int:
+    for _ in range(80):
+        port = _free_tcp_port()
+        if port >= 65534:
+            continue
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", port + 1))
+            return port
+        except OSError:
+            continue
+        finally:
+            probe.close()
+    raise RuntimeError("找不到连续两个空闲 TCP 端口")
+
+
+class TestHttpSecurity(unittest.TestCase):
+    """v2.11：面板不再对任意网站开放；写接口只认同源；输出做转义。"""
+
+    def setUp(self) -> None:
+        from audiomixing.config import Config
+        from audiomixing.engine import AudioMixingNode
+        from audiomixing.webui import WebUI
+
+        self._real_list_all = audio_base.list_all_devices
+        audio_base.list_all_devices = lambda: []
+        cfg = Config()
+        cfg.node_id = "self-node"
+        cfg.name = "本机"
+        self.node = AudioMixingNode(cfg, audio_port=_free_tcp_port(),
+                                    discovery_port=_free_tcp_port(), simulate=True)
+        self.node.devices = []
+        self.ui = WebUI(self.node, host="127.0.0.1", port=_free_tcp_pair())
+        self.port = self.ui.start()
+        self.base = "http://127.0.0.1:%d" % self.port
+
+    def tearDown(self) -> None:
+        try:
+            self.ui.stop()
+        except Exception:
+            pass
+        try:
+            self.node.stop()
+        except Exception:
+            pass
+        audio_base.list_all_devices = self._real_list_all
+
+    def _request(self, method: str, path: str, body=None, origin: str | None = None,
+                 raw: bytes | None = None, ctype: str = "application/json"):
+        data = raw if raw is not None else (None if body is None
+                                            else json.dumps(body).encode("utf-8"))
+        req = urllib.request.Request(self.base + path, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", ctype)
+        if origin:
+            req.add_header("Origin", origin)
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                return resp.status, resp.headers, resp.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.headers, exc.read()
+
+    def test_no_cors_and_no_python_version_in_headers(self) -> None:
+        status, headers, _ = self._request("GET", "/plain")
+        self.assertEqual(status, 200)
+        self.assertIsNone(headers.get("Access-Control-Allow-Origin"),
+                          "不能再让任意网站读到面板")
+        self.assertEqual(headers.get("Server"), "AudioMixing",
+                         "Server 头不能泄露 Python 版本")
+        self.assertEqual(headers.get("X-Content-Type-Options"), "nosniff")
+
+    def test_options_does_not_allow_cross_origin(self) -> None:
+        status, headers, _ = self._request("OPTIONS", "/api/settings",
+                                           origin="http://evil.example")
+        self.assertEqual(status, 204)
+        self.assertIsNone(headers.get("Access-Control-Allow-Origin"))
+
+    def test_cross_origin_post_is_rejected(self) -> None:
+        status, _, _ = self._request("POST", "/api/settings", {"codec": "pcm_s16"},
+                                     origin="http://evil.example")
+        self.assertEqual(status, 403)
+
+    def test_same_origin_post_is_allowed(self) -> None:
+        status, _, body = self._request("POST", "/api/settings", {"codec": "pcm_s16"},
+                                        origin="http://127.0.0.1:%d" % self.port)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_plain_page_escapes_node_name(self) -> None:
+        self.node.name = "<img src=x onerror=alert(1)>"
+        status, _, body = self._request("GET", "/plain")
+        self.assertEqual(status, 200)
+        text = body.decode("utf-8")
+        self.assertIn("&lt;img", text)
+        self.assertNotIn("<img src=x", text)
+
+    def test_firewall_get_is_rejected(self) -> None:
+        # 以前一个 <img src=".../api/firewall"> 就能弹 UAC；现在只收 POST。
+        with mock.patch("audiomixing.tray.add_firewall_rules") as called:
+            status, _, _ = self._request("GET", "/api/firewall")
+            self.assertEqual(status, 405)
+            called.assert_not_called()
+
+    def test_mic_stream_rejects_absurd_rate(self) -> None:
+        status, _, _ = self._request("POST", "/api/mic/stream?name=phone&rate=999999",
+                                     raw=b"\x00\x00", ctype="application/octet-stream")
+        self.assertEqual(status, 400)
+
+    def test_foreign_host_is_rejected(self) -> None:
+        """DNS rebinding：域名解析到 127.0.0.1 时 Host 仍是恶意域名，必须拒绝。"""
+        req = urllib.request.Request(self.base + "/healthz")
+        req.add_unredirected_header("Host", "evil.example")
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        self.assertEqual(status, 403)
+
+
+class TestNetMicLimits(unittest.TestCase):
+    """名字/采样率/槽位都要有上限 —— 否则局域网一台机器就能把内存刷起来。"""
+
+    def test_name_and_rate_are_clamped(self) -> None:
+        from audiomixing.audio.backends import netmic
+
+        mic = netmic.open_mic("x" * 200, 10 ** 9)
+        try:
+            self.assertEqual(len(mic.name), 64)
+            self.assertEqual(mic.device_rate, 48000)
+        finally:
+            netmic.close_mic(mic.name, mic)
+
+    def test_slot_count_is_capped(self) -> None:
+        from audiomixing.audio.backends import netmic
+
+        for m in list(netmic.MICS.values()):
+            netmic.close_mic(m.name, m)
+        for i in range(netmic.MAX_MICS):
+            netmic.open_mic("填充音源-%d" % i)
+        with self.assertRaises(ValueError):
+            netmic.open_mic("再多一个音源")
+        for m in list(netmic.MICS.values()):
+            netmic.close_mic(m.name, m)
 
 
 class TestQuickStartAndVersion(unittest.TestCase):
@@ -2749,7 +3421,7 @@ class TestQuickStartAndVersion(unittest.TestCase):
         return audio_base.AudioDevice("snk-" + name[:6], name, audio_base.KIND_SINK, "wasapi",
                                       "render", is_default=default)
 
-    def _add_peer(self, name: str, host: str = "192.168.0.101") -> None:
+    def _add_peer(self, name: str, host: str = "198.51.100.10") -> None:
         self.node.registry.update(
             {"wl": 1, "id": "peer-" + name, "name": name, "audio_port": 47831,
              "web_port": 8080}, host)
@@ -2812,6 +3484,202 @@ class TestQuickStartAndVersion(unittest.TestCase):
         self.assertEqual(states, ["ok", "ok", "ok"], guide["steps"][:3])
         self.assertTrue(guide["ready"])
         self.assertIn("可以用了 ✓", guide["summary"])
+
+    def test_the_phone_listen_address_skips_virtual_adapters(self) -> None:
+        """★ 2026-10-26：快速上手第 4 步给的地址必须是手机真能连上的那块网卡。
+
+        现场报告里给的是 172.18.x.x（WSL/Hyper-V 虚拟网卡），手机打不开；
+        真实局域网是 192.168.137.x。排序口径必须和二维码/面板一致。
+        """
+        from unittest import mock
+
+        from audiomixing.net import discovery as disc
+
+        report = {"interfaces": [
+            {"address": "172.18.0.1", "kind": "private"},
+            {"address": "192.168.1.10", "kind": "private"},
+        ]}
+        with mock.patch.object(disc, "lan_report", return_value=report):
+            url = self.api.phone_listen_url()
+        self.assertEqual(url, "http://192.168.1.10:17800/listen", url)
+
+    def test_panel_banner_uses_the_best_address_not_interface_zero(self) -> None:
+        """★ 2026-11-06（真实截图自查）：横幅原来取 interfaces[0]。
+
+        这台机器第一项是 Hyper-V/WSL 的 172.23.128.1，界面把它印成
+        "别的电脑/手机用这个网址打开"，手机连不上；服务端必须下发 preferred。
+        """
+        from audiomixing.webui import _network_payload
+
+        report = {"interfaces": [
+            {"address": "172.23.128.1", "kind": "private"},
+            {"address": "192.168.0.105", "kind": "private"},
+        ]}
+        node = types.SimpleNamespace(
+            registry=types.SimpleNamespace(snapshot=lambda: []),
+            config=types.SimpleNamespace(manual_peers=[]))
+        payload = _network_payload(node, report)
+        self.assertEqual(payload["preferred"], "192.168.0.105")
+        self.assertEqual(len(payload["interfaces"]), 2)
+
+    def test_startup_banner_lists_the_reachable_address_first(self) -> None:
+        """★ 2026-11-06（真实启动自查）：控制台横幅也照 interfaces[0] 打印。
+
+        真实输出里第一行是 `http://172.23.128.1:...`（WSL/Hyper-V），手机连不上；
+        `--open-browser` 还会直接打开这个死地址。启动横幅必须把推荐地址排第一。
+        """
+        from audiomixing import cli
+
+        report = {"interfaces": [
+            {"address": "172.23.128.1", "kind": "private"},
+            {"address": "192.168.0.105", "kind": "private"},
+            {"address": "26.60.122.130", "kind": "public"},
+        ]}
+        node = types.SimpleNamespace(
+            registry=types.SimpleNamespace(snapshot=lambda: []),
+            config=types.SimpleNamespace(manual_peers=[]))
+        ips = cli._ordered_lan_ips(node, report)
+        self.assertEqual(ips[0], "192.168.0.105", ips)
+        self.assertNotIn("26.60.122.130", ips, "非局域网地址不许进横幅")
+        self.assertEqual(len(ips), 2)
+
+    def test_self_host_prefers_the_subnet_a_known_peer_is_on(self) -> None:
+        """★ 2026-11-03（Q1）：本机地址不能取 interfaces[0]（Hyper-V 的 172.26.x）。
+
+        有对端时，和它对端同 /24 的那块网卡才是手机真正能到达的本机地址。
+        """
+        from audiomixing.webui import _best_local_address
+
+        report = {"interfaces": [
+            {"address": "172.26.192.1", "subnet": "172.26.192.0/24", "kind": "private"},
+            {"address": "192.168.0.111", "subnet": "192.168.0.0/24", "kind": "private"},
+        ]}
+        node = types.SimpleNamespace(
+            registry=types.SimpleNamespace(snapshot=lambda: [{"host": "192.168.0.100"}]),
+            config=types.SimpleNamespace(manual_peers=[]))
+        self.assertEqual(_best_local_address(node, report), "192.168.0.111")
+
+    def test_self_host_falls_back_to_the_wired_private_range_without_peers(self) -> None:
+        """没有对端时退回网段排序：192.168 优先，172.16~31（WSL/Hyper-V）最后。"""
+        from audiomixing.webui import _best_local_address
+
+        report = {"interfaces": [
+            {"address": "172.26.192.1", "subnet": "172.26.192.0/24", "kind": "private"},
+            {"address": "10.0.0.9", "subnet": "10.0.0.0/24", "kind": "private"},
+            {"address": "192.168.0.111", "subnet": "192.168.0.0/24", "kind": "private"},
+        ]}
+        node = types.SimpleNamespace(
+            registry=types.SimpleNamespace(snapshot=lambda: []),
+            config=types.SimpleNamespace(manual_peers=[]))
+        self.assertEqual(_best_local_address(node, report), "192.168.0.111")
+        self.assertEqual(_best_local_address(node, {"interfaces": []}), "127.0.0.1")
+
+    def test_the_peers_payload_does_not_report_a_virtual_adapter(self) -> None:
+        """面板「本机」那一栏读的就是 /api/peers，不能显示 172.26.x 的虚拟网卡。"""
+        from unittest import mock
+
+        from audiomixing import webui as webui_mod
+
+        report = {"interfaces": [
+            {"address": "172.26.192.1", "subnet": "172.26.192.0/24", "kind": "private"},
+            {"address": "192.168.0.111", "subnet": "192.168.0.0/24", "kind": "private"},
+        ]}
+        with mock.patch.object(webui_mod.disc, "lan_report", return_value=report):
+            self_host = self.api.peers()["self"]["host"]
+        self.assertEqual(self_host, "192.168.0.111")
+
+
+    def test_the_diagnosis_separates_device_stutter_from_network_loss(self) -> None:
+        """★ 2026-10-26：用户说"音频一卡一卡"，旧报告只写包/字节，根本分不清
+        是网络丢了包还是声卡没喂上。现在必须同时给出两侧的证据。
+
+        这份数据复刻现场：收包正常、丢 6 个；播放端声卡放空 1 次、喂块最长间隔
+        38ms（声卡缓冲 20ms）—— 报告要能直接读出"声卡这侧断过"。
+        """
+        from unittest import mock
+
+        from audiomixing import bluetooth as bt
+
+        st = {
+            "node": {"id": "self-node", "name": "本机", "web_port": 17800,
+                     "audio_port": 47831, "discovery_port": 47830, "uptime_s": 66},
+            "peers": [], "discovery": {}, "senders": [], "inputs": [],
+            "local": {"enabled": False}, "sources": [],
+            "sinks": [{
+                "route_id": "c1bff8a5", "device_selector": "耳机", "gain": 1.0,
+                "mute": False, "frames_written": 1096320, "underruns": 0,
+                "dropped_frames": 0, "running": True, "error": "", "peak": 0.7112,
+                "blocks": 1000, "late_blocks": 2, "max_block_gap_ms": 38.0,
+                "device_buffer_ms": 20.0,
+                "device": {"backend": "wasapi", "name": "耳机",
+                           "endpoint_format": {"sample_rate": 48000, "channels": 2},
+                           "capacity_ms": 20.0, "buffer_ms": 11.0, "backlog_frames": 0,
+                           "resampled": False, "starvations": 1, "underruns": 40,
+                           "dropped_frames": 0},
+            }],
+        }
+        streams = {"receiver": {"streams": [{
+            "node_name": "手机A", "codec": "PCM_F32", "packets": 3819,
+            "bytes": 7332480, "lost": 6, "late": 0, "overflow": 0,
+            "trimmed": 0, "held_gaps": 0, "underruns": 0, "resyncs": 0,
+            "depth_ms": 50.0, "target_ms": 50.0, "peak": 0.7112,
+            "played": 1096320, "written": 1100000,
+        }]}}
+        with mock.patch.object(self.api, "status", return_value=st), \
+                mock.patch.object(self.api, "streams", return_value=streams), \
+                mock.patch.object(self.api, "guide", return_value={"steps": []}), \
+                mock.patch.object(self.api, "netcheck", return_value={"checks": []}), \
+                mock.patch.object(self.api, "build_info", return_value={"text": "Audio Mixing v2.4"}), \
+                mock.patch("audiomixing.webui._cpu_vendor", return_value="AuthenticAMD"), \
+                mock.patch.object(bt, "radio_name", return_value="Test Bluetooth(R) Adapter"), \
+                mock.patch.object(bt, "cached_devices", return_value=[]), \
+                mock.patch.object(bt, "endpoint_report", return_value=[]):
+            text = self.api.diagnose()["text"]
+        self.assertIn("丢包=6（0.16%）", text)
+        self.assertIn("下溢=0", text)
+        self.assertIn("设备放空 1 次", text)
+        self.assertIn("最长间隔 38.0ms / 声卡缓冲 20.0ms", text)
+        self.assertIn("超过缓冲 2 次", text)
+        # ★ 2026-10-26 用户图1：AMD 机器也要有适配说明，不能只写「Intel 适配」。
+        self.assertIn("CPU AMD（AuthenticAMD）", text)
+        self.assertIn("这是 AMD 平台", text)
+        # ★ 2026-11-04（第 11 条）：诊断里的兜底提示改成「频道 → 音源 + 本机直通」，
+        #   不再提已经删掉的「本机播放」按钮。
+        self.assertIn("本机直通", text)
+        # 老问题的自愈证据要出现在报告里。
+        self.assertIn("自动重开：0 次", text)
+        self.assertIn("蓝牙适配器 Test Bluetooth(R) Adapter", text,
+                      "诊断里的适配器型号不能因为函数内局部 import 被吞成「未知」")
+
+    def test_the_diagnostic_bundle_is_one_downloadable_zip(self) -> None:
+        """★ 2026-10-26 用户：「下次直接生成诊断包吧，老是复制好麻烦」。
+
+        一次下载就要拿到报告、状态、配置、设备/蓝牙端点和启动日志，
+        不能再让用户在一屏文字里全选复制。
+        """
+        import io
+        import zipfile
+        from unittest import mock
+
+        from audiomixing import bluetooth as bt
+
+        with mock.patch.object(self.api, "diagnose", return_value={"text": "诊断正文"}), \
+                mock.patch.object(self.api, "build_info",
+                                  return_value={"text": "Audio Mixing v9.9",
+                                                "built_at": "2026-10-26 23:00"}), \
+                mock.patch.object(self.api, "status", return_value={"node": {"name": "本机"}}), \
+                mock.patch.object(bt, "radio_name", return_value="Test Bluetooth(R) Adapter"), \
+                mock.patch.object(bt, "cached_devices", return_value=[]), \
+                mock.patch.object(bt, "endpoint_report", return_value=[]):
+            data, name = self.api.diagnose_bundle()
+        self.assertIn("诊断包", name)
+        self.assertTrue(name.endswith(".zip"), name)
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = set(zf.namelist())
+            for wanted in ("诊断报告.txt", "status.json", "config.json",
+                           "devices.json", "bluetooth.json", "怎么发.txt"):
+                self.assertIn(wanted, names, "诊断包缺少 %s" % wanted)
+            self.assertIn("诊断正文", zf.read("诊断报告.txt").decode("utf-8"))
 
     def test_the_guide_flags_a_network_device_as_the_source(self) -> None:
         """第 2 步：音源是网络上的另一台设备 —— 直接说清"一个字节都不会发"。"""
@@ -3050,6 +3918,10 @@ class TestQuickStartAndVersion(unittest.TestCase):
         self.assertIn("程序", text)
         self.assertNotIn("源码运行", text, "跑 exe 时报告不许说源码运行")
         self.assertIn(str(exe), text)
+        # ★ 2026-10-26：用户看到任务管理器里两个 Audio Mixing，怀疑重复启动。
+        #   onefile 的引导器 + 子进程本来就有两个，报告必须自己说清楚。
+        self.assertIn("打包形态", text)
+        self.assertIn("两个进程", text, "单文件版必须解释任务管理器里那两个进程是什么")
 
     def test_embedded_build_time_wins_over_file_mtime(self) -> None:
         """打包时写死的时间优先：exe 复制到桌面后文件时间变了，构建时间不该跟着变。"""
@@ -3098,7 +3970,7 @@ class TestQuickStartAndVersion(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             exe = pathlib.Path(tmp) / "Audio Mixing v9.9.exe"
             exe.write_bytes(b"fake")
-            (pathlib.Path(tmp) / "AudioMixing-手机版.apk").write_bytes(b"fake-apk")
+            (pathlib.Path(tmp) / "AudioMixing-手机版-v2.20.apk").write_bytes(b"fake-apk")
             webui.__compiled__ = self._fake_nuitka(tmp, exe)
             try:
                 ghost = str(pathlib.Path(tmp) / "onefile_tmp" / "python.exe")
@@ -3108,15 +3980,17 @@ class TestQuickStartAndVersion(unittest.TestCase):
             finally:
                 del webui.__compiled__
         self.assertIsNotNone(found, "exe 旁边那颗 apk 必须被找到")
-        self.assertEqual(found.name, "AudioMixing-手机版.apk")
+        self.assertEqual(found.name, "AudioMixing-手机版-v2.20.apk",
+                         "★ 第 6 条：交付名必须带版本号")
 
     def test_apk_lookup_knows_every_shipped_filename(self) -> None:
         from audiomixing import webui
 
-        self.assertIn("AudioMixing-手机版.apk", webui._APK_NAMES)
+        self.assertIn("AudioMixing-手机版-v2.20.apk", webui._APK_NAMES,
+                      "★ 第 6 条：交付名必须带版本号")
         self.assertIn("AudioMixing-mic.apk", webui._APK_NAMES)
         src = (ROOT / "audiomixing" / "webui.py").read_text(encoding="utf-8")
-        self.assertIn("/app/AudioMixing-手机版.apk", src, "下载路由要认新文件名")
+        self.assertIn("/app/AudioMixing-手机版-v%s.apk", src, "下载路由要认带版本号的新文件名")
 
     def test_the_apk_download_header_stays_ascii_safe(self) -> None:
         """中文文件名的附件头必须仍然合法 —— 否则用户点「下载」就失败。
@@ -3128,20 +4002,28 @@ class TestQuickStartAndVersion(unittest.TestCase):
 
         from audiomixing.webui import content_disposition
 
-        for name in ("AudioMixing-手机版.apk", "AudioMixing-mic.apk", ""):
+        for name in ("AudioMixing-手机版-v2.14.apk", "AudioMixing-手机版.apk", "AudioMixing-mic.apk", ""):
             header = content_disposition(name)
             header.encode("ascii")                      # 编码不过就是非法头
             self.assertIn("filename*=UTF-8''", header)
             if name:
                 self.assertIn(unquote(header.split("UTF-8''")[-1]), name)
-        # ASCII 兜底名也要像个正常文件名（不留下孤零零的短横）
-        self.assertIn('filename="AudioMixing.apk"', content_disposition("AudioMixing-手机版.apk"))
+        # ASCII 兜底名也要像个正常文件名（不留下孤零零或连续的短横）
+        header = content_disposition("AudioMixing-手机版-v2.14.apk")
+        self.assertIn('filename="AudioMixing-v214.apk"', header)
+        self.assertNotIn('filename="AudioMixing--', header)
+        self.assertIn('filename="AudioMixing.apk"',
+                      content_disposition("AudioMixing-手机版.apk"))
 
     def test_the_install_page_uses_the_current_brand_and_filename(self) -> None:
-        """用户原话「名字也是老版不对货」：安装页不许再写 WaveLink / wavelink-mic.apk。"""
+        """用户原话「名字也是老版不对货」：安装页不许再写 WaveLink / wavelink-mic.apk。
+
+        ★ 2026-11-04（第 6 条）：页面还要明确"文件名带版本号"，否则用户分不清装的是哪版
+        （他实机就装错过一次）。
+        """
         html = (ROOT / "audiomixing" / "ui" / "app.html").read_text(encoding="utf-8")
         self.assertIn("Audio Mixing 手机端", html)
-        self.assertIn("AudioMixing-手机版.apk", html)
+        self.assertIn("AudioMixing-手机版-v", html, "要写明文件名形如 …-v版本号.apk")
         self.assertNotIn("WaveLink 手机端", html)
         self.assertNotIn("wavelink-mic.apk", html)
 
@@ -3442,7 +4324,7 @@ class TestCardVolumeSlidersAndPing(unittest.TestCase):
 
     用户原话：「我要求的是各设备**可调节**的音量条。当然现在有的显示实际音量条也不错」
     —— 所以滑块（可调）和电平条（实时显示）两个都要有，滑块控制我们这一层的增益。
-    另一条来自截图：面板写着「192.168.0.101 不通：timed out」——查清是手机没回还是我们等错了。
+    另一条来自截图：面板写着「198.51.100.10 不通：timed out」——查清是手机没回还是我们等错了。
     """
 
     @staticmethod
@@ -3509,38 +4391,24 @@ class TestCardVolumeSlidersAndPing(unittest.TestCase):
         self.assertNotIn('id="cg_out"', html)
         self.assertIn("$('cg_' + slot + '_' + uid)", html)
 
-    def test_ping_uses_the_port_the_peer_advertised(self) -> None:
-        """对端端口要用它自己广播里报的：以前拿本机端口去探，探错了地方当然是超时。"""
-        port = free_udp_port()
-        receiver = Receiver("peer-node", port, bind_host="127.0.0.1")
-        receiver.start()
-        try:
-            self.node.registry.update(
-                {"wl": 1, "id": "peer-1", "name": "手机", "audio_port": port, "web_port": 0},
-                "127.0.0.1")
-            result = self.api.ping({"host": "127.0.0.1"})       # 不带 port
-            self.assertTrue(result["ok"], result)
-            self.assertEqual(result["port"], port, "应该用对端广播里报的 audio_port")
-            self.assertEqual(result["type"], "PONG", "电脑↔电脑时对端会回 PONG")
-            self.assertIn("回了 PONG", result["note"])
-        finally:
-            receiver.stop()
+    # ---- ★ 2026-11-04（第 8 条）：删除「测连通」按钮与 /api/ping -----------------
+    def test_the_ping_button_and_api_are_gone(self) -> None:
+        """用户点了「测连通」没有任何反馈（手机端本来就不回 PING/PONG）→ 整条下线。"""
+        from audiomixing import webui
 
-    def test_a_silent_peer_gets_an_honest_answer(self) -> None:
-        """没人监听时：不谎报"不通"，而是说清"手机端不回 PING/PONG"。"""
-        port = free_udp_port()
-        result = self.api.ping({"host": "127.0.0.1", "port": port})
-        self.assertFalse(result["ok"])
-        note = result.get("note") or ""
-        self.assertIn("没有回应 UDP 探测包", note)
-        self.assertIn("不回 PING/PONG", note, "必须告诉用户安卓端本来就不回，别让人以为坏了")
-        self.assertIn("不等于连不通", note)
+        self.assertFalse(hasattr(webui.AudioMixingApi, "ping"), "服务端 ping 方法必须删掉")
+        self.assertFalse(hasattr(self.api, "ping"))
+        import re
 
-    def test_the_page_passes_the_peer_port_and_shows_the_note(self) -> None:
-        html = self._html()
-        self.assertIn("async function pingPeer(host, port)", html)
-        self.assertIn("pingPeer('${esc(n.host)}', ${Number(n.audio_port) || 0})", html)
-        self.assertIn("r.note ||", html, "超时时要把服务端那句解释原样显示出来")
+        html = re.sub(r"<!--.*?-->", "", self._html(), flags=re.S)
+        html = re.sub(r"/\*.*?\*/", "", html, flags=re.S)     # 只查代码，注释里说明"已删除"不算残留
+        self.assertNotIn("测连通", html, "前端按钮必须删掉")
+        self.assertNotIn("pingPeer", html)
+        self.assertNotIn("/api/ping", html)
+        src = pathlib.Path(webui.__file__).read_text(encoding="utf-8")
+        live = "\n".join(line for line in src.splitlines()
+                         if not line.lstrip().startswith("#"))
+        self.assertNotIn("/api/ping", live, "服务端路由必须删掉，不留死接口")
 
 
 class TestPeerLivenessAndAutoListen(unittest.TestCase):
@@ -3574,7 +4442,7 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         except Exception:
             pass
 
-    def _peer(self, node_id: str = "peer-1", name: str = "手机", host: str = "192.168.0.101",
+    def _peer(self, node_id: str = "peer-1", name: str = "手机", host: str = "198.51.100.10",
               age: float = 0.0, audio_port: int = 47831) -> None:
         """登记一台对端，并把它"最后一次被听到"设成 age 秒之前。"""
         self.node.registry.update(
@@ -3599,14 +4467,17 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
                          "对端 30 秒没有任何消息了，不能再往它发声音")
         blocked = self.node.status()["senders_blocked"]
         self.assertTrue(blocked, "面板要能说明为什么停发")
-        self.assertIn("已停止向", blocked[0]["text"])
+        self.assertIn("已暂停向", blocked[0]["text"],
+                      "★ 第 2 条：措辞要如实 —— 只是「这个 ID 没有消息」，不是断言关机")
         self.assertIn("秒没有任何消息", blocked[0]["text"])
+        self.assertNotIn("关机", blocked[0]["text"],
+                         "对端可能只是换了 ID/网络；报成关机就是误报")
         self.assertGreaterEqual(blocked[0]["silent_for_s"], 30.0)
 
     def test_a_manual_peer_also_expires(self) -> None:
         """手动添加的对端以前永远 online（online 对 manual 恒 True）→ 会一直白发。"""
-        self.node.registry.add_manual("192.168.0.101", 47831, "手机")
-        peer = self.node.registry.resolve("192.168.0.101")
+        self.node.registry.add_manual("198.51.100.10", 47831, "手机")
+        peer = self.node.registry.resolve("198.51.100.10")
         self.assertTrue(peer.online, "Discovery 层对手动设备就是这么设计的（不改它）")
         peer.last_seen = time.time() - 40.0
         self._route_to_peer(peer.node_id)
@@ -3634,7 +4505,7 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         """信标停了但手机还在每 2 秒发统计包 → 它活着，不能停发。"""
         self._peer(age=60.0)
         self._route_to_peer()
-        self._stats_from("peer-1", "192.168.0.101")
+        self._stats_from("peer-1", "198.51.100.10")
         self.node._track_peer_liveness()
         self.assertEqual(len(self.node.desired_senders()), 1)
 
@@ -3642,7 +4513,7 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         """旧消息不能反复当成新证据，否则死掉的对端永远不会被判死。"""
         self._peer(age=60.0)
         self._route_to_peer()
-        self._stats_from("peer-1", "192.168.0.101")
+        self._stats_from("peer-1", "198.51.100.10")
         self.node.receiver.control_messages[-1]["_at"] = time.monotonic() - 60.0
         self.node._track_peer_liveness()
         self.assertEqual(self.node.desired_senders(), [],
@@ -3658,7 +4529,7 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
     # ---- ① 自动收听 -------------------------------------------------------
     def test_a_listen_request_creates_a_route_marked_auto(self) -> None:
         self.node.config.save()
-        self._stats_from("peer-1", "192.168.0.101",
+        self._stats_from("peer-1", "198.51.100.10",
                          want_listen=True)
         self.node._handle_peer_requests()
         auto = [r for r in self.node.routes if r.get("auto")]
@@ -3677,11 +4548,11 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         「手机按了发送、电脑不接收」：日志里反复的 "stream … has no local sink yet"。
         现在按来源 IP 从发现表反查 id，所以这条必须仍然开出自动路由。
         """
-        self._peer(node_id="phone-abc", name="M332BF", host="192.168.0.101")
+        self._peer(node_id="phone-abc", name="M332BF", host="198.51.100.10")
         self.node.config.save()
         self.node.receiver.control_messages.append({
             "t": "stats", "name": "M332BF", "_type": "STATS",
-            "_from": "192.168.0.101:47831", "_at": time.monotonic(),
+            "_from": "198.51.100.10:47831", "_at": time.monotonic(),
             "want_listen": True, "sending": True,          # ← 故意不带 node 字段
         })
         self.node._handle_peer_requests()
@@ -3704,13 +4575,13 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         于是电脑「我送它的」停在旧值、手机「我听它的」是新值 ——
         用户截图里就是 1.45 对 0.68。
         """
-        self._peer(node_id="phone-abc", name="M332BF", host="192.168.0.101")
+        self._peer(node_id="phone-abc", name="M332BF", host="198.51.100.10")
         self.node.set_routes([{"id": "r1", "from": [self.node.config.node_id],
                                "to": ["phone-abc"], "gain": 1.45}], persist=False)
         ahead = int(time.time() * 1000) + 10_000        # 明显比本机的记录新
         self.node.receiver.control_messages.append({
             "t": "stats", "name": "M332BF", "_type": "STATS",
-            "_from": "192.168.0.101:47831", "_at": time.monotonic(),
+            "_from": "198.51.100.10:47831", "_at": time.monotonic(),
             "gain_rx": 0.68, "gain_rx_ts": ahead,       # ← 故意不带 node 字段
         })
         self.node._handle_peer_requests()
@@ -3720,19 +4591,19 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
 
     def test_a_listen_request_does_not_duplicate_an_existing_route(self) -> None:
         self.node.set_routes([{"id": "mine", "from": ["peer-1"], "to": ["self"]}], persist=False)
-        self._stats_from("peer-1", "192.168.0.101", want_listen=True)
+        self._stats_from("peer-1", "198.51.100.10", want_listen=True)
         self.node._handle_peer_requests()
         self.assertEqual([r["id"] for r in self.node.routes], ["mine"], "已经有路由就别再加一条")
 
     def test_revoking_removes_only_the_auto_route(self) -> None:
         self.node.set_routes([{"id": "mine", "from": ["peer-1"], "to": ["self"]}], persist=False)
-        self._stats_from("peer-1", "192.168.0.101", want_listen=True)
+        self._stats_from("peer-1", "198.51.100.10", want_listen=True)
         self.node._handle_peer_requests()
         self.assertEqual([r["id"] for r in self.node.routes], ["mine"],
                          "已经有一条 它→本机 的路由了，不该再加一条")
         # 对方关掉送声音：只撤"自动"那种，用户自己建的路由必须原样留着
         self.node.receiver.control_messages.clear()
-        self._stats_from("peer-1", "192.168.0.101", want_listen=False)
+        self._stats_from("peer-1", "198.51.100.10", want_listen=False)
         self.node._handle_peer_requests()
         self.assertEqual([r["id"] for r in self.node.routes], ["mine"],
                          "撤销只能撤自动建的那条，用户自己建的不能动")
@@ -3742,14 +4613,17 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
 
         注意：协议里 want_listen 是幂等的（没有"取消"消息），撤销是【用户】的动作
         （面板上的「撤销」/关掉那台的收听），走的也是这个入口。
+        ★ v2.27（Bug-3.1）：同语义的自动路由与手工路由会收敛成一条（手工优先）——
+        两条都留着正是"取消收听要点两次"的根因，所以这里断言只剩手工那条。
         """
         self.node.config.save()
-        self._stats_from("peer-1", "192.168.0.101", want_listen=True)
+        self._stats_from("peer-1", "198.51.100.10", want_listen=True)
         self.node._handle_peer_requests()
         self.node.set_routes(list(self.node.routes)
                              + [{"id": "mine", "from": ["peer-1"], "to": ["self"]}],
                              persist=False)
-        self.assertEqual(len(self.node.routes), 2)
+        self.assertEqual([r["id"] for r in self.node.routes], ["mine"],
+                         "同端点的自动路由与手工路由必须收敛成一条（手工优先）")
         self.node._revoke_auto_listen("peer-1")      # 用户点「撤销」
         self.assertEqual([r["id"] for r in self.node.routes], ["mine"],
                          "撤销只删自动那条，用户自己建的不动")
@@ -3759,7 +4633,7 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         """对端的 gain 是"它→我"这条链路（= 我的「我听它的」）。"""
         self.node.set_routes([{"id": "in", "from": ["peer-1"], "to": ["self"], "gain": 1.0}],
                              persist=False)
-        self._stats_from("peer-1", "192.168.0.101", gain=0.5, gain_ts=1700000000000)
+        self._stats_from("peer-1", "198.51.100.10", gain=0.5, gain_ts=1700000000000)
         self.node._handle_peer_requests()
         rule = [r for r in self.node.routes if r["id"] == "in"][0]
         self.assertAlmostEqual(rule["gain"], 0.5, places=3, msg="两端共享同一个增益")
@@ -3768,7 +4642,7 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         self.node.set_routes([{"id": "r1", "from": ["self"], "to": ["peer-1"], "gain": 1.2}],
                              persist=False)
         self.node.note_local_gain_change("r1")                 # 用户刚拖过这个滑块
-        self._stats_from("peer-1", "192.168.0.101", gain_rx=0.5, gain_rx_ts=1700000000000)
+        self._stats_from("peer-1", "198.51.100.10", gain_rx=0.5, gain_rx_ts=1700000000000)
         self.node._handle_peer_requests()
         rule = [r for r in self.node.routes if r["id"] == "r1"][0]
         self.assertAlmostEqual(rule["gain"], 1.2, places=3,
@@ -3780,18 +4654,46 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
             {"id": "out", "from": ["self"], "to": ["peer-1"], "gain": 1.0},
             {"id": "in", "from": ["peer-1"], "to": ["self"], "gain": 1.0},
         ], persist=False)
-        self._stats_from("peer-1", "192.168.0.101", gain=0.4, gain_ts=1700000000000,
+        self._stats_from("peer-1", "198.51.100.10", gain=0.4, gain_ts=1700000000000,
                          gain_rx=0.9, gain_rx_ts=1700000000000)
         self.node._handle_peer_requests()
         by_id = {r["id"]: r["gain"] for r in self.node.routes}
         self.assertAlmostEqual(by_id["in"], 0.4, places=3, msg="对端 gain → 我的「我听它的」")
         self.assertAlmostEqual(by_id["out"], 0.9, places=3, msg="对端 gain_rx → 我的「我送它的」")
 
+    def test_shared_gain_works_on_an_auto_listen_route_authored_by_the_peer(self) -> None:
+        """★ 2026-11-02 用户截图：PC「我听它的」=1.60，手机同一链路「我送它的」=0.40。
+
+        智连自动建的 `从它到本机` 路由，`origin` 记的是**对端**（它请求的）。
+        而共享增益/统计收件人原来只扫 `local_routes()`（origin=本机）—— 恰好把
+        这条唯一的路由整条跳过：手机报来的 0.40 落不下来，本机的 1.60 也报不回去。
+        链路事实必须读整张路由表，不能读"哪些行归我编辑"。
+        """
+        self._peer(node_id="peer-1", name="手机", host="198.51.100.10")
+        self.node.set_routes([{
+            "id": "auto-listen-peer1", "from": ["peer-1"],
+            "to": [self.node.config.node_id], "gain": 1.6,
+            "label": "智连自动收听", "origin": "peer-1", "auto": True,
+        }], persist=False)
+        # 本机要能读到这条链路的两个方向（含报给手机的 gain_rx）
+        gains = self.node._link_gains("peer-1")
+        self.assertAlmostEqual(float(gains["gain_rx"]), 1.6, places=3,
+                               msg="这条链路是本机在听，必须报 gain_rx")
+        self.assertIn("peer-1", self.node._listening_peer_targets(),
+                      "只听手机时，统计收件人必须包含它")
+        # 手机把它那边的「我送它的」拖到 0.40 → 本机「我听它的」必须落地
+        self._stats_from("peer-1", "198.51.100.10", want_listen=True,
+                         gain=0.4, gain_ts=1700000000000)
+        self.node._handle_peer_requests()
+        rule = [r for r in self.node.routes if r["id"] == "auto-listen-peer1"][0]
+        self.assertAlmostEqual(float(rule["gain"]), 0.4, places=3,
+                               msg="origin=对端 的自动收听路由也必须参与共享增益同步")
+
     def test_an_equal_value_does_not_bounce_back(self) -> None:
         """值一样时只对齐时间戳，绝不回推（否则两端会互相弹）。"""
         self.node.set_routes([{"id": "in", "from": ["peer-1"], "to": ["self"], "gain": 0.7}],
                              persist=False)
-        self._stats_from("peer-1", "192.168.0.101", gain=0.7, gain_ts=1700000000000)
+        self._stats_from("peer-1", "198.51.100.10", gain=0.7, gain_ts=1700000000000)
         self.node._handle_peer_requests()
         self.assertEqual(self.node._gain_ts["in"], 1700000000000, "时间戳要对齐，值不动")
         self.assertAlmostEqual([r for r in self.node.routes if r["id"] == "in"][0]["gain"],
@@ -3809,7 +4711,7 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         # 本机 2 秒前动过（还没到原来那条 5 秒线），而且对端的墙钟明显更慢
         self.node._gain_local_at["in"] = time.monotonic() - 2.0
         self.node._gain_ts["in"] = 9_999_999_999_999
-        self._stats_from("peer-1", "192.168.0.101", gain=0.3, gain_ts=1700000000000)
+        self._stats_from("peer-1", "198.51.100.10", gain=0.3, gain_ts=1700000000000)
         self.node._handle_peer_requests()
         self.assertAlmostEqual([r for r in self.node.routes if r["id"] == "in"][0]["gain"], 0.3,
                                places=3, msg="对端时钟慢不该让它干等 5 秒")
@@ -3817,7 +4719,7 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         # 本机 0.3 秒前刚动过 → 不抢（用户还在拖）
         self.node._gain_local_at["in"] = time.monotonic() - 0.3
         self.node.receiver.control_messages.clear()
-        self._stats_from("peer-1", "192.168.0.101", gain=1.7, gain_ts=1700000001000)
+        self._stats_from("peer-1", "198.51.100.10", gain=1.7, gain_ts=1700000001000)
         self.node._handle_peer_requests()
         self.assertAlmostEqual([r for r in self.node.routes if r["id"] == "in"][0]["gain"], 0.3,
                                places=3, msg="用户正在拖的时候对端不许抢")
@@ -3829,7 +4731,7 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         在对面看起来一模一样，对面就把这个凭空来的 1.00 采纳过去，音量条当场跳回 1。
         现在没路由就一个字段都不报（缺字段对面什么都不做）。
         """
-        self._peer(node_id="peer-1", name="手机", host="192.168.0.101")
+        self._peer(node_id="peer-1", name="手机", host="198.51.100.10")
         self.assertEqual(self.node._link_gains("peer-1"), {},
                          "两条路由都没有时，不该报任何增益值")
         self.node.set_routes([{"id": "out", "from": [self.node.config.node_id], "to": ["peer-1"],
@@ -3857,7 +4759,7 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         """
         self.node.config.smart_link = []          # 默认状态
         self.node.config.save()
-        self._stats_from("peer-1", "192.168.0.101", want_listen=True)
+        self._stats_from("peer-1", "198.51.100.10", want_listen=True)
         self.node._handle_peer_requests()
         self.assertEqual([r for r in self.node.routes if r.get("auto")], [],
                          "没开「智连」的设备不许被自动加进来")
@@ -3874,31 +4776,145 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         self.node.config.save()
         for round_no in range(3):
             self.node.receiver.control_messages.clear()
-            self._stats_from("peer-1", "192.168.0.101", want_listen=True)
+            self._stats_from("peer-1", "198.51.100.10", want_listen=True)
             self.node._handle_peer_requests()
             self.assertEqual(len([r for r in self.node.routes if r.get("auto")]), 1,
                              "第 %d 轮：开着智连就一直自动打开，不许半路卡死" % (round_no + 1))
             self.node._revoke_auto_listen("peer-1")      # 用户点「撤销」：只撤这一条
             self.assertEqual([r for r in self.node.routes if r.get("auto")], [])
 
+    def test_a_sending_device_with_smart_link_is_listened_to_without_want_listen(self) -> None:
+        """★ 2026-10-26 用户钉死的 Wi-Fi 方向：本机开着「智连」的设备一开始送声音，
+        本机自己就打开收听 —— 不等对方先发 want_listen。
+
+        旧路径只认对端主动请求；对端不发（旧版本/手动路由/控制消息丢了）时，
+        本机明明开着智连却什么都没发生。新路径由本机在收到无路由的流时排队建路由。
+        """
+        self.node.config.smart_link = []
+        self.node._queue_auto_listen("peer-1", "手机", "198.51.100.10")
+        self.node._apply_pending_auto_listen()
+        self.assertEqual([r for r in self.node.routes if r.get("auto")], [],
+                         "没开智连：对方送声音也不许自动收听")
+
+        self.node.config.smart_link = ["peer-1"]
+        self.node._queue_auto_listen("peer-1", "手机", "198.51.100.10")
+        self.node._apply_pending_auto_listen()
+        autos = [r for r in self.node.routes if r.get("auto")]
+        self.assertEqual(len(autos), 1, "开了智连：不用对方请求也要自己打开收听")
+        self.assertEqual(autos[0].get("from"), ["peer-1"])
+        self.assertEqual(autos[0].get("to"), [self.node.node_id])
+
+    # ---- ★ 2026-11-04（第 11 条）：删除「本机播放」与 /api/bluetooth/local ----
+    def test_the_local_play_button_and_engine_path_are_gone(self) -> None:
+        """用户确认删掉这个入口；兜底改为「频道 → 音源 + 本机直通」，并在诊断里写明。"""
+        from audiomixing import webui
+
+        self.assertFalse(hasattr(self.node, "set_bluetooth_local_play"))
+        self.assertFalse(hasattr(self.node, "bluetooth_local_playing"))
+        self.assertFalse(hasattr(webui.AudioMixingApi, "bluetooth_local"))
+        src = pathlib.Path(webui.__file__).read_text(encoding="utf-8")
+        live = "\n".join(line for line in src.splitlines()
+                         if not line.lstrip().startswith("#"))
+        self.assertNotIn("/api/bluetooth/local", live, "只检查真实路由，注释里说明删除不算残留")
+        index = (ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8")
+        import re
+
+        code = re.sub(r"<!--.*?-->", "", index, flags=re.S)
+        code = re.sub(r"/\*.*?\*/", "", code, flags=re.S)   # 注释里记录"已删除"不算残留
+        self.assertNotIn("本机播放", code, "前端按钮必须删掉")
+        self.assertNotIn("btLocal(", code)
+        self.assertIn("本机直通",
+                      pathlib.Path(webui.__file__).read_text(encoding="utf-8"),
+                      "驱动不出声时的兜底路径要在诊断里告诉用户")
+
     def test_turning_smart_link_off_stops_it_and_on_resumes_it(self) -> None:
         """关掉智连 → 不再自动；再开回来 → 又自动了（没有任何"记忆"挡在中间）。"""
         self.node.config.smart_link = []
         self.node.config.save()
-        self._stats_from("peer-1", "192.168.0.101", want_listen=True)
+        self._stats_from("peer-1", "198.51.100.10", want_listen=True)
         self.node._handle_peer_requests()
         self.assertEqual([r for r in self.node.routes if r.get("auto")], [])
 
         self.node.set_smart_link("peer-1", "手机", on=True)
         self.assertIn("peer-1", self.node.config.smart_link)
         self.node.receiver.control_messages.clear()
-        self._stats_from("peer-1", "192.168.0.101", want_listen=True)
+        self._stats_from("peer-1", "198.51.100.10", want_listen=True)
         self.node._handle_peer_requests()
         self.assertEqual(len([r for r in self.node.routes if r.get("auto")]), 1)
 
         self.node.set_smart_link("peer-1", "手机", on=False)
         self.assertNotIn("peer-1", self.node.config.smart_link)
         self.assertNotIn("peer-1", [str(x) for x in self.node.config.smart_link])
+
+    def test_turning_smart_link_on_takes_effect_at_once(self) -> None:
+        """★ 2026-11-01 用户：「电脑的智连不是真实反馈，功能不完整」。
+
+        旧实现只把名单写进配置：按钮变色了，引擎却要等下一包统计/下一轮清扫才动。
+        这里钉住：对端**正在送声音**时打开「智连」→ 当场就有一条自动收听路由；
+        关掉 → 当场撤回（两个方向都清）。没在送声音时不建（不白占输出设备）。
+        """
+        self._peer()
+        # 假装这台手机已经有一路流进来（receiver.stats 是界面/引擎判"正在收"的口径）
+        self.node.receiver.stats = lambda: {"streams": [
+            {"node_id": "peer-1", "host": "198.51.100.10", "packets": 10}]}
+        self.node.config.smart_link = []
+        self.node.config.routes = []
+        self.node.routes = []
+        self.node.apply_smart_link_now()
+        self.assertEqual([r for r in self.node.routes if r.get("auto")], [],
+                         "没开智连时不能平白建自动收听")
+
+        self.node.config.smart_link = ["peer-1"]
+        effect = self.node.apply_smart_link_now()
+        auto = [r for r in self.node.routes if r.get("auto")]
+        self.assertEqual(len(auto), 1, "开着智连、对端又在送声音 → 必须当场建好收听")
+        self.assertIn("peer-1", [str(t) for t in auto[0].get("from") or []])
+        self.assertEqual(effect["granted"], ["手机"])
+
+        self.node.config.smart_link = []
+        self.node.apply_smart_link_now()
+        self.assertEqual([r for r in self.node.routes if r.get("auto")], [],
+                         "关掉智连要当场撤回自动建的收听（不等下一轮清扫）")
+
+    def test_smart_link_on_does_not_open_a_route_when_nobody_is_sending(self) -> None:
+        """没在送声音时只显示"等它送声音"，不要建一条空路由占着输出设备。"""
+        self._peer()
+        self.node.receiver.stats = lambda: {"streams": []}
+        self.node.config.routes = []
+        self.node.routes = []
+        self.node.config.smart_link = ["peer-1"]
+        effect = self.node.apply_smart_link_now()
+        self.assertEqual([r for r in self.node.routes if r.get("auto")], [])
+        self.assertEqual(effect["granted"], [])
+
+    def test_routes_from_the_config_come_back_after_a_restart(self) -> None:
+        """★ 2026-11-02 用户：「电脑端调节音量条手机端不同步」的另一半根因。
+
+        `config.routes` 一直在写盘，但 `start()` 从来没把它读回内存 —— 每次重启
+        （端口保存后的自动重启、用户自己重开）整张路由表都是空的：两条音量滑杆
+        全变灰，手机端没有任何共享音量可同步。现场看起来就是"调音量不同步"。
+        """
+        from audiomixing.config import Config
+        from audiomixing.engine import AudioMixingNode
+
+        cfg = Config()
+        cfg.node_id = "self-node"
+        cfg.name = "本机"
+        cfg.routes = [{"id": "out1", "from": ["self-node"], "to": ["peer-1"],
+                       "gain": 1.05, "mute": False, "codec": "pcm_s16"}]
+        node = AudioMixingNode(cfg, audio_port=free_udp_port(),
+                               discovery_port=free_udp_port(), simulate=True)
+        node.devices = []
+        try:
+            node.start(announce=False)
+            rule = [r for r in node.routes if str(r.get("id")) == "out1"]
+            self.assertTrue(rule, "重启后上次的路由必须回到内存里（否则音量条全灰）")
+            self.assertAlmostEqual(float(rule[0]["gain"]), 1.05, places=3)
+        finally:
+            try:
+                node.stop()
+            except Exception:
+                pass
 
     # ---- ② 「正在发送的手机自动播放」并进「智连」（2026-10-18 用户图2） --------------
     def test_a_sending_phone_is_adopted_only_when_its_smart_link_is_on(self) -> None:
@@ -3932,34 +4948,35 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
             netmic_backend.close_mic("M332BF")
             netmic_backend.close_mic("陌生手机")
 
-    def test_a_bluetooth_phone_is_adopted_only_when_its_smart_link_is_on(self) -> None:
+    def test_bluetooth_smart_link_only_auto_connects_and_never_auto_captures(self) -> None:
         """蓝牙那一路：手机的声音在 Windows 里是一块采集设备「麦克风 (<手机名> A2DP SNK)」。
 
-        ★ 用户图2 的原话就是「（那个全局勾）就是**蓝牙的**「智连」」——
-        所以这台蓝牙设备的「智连」（蓝牙卡片上那颗按钮，服务端是 autoconnect）开着时，
-        它连上后一开始送声音就自动收进「音源」播放；没开就什么都不做。
+        ★ 2026-10-26 用户重新钉死语义：「蓝牙的智联应当是打开软件自动尝试一次连接
+        有的蓝牙设备」。连上后手机媒体音频由 **Windows 直接播放**（用户真机已经
+        听得到），本工具不能再自动把这块 A2DP SNK 塞进「音源」—— 那会采第二遍、
+        再放一遍，和系统播放叠在一起。
+
+        所以这里钉住：即使蓝牙卡片的「智连」（服务端 autoconnect）开着，
+        `_auto_play_sources()` 也不许改动 channel_sources。要转发手机声音时，
+        用户仍然可以手动在「音源」里选 A2DP SNK。
         """
         from audiomixing.engine import bt_sink_phone_name
 
-        self.assertEqual(bt_sink_phone_name("麦克风 (真我GT Neo5 SE A2DP SNK)"), "真我GT Neo5 SE")
-        self.assertEqual(bt_sink_phone_name("耳机 (1MORE HQ51)"), "", "只有 A2DP 采集设备才算手机进来的声音")
+        self.assertEqual(bt_sink_phone_name("麦克风 (手机A A2DP SNK)"), "手机A")
+        self.assertEqual(bt_sink_phone_name("耳机 (某耳机)"), "", "只有 A2DP 采集设备才算手机进来的声音")
         self.assertEqual(bt_sink_phone_name(""), "")
 
         self.node.devices = [
-            audio_base.AudioDevice("c1", "麦克风 (真我GT Neo5 SE A2DP SNK)",
+            audio_base.AudioDevice("c1", "麦克风 (手机A A2DP SNK)",
                                    audio_base.KIND_SOURCE, "wasapi", "capture"),
         ]
-        self.node.config.autoconnect = []
+        self.node.config.autoconnect = ["手机A"]
         self.node.config.channel_sources = []
+        self.node.config.local = False
         self.node._auto_play_sources()
         self.assertEqual(self.node.config.channel_sources, [],
-                         "没开「智连」的蓝牙设备不许被自动收下")
-
-        self.node.config.autoconnect = ["真我GT Neo5 SE"]
-        self.node._auto_play_sources()
-        self.assertIn("真我GT Neo5 SE", self.node.config.channel_sources,
-                      "开了「智连」的蓝牙设备，一开始送声音就自动收进音源播放")
-        self.assertTrue(self.node.config.local, "收下了就得真的在本地放出来（本机直通）")
+                         "蓝牙音频由 Windows 直接播放，绝不能再自动收进音源")
+        self.assertFalse(self.node.config.local, "也不许因此打开本机直通")
 
     # ---- ★ 2026-10-19 孤儿路由（整条都是没见过的设备）清扫 --------------------
     def test_a_route_about_devices_we_never_met_is_swept(self) -> None:
@@ -4016,6 +5033,11 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         根因：`_attach_stream_routes` 里"只有一个播放端就兜底"那条老路，本来只该给
         **认不出身份**的手动对端（信标丢了 / AP 隔离），结果认得出身份、但本机没开它收听的
         发送方也走了兜底。现在只给真认不出身份的兜底。
+
+        ★ 2026-11-04（审计 A1）：又把"认不出身份"收紧成"**用户手动添加的对端**"。
+        原因：认不出身份不等于手动对端 —— 没接受的点对点单播，只要对方信标丢了
+        （Wi-Fi 丢包 / AP 隔离 / 换了 IP），在这台电脑上就同样表现为"认不出身份"，
+        于是照样被兜底收下。核对：没手动加过 127.0.0.1 → 一个端都不挂；加过才兜底。
         """
         class _Info:
             def __init__(self, node_id: str) -> None:
@@ -4024,12 +5046,117 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         self._peer(node_id="peer-1", name="手机")        # 认得出的设备（注册表里有）
         self.node.sinks = {"only-sink": object()}          # 恰好只有一个播放端
         self.node.routes = []
+        self.node.config.manual_peers = []
         self.assertEqual(self.node._attach_stream_routes(_Info("peer-1"), ("127.0.0.1", 1)),
                          set(),
                          "认得出身份、但本机没给它开收听 → 一个端都不许挂（挂了就是串台）")
         self.assertEqual(self.node._attach_stream_routes(_Info(""), ("127.0.0.1", 1)),
+                         set(),
+                         "认不出身份、又不是手动对端 → 不许兜底（这是没接受的点对点的第二条路）")
+        self.node.config.manual_peers = [{"name": "手动电脑", "host": "10.0.0.9"}]
+        self.assertEqual(self.node._attach_stream_routes(_Info(""), ("10.0.0.9", 1)),
                          {"only-sink"},
-                         "真认不出身份、又只有一个端，才允许兜底")
+                         "用户手动添加过的对端，信标丢了也要兜底（这是原本的意图）")
+
+    # ---- ★ 2026-11-04（审计 A4）：一条路由写了两台来源时，取最安静的那台 ----
+    def test_a_route_with_two_sources_uses_the_quietest_volume(self) -> None:
+        """改前：`_peer_media_volume_source` 命中第一个 token 就返回。
+
+        一条具名路由 `from=[A, B]` 送进同一个播放端时，整条 sink 只有一份 gain，
+        于是 A 的 0.9 会把 B 调到 0.2 的事实完全盖掉。改成取最小值。
+        """
+        now = time.monotonic()
+        self.node._peer_volume["peer-a"] = (0.9, now)
+        self.node._peer_volume["peer-b"] = (0.2, now)
+        value, key = self.node._peer_media_volume_source({"from": ["peer-a", "peer-b"]})
+        self.assertAlmostEqual(value, 0.2, places=3, msg="两台来源必须取最安静的那台")
+        self.assertIn(key, ("peer-a", "peer-b"))
+        self.assertAlmostEqual(
+            self.node._peer_media_volume({"from": ["peer-a"]}), 0.9, places=3,
+            msg="单源路由不受影响（行为不变）")
+
+    # ---- ★ 2026-11-04（审计 A1 的回归）：开播时没认出身份的流必须能补上 ----
+    def test_a_stream_that_started_before_the_beacon_gets_its_identity_later(self) -> None:
+        """改前：`node_id` 只在第一个包时解析一次，之后永不更新。
+
+        信标比音频晚到（同机自检、Wi-Fi 刚连上、对方刚启动）时，这条流拿着空身份
+        匹配不上任何具名路由，既挂不上路由也不建播放端 —— 整场没声音且不会自愈。
+        `_refresh_stream_identities()` 每半秒补一次空身份。
+        """
+        class _Info:
+            node_id = ""
+            host = "10.0.0.9"
+
+        info = _Info()
+        self.node.receiver.streams[9] = info
+        self.node._refresh_stream_identities()
+        self.assertEqual(info.node_id, "", "发现表里还没这台，就不许瞎认")
+        # ★ 2026-11-04（审计 B1，第 2 轮）：手动添加只写 `manual:IP` 占位，那不是
+        #   路由里认得的身份。把它当成 node_id 会让这条流永远匹配不上具名路由。
+        self.node.registry.add_manual("10.0.0.9", 47831, "手动电脑")
+        self.node._refresh_stream_identities()
+        self.assertEqual(info.node_id, "",
+                         "手动占位不算身份（改前会被写成 manual:10.0.0.9，整场挂不上路由）")
+        # 同一 IP 上真实身份晚到（信标 / HTTP 探测）时，必须补上真实 id。
+        self.node.registry.update({"wl": 1, "id": "real-node", "name": "真名",
+                                   "audio_port": 47831}, "10.0.0.9")
+        self.node._refresh_stream_identities()
+        self.assertEqual(info.node_id, "real-node",
+                         "真实身份一到，这条流就要补上（且不被 manual:IP 盖住）")
+        self.node.receiver.streams[10] = _Info()
+        self.node.receiver.streams[10].node_id = "peer-1"
+        self.node._refresh_stream_identities()
+        self.assertEqual(self.node.receiver.streams[10].node_id, "peer-1",
+                         "已经认出身份的不许被覆盖")
+
+    # ---- ★ 2026-11-04（审计 B1，第 2 轮）：手动占位不许盖住真实身份 ----
+    def test_a_manual_placeholder_never_shadows_the_real_identity(self) -> None:
+        """`add_manual()` 写的 `manual:IP` 记录可能比真实信标先入表。
+
+        `registry.resolve(host)` 按字典顺序返回，先命中占位时，流身份会被写成
+        `manual:IP`；之后即使真实信标到了也不会再更新（只补空身份）。这里直接钉住
+        "同 host 两条记录、占位在前"时也必须解析出真实 id。
+        """
+        self.node.registry.add_manual("10.0.0.9", 47831, "手动电脑")
+        self.node.registry.update({"wl": 1, "id": "real-node", "name": "真名",
+                                   "audio_port": 47831}, "10.0.0.9")
+        self.assertEqual(self.node._node_id_for_host("10.0.0.9"), "real-node",
+                         "占位 manual:10.0.0.9 不许盖住真实 id")
+        self.assertEqual(self.node._node_id_for_host(""), "", "没有地址就不认领")
+        self.assertEqual(self.node._node_id_for_host("10.0.0.8"), "",
+                         "发现表里没有这台，不许瞎认")
+
+    def test_the_first_packet_records_only_the_real_identity(self) -> None:
+        """首包解析也必须走同一条规则，否则占位身份会在开播那一刻就被写死。"""
+        from audiomixing.net.rtpaudio import StreamInfo
+
+        self.node.registry.add_manual("10.0.0.9", 47831, "手动电脑")
+        self.node.registry.update({"wl": 1, "id": "real-node", "name": "真名",
+                                   "audio_port": 47831}, "10.0.0.9")
+        info = StreamInfo(ssrc=7)
+        self.node._on_stream_start(info, ("10.0.0.9", 47831))
+        self.assertEqual(info.host, "10.0.0.9")
+        self.assertEqual(info.node_id, "real-node", "首包不许记成 manual:10.0.0.9")
+        self.assertEqual(info.node_name, "真名")
+
+
+    def test_a_non_finite_route_gain_cannot_poison_the_sink(self) -> None:
+        """改前：`gain: float(raw.get("gain", 1.0))` 原样接收 JSON 的 NaN / Infinity。
+
+        一旦写进路由，`apply_gain` 把 NaN 乘进每一声采样，整条输出变成 NaN ——
+        听感是"彻底没声音"，而且不重启好不了（NaN 会一直留在总线上）。
+        """
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            self.assertEqual(self.node._normalize_route({"gain": bad})["gain"], 1.0,
+                             "非有限值必须退回 1.0（改前会原样写进播放端）")
+        self.assertEqual(self.node._normalize_route({"gain": "abc"})["gain"], 1.0)
+        self.assertEqual(self.node._normalize_route({"gain": 100})["gain"], 8.0,
+                         "超大增益夹到上限，避免削顶成方波")
+        self.assertEqual(self.node._normalize_route({"gain": -5})["gain"], 0.0,
+                         "负增益夹到 0（不允许反相）")
+        rule = self.node._normalize_route({"sink_device": {"evil": 1}})
+        self.assertIsInstance(rule["sink_device"], str,
+                              "设备字段必须是字符串，否则渲染线程比较时抛 TypeError")
 
     # ---- ★ 2026-10-19 实测：智连没开，按钮也会自己亮（对端旧版本 + 本机请求）--------
     def test_we_never_ask_the_peer_to_auto_listen_when_its_smart_link_is_off(self) -> None:
@@ -4180,11 +5307,11 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         带着新的路由表把收发两端 reconcile 完（_handle_peer_requests 在 desired_senders
         之前执行，所以不会漏事）。这条测试断言两件事：不许再递归、而且效果没丢。
         """
-        self._peer(node_id="phone-abc", name="M332BF", host="192.168.0.101")
+        self._peer(node_id="phone-abc", name="M332BF", host="198.51.100.10")
         self.node.set_routes([{"id": "r1", "from": ["self"], "to": ["phone-abc"],
                                "gain": 1.0}], persist=False)
         ahead = int(time.time() * 1000) + 10_000
-        self._stats_from("phone-abc", "192.168.0.101", want_listen=True,
+        self._stats_from("phone-abc", "198.51.100.10", want_listen=True,
                          gain=0.8, gain_ts=ahead, gain_rx=1.28, gain_rx_ts=ahead)
         self.node.apply_routes()          # 旧代码：这里就会无限递归（打包版直接崩）
         self.assertGreaterEqual(int(getattr(self.node, "_apply_reentered", 0)), 1,
@@ -4222,7 +5349,7 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
 
         _FakeSession.port = port
 
-        self._peer(node_id="peer-1", name="手机", host="192.168.0.101")
+        self._peer(node_id="peer-1", name="手机", host="198.51.100.10")
         self.node.sender.sessions["r1|peer-1"] = _FakeSession()   # type: ignore[assignment]
         self.node.routes = [{"id": "r1", "from": [self.node.config.node_id],
                              "to": ["peer-1"], "gain": 0.75}]
@@ -4262,15 +5389,15 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
 
 
 class TestFirewallScriptCleansUpOldRules(unittest.TestCase):
-    """★ 2026-10-15 自查：规则是绑**程序路径**的，所以每换一版 exe 就会多堆一批旧规则。
+    """★ 2026-10-15 自查 + 2026-10-27 用户要求：规则绑程序路径，每换一版就多一堆旧规则。
 
-    这台机器上实测：`Audio Mixing*` 名下已经 **50 条**，其中约 **38 条**指向早就删掉的 exe
-    （连"某个 Nuitka 解包临时目录里的 .py"都在里面），而**当前这份 exe 一条规则都没有**
-    —— 入站 TCP/UDP 被 Windows 直接拦掉，手机连不上。用户点「放行防火墙」时顺手清掉死规则，
-    判据只认「规则指向的文件已经不存在」，指向别的副本（文件还在）的一律不碰。
+    用户机器上有大量 v1.11/v1.12/版本备份 的 exe，旧逻辑只删“文件已不存在”的规则，
+    于是 `Audio Mixing*` 名下堆到几百条。用户明确要求「直接清理旧版本规则」：
+    点一次「放行防火墙」= 清掉所有 Audio Mixing*/WaveLink* 旧规则，再为当前 exe
+    重建 TCP/UDP（入站+出站）。只匹配我们自己的显示名，不碰其它软件。
     """
 
-    def test_the_script_clears_dead_rules_and_permits_this_exe(self) -> None:
+    def test_the_script_clears_all_old_versions_and_permits_this_exe(self) -> None:
         import pathlib
         from unittest import mock
 
@@ -4279,9 +5406,11 @@ class TestFirewallScriptCleansUpOldRules(unittest.TestCase):
         with mock.patch.object(tray.ctypes.windll.shell32, "ShellExecuteW", return_value=42):
             path = tray.add_firewall_rules()          # 弹 UAC 那句被挡掉了，只生成脚本
         text = pathlib.Path(path).read_text(encoding="mbcs", errors="replace")
-        self.assertIn("Remove-NetFirewallRule", text, "要清掉死规则")
-        self.assertIn("Test-Path", text, "判据是「文件已经不存在」")
-        self.assertIn("audio mixing", text.lower(), "只碰我们自己的规则")
+        self.assertIn("Remove-NetFirewallRule", text, "要清掉旧版本规则")
+        self.assertIn("Audio Mixing*", text, "只匹配新版显示名")
+        self.assertIn("WaveLink*", text, "旧版显示名也要清")
+        self.assertNotIn("Test-Path", text,
+                         "现在直接清全部旧版本规则，不再只删“文件已不存在”的")
         self.assertIn('name="Audio Mixing TCP"', text, "当前这份 exe 照旧要放行")
         self.assertNotIn("chcp", text, "批处理不带 chcp（中文路径会变乱码）")
 
@@ -4617,10 +5746,10 @@ class TestControlChannelPicksTheRightRoad(unittest.TestCase):
         #   "从发现层收到的请求也走同一条路"，所以先把这台开上智连。
         self.node.config.smart_link = ["peer-1"]
         self.node.registry.update({"wl": 1, "id": "peer-1", "name": "手机",
-                                   "audio_port": 47831}, "192.168.0.101")
+                                   "audio_port": 47831}, "198.51.100.10")
         service._queue_control({"t": "stats", "node": "peer-1", "name": "手机",
                                 "want_listen": True},
-                               ("192.168.0.101", 47830), time.monotonic())
+                               ("198.51.100.10", 47830), time.monotonic())
         self.node._handle_peer_requests()
 
         auto = [r for r in self.node.routes if r.get("auto")]
@@ -4639,9 +5768,9 @@ class TestControlChannelPicksTheRightRoad(unittest.TestCase):
         service, _raw = self._beacon()
         self.node.registry.update({"wl": 1, "id": "peer-1", "name": "手机",
                                    "audio_port": 47831, "ctl": 1, "disc_port": 47833},
-                                  "192.168.0.101")
+                                  "198.51.100.10")
         targets = service._unicast_targets()
-        self.assertEqual(targets, [("192.168.0.101", 47833)],
+        self.assertEqual(targets, [("198.51.100.10", 47833)],
                          "按对端自己公布的发现端口单播回去（端口被占时它可能不是 47830）")
 
         # 15 秒都没任何消息的对端不再单播：对端真走了就别一直往一个死地址发。
@@ -4730,13 +5859,13 @@ class TestControlChannelPicksTheRightRoad(unittest.TestCase):
         service, _raw = self._beacon()
         self._route()
         self.node.registry.update({"wl": 1, "id": "peer-1", "name": "手机",
-                                   "audio_port": 47831}, "192.168.0.101")
+                                   "audio_port": 47831}, "198.51.100.10")
         peer = self.node.registry.get("peer-1")
         peer.last_seen = time.time() - 30.0     # 信标早就过期了
         self.assertEqual(self.node.desired_senders(), [], "先确认它现在是被判死的")
 
         service._queue_control({"t": "stats", "node": "peer-1", "name": "手机"},
-                               ("192.168.0.101", 47830), time.monotonic())
+                               ("198.51.100.10", 47830), time.monotonic())
         self.node._track_peer_liveness()
         peer = self.node.registry.get("peer-1")
         peer.last_seen = time.time() - 30.0     # 信标这一路仍然过期
@@ -4904,7 +6033,11 @@ class TestTask16PanelTexts(unittest.TestCase):
         # 局域网设备卡片：第 4 颗按钮，默认是「智连」（不是 ✓ 智连）
         self.assertIn("toggleSmart(", html)
         self.assertIn("smartOnFor(", html)
-        self.assertIn(">${smartOn ? '✓ 智连' : '智连'}</button>", html)
+        # ★ 2026-11-04（A 硬规则）：广播开着时按钮要置灰并写"广播中不可用"，
+        #   所以文案再也不是固定两个词。这里断言"智连按钮存在 + 有禁用分支"。
+        self.assertIn("onclick=\"toggleSmart(", html)
+        self.assertIn("广播中不可用", html)
+        self.assertIn("smartAvail", html)
         self.assertIn("kind:'route'", html)  # 别把卡片上的既有按钮删了
         # 蓝牙那张卡片的「自启」并进同一个词（用户选了"局域网+蓝牙都加"）
         self.assertIn("btAuto(", html)
@@ -4967,7 +6100,12 @@ class TestTask16PanelTexts(unittest.TestCase):
                         "『本机』要在『放行防火墙』的左侧")
         self.assertIn("am.monitor.localOnly", html, "开关状态要记住")
         self.assertIn("=== '时钟'", html, "打开后要隐藏时钟通道")
-        self.assertIn("String(f.from || '') === me || String(f.to || '') === me", html,
+        # ★ 2026-10-21 用户现场：打开「本机」后「瘾控 → 本机（蓝牙）」整行消失。
+        #   /api/monitor 的本地端是字面量「本机」/「本机声音」，不是节点名（2024TSJ）；
+        #   过滤必须把这几种写法都认成本机，否则所有入向流都会被误判成"和本机无关"。
+        self.assertIn("s === me || s === '本机' || s === '本机声音' || s === 'self'", html,
+                      "本地端的几种写法都要认成本机")
+        self.assertIn("isLocalEnd(f.from) || isLocalEnd(f.to)", html,
                       "只留本机收发的那几路")
         self.assertIn("paintLocalOnly();", html, "打开页面就按上次选的那档画一次")
 
@@ -5202,6 +6340,142 @@ class TestBackendAutoload(unittest.TestCase):
             self.assertIn(name, names, "%s 后端必须能自己补回来" % name)
 
 
+class TestMonitorWindowReuse(unittest.TestCase):
+    """★ 2026-10-26 用户现场「窗口无限开」：任务栏叠了十几个「Audio Mixing 监控」。
+
+    根因是服务已就绪、但监控窗还没出现的那几秒里，多个双击实例都走到
+    “没有窗口”这一步，各自执行 Edge --app。修法有两层：
+      · 窗口识别改成按前缀找任意页面（监控/控制台/诊断），不再精确匹配标题；
+      · 真正去开窗之前抢一把跨进程锁，第一个开，后面的只提窗、不再开。
+    """
+
+    def test_window_title_accepts_any_panel_page_but_not_browser_tabs(self) -> None:
+        import audiomixing_launcher as launcher
+
+        for title in ("Audio Mixing 监控", "Audio Mixing 控制台", "Audio Mixing 诊断",
+                      "Audio Mixing 简洁", "Audio Mixing", "Audio Mixing 监控 - 个人"):
+            self.assertTrue(launcher._monitor_window_title(title), title)
+        for title in ("Audio Mixing 监控 - Google Chrome",
+                      "Audio Mixing 监控 - Microsoft Edge",
+                      "Audio Mixing - Mozilla Firefox",
+                      "别的程序 Audio Mixing 监控", ""):
+            self.assertFalse(launcher._monitor_window_title(title), title)
+
+    def test_an_existing_window_is_raised_instead_of_opening_another(self) -> None:
+        from unittest import mock
+
+        import audiomixing_launcher as launcher
+
+        with mock.patch.object(launcher, "_acquire_monitor_open_lock", return_value=1), \
+                mock.patch.object(launcher, "_release_monitor_open_lock"), \
+                mock.patch.object(launcher, "_window_handle", return_value=4242), \
+                mock.patch.object(launcher, "_raise_window") as raise_win, \
+                mock.patch.object(launcher.subprocess, "Popen") as popen:
+            launcher.open_monitor("http://127.0.0.1:17800")
+        raise_win.assert_called_once_with(4242)
+        popen.assert_not_called()
+
+    def test_only_the_first_opener_launches_edge_and_later_ones_raise(self) -> None:
+        from unittest import mock
+
+        import audiomixing_launcher as launcher
+
+        # 第一次检查：没有窗口 → 开；第二次检查：窗口已经在了 → 只提窗。
+        with mock.patch.object(launcher, "_acquire_monitor_open_lock", return_value=1), \
+                mock.patch.object(launcher, "_release_monitor_open_lock"), \
+                mock.patch.object(launcher, "_window_handle", side_effect=[0, 4242]), \
+                mock.patch.object(launcher, "_monitor_process_exists", return_value=False), \
+                mock.patch.object(launcher, "_raise_window") as raise_win, \
+                mock.patch.object(launcher, "_find_edge", return_value="msedge.exe"), \
+                mock.patch.object(launcher, "_wait_for_monitor_window", return_value=True), \
+                mock.patch.object(launcher.subprocess, "Popen") as popen:
+            launcher.open_monitor("http://127.0.0.1:17800")
+            launcher.open_monitor("http://127.0.0.1:17800")
+        self.assertEqual(popen.call_count, 1, "同一个监控页只能拉起一次 Edge")
+        raise_win.assert_called_once_with(4242)
+
+    def test_a_loser_that_cannot_get_the_open_lock_never_opens_another_window(self) -> None:
+        from unittest import mock
+
+        import audiomixing_launcher as launcher
+
+        with mock.patch.object(launcher, "_acquire_monitor_open_lock", return_value=0), \
+                mock.patch.object(launcher, "_window_handle", return_value=0), \
+                mock.patch.object(launcher.subprocess, "Popen") as popen:
+            launcher.open_monitor("http://127.0.0.1:17800")
+        popen.assert_not_called()
+
+    def test_an_existing_monitor_process_blocks_a_second_window_even_if_title_is_unreadable(self) -> None:
+        """★ 2026-10-26 真机兜底：Edge 版本可能把标题改成认不出的样子。
+
+        只要已经有一个带 `panel-profile` 的 Edge 应用进程，就不许再开新窗。
+        """
+        from unittest import mock
+
+        import audiomixing_launcher as launcher
+
+        with mock.patch.object(launcher, "_acquire_monitor_open_lock", return_value=1), \
+                mock.patch.object(launcher, "_release_monitor_open_lock"), \
+                mock.patch.object(launcher, "_window_handle", return_value=0), \
+                mock.patch.object(launcher, "_monitor_process_exists", return_value=True), \
+                mock.patch.object(launcher.subprocess, "Popen") as popen:
+            launcher.open_monitor("http://127.0.0.1:17800")
+        popen.assert_not_called()
+
+    def test_edge_launch_without_detectable_window_does_not_open_a_browser_too(self) -> None:
+        """Edge 已经拉起来了但窗口没认出来时，不许再 webbrowser.open 补一个。
+
+        那会开出一个标题不可识别的普通浏览器页，下一次双击又再开一个 —— 正是
+        “窗口无限开”的放大器。
+        """
+        from unittest import mock
+
+        import audiomixing_launcher as launcher
+
+        with mock.patch.object(launcher, "_acquire_monitor_open_lock", return_value=1), \
+                mock.patch.object(launcher, "_release_monitor_open_lock"), \
+                mock.patch.object(launcher, "_window_handle", return_value=0), \
+                mock.patch.object(launcher, "_monitor_process_exists", return_value=False), \
+                mock.patch.object(launcher, "_find_edge", return_value="msedge.exe"), \
+                mock.patch.object(launcher, "_wait_for_monitor_window", return_value=False), \
+                mock.patch.object(launcher, "_message_box") as box, \
+                mock.patch.object(launcher.subprocess, "Popen"), \
+                mock.patch("webbrowser.open") as browser:
+            launcher.open_monitor("http://127.0.0.1:17800")
+        browser.assert_not_called()
+        self.assertTrue(box.called, "窗口没出现时要给用户一个手动打开的提示")
+
+    def test_the_tray_double_click_uses_the_same_deduped_opener(self) -> None:
+        """★ 2026-10-26 真机：托盘双击原来走 `_open_url`，绕过互斥体。
+
+        这里钉住：托盘开监控必须调用启动器的 `open_monitor`，不能再自己开新窗。
+        """
+        from unittest import mock
+
+        import audiomixing.tray as tray
+
+        opener = mock.Mock()
+        with mock.patch.object(tray, "_resolve_panel_opener", return_value=opener), \
+                mock.patch.object(tray, "_open_url") as old_open:
+            tray._open_panel("http://127.0.0.1:17800", "monitor")
+        opener.assert_called_once_with("http://127.0.0.1:17800", "monitor")
+        old_open.assert_not_called()
+
+    def test_the_launcher_injects_its_opener_into_the_tray(self) -> None:
+        """冻结包里 `import audiomixing_launcher` 不可靠，必须由启动器直接注入。"""
+        from unittest import mock
+
+        import audiomixing.tray as tray
+
+        old = tray._PANEL_OPENER
+        try:
+            opener = mock.Mock()
+            tray.set_panel_opener(opener)
+            self.assertIs(tray._resolve_panel_opener(), opener)
+        finally:
+            tray.set_panel_opener(old)
+
+
 class TestTakeOverOldVersion(unittest.TestCase):
     """「新版要把旧版关掉」——2026-10-14 用户明确提出的要求。
 
@@ -5247,6 +6521,33 @@ class TestTakeOverOldVersion(unittest.TestCase):
 
         self.assertEqual(launcher._our_version(), pkg.__version__)
         self.assertTrue(launcher._parse_version(pkg.__version__))
+
+    def test_build_forces_a_baseline_cpu_isa(self) -> None:
+        """★ 2026-10-21 真机 0xc000001d：构建机 Ryzen 9800X3D 有 AVX-512，
+        对方 Intel Core Ultra 5 125H 没有，zig 在**链接时**选了 AVX-512 的 memcpy，
+        程序进 Python 之前就崩。只加 CFLAGS 不够，必须同时给 LDFLAGS；
+        这里钉住构建环境，防止下次又交付一颗只有编译机能跑的 exe。
+        """
+        import importlib.util
+        import pathlib
+        import shutil
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location(
+            "build_nuitka_under_test", root / "tools" / "build_nuitka.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        env = module.build_env()
+        try:
+            for key in ("CFLAGS", "CXXFLAGS", "LDFLAGS"):
+                self.assertIn("-mcpu=baseline", env[key], key)
+            args = module.nuitka_args(onedir=True)
+            self.assertIn("--zig", args)
+            self.assertIn("--target-arch=x86_64", args)
+        finally:
+            shutil.rmtree(pathlib.Path(env["ZIG_GLOBAL_CACHE_DIR"]).parent,
+                          ignore_errors=True)
 
     def test_the_port_owner_lookup_survives_gbk_output(self) -> None:
         """中文 Windows 上 netstat 输出是 GBK：只写 text=True 会按 UTF-8 解码并抛
@@ -5514,7 +6815,7 @@ class TestBluetoothRequest(unittest.TestCase):
         with mock.patch.object(bt, "cached_devices", return_value=[device]):
             text = AudioMixingApi(node).diagnose()["text"]
         self.assertIn("蓝牙（手机的声音经蓝牙进电脑", text)
-        self.assertIn("手机未连接", text)
+        self.assertIn("手机已连接，但媒体音频未到", text)
         self.assertNotIn("电脑已就绪", text, "文案砍掉后半句（用户：「然后『手机未连接』」）")
         self.assertIn("瘾控", text)
 
@@ -5525,6 +6826,45 @@ class TestBluetoothAddress(unittest.TestCase):
     地址就在 Windows 的设备实例 ID 里；下面这个形状是实机抄下来的（真机名不写进来）。
     解析结果与 Windows 自己的 DEVPKEY_Bluetooth_DeviceAddress 一致 —— 实机核对过。
     """
+
+    def test_endpoint_state_prefers_the_a2dp_endpoint_and_accepts_any_case(self) -> None:
+        """★ 2026-10-26 用户真机：手机蓝牙已经出声，面板还报「媒体音频未到」。
+
+        根因之一是只扫 Capture、要求名字里必须有 "A2DP SNK"，而且比较大小写敏感。
+        这里钉住：优先用 A2DP/SNK 端点；名字归一化后大小写/空格不影响匹配。
+        """
+        from unittest import mock
+
+        from audiomixing import bluetooth as bt
+
+        self.assertEqual(bt._norm_device_text("  Phone   A "), "phonea")
+        fake = [{"flow": "Capture", "name": "PHONE A A2DP SNK",
+                 "state": 1, "active": True, "bluetooth": True}]
+        with mock.patch.object(bt, "mmdevice_endpoints", return_value=fake) as fn:
+            self.assertTrue(bt._endpoint_state_from_registry("Phone A"))
+            fn.assert_called_once_with("Phone A")
+
+    def test_a_non_a2dp_endpoint_is_only_a_fallback(self) -> None:
+        """找不到 A2DP/SNK 名字时退回任何含设备名的端点；有 A2DP 时以它为准。"""
+        from unittest import mock
+
+        from audiomixing import bluetooth as bt
+
+        # 只有 HFP 端点、且未激活 → False（至少证明"找到了，但没声音"）。
+        fake = [{"flow": "Capture", "name": "Phone A Hands-Free",
+                 "state": 8, "active": False, "bluetooth": False}]
+        with mock.patch.object(bt, "mmdevice_endpoints", return_value=fake):
+            self.assertFalse(bt._endpoint_state_from_registry("Phone A"))
+
+        # A2DP 端点 active，HFP 未激活 → True（以 A2DP 为准）。
+        fake.append({"flow": "Capture", "name": "Phone A A2DP SNK",
+                     "state": 1, "active": True, "bluetooth": True})
+        with mock.patch.object(bt, "mmdevice_endpoints", return_value=fake):
+            self.assertTrue(bt._endpoint_state_from_registry("Phone A"))
+
+        # 一个端点都找不到 → None（调用方沿用旧值，不瞎改）。
+        with mock.patch.object(bt, "mmdevice_endpoints", return_value=[]):
+            self.assertIsNone(bt._endpoint_state_from_registry("Phone A"))
 
     def test_it_reads_the_address_out_of_the_instance_id(self) -> None:
         from audiomixing import bluetooth as bt
@@ -5668,6 +7008,35 @@ class TestOutputLevelAndBluetoothCleanup(unittest.TestCase):
         # 0.3 × 增益 2.0 = 0.6：条上看到的必须是用户实际送出去的那份大小。
         self.assertAlmostEqual(session.stats()["peak"], 0.6, places=2)
 
+    def test_the_sender_leaves_the_shared_gain_scaling_to_the_receiver(self) -> None:
+        """★ 2026-11-02：同一条共享增益两端各乘一次 → 0.40 实际只有 0.16。
+
+        现在发送端只写 `gain_q14`（如实描述这条流），样本原样发；接收端
+        （PC 的 sink / 手机的 AudioRecv#hostGain）乘一次。电平台仍按增益显示。
+        """
+        from audiomixing.net import rtpaudio
+
+        captured = {}
+
+        class _Sock:
+            def send(self, payload):
+                captured["packet"] = payload
+                return len(payload)
+
+        session = rtpaudio.SenderSession(
+            None, "127.0.0.1", 9, codec=proto.CODEC_PCM_S16,
+            gain=0.4, route_id="r1", node_id="node-self")
+        session._sock = _Sock()
+        session._send_chunk(array("f", [0.3, -0.3] * 480))
+        sent = proto.decode(captured["packet"])
+        samples = proto.decode_pcm_s16(sent.payload)
+        self.assertAlmostEqual(abs(samples[0]), 0.3, delta=0.002,
+                               msg="发送端不能自己缩样本，否则接收端再乘一次就变成 0.12")
+        self.assertAlmostEqual(sent.gain, 0.4, places=3,
+                               msg="包头里的 gain_q14 仍要如实描述这条链路的音量")
+        self.assertAlmostEqual(session.stats()["peak"], 0.12, places=2,
+                               msg="「送」电平仍按最终会听到的大小显示")
+
     def test_output_level_stays_zero_when_nothing_is_playing(self) -> None:
         out = self._node().output_level()
         self.assertEqual(out["peak"], 0.0)
@@ -5721,7 +7090,7 @@ class TestOutputLevelAndBluetoothCleanup(unittest.TestCase):
 
         original_dir = bt._STATE_DIR
         try:
-            bt._STATE_DIR = pathlib.Path(tempfile.mkdtemp())
+            bt._STATE_DIR = _mkdtemp()
             keys = [bt._key("dev-a"), bt._key("dev-b")]
             for key in keys:
                 (bt._STATE_DIR / ("%s.keep" % key)).write_text("1", encoding="utf-8")
@@ -5780,7 +7149,7 @@ class TestOutputLevelAndBluetoothCleanup(unittest.TestCase):
 
         original_dir = bt._STATE_DIR
         try:
-            bt._STATE_DIR = pathlib.Path(tempfile.mkdtemp())
+            bt._STATE_DIR = _mkdtemp()
             result = bt.disconnect_all()
             self.assertTrue(result["ok"])
             self.assertEqual(result["count"], 0)
@@ -5824,12 +7193,12 @@ class TestSignalWithoutAudio(unittest.TestCase):
 
         reg = DiscoveryRegistry("node-self")
         payload = {"id": "node-phone", "name": "手机A", "audio_port": 47831}
-        reg.update(payload, "192.168.0.101")
+        reg.update(payload, "198.51.100.10")
         peer = reg.get("node-phone")
         self.assertIsNotNone(peer)
         for gap in (2.0, 2.0, 2.1, 2.0):
             peer.last_seen -= gap        # 假装信标是 gap 秒之前到的
-            reg.update(payload, "192.168.0.101")
+            reg.update(payload, "198.51.100.10")
         beats = reg.get("node-phone")
         self.assertIsNotNone(beats.beat_ms, "满 3 个样本之后就该有中位间隔")
         self.assertAlmostEqual(beats.beat_ms, 2000.0, delta=120.0)
@@ -5903,8 +7272,10 @@ class TestTheFigureTwoShell(unittest.TestCase):
         self.assertIn('<div class="app">', html)
         self.assertIn('<aside class="rail"', html, "一级菜单是左边那一竖条")
         self.assertIn(">Audio Mixing</div>", html, "LOGO")
-        for label in (">监控<", ">简洁<", ">详细<", ">二维码<", ">版本号<"):
+        for label in (">监控<", ">简洁<", ">详细<", ">二维码<", ">设置<"):
             self.assertIn(label, html, "一级菜单少了 %s" % label)
+        # v2.10 用户要求：原来那一页叫「版本号」，改名为「设置」
+        self.assertNotIn(">版本号</button>", html)
 
     def test_the_tabs_are_the_four_he_drew(self) -> None:
         html = self._html()
@@ -6047,8 +7418,8 @@ class TestNetworkSelfCheckAndBluetoothRow(unittest.TestCase):
             if "Get-NetFirewallRule" in script:
                 program = r"C:\Users\x\Desktop\Audio Mixing v9.9.exe" if stderr_ok else r"C:\old\gone.exe"
                 return types.SimpleNamespace(stdout=(
-                    "Audio Mixing TCP|%s|TCP|Allow|True\n"
-                    "Audio Mixing UDP|%s|UDP|Allow|True\n" % (program, program)))
+                    "Audio Mixing TCP|%s|TCP|Allow|True|Private\n"
+                    "Audio Mixing UDP|%s|UDP|Allow|True|Private\n" % (program, program)))
             if "Get-Process" in script:
                 # 旧写法就是靠这一句找"正在跑的 exe"，进程名对不上时永远写「读不到」。
                 return types.SimpleNamespace(stdout="")
@@ -6057,15 +7428,17 @@ class TestNetworkSelfCheckAndBluetoothRow(unittest.TestCase):
 
     def test_rules_are_found_by_name_not_by_a_stale_program_filter(self) -> None:
         """改名成 Audio Mixing 之后，旧的 `Program -like '*avelink*'` 一条规则都匹配不到，
-        于是「入站 TCP 放行 / 入站 UDP 放行」永远红着 —— 用户点多少次放行都不变。"""
+        于是网络自检永远红着 —— 用户点多少次放行都不变。"""
         api = self._api()
         with mock.patch("subprocess.run", side_effect=self._run()), \
                 mock.patch("audiomixing.tray._real_exe",
                            return_value=r"C:\Users\x\Desktop\Audio Mixing v9.9.exe"):
             result = api.netcheck()
         checks = {c["name"]: c for c in result["checks"]}
-        self.assertTrue(checks["入站 TCP 放行"]["ok"], "规则存在就必须判通过")
-        self.assertTrue(checks["入站 UDP 放行"]["ok"], "UDP 规则存在就必须判通过")
+        row = checks["入站规则（当前程序）"]
+        self.assertTrue(row["ok"], "当前程序路径有 TCP/UDP 规则就必须判通过")
+        self.assertTrue(row["meta"]["covered"]["tcp"])
+        self.assertTrue(row["meta"]["covered"]["udp"])
         self.assertTrue(result["ok"], "这几种情况下不该再有任何红叉")
 
     def test_current_program_path_comes_from_the_running_exe(self) -> None:
@@ -6079,15 +7452,81 @@ class TestNetworkSelfCheckAndBluetoothRow(unittest.TestCase):
         self.assertTrue(checks["当前程序路径"]["ok"])
         self.assertIn("Audio Mixing v9.9.exe", checks["当前程序路径"]["detail"])
 
-    def test_a_rule_bound_to_another_copy_is_reported_with_the_fix(self) -> None:
-        """规则绑的是别的副本时要说清"点一次放行防火墙"，而不是默默显示通过。"""
+    def test_a_rule_bound_to_another_copy_is_not_counted_as_current(self) -> None:
+        """只有旧版本规则时，主行绝不能显示“通过”；要说清点一次放行防火墙。"""
         api = self._api()
         with mock.patch("subprocess.run", side_effect=self._run(stderr_ok=False)), \
                 mock.patch("audiomixing.tray._real_exe",
                            return_value=r"C:\Users\x\Desktop\Audio Mixing v9.9.exe"):
             checks = {c["name"]: c for c in api.netcheck()["checks"]}
-        self.assertFalse(checks["规则是否覆盖当前路径"]["ok"])
-        self.assertIn("放行防火墙", checks["规则是否覆盖当前路径"]["detail"])
+        row = checks["入站规则（当前程序）"]
+        self.assertFalse(row["ok"], "旧版本规则不能让当前程序判通过")
+        self.assertIn("当前程序未放行", row["summary"])
+        self.assertEqual(row["meta"]["history"]["total"], 2)
+        self.assertIn("放行防火墙", row["detail"])
+
+    def test_many_near_identical_versions_are_summarized_not_dumped(self) -> None:
+        """★ 2026-10-27 用户：机器上大量近似版本时，旧规则不能把详情撑爆。
+
+        120 条旧版本规则 + 当前程序规则：主行必须是短摘要，
+        历史规则折叠成计数和最多 5 条示例；当前程序仍判通过。
+        """
+        api = self._api()
+        current = r"C:\Users\x\Desktop\Audio Mixing v9.9.exe"
+
+        def fake(args, **kwargs):
+            script = " ".join(str(a) for a in (args or []))
+            if "Get-NetConnectionProfile" in script:
+                return types.SimpleNamespace(stdout="以太网|Private\n")
+            if "Get-NetFirewallProfile" in script:
+                return types.SimpleNamespace(stdout="Domain=True\nPrivate=True\nPublic=True\n")
+            if "Get-NetFirewallRule" in script:
+                lines = [
+                    "Audio Mixing TCP|%s|TCP|Allow|True|Private" % current,
+                    "Audio Mixing UDP|%s|UDP|Allow|True|Private" % current,
+                ]
+                for i in range(120):
+                    lines.append(
+                        "Audio Mixing - LAN audio casting|E:\\backup\\v%d\\audiomixing.exe|TCP|Allow|True|Private" % i)
+                return types.SimpleNamespace(stdout="\n".join(lines))
+            return types.SimpleNamespace(stdout="")
+
+        with mock.patch("subprocess.run", side_effect=fake), \
+                mock.patch("audiomixing.tray._real_exe", return_value=current):
+            checks = {c["name"]: c for c in api.netcheck()["checks"]}
+        row = checks["入站规则（当前程序）"]
+        self.assertTrue(row["ok"])
+        self.assertLess(len(row["detail"]), 260, "主行详情必须是摘要，不能铺 120 条路径")
+        history = row["meta"]["history"]
+        self.assertEqual(history["total"], 120)
+        self.assertEqual(history["unique_paths"], 120)
+        self.assertEqual(len(history["examples"]), 5)
+        self.assertTrue(history["truncated"])
+        self.assertNotIn("v119", row["detail"], "具体路径只能出现在折叠数据里")
+
+    def test_a_rule_for_another_profile_is_not_counted_as_covering_this_network(self) -> None:
+        """规则只放行 Domain、当前网络是 Private 时，不能判通过。"""
+        api = self._api()
+        current = r"C:\Users\x\Desktop\Audio Mixing v9.9.exe"
+
+        def fake(args, **kwargs):
+            script = " ".join(str(a) for a in (args or []))
+            if "Get-NetConnectionProfile" in script:
+                return types.SimpleNamespace(stdout="以太网|Private\n")
+            if "Get-NetFirewallProfile" in script:
+                return types.SimpleNamespace(stdout="Domain=True\nPrivate=True\nPublic=True\n")
+            if "Get-NetFirewallRule" in script:
+                return types.SimpleNamespace(
+                    stdout="Audio Mixing TCP|%s|TCP|Allow|True|Domain\n"
+                           "Audio Mixing UDP|%s|UDP|Allow|True|Domain\n" % (current, current))
+            return types.SimpleNamespace(stdout="")
+
+        with mock.patch("subprocess.run", side_effect=fake), \
+                mock.patch("audiomixing.tray._real_exe", return_value=current):
+            checks = {c["name"]: c for c in api.netcheck()["checks"]}
+        row = checks["入站规则（当前程序）"]
+        self.assertFalse(row["ok"])
+        self.assertIn("没有覆盖当前网络类型", row["summary"])
 
     def test_the_bluetooth_row_can_be_disconnected_from_the_monitor(self) -> None:
         """图3：蓝牙那一行只有状态、没有断开按钮，用户想断只能进系统蓝牙设置。"""
@@ -6245,3 +7684,2332 @@ class TestNetworkSelfCheckAndBluetoothRow(unittest.TestCase):
 
         html = monitor_html()
         self.assertIn("f.disconnect_id || f.route_id", html)
+
+class Test20261103GhostsAndStats(unittest.TestCase):
+    """★ 2026-11-03 用户三张截图：
+
+    * 图1：`2cdffa7c-30ee-45c…` / `M332BF-999c` 这类历史设备一直挂在线/不可达；
+    * 图3："正在接收 / 累计 9.2MB" 但 "速率 0 KB/s"、缓冲 60ms 而目标 25ms；
+    * 图2：路由写着"送在跑"而卡片写"没有在送"、收没有在收。
+
+    这里钉住三条口径：发现表按 TTL 淘汰但"见过"要留着（不误删真设备路由）；
+    路由只 stale 不删除；收发状态/速率必须来自真实流，而不是另一个布尔开关。
+    """
+
+    def _node(self):
+        from audiomixing.config import Config
+        from audiomixing.engine import AudioMixingNode
+
+        cfg = Config()
+        cfg.node_id = "self-node"
+        cfg.name = "本机"
+        cfg.routes = []
+        cfg.codec = "pcm_s16"
+        node = AudioMixingNode(cfg, audio_port=free_udp_port(),
+                               discovery_port=free_udp_port(), simulate=True)
+        node.devices = []
+        return node
+
+    def test_a_forgotten_peer_leaves_the_list_but_stays_ever_seen(self) -> None:
+        node = self._node()
+        try:
+            node.registry.update({"wl": 1, "id": "old-phone", "name": "M332BF-999c",
+                                  "audio_port": 47831, "web_port": 0}, "192.168.0.100")
+            node.registry.get("old-phone").last_seen = time.time() - 90.0
+            removed = node.registry.prune(60.0)
+            self.assertIn("old-phone", removed, "90 秒没有音讯的历史设备要从界面列表里消失")
+            self.assertIsNone(node.registry.resolve("old-phone"))
+            self.assertTrue(node.registry.ever_seen("old-phone"),
+                            "‘见过一次’必须留下，否则关机中的真设备会被当假设备删路由")
+        finally:
+            node.stop()
+
+    def test_a_manual_peer_is_never_pruned(self) -> None:
+        node = self._node()
+        try:
+            node.registry.add_manual("192.168.0.102", 47831, "手动设备")
+            peer = node.registry.resolve("192.168.0.102")
+            peer.last_seen = time.time() - 600.0
+            removed = node.registry.prune(60.0)
+            self.assertNotIn(peer.node_id, removed, "手动添加是用户明确要求，TTL 不能删它")
+        finally:
+            node.stop()
+
+    def test_a_route_to_a_vanished_peer_is_flagged_stale_not_deleted(self) -> None:
+        node = self._node()
+        try:
+            node.set_routes([{"id": "r-old", "from": ["2cdffa7c-old"], "to": ["self"]}],
+                            persist=False)
+            node._refresh_route_staleness()
+            self.assertFalse(node.status()["routes"][0]["stale"],
+                             "刚发现找不到时先观察，不能立刻判死")
+            node._unknown_route_since["r-old"] = time.monotonic() - 90.0
+            node._refresh_route_staleness()
+            self.assertTrue(node.status()["routes"][0]["stale"],
+                            "持续找不到 60 秒后，界面不再画这个幽灵节点")
+            self.assertEqual(len(node.routes), 1, "只是标记，不能删用户路由")
+        finally:
+            node.stop()
+
+    def test_the_tick_loop_really_prunes_but_never_stales_a_real_device(self) -> None:
+        """★ 2026-11-04（第 1 条回退）：tick 仍要真淘汰离线设备，但**不能**把见过面的真设备
+        当"不存在"。这正是用户现场"虚线节点反而变多"的根因：以前只看"当前不在线"。
+
+        tick 每半秒跑一次，是唯一稳定执行的地方；这条把"90s 淘汰 + 只有真 ghost 才 stale"
+        钉在真正的调用链上（不是只测函数本身）。
+        """
+        node = self._node()
+        try:
+            node.registry.update({"wl": 1, "id": "old-phone", "name": "M332BF-999c",
+                                  "audio_port": 47831, "web_port": 0}, "192.168.0.100")
+            node.registry.get("old-phone").last_seen = time.time() - 120.0
+            node.set_routes([{"id": "r-ghost", "from": ["old-phone"], "to": ["self"]}],
+                            persist=False)
+            node._last_peer_prune = time.monotonic() - 30.0
+            node._unknown_route_since["r-ghost"] = time.monotonic() - 90.0
+            with mock.patch.object(node, "refresh_devices", lambda: None), \
+                    mock.patch.object(node, "_apply_pushed_routes", lambda: None), \
+                    mock.patch.object(node, "apply_routes", lambda: None), \
+                    mock.patch.object(node, "_apply_multi_out", lambda: None), \
+                    mock.patch.object(node, "_sweep_dead_senders", lambda: None), \
+                    mock.patch.object(node, "_sweep_orphan_routes", lambda: None), \
+                    mock.patch.object(node, "_sweep_unwanted_auto_routes", lambda: None):
+                node.tick()
+            self.assertNotIn("old-phone", [p["node_id"] for p in node.registry.snapshot()],
+                             "tick 必须真的把 90 秒没音讯的设备从界面列表拿掉")
+            item = node.status()["routes"][0]
+            self.assertFalse(item["stale"],
+                             "见过面的真设备只是关机/换网 → 实线（offline），不能当幽灵清掉")
+            self.assertEqual(item["state"], "offline")
+            self.assertEqual(len(node.routes), 1, "路由仍然保留（用户配置不能丢）")
+
+            # 换成"本进程从没见过的 id"：这才是脏配置/旧 id，连续 60 秒解析不到必须标 missing。
+            node.set_routes([{"id": "r-ghost", "from": ["b1fbc20c-b560-48"], "to": ["self"]}],
+                            persist=False)
+            node._unknown_route_since["r-ghost"] = time.monotonic() - 90.0
+            node._refresh_route_staleness()
+            ghost = node.status()["routes"][0]
+            self.assertTrue(ghost["stale"], "真 ghost（从未见过）60 秒后才画虚线")
+            self.assertEqual(ghost["state"], "missing")
+        finally:
+            node.stop()
+
+    def test_the_frontend_draws_only_true_missing_as_dashed(self) -> None:
+        """第 1/14 条（第四轮修正）：身份确实不存在的路由**根本不上图**（不再有幽灵卡片），
+        状态只影响线型/透明度、不再换颜色；自环 u===v 不画。"""
+        html = (ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8")
+        self.assertNotIn("if(r.stale) return;", html,
+                         "旧的一刀切跳过会把 no_data 路由也藏掉")
+        self.assertIn("if(String(r.state || '') === 'missing' || r.stale) return;", html,
+                      "真 missing 路由只留在路由表，不上关系图")
+        self.assertIn("if(l.state === 'missing') return cls + ' missing';", html,
+                      "兜底分支保留（万一还有漏画的 missing 边）")
+        self.assertIn("if(l.state === 'no_data' || !l.live)", html)
+        self.assertIn("if(u === v) return;", html, "同一台设备（WiFi/蓝牙）不能画自环")
+
+    def test_late_packet_wording_does_not_imply_dropped_audio(self) -> None:
+        """★ 2026-11-03（Q2）：代码里 `late` 只计数、样本照播。
+
+        「迟到」文案会被用户读成"丢音"，和「溢出」一起看就像同一次会话里自相矛盾。
+        统一改成「晚到包」，并在诊断里写明不代表丢音。目标值**不是**下限：
+        用户现场 116ms < 「最低 150ms」就是反例，文案必须是「目标（不是下限）」。
+        """
+        src = (ROOT / "audiomixing" / "webui.py").read_text(encoding="utf-8")
+        self.assertIn("晚到包", src)
+        self.assertNotIn("迟到=", src, "不允许再出现会误导成丢音的旧文案")
+        self.assertIn("不代表丢音", src, "必须写明晚到包不是丢音")
+        # ★ 2026-11-04：现场 116ms < 「最低 150ms」证明 target 不是下限。文案改为
+        #   「目标（不是下限）」，实际值允许短时低于它。
+        self.assertIn("目标 %s 毫秒（不是下限）", src)
+        html = (ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("目标 ${x.target_ms}ms", html)
+        self.assertNotIn("最低 ${x.target_ms}ms", html, "不能再把目标写成下限")
+
+
+
+    def test_receiver_reports_a_live_rate_instead_of_always_zero(self) -> None:
+        from audiomixing.net.rtpaudio import Receiver, StreamInfo
+
+        recv = Receiver("self", 0)
+        info = StreamInfo(ssrc=7, node_id="phone", bytes=1000, packets=10)
+        recv.streams[7] = info
+        first = recv.stats()["streams"][0]
+        self.assertEqual(first["kbps"], 0.0, "第一次没有窗口，先给 0")
+        time.sleep(0.25)
+        info.bytes = 3000
+        second = recv.stats()["streams"][0]
+        self.assertGreater(second["kbps"], 1.0,
+                           "累计字节涨了 2000，速率不能再是 0（图3 的根因）")
+
+    def test_the_listening_gain_is_attenuated_by_the_phone_volume_only(self) -> None:
+        node = self._node()
+        try:
+            node.registry.update({"wl": 1, "id": "peer-1", "name": "手机",
+                                  "audio_port": 47831, "web_port": 0}, "198.51.100.10")
+            node.set_routes([{"id": "r-listen", "from": ["peer-1"], "to": ["self"],
+                              "gain": 0.8, "mute": False}], persist=False)
+            node.receiver.control_messages.append(
+                {"t": "stats", "node": "peer-1", "name": "手机", "_type": "STATS",
+                 "_from": "198.51.100.10:47831", "_at": time.monotonic(), "vol": 0.5})
+            node._handle_peer_requests()
+            self.assertAlmostEqual(node._peer_media_volume(node.routes[0]), 0.5)
+            self.assertAlmostEqual(node.routes[0]["gain"], 0.8,
+                                   "路由上的『我听它的』不能被手机音量改写")
+            # ★ 2026-11-04（Q2）：验收必须能从 /api/status 直接看到手机报的音量。
+            peer = {p["node_id"]: p for p in node.status()["peers"]}["peer-1"]
+            self.assertEqual(peer["media_vol"], 0.5)
+            self.assertIsNotNone(peer["media_vol_age_s"])
+            # v2.26 起 vol 会存进多个身份键（node_id / device_id / alias / host）。
+            # "不再上报"必须让**所有**键一起过期，否则 host 上的新值会继续生效。
+            node._peer_volume.clear()
+            self.assertAlmostEqual(node._peer_media_volume(node.routes[0]), 1.0,
+                                   msg="手机不再报音量（老版本）时行为必须回到 1.0")
+            peer = {p["node_id"]: p for p in node.status()["peers"]}["peer-1"]
+            self.assertIsNone(peer["media_vol"], "过期后状态里必须显示未上报，而不是旧值")
+        finally:
+            node.stop()
+
+    def test_phone_volume_scales_the_final_sink_gain(self) -> None:
+        """★ 2026-11-04（Q1）：钉死「最终播放端增益 = 路由增益 × 手机媒体音量」。
+
+        用户现场看到的 `sinks[0].gain=0.49` 恰好等于路由增益 0.49，只有两种可能：
+        ① 手机上跑的版本没报 vol；② 报了但乘算没发生（键对不上/走了通配路由）。
+        这条测试钉住②：只要 vol 到了电脑，`_apply_sink_gain` 必须乘进去。
+        """
+        node = self._node()
+        try:
+            node.registry.update({"wl": 1, "id": "peer-1", "name": "手机",
+                                  "audio_port": 47831, "web_port": 0}, "198.51.100.10")
+            node.set_routes([{"id": "r-listen", "from": ["peer-1"], "to": [node.config.node_id],
+                              "gain": 0.8, "mute": False}], persist=False)
+            node.receiver.control_messages.append(
+                {"t": "stats", "node": "peer-1", "name": "手机", "_type": "STATS",
+                 "_from": "198.51.100.10:47831", "_at": time.monotonic(), "vol": 0.5})
+            node._handle_peer_requests()
+            rule = next(r for r in node.routes if r["id"] == "r-listen")
+            sink = SinkEngine(route_id="r-listen", device_selector="d")
+            node._apply_sink_gain(sink, rule)
+            self.assertAlmostEqual(sink.gain, 0.4, msg="0.8 × 0.5 必须等于 0.4")
+            self.assertEqual(sink.route_gain, 0.8)
+            self.assertEqual(sink.media_vol, 0.5)
+            self.assertEqual(sink.media_vol_source, "peer-1",
+                             "诊断要能说出 vol 是从哪个键查到的")
+            self.assertAlmostEqual(sink.describe()["gain"], 0.4,
+                                   msg="面板/诊断读的就是 describe()，这里也必须是 0.4")
+            # 同样：所有身份键一起清掉才算真正的"过期"，只陈旧 node_id 不够。
+            node._peer_volume.clear()
+            node._apply_sink_gain(sink, rule)
+            self.assertAlmostEqual(sink.gain, 0.8)
+            self.assertEqual(sink.media_vol, 1.0)
+        finally:
+            node.stop()
+
+    def test_unaccepted_point_to_point_is_not_attached_to_the_channel(self) -> None:
+        """★ 2026-11-06（用户第 1 条）：勾「只听」不等于放行点对点。
+
+        v2.28 为了修"只听下彻底没声"把准入改成一律放行，结果没开「收听」的手机
+        也能把点对点流灌进频道通配路由 —— 声音能听到，但走的是给广播准备的混音
+        路径，真机表现是"很卡"。现在恢复文档铁律（BUG-20261104-04）：
+          * 「只听」只收**频道广播**；
+          * 点对点必须在这台设备卡片上开「收听」（具名路由）才收；
+          * 广播流仍然照常落进频道通配。
+        """
+        node = self._node()
+        try:
+            node.config.broadcast = False
+            node.config.listen = True
+            node.registry.update({"wl": 1, "id": "peer-1", "name": "手机",
+                                  "audio_port": 47831, "web_port": 0}, "198.51.100.10")
+            node.set_routes([], persist=False)
+            self.assertEqual(node.routes_for_sender("peer-1"), {"channel"},
+                             "还没声明点对点时，频道收听本来就该收它")
+            node.receiver.control_messages.append(
+                {"t": "stats", "node": "peer-1", "name": "手机", "_type": "STATS",
+                 "_from": "198.51.100.10:47831", "_at": time.monotonic(),
+                 "send_mode": 1, "broadcast": False, "sending": True,
+                 "want_listen": True})
+            node._handle_peer_requests()
+            self.assertEqual(node._peer_send_mode_for("peer-1"), (1, False))
+            self.assertEqual(node.routes_for_sender("peer-1"), set(),
+                             "★ 第 1 条：只听 ≠ 放行点对点，没开「收听」就一个播放端都不挂")
+            self.assertFalse(node._stream_is_accepted("peer-1"),
+                             "★ 第 1 条：接收准入必须把未接受的点对点挡在流表之外")
+            node.config.listen = False
+            self.assertEqual(node.routes_for_sender("peer-1"), set(),
+                             "没开「只听」且没接受 → 一个播放端都不挂")
+            self.assertFalse(node._stream_is_accepted("peer-1"))
+            node.config.listen = True
+            node.set_routes([{"id": "named", "from": ["peer-1"],
+                              "to": [node.config.node_id]}], persist=False)
+            self.assertEqual(node.routes_for_sender("peer-1"), {"named"},
+                             "接受之后要立刻挂上具名路由（不用等重启）")
+            self.assertTrue(node._stream_is_accepted("peer-1"))
+        finally:
+            node.stop()
+
+    def test_a_broadcast_from_a_known_sender_still_reaches_the_channel(self) -> None:
+        """★ 2026-11-04（Q2）：修准入不能把正常的广播→只听一起弄死。
+
+        广播那条线路不报 want_listen（手机端「广播是和路由独立开的」），所以同一台
+        已登记的手机在广播时仍必须落进频道那条。
+        """
+        node = self._node()
+        try:
+            node.config.broadcast = False
+            node.config.listen = True
+            node.registry.update({"wl": 1, "id": "peer-1", "name": "手机",
+                                  "audio_port": 47831, "web_port": 0}, "198.51.100.10")
+            node.set_routes([], persist=False)
+            # ★ 2026-11-04（Q1 回退）：广播时手机可能因为残留的 sendIds 同时报
+            #   want_listen=true —— 这一条正是回退的触发链，必须照样能落进频道。
+            node.receiver.control_messages.append(
+                {"t": "stats", "node": "peer-1", "name": "手机", "_type": "STATS",
+                 "_from": "198.51.100.10:47831", "_at": time.monotonic(),
+                 "send_mode": 1, "broadcast": True, "sending": True,
+                 "want_listen": True})
+            node._handle_peer_requests()
+            self.assertEqual(node._peer_send_mode_for("peer-1"), (1, True))
+            self.assertFalse(node._peer_sends_point_to_point("peer-1"),
+                             "显式 broadcast=true 永远不算点对点，哪怕 want_listen 误报")
+            self.assertEqual(node.routes_for_sender("peer-1"), {"channel"})
+            self.assertTrue(node._stream_is_accepted("peer-1"))
+        finally:
+            node.stop()
+
+    def test_a_legacy_phone_that_never_reports_its_mode_is_still_heard(self) -> None:
+        """★ 2026-11-04（Q1 回退）：2.10 及以前没有 send_mode / broadcast。
+
+        退化行为必须是"能听"：不许因为字段缺失就把它当成点对点拒掉
+（历史上广播一直是能听的，回退比漏音更不能接受）。
+        """
+        node = self._node()
+        try:
+            node.config.broadcast = False
+            node.config.listen = True
+            node.registry.update({"wl": 1, "id": "peer-old", "name": "老手机",
+                                  "audio_port": 47831, "web_port": 0}, "192.168.0.102")
+            node.set_routes([], persist=False)
+            node.receiver.control_messages.append(
+                {"t": "stats", "node": "peer-old", "name": "老手机", "_type": "STATS",
+                 "_from": "192.168.0.102:47831", "_at": time.monotonic(),
+                 "want_listen": True})
+            node._handle_peer_requests()
+            self.assertIsNone(node._peer_send_mode_for("peer-old"),
+                              "老版本没报模式，就不许凭空造一个")
+            self.assertFalse(node._peer_sends_point_to_point("peer-old"))
+            self.assertEqual(node.routes_for_sender("peer-old"), {"channel"})
+            self.assertTrue(node._stream_is_accepted("peer-old"))
+        finally:
+            node.stop()
+
+    def test_broadcast_listen_receives_real_audio_packets_end_to_end(self) -> None:
+        """★ 2026-11-04（Q1）：端到端走一遍接收端准入 → 真的收下音频包。
+
+        对照：同一条 stats 改成点对点（broadcast=false）且本机没接受 → 同一个
+        接收端必须一个包都不收（`packets_denied` 增加）。
+        """
+        from audiomixing import proto
+
+        def stats(node, cid, broadcast):
+            node.receiver.control_messages.append(
+                {"t": "stats", "node": cid, "name": "手机", "_type": "STATS",
+                 "_from": "198.51.100.10:47831", "_at": time.monotonic(),
+                 "send_mode": 1, "broadcast": broadcast, "sending": True,
+                 "want_listen": True})
+            node._handle_peer_requests()
+
+        node = self._node()
+        try:
+            node.config.broadcast = False
+            node.config.listen = True
+            node.registry.update({"wl": 1, "id": "peer-1", "name": "手机",
+                                  "audio_port": 47831, "web_port": 0}, "198.51.100.10")
+            node.set_routes([], persist=False)
+            stats(node, "peer-1", True)
+            pkt = proto.Packet(type=proto.T_AUDIO, payload=b"\x01\x02" * 480,
+                               codec=proto.CODEC_PCM_S16, seq=1, ssrc=0x5151,
+                               samples=480, ts_ns=proto.now_ns())
+            self.assertTrue(node.receiver._admitted(pkt, "198.51.100.10"),
+                            "广播流必须过准入闸门")
+            node.receiver._handle_audio(pkt, ("198.51.100.10", 47831))
+            found = node.receiver.stats()["streams"]
+            self.assertEqual(len(found), 1, "广播必须真的进流表")
+            self.assertEqual(found[0]["packets"], 1)
+        finally:
+            node.stop()
+
+        node2 = self._node()
+        try:
+            node2.config.broadcast = False
+            node2.config.listen = True
+            node2.registry.update({"wl": 1, "id": "peer-1", "name": "手机",
+                                   "audio_port": 47831, "web_port": 0}, "198.51.100.10")
+            node2.set_routes([], persist=False)
+            stats(node2, "peer-1", False)
+            # ★ 2026-11-06（第 1 条）：只听只收广播，未接受的点对点必须被拦住。
+            self.assertFalse(node2.receiver._admitted(pkt, "198.51.100.10"),
+                            "★ 第 1 条：只听 ≠ 放行点对点，准入必须拒绝")
+            self.assertEqual(node2.routes_for_sender("peer-1"), set(),
+                            "★ 第 1 条：未接受的点对点一个播放端都不挂")
+        finally:
+            node2.stop()
+
+    def test_phone_volume_is_not_multiplied_twice_when_the_capture_is_already_attenuated(
+            self) -> None:
+        """★ 2026-11-04（Q2）：手机采集点在音量**之后**（用户实测结论）。
+
+        vol 1.0→0.5、收到峰值 0.80→0.40 同比例降 → 判定"采集端已衰减" → PC 不再乘 vol。
+        最终 gain 必须等于路由增益本身，否则手机音量会被平方（调小一半变四分之一）。
+        """
+        from types import SimpleNamespace
+
+        from audiomixing.net.rtpaudio import JitterBuffer, StreamInfo
+
+        node = self._node()
+        try:
+            peer = "peer-1"
+            node.registry.update({"wl": 1, "id": peer, "name": "手机",
+                                  "audio_port": 47831, "web_port": 0}, "198.51.100.10")
+            node._peer_volume[peer] = (0.5, time.monotonic())
+            node.receiver.streams[4242] = StreamInfo(ssrc=4242, node_id=peer)
+            buf = JitterBuffer(name="q2")
+            node.receiver.buffers[4242] = buf
+            base = time.monotonic() - 60.0
+            buf.peak = 0.8
+            node._observe_peer_volume(peer, 1.0, base)
+            buf.peak = 0.4
+            node._observe_peer_volume(peer, 0.5, base + 12.0)
+            self.assertTrue(node._peer_vol_verdict.get(peer),
+                            "峰值随 vol 同比例变化 → 采集端已衰减")
+            rule = {"gain": 0.8, "from": [peer], "to": [node.config.node_id]}
+            sink = SimpleNamespace()
+            node._apply_sink_gain(sink, rule)
+            self.assertAlmostEqual(sink.gain, 0.8, msg="判定已衰减时不许再乘 vol")
+            self.assertAlmostEqual(sink.media_vol, 0.5, msg="上报值仍要显示出来")
+            self.assertAlmostEqual(sink.volume_factor, 1.0)
+            self.assertIn("不叠加", sink.volume_note)
+            row = next(p for p in node._peers_with_media_volume() if p["node_id"] == peer)
+            self.assertIn("vol=0.50", row["volume_note"], "诊断必须一眼看到 vol")
+            self.assertIn("收到峰值=0.40", row["volume_note"])
+            self.assertIn("不叠加", row["volume_note"])
+            # 手动强制开：回到旧行为 0.8 × 0.5 = 0.40（对照，证明开关真的在起作用）
+            node.config.phone_volume_mode = "on"
+            node._apply_sink_gain(sink, rule)
+            self.assertAlmostEqual(sink.gain, 0.4)
+            # 手动强制关：即使判定是"需要乘"也只乘路由增益
+            node.config.phone_volume_mode = "off"
+            node._apply_sink_gain(sink, rule)
+            self.assertAlmostEqual(sink.gain, 0.8)
+        finally:
+            node.stop()
+
+    def test_phone_volume_is_still_applied_when_the_capture_precedes_the_volume(self) -> None:
+        """★ 2026-11-04（Q2）：峰值**不随** vol 变 → 采集在音量之前 → 仍要乘一次。"""
+        from types import SimpleNamespace
+
+        from audiomixing.net.rtpaudio import JitterBuffer, StreamInfo
+
+        node = self._node()
+        try:
+            peer = "peer-2"
+            node._peer_volume[peer] = (0.5, time.monotonic())
+            node.receiver.streams[4243] = StreamInfo(ssrc=4243, node_id=peer)
+            buf = JitterBuffer(name="q2b")
+            node.receiver.buffers[4243] = buf
+            base = time.monotonic() - 60.0
+            buf.peak = 0.8
+            node._observe_peer_volume(peer, 1.0, base)
+            buf.peak = 0.8
+            node._observe_peer_volume(peer, 0.5, base + 12.0)
+            self.assertFalse(node._peer_vol_verdict.get(peer),
+                             "峰值没变 → 采集在音量之前，需要 PC 补上衰减")
+            rule = {"gain": 0.8, "from": [peer], "to": [node.config.node_id]}
+            sink = SimpleNamespace()
+            node._apply_sink_gain(sink, rule)
+            self.assertAlmostEqual(sink.gain, 0.4, msg="0.8 × 0.5")
+            self.assertAlmostEqual(sink.volume_factor, 0.5)
+            self.assertIn("叠加", sink.volume_note)
+        finally:
+            node.stop()
+
+    def test_volume_decision_defaults_to_the_old_behaviour_without_samples(self) -> None:
+        """★ 2026-11-04（Q2）：没有样本（老手机 / 还没调过音量）时按旧行为叠加，
+        不许因为"判不出来"就把音量丢掉。"""
+        node = self._node()
+        try:
+            node._peer_volume["peer-3"] = (0.5, time.monotonic())
+            factor, note = node._volume_factor_for(
+                0.5, node._volume_verdict_for(["peer-3"]))
+            self.assertAlmostEqual(factor, 0.5)
+            self.assertIn("样本不足", note)
+        finally:
+            node.stop()
+
+    def test_the_receiver_drops_a_denied_source_before_it_enters_the_stats(self) -> None:
+        """★ 2026-11-04（Q2）：准入在**计数之前**生效 —— 被拒绝的流不能出现在监控页。"""
+        from types import SimpleNamespace
+
+        from audiomixing import proto
+        from audiomixing.net.rtpaudio import Receiver
+
+        recv = Receiver("self", 0, accept_source=lambda nid: False,
+                        resolve_source=lambda host: "peer-1")
+        try:
+            self.assertFalse(recv._admitted(SimpleNamespace(type=proto.T_AUDIO), "198.51.100.10"))
+            self.assertTrue(recv._admitted(SimpleNamespace(type=proto.T_PING), "198.51.100.10"),
+                            "控制包不受音频准入影响（时钟/统计还要能走）")
+            self.assertIn("packets_denied", recv.stats())
+        finally:
+            recv.stop()
+        recv2 = Receiver("self", 0, accept_source=lambda nid: False,
+                         resolve_source=lambda host: "")
+        try:
+            self.assertTrue(recv2._admitted(SimpleNamespace(type=proto.T_AUDIO), "10.0.0.9"),
+                            "认不出来源的流照旧放行（老行为：手动 IP / 信标丢了）")
+        finally:
+            recv2.stop()
+
+    def test_a_synthetic_test_node_id_is_migrated_without_losing_routes(self) -> None:
+        from audiomixing.config import Config, default_node_id
+
+        path = _mkdtemp(prefix="am-cfg-mig-") / "config.json"
+        path.write_text(json.dumps({
+            "node_id": "self-node",
+            "name": "本机",
+            "routes": [{"id": "r1", "from": ["2cdffa7c"], "to": ["self-node"],
+                        "origin": "self-node", "gain": 1.0}],
+            "smart_link": ["peer-1", "real-phone"],
+        }), encoding="utf-8")
+        cfg = Config.load(path, create=True)
+        self.assertNotEqual(cfg.node_id, "self-node", "测试身份必须换成真 UUID")
+        self.assertEqual(len(cfg.node_id.split("-")), 5, "换成的是标准 uuid4")
+        self.assertEqual(cfg.routes[0]["to"], [cfg.node_id], "指向旧身份的端点要原地改写")
+        self.assertEqual(cfg.routes[0]["origin"], cfg.node_id)
+        self.assertEqual(cfg.smart_link, ["real-phone"], "测试留下的 peer-1 不能继续自动连")
+        self.assertEqual(len(cfg.routes), 1, "不能顺手删掉用户路由")
+        # ★ 2026-11-03：迁移前必须留下原件，出问题能人工回退。
+        backups = sorted(path.parent.glob(path.name + ".bak-*"))
+        self.assertEqual(len(backups), 1, "迁移前应恰好生成一份 config.json.bak-<时间戳>")
+        original = json.loads(backups[0].read_text(encoding="utf-8"))
+        self.assertEqual(original["node_id"], "self-node", "备份必须是迁移前的原样内容")
+        self.assertEqual(original["smart_link"], ["peer-1", "real-phone"])
+        self.assertEqual(original["routes"][0]["to"], ["self-node"])
+
+
+class Test20261104ClockAndJitter(unittest.TestCase):
+    """★ 2026-11-04（Q1）：把"晚到包 595675 / 5960 秒 ≈ 100%"这个假数字钉死在测试里。
+
+    诊断包证据：`clocks` 里 node_id 那条 samples=0；IP 那条 samples=8752、
+    offset=-1173.839ms。音频流按 node_id 查 → offset=0 → 所有包都被判晚到。
+    """
+
+    def test_a_stream_uses_the_clock_learned_under_the_ip_address(self) -> None:
+        from audiomixing.net.rtpaudio import Receiver, StreamInfo
+
+        recv = Receiver("self", 0)
+        cs = proto.ClockSync("192.168.0.100")
+        cs.samples = 1
+        cs.offset_ns = -1_173_839_000
+        recv._clock["192.168.0.100"] = cs
+        node_id = "605a4964-0000-0000-0000-000000000000"
+        got = recv._clock_for(node_id, ("192.168.0.100", 47971))
+        self.assertIs(got, cs, "node_id 名下没有样本时必须回退到 IP 上已同步的时钟")
+        self.assertTrue(got.ready)
+        self.assertAlmostEqual(got.offset_ns / 1e6, -1173.839, places=1)
+        self.assertIs(recv._clock[node_id], cs, "回退成功后要登记到 node_id，stats 才能显示真实偏移")
+        recv.streams[7] = StreamInfo(ssrc=7, node_id=node_id)
+        stream = recv.stats()["streams"][0]
+        self.assertTrue(stream["clock_ready"])
+        self.assertAlmostEqual(stream["clock_ms"], -1173.8, places=1)
+        self.assertEqual(stream["clock_samples"], 1)
+
+    def test_unsynced_packets_are_not_counted_as_late(self) -> None:
+        from audiomixing.net.rtpaudio import JitterBuffer
+
+        buf = JitterBuffer()
+        buf._have_timeline = True
+        buf._primed = True
+        buf._play_at = proto.now_ns()
+        samples = make_tone(1000.0, BLOCK, 0.3, CHANNELS)
+        # offset=0 时包时间戳不在本机时间轴上（手机墙钟比电脑慢 1.17 秒）。
+        buf.write(samples, proto.now_ns() - 1_200_000_000, 0.0)
+        self.assertEqual(buf.dropped_late, 1, "时钟已同步时该计就计（不变）")
+        buf.dropped_late = 0
+        buf.write(samples, proto.now_ns() - 1_200_000_000, 0.0, count_late=False)
+        self.assertEqual(buf.dropped_late, 0, "时钟未同步时不允许把包算成晚到")
+
+    def test_a_few_underruns_do_not_pin_the_target_at_the_max(self) -> None:
+        from audiomixing.net.rtpaudio import JitterBuffer, _ms_to_frames
+
+        buf = JitterBuffer()
+        buf.target_frames = _ms_to_frames(55.0)
+        now = proto.now_ns()
+        buf._last_adjust_ns = now - 5_000_000_000
+        buf.samples_written = 96_000
+        buf._last_written = 0
+        buf.underruns = 1
+        buf._last_underruns = 0
+        buf._reads = 200
+        buf._last_reads = 0
+        before = buf.target_frames
+        buf._adapt(now)
+        self.assertEqual(buf.target_frames, before,
+                         "现场 0.5% 的欠载率不该把目标一路推到 150ms 上限")
+        # 高欠载率（15%）才允许快速上调。
+        buf.underruns = 31
+        buf._last_underruns = 1
+        buf._reads = 400
+        buf._last_reads = 200
+        buf._last_adjust_ns = now - 1_200_000_000
+        buf._adapt(now)
+        self.assertGreater(buf.target_frames, before, "欠载 >5% 必须一次涨 10ms")
+
+    def test_the_target_shrinks_only_after_five_clean_seconds(self) -> None:
+        from audiomixing.net.rtpaudio import JitterBuffer, _ms_to_frames
+
+        buf = JitterBuffer()
+        buf.target_frames = _ms_to_frames(60.0)
+        now = proto.now_ns()
+        buf.samples_written = 0
+        for i in range(5):
+            buf._last_adjust_ns = now - (6 - i) * 1_000_000_000
+            buf._adapt(now)
+        before = buf.target_frames
+        buf._last_adjust_ns = now - 1_200_000_000
+        buf._adapt(now)
+        self.assertLess(buf.target_frames, before,
+                         "连续 5 秒无欠载/晚到/溢出后才允许每秒收 2%（收要慢）")
+
+    # ---- ★ 2026-11-04（审计 A2）：对端校时后 offset 必须跟得上 ----
+    def test_a_peer_clock_step_is_followed_after_the_best_rtt_is_settled(self) -> None:
+        """改前：offset 只在 `rtt <= 历史最小 RTT` 的样本上更新。
+
+        `_best_rtt` 只减不增，采集几轮之后后续样本几乎永不命中 —— 对端墙钟被
+        NTP 校正（或用户改时间）时 offset 永远停在旧值，播放头整体错位，
+        表现为持续溢出/整段延迟直到重启。改后：250ms 以上的跳变两次 PONG 内重锚。
+        """
+        sync = proto.ClockSync("remote")
+
+        def feed(offset_ns: float, rtt_us: int) -> None:
+            t0 = proto.now_ns()
+            ping = proto.Packet.control(proto.T_PING, proto.ping_body(t0))
+            half = rtt_us * 1000 // 2
+            t1 = t0 + offset_ns + half
+            t2 = t1 + 300_000
+            pong = proto.Packet.control(proto.T_PONG, proto.pong_body(ping, t1, t2))
+            t3 = t2 - offset_ns + half
+            sync.update(pong, t3)
+
+        feed(0.0, 4000)
+        self.assertAlmostEqual(sync.offset_ns, 0.0, delta=1_000_000)
+        # 比历史最小值略大的正常样本：改前直接丢弃，改后允许小幅修正（窗口内）。
+        feed(0.0, 5000)
+        self.assertAlmostEqual(sync.offset_ns, 0.0, delta=3_000_000)
+        # 对端校时：墙钟跳了 +500ms。
+        feed(500_000_000.0, 5000)
+        self.assertGreater(sync.offset_ns, 10_000_000,
+                           "校时后的第一个样本就必须开始把 offset 拉过去（改前恒为 0）")
+        feed(500_000_000.0, 5000)
+        self.assertAlmostEqual(sync.offset_ns, 500_000_000.0, delta=5_000_000,
+                               msg="两次 PONG 内必须重锚到新的墙钟（改前永远到不了）")
+
+    # ---- ★ 2026-11-04（审计 A3）：乱序/重复包不许污染计数、不许重复入缓冲 ----
+    def test_reordered_and_duplicate_packets_do_not_corrupt_the_counters(self) -> None:
+        """改前：乱序旧包会把 `last_seq` 退回去，下一包被算成丢了几十个；
+        重复包（同一 seq）照样写进抖动缓冲，10ms 音频被播第二遍。
+        """
+        from audiomixing.net.rtpaudio import Receiver
+
+        recv = Receiver("self", 0)
+        payload = b"\x00" * (480 * 2 * 2)   # 10ms 立体声 s16
+
+        def pkt(seq: int) -> proto.Packet:
+            return proto.Packet(type=proto.T_AUDIO, payload=payload,
+                                codec=proto.CODEC_PCM_S16, seq=seq, ssrc=0x1234,
+                                samples=480, ts_ns=proto.now_ns())
+
+        for seq in (1, 2, 3):
+            recv._handle_audio(pkt(seq), ("127.0.0.1", 5000))
+        info = recv.streams[0x1234]
+        self.assertEqual(info.lost, 0)
+        self.assertEqual(info.last_seq, 3)
+        recv._handle_audio(pkt(1), ("127.0.0.1", 5000))   # 乱序旧包
+        recv._handle_audio(pkt(4), ("127.0.0.1", 5000))
+        self.assertEqual(info.lost, 0, "一个乱序旧包不许把丢包数撑大")
+        self.assertEqual(info.last_seq, 4, "旧包不许把游标退回去")
+        before = recv.buffers[0x1234].samples_written
+        recv._handle_audio(pkt(4), ("127.0.0.1", 5000))   # 重复包
+        self.assertEqual(info.duplicates, 1)
+        self.assertEqual(recv.buffers[0x1234].samples_written, before,
+                         "重复包不许再写进抖动缓冲（否则同一段音频播两遍）")
+        self.assertEqual(info.lost, 0, "重复包不算丢包")
+
+    # ---- ★ 2026-11-04（审计 B2，第 3 轮）：同一 ssrc 换编码必须换解码器 ----
+    def test_a_stream_that_switches_codec_rebuilds_its_decoder(self) -> None:
+        """改前 `_decoders[ssrc]` 只在首包建一次。
+
+        发送端用同一条路由重启并换了编码时 ssrc 不变（`stable_ssrc` 由 node_id|route_id
+        派生），接收端却继续用旧解码器解新负载 —— 整条流噪声/无声，诊断里还显示旧编码。
+        """
+        from audiomixing.net.rtpaudio import Receiver
+
+        recv = Receiver("self", 0)
+        ssrc = 0x4321
+        pcm_f32 = proto.Packet(
+            type=proto.T_AUDIO, payload=b"\x00" * (480 * 2 * 4),
+            codec=proto.CODEC_PCM_F32, seq=1, ssrc=ssrc, samples=480,
+            ts_ns=proto.now_ns())
+        recv._handle_audio(pcm_f32, ("127.0.0.1", 5000))
+        info = recv.streams[ssrc]
+        self.assertEqual(info.codec, proto.CODEC_PCM_F32)
+        before = recv.buffers[ssrc].samples_written
+
+        pcm_s16 = proto.Packet(
+            type=proto.T_AUDIO, payload=b"\x00" * (480 * 2 * 2),
+            codec=proto.CODEC_PCM_S16, seq=2, ssrc=ssrc, samples=480,
+            ts_ns=proto.now_ns())
+        recv._handle_audio(pcm_s16, ("127.0.0.1", 5000))
+        self.assertEqual(info.codec, proto.CODEC_PCM_S16,
+                         "编码变了，流的编码字段必须跟着变")
+        self.assertEqual(recv.buffers[ssrc].samples_written - before, 480,
+                         "必须换成 s16 解码器（旧 f32 解码器只会解出 120 帧 = 240 字节）")
+
+
+class TestApkReleaseGate(unittest.TestCase):
+    """★ 2026-11-03（Q3）：交付门槛必须自己长牙，不能靠人记得升版本号。
+
+    真机事故的形态：源码写着 2.10、交付目录里还是 2.9 的包，脚本却报 PASS。
+    """
+
+    def _mod(self):
+        import importlib.util
+
+        path = ROOT / "tools" / "check_apk.py"
+        spec = importlib.util.spec_from_file_location("check_apk_for_test", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_the_debug_apk_is_the_current_version_and_has_the_new_symbols(self) -> None:
+        mod = self._mod()
+        apk = mod.DEFAULT
+        if not apk.is_file():
+            self.skipTest("本机没有构建产物，跳过（打包机才会跑）")
+        self.assertTrue(mod._manifest_has_version(apk, "2.20"), "交付版本必须是 2.20")
+        self.assertFalse(mod._manifest_has_version(apk, "2.16"), "2.16 的旧包必须被拦下")
+        self.assertFalse(mod._manifest_has_version(apk, "2.12"), "2.12 的包必须被拦下")
+        self.assertFalse(mod._manifest_has_version(apk, "2.14"), "2.14 的旧包必须被拦下")
+        import zipfile
+
+        blob = b"".join(zipfile.ZipFile(apk).read(n)
+                        for n in zipfile.ZipFile(apk).namelist() if n.endswith(".dex"))
+        self.assertIn(b"mediaVolumeRatio", blob, "手机音量联动符号必须在 dex 里")
+        self.assertIn(b"send_mode", blob, "送声音档位字段必须在 dex 里（Q1 准入判据靠它）")
+        self.assertIn(b"originId", blob, "防自环扩展段字段必须在 dex 里（B 身份/防环）")
+        self.assertIn(b"diagJson", blob, "2.17+：增益乘数/前后电平的取证字段必须在 dex 里")
+        self.assertIn(b"bt_name", blob, "手机自报蓝牙身份字段必须在 dex 里（第 9 条合并证据）")
+        self.assertIn(b"vol_in_capture", blob, "v2.27 的采集点声明必须在 dex 里（Bug-1）")
+        self.assertIn(b"silent_vol_policy", blob, "2.20+：静音档乘数策略必须随统计包上报")
+        self.assertIn(b"vol_policy", blob, "2.20+：电脑端读取静音档策略的字段必须在 dex 里")
+
+    def test_delivery_copies_have_the_same_hash_as_the_installer_payload(self) -> None:
+        mod = self._mod()
+        if not mod.PAYLOAD.is_file():
+            self.skipTest("本机没有 installer payload，跳过")
+        want = mod._sha256(mod.PAYLOAD)
+        for copy in mod.DELIVERY_COPIES:
+            if not copy.is_file():
+                self.skipTest("本机没有 %s，跳过" % copy)
+            self.assertEqual(mod._sha256(copy), want,
+                             "六处副本必须是同一颗 APK：%s" % copy)
+
+
+class TestAuditFindsSyntheticIdentities(unittest.TestCase):
+    """★ 2026-11-03（Q1）：审计工具必须把测试身份报出来，但不能替用户删。
+
+    以前它只扫 manual_peers 与路由 id 前缀，`node_id="self-node"`、
+    `smart_link=["peer-1"]` 明明在用户配置里，却打印 `[ok] no test peers/routes`。
+    """
+
+    def _identity_findings(self, cfg):
+        import importlib.util
+
+        path = ROOT / "tools" / "audit_leftovers.py"
+        spec = importlib.util.spec_from_file_location("audit_leftovers_for_test", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.identity_findings(cfg)
+
+    def test_synthetic_node_id_and_smart_link_are_reported(self) -> None:
+        hits, routes = self._identity_findings({
+            "node_id": "self-node",
+            "smart_link": ["peer-1", "real-phone"],
+            "routes": [{"id": "r1", "from": ["2cdffa7c-30ee-45cb-9862-46469ecf7ae8"],
+                        "to": ["self-node"], "origin": "self-node"}],
+        })
+        self.assertTrue(any("node_id" in h for h in hits), "假 node_id 必须被 WARN 出来")
+        self.assertTrue(any("peer-1" in h for h in hits), "smart_link 里的测试身份必须被 WARN 出来")
+        self.assertTrue(any("origin" in h for h in routes), "路由 origin 指向假身份必须被 WARN 出来")
+        self.assertTrue(any("to" in h for h in routes), "路由端点指向假身份必须被 WARN 出来")
+
+    def test_real_uuid_and_real_devices_stay_quiet(self) -> None:
+        hits, routes = self._identity_findings({
+            "node_id": "a4c6d0f2-8b1e-4f7a-9c3d-2e5b6a7c8d9e",
+            "smart_link": ["a4c6d0f2-8b1e-4f7a-9c3d-2e5b6a7c8d9e"],
+            "routes": [{"id": "r-real", "from": ["b5d7e1a3-9c2f-4a8b-8d4e-3f6c7b8d9e0f"],
+                        "to": ["a4c6d0f2-8b1e-4f7a-9c3d-2e5b6a7c8d9e"],
+                        "origin": "a4c6d0f2-8b1e-4f7a-9c3d-2e5b6a7c8d9e"}],
+        })
+        self.assertEqual(hits, [], "真实 UUID 不能误报")
+        self.assertEqual(routes, [], "真实设备路由不能误报")
+
+
+# --------------------------------------------------------------------------
+# ★ 2026-11-04（PC v2.22 / 手机 2.12）：A「智连」+ B「身份合并 / 防自环」
+# --------------------------------------------------------------------------
+
+class Test20261104SmartLinkAndIdentity(unittest.TestCase):
+    """A「智连」= 接收方开了就自动接（发送方不需要开）：
+
+    * 多台同时送 → 全接，不排队、不拒绝；
+    * 「没声音」不挂断、数据流没了才挂（音频包静默 + 发现端口心跳消失，双判据）；
+    * 自动打开的收听被用户手动关掉 → 智连按钮一起关，等下次人工打开；
+    * 广播模式与智连互斥（不可用并给出原因）。
+
+    B「身份合并 + 防自环」第一阶段：
+
+    * 同一 deviceId 的多条链路（WiFi / 蓝牙）并成一个节点；
+    * 同一 deviceId + 不同 instanceId = 两台真机，只提示、绝不自动合并；
+    * 旧配置迁移：路由一条不少，旧 token 降级成 aliasIds，迁移前备份；
+    * originId == 自己 → 丢帧并计数；hop 超限 → 丢帧并计数。
+    """
+
+    def _node(self, *, broadcast: bool = False, smart: list[str] | None = None):
+        from audiomixing.config import Config
+        from audiomixing.engine import AudioMixingNode
+
+        cfg = Config()
+        cfg.node_id = "self-node"
+        cfg.name = "本机"
+        cfg.routes = []
+        cfg.codec = "pcm_s16"
+        cfg.broadcast = broadcast
+        cfg.smart_link = list(smart or [])
+        node = AudioMixingNode(cfg, audio_port=free_udp_port(),
+                               discovery_port=free_udp_port(), simulate=True)
+        node.devices = []
+        return node
+
+    def _peer(self, node, node_id: str = "peer-1", name: str = "手机A",
+              host: str = "198.51.100.10", **extra):
+        payload = {"wl": 1, "id": node_id, "name": name,
+                   "audio_port": 47831, "web_port": 0}
+        payload.update(extra)
+        node.registry.update(payload, host)
+        return node.registry.get(node_id)
+
+    # ---- A1：接收方开了智连就自动接，发送方不需要也开 ----
+    def test_smart_link_auto_accepts_on_the_receiver_side_only(self) -> None:
+        node = self._node()
+        try:
+            self._peer(node)
+            node._grant_listen_request("peer-1", "手机A", "198.51.100.10")
+            self.assertEqual(node.routes, [], "接收方没开智连 → 不许自动接")
+            self.assertFalse(node._auto_listen_granted)
+            node.config.smart_link = ["手机A"]   # 只动接收方；发送方什么都不用开
+            node._grant_listen_request("peer-1", "手机A", "198.51.100.10")
+            self.assertEqual(len(node.routes), 1)
+            rule = node.routes[0]
+            self.assertEqual(rule["from"], ["peer-1"])
+            self.assertEqual(rule["to"], [node.node_id])
+            self.assertTrue(rule["auto"])
+            self.assertTrue(node._auto_listen_granted["peer-1"]["created"])
+        finally:
+            node.stop()
+
+    # ---- A2：多台同时送 → 全接，不排队、不拒绝 ----
+    def test_two_sending_phones_are_both_answered_no_queue_no_refusal(self) -> None:
+        node = self._node(smart=["手机A", "手机B"])
+        try:
+            self._peer(node, "peer-1", "手机A", "198.51.100.10")
+            self._peer(node, "peer-2", "手机B", "192.168.0.102")
+            node._grant_listen_request("peer-1", "手机A", "198.51.100.10")
+            node._grant_listen_request("peer-2", "手机B", "192.168.0.102")
+            self.assertEqual({r["from"][0] for r in node.routes}, {"peer-1", "peer-2"})
+            self.assertEqual(len(node.auto_listen_state()["items"]), 2)
+            self.assertEqual(node._pending_auto_listen, {}, "两边都要立刻接上，不能有排队")
+        finally:
+            node.stop()
+
+    # ---- A3：静音不挂 / 断流才挂（双判据） ----
+    def test_silent_audio_never_hangs_but_a_dead_stream_does(self) -> None:
+        from audiomixing.engine import AUTO_LISTEN_HANG_S
+
+        node = self._node(smart=["手机A"])
+        try:
+            peer = self._peer(node)
+            node._grant_listen_request("peer-1", "手机A", "198.51.100.10")
+            self.assertEqual(len(node.routes), 1)
+
+            now = time.monotonic()
+            peer.last_seen = time.time()
+            node._auto_listen_granted["peer-1"]["last_audio"] = now
+            node._sweep_auto_listen_hangs()
+            self.assertEqual(len(node.routes), 1, "静音音频仍然有包 → 不许挂")
+            self.assertFalse(node._auto_listen_hangs)
+
+            # 只有音频静默、发现端口心跳还在 → 仍然不挂（双判据缺一不成立）。
+            node._auto_listen_granted["peer-1"]["last_audio"] = now - 10.0
+            peer.last_seen = time.time()
+            node._sweep_auto_listen_hangs()
+            self.assertEqual(len(node.routes), 1, "心跳还在 → 不挂")
+
+            # 音频包和心跳都消失 → 这才是"数据流没了"。
+            peer.last_seen = time.time() - 10.0
+            node._sweep_auto_listen_hangs()
+            self.assertEqual(node.routes, [])
+            record = node._auto_listen_hangs["peer-1"]
+            self.assertGreaterEqual(record["audio_silence_s"], AUTO_LISTEN_HANG_S)
+            self.assertGreaterEqual(record["heartbeat_s"], AUTO_LISTEN_HANG_S)
+            self.assertEqual(record["threshold_s"], AUTO_LISTEN_HANG_S,
+                             "阈值要写成可观测字段，诊断页才解释得清")
+            self.assertEqual(node._auto_listen_granted, {})
+        finally:
+            node.stop()
+
+    # ---- A4：手动关自动收听 → 智连一起关；下次人工打开才恢复 ----
+    def test_manual_listen_off_also_switches_the_smart_link_off(self) -> None:
+        from audiomixing.webui import AudioMixingApi
+
+        node = self._node(smart=["peer-1", "手机A"])
+        try:
+            self._peer(node)
+            node._grant_listen_request("peer-1", "手机A", "198.51.100.10")
+            self.assertEqual(len(node.routes), 1)
+            # 走真实的删除入口（webui 会在同一个请求里先关智连、再删路由）。
+            AudioMixingApi(node).set_routes({"routes": []})
+            self.assertFalse(node.smart_link_allows("peer-1", "手机A"),
+                             "手动关掉自动打开的收听 → 智连必须跟着关")
+            self.assertEqual(node.config.smart_link, [])
+            node._queue_auto_listen("peer-1", "手机A", "198.51.100.10")
+            self.assertEqual(node._pending_auto_listen, {},
+                             "下一包音频不许把它又自动打开（你越关它越开）")
+            # 等用户下次人工打开才恢复。
+            node.set_smart_link("peer-1", "手机A", on=True)
+            self.assertTrue(node.smart_link_allows("peer-1", "手机A"))
+        finally:
+            node.stop()
+
+    # ---- A 硬规则：广播模式下智连不可用 ----
+    def test_smart_link_is_unavailable_while_broadcasting(self) -> None:
+        node = self._node(broadcast=True, smart=["手机A"])
+        try:
+            self.assertFalse(node.smart_link_allows("peer-1", "手机A"),
+                             "广播开着时智连一律不可用")
+            result = node.set_smart_link("peer-1", "手机A", on=True)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["reason"], "broadcast")
+            state = node.auto_listen_state()
+            self.assertFalse(state["available"])
+            self.assertIn("广播", state["reason"])
+            self.assertFalse(node.status()["auto_listen"]["available"])
+            self._peer(node)
+            node._grant_listen_request("peer-1", "手机A", "198.51.100.10")
+            self.assertEqual(node.routes, [], "广播模式下不许自动建收听路由")
+        finally:
+            node.stop()
+
+    # ---- B1：同一 deviceId 的多条链路 = 一个节点 ----
+    def test_multiple_links_with_one_device_id_become_one_node(self) -> None:
+        reg = DiscoveryRegistry("self-node")
+        base = {"wl": 1, "name": "手机", "audio_port": 47831, "web_port": 0,
+                "device_id": "dev-1", "instance_id": "install-a", "ext": 1}
+        reg.update(dict(base, id="phone-wifi"), "192.168.0.10")
+        reg.update(dict(base, id="phone-bt"), "192.168.0.11")
+        self.assertEqual(len(reg.all()), 1, "同一 deviceId 的 WiFi/蓝牙必须是一个节点")
+        peer = reg.get("phone-wifi")
+        self.assertEqual(peer.node_id, "phone-wifi", "主身份保留先到的那条")
+        self.assertIn("phone-bt", peer.alias_ids)
+        self.assertEqual(sorted(peer.hosts), ["192.168.0.10", "192.168.0.11"])
+        self.assertTrue(peer.ext)
+        self.assertIs(reg.get("phone-bt"), peer, "旧 id 必须仍能解析到同一个节点")
+        self.assertIs(reg.resolve("phone-bt"), peer)
+        self.assertEqual(reg.snapshot()[0]["device_id"], "dev-1")
+
+    # ---- B1 反例：同一 deviceId + 不同 instanceId = 两台真机，不合并 ----
+    def test_the_same_device_id_from_two_real_phones_is_never_auto_merged(self) -> None:
+        reg = DiscoveryRegistry("self-node")
+        base = {"wl": 1, "name": "手机", "audio_port": 47831, "web_port": 0,
+                "device_id": "dev-shared"}
+        reg.update(dict(base, id="phone-a", instance_id="install-a"), "192.168.0.20")
+        reg.update(dict(base, id="phone-b", instance_id="install-b"), "192.168.0.21")
+        self.assertEqual(len(reg.all()), 2,
+                         "同一 deviceId 但 instanceId 不同 = 两台真机，绝不合并")
+        self.assertTrue(reg.get("phone-a").identity_conflict)
+        self.assertTrue(reg.get("phone-b").identity_conflict)
+
+    # ---- B1 迁移：路由一条不少，旧 id 降级为 alias，迁移前备份 ----
+    def test_old_config_migration_keeps_every_route_and_demotes_ids_to_aliases(self) -> None:
+        folder = _mkdtemp(prefix="am-identity-")
+        path = folder / "config.json"
+        mine = "a4c6d0f2-8b1e-4f7a-9c3d-2e5b6a7c8d9e"
+        raw = {
+            "node_id": mine, "name": "本机",
+            "routes": [
+                {"id": "r-old-1", "from": ["legacy-node-a"], "to": [mine]},
+                {"id": "r-old-2", "from": ["manual:192.168.0.9"], "to": ["legacy-node-b"]},
+            ],
+        }
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        cfg = Config.load(path)
+        self.assertEqual(len(cfg.routes), 2, "迁移不许删用户路由")
+        self.assertEqual([r["id"] for r in cfg.routes], ["r-old-1", "r-old-2"])
+        self.assertEqual(cfg.device_id, mine, "老配置没有 device_id 时取 node_id")
+        self.assertTrue(cfg.instance_id)
+        self.assertTrue(cfg.identity_migrated)
+        self.assertEqual(cfg.routes[0]["aliasIds"], ["legacy-node-a"])
+        self.assertEqual(set(cfg.routes[1]["aliasIds"]),
+                         {"manual:192.168.0.9", "legacy-node-b"})
+        self.assertEqual(len(list(folder.glob("config.json.bak-*"))), 1,
+                         "迁移前必须留一份 config 备份")
+        # 第二次加载不能再生成备份、也不能改路由。
+        cfg2 = Config.load(path)
+        self.assertEqual(len(list(folder.glob("config.json.bak-*"))), 1)
+        self.assertEqual(len(cfg2.routes), 2)
+
+    # ---- B2：originId == 自己 → 丢帧并计数（诊断可见） ----
+    def test_frames_whose_origin_is_ourselves_are_dropped_and_counted(self) -> None:
+        node = self._node()
+        try:
+            oid = node.origin_id
+            self.assertTrue(oid)
+            own = proto.Packet(type=proto.T_AUDIO, payload=b"\x00" * 1920,
+                               codec=proto.CODEC_PCM_S16, seq=1, ssrc=1,
+                               samples=480, ts_ns=proto.now_ns())
+            own.origin_id = oid
+            self.assertFalse(node.receiver._admitted(own, "198.51.100.10"))
+            self.assertEqual(node.receiver.packets_echo_dropped, 1)
+            self.assertEqual(node.status()["loop_guard"]["echo_dropped"], 1,
+                             "诊断页必须显示「自回声丢弃 N」")
+            # 老端没有扩展段（origin_id=0）→ 走老路径、照样收下，不报错、不拒流。
+            legacy = proto.Packet(type=proto.T_AUDIO, payload=b"\x00" * 1920)
+            self.assertTrue(node.receiver._admitted(legacy, "198.51.100.10"))
+            self.assertEqual(node.receiver.packets_echo_dropped, 1)
+            # 编码/解码：扩展段里的 originId + hop 全程跟着走；老包一个字节都不变。
+            decoded = proto.decode(own.encode())
+            self.assertEqual((decoded.origin_id, decoded.hop), (oid, 0))
+            self.assertEqual(len(proto.Packet(type=proto.T_AUDIO, payload=b"abc").encode()),
+                             proto.HEADER_SIZE + 3)
+        finally:
+            node.stop()
+
+    # ---- B2：hop 超限 → 丢帧并计数（正好到上限仍允许） ----
+    def test_frames_that_exceed_the_hop_limit_are_dropped_and_counted(self) -> None:
+        recv = Receiver("self", 0, self_origin_id=proto.origin_id_of("other-device"))
+        over = proto.Packet(type=proto.T_AUDIO, payload=b"\x00" * 1920,
+                            origin_id=proto.origin_id_of("some-origin"),
+                            hop=proto.MAX_HOP + 1)
+        self.assertFalse(recv._admitted(over, "198.51.100.10"))
+        self.assertEqual(recv.packets_hop_dropped, 1)
+        edge = proto.Packet(type=proto.T_AUDIO, payload=b"\x00" * 1920,
+                            origin_id=proto.origin_id_of("some-origin"),
+                            hop=proto.MAX_HOP)
+        self.assertTrue(recv._admitted(edge, "198.51.100.10"),
+                        "正好到上限还允许（超过才丢）")
+        self.assertEqual(recv.packets_hop_dropped, 1)
+
+
+# --------------------------------------------------------------------------
+# ★ 2026-11-04（PC v2.24 / 手机 2.14）：用户真机第二轮 11 条，逐条一条回归
+# --------------------------------------------------------------------------
+
+def _strip_markup(text: str) -> str:
+    """去掉 HTML/JS/Java 注释后再查"残留"——注释里记录"已删除"不算残留。"""
+    import re
+
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"//[^\n]*", "", text)
+    return text
+
+
+class TestRoundTwoRegressions(unittest.TestCase):
+    """11 条真机问题，每一条都有独立断言；不合并成"顺手重构"。"""
+
+    def _node(self, *, smart: list[str] | None = None):
+        from audiomixing.config import Config
+        from audiomixing.engine import AudioMixingNode
+
+        cfg = Config()
+        cfg.node_id = "self-node"
+        cfg.name = "本机"
+        cfg.routes = []
+        cfg.codec = "pcm_s16"
+        cfg.smart_link = list(smart or [])
+        node = AudioMixingNode(cfg, audio_port=free_udp_port(),
+                               discovery_port=free_udp_port(), simulate=True)
+        node.devices = []
+        return node
+
+    def _peer(self, node, node_id: str = "peer-1", name: str = "手机A",
+              host: str = "198.51.100.10", **extra):
+        payload = {"wl": 1, "id": node_id, "name": name,
+                   "audio_port": 47831, "web_port": 0}
+        payload.update(extra)
+        node.registry.update(payload, host)
+        return node.registry.get(node_id)
+
+    def _api(self, node):
+        from audiomixing.webui import AudioMixingApi
+
+        return AudioMixingApi(node)
+
+    # ---- 第 1 条：僵尸路由必须能标失效、能一键清理 ----
+    def test_zombie_routes_are_marked_with_missing_seconds_and_purged(self) -> None:
+        node = self._node()
+        try:
+            self._peer(node, "live-peer", "手机在线", "198.51.100.10")
+            node.set_routes([
+                {"id": "r-live", "from": ["live-peer"], "to": [node.node_id]},
+                {"id": "r-zombie", "from": ["b1fbc20c-b560-48"], "to": [node.node_id]},
+            ], persist=False)
+            node._refresh_route_staleness()
+            zombie = next(r for r in node.routes_json() if r["id"] == "r-zombie")
+            self.assertFalse(zombie["stale"], "刚发现端点消失时先观察，不能立刻判死")
+            node._unknown_route_since["r-zombie"] = time.monotonic() - 90.0
+            node._refresh_route_staleness()
+            zombie = next(r for r in node.routes_json() if r["id"] == "r-zombie")
+            self.assertTrue(zombie["stale"], "持续找不到 60 秒 → 路由必须标失效")
+            self.assertGreaterEqual(zombie["missing_s"], 90.0,
+                                    "诊断要能看到它消失了多久，而不是只给一个布尔值")
+            result = self._api(node).purge_stale_routes()
+            self.assertEqual(result["count"], 1)
+            self.assertEqual(result["removed"], ["r-zombie"])
+            self.assertEqual([r["id"] for r in node.routes_json()], ["r-live"],
+                             "一键清理只删失效的，活的路线一条都不能动")
+        finally:
+            node.stop()
+
+    # ---- 第 2 条（a）：离线设备卡片按超时回收，manual 不回收 ----
+    def test_offline_device_cards_expire_after_thirty_seconds(self) -> None:
+        node = self._node()
+        try:
+            live = self._peer(node, "live-peer", "手机在线", "198.51.100.10")
+            old = self._peer(node, "old-peer", "手机离线", "192.168.0.100")
+            old.last_seen = time.time() - 40.0
+            node.registry.add_manual("192.168.0.9", 47831, "手动设备")
+            manual = node.registry.resolve("192.168.0.9")
+            manual.last_seen = time.time() - 600.0
+            peers = self._api(node).peers()["peers"]
+            ids = [p["node_id"] for p in peers]
+            self.assertIn("live-peer", ids)
+            self.assertNotIn("old-peer", ids, "40 秒没音讯的卡片必须在面板上消失")
+            self.assertIn(manual.node_id, ids,
+                          "用户明确添加的对端不参与超时回收")
+        finally:
+            node.stop()
+
+    # ---- 第 2 条（b）：同 IP 重复卡片合并；不同名的真机不许误合并 ----
+    def test_duplicate_cards_on_the_same_host_are_merged_but_two_phones_are_not(self) -> None:
+        reg = DiscoveryRegistry("self-node")
+        base = {"wl": 1, "audio_port": 47831, "web_port": 0, "platform": "android"}
+        reg.update(dict(base, id="M332BF-da71", name="M332BF-da71"), "192.168.0.100")
+        reg.get("M332BF-da71").last_seen = time.time() - 30.0   # 旧卡已经超时
+        reg.update(dict(base, id="M332BF-b1fb", name="M332BF-b1fb"), "192.168.0.100")
+        self.assertEqual(len(reg.all()), 1,
+                         "同 IP + 同机型前缀、旧记录已超时 → 必须并成一张卡")
+        self.assertTrue(reg.resolve("M332BF-da71") is not None,
+                        "旧 id 仍要能解析到合并后的那条（路由不能失联）")
+
+        reg2 = DiscoveryRegistry("self-node")
+        reg2.update(dict(base, id="phone-a", name="小明的手机"), "192.168.0.101")
+        reg2.update(dict(base, id="phone-b", name="小红的手机"), "192.168.0.101")
+        self.assertEqual(len(reg2.all()), 2,
+                         "两条都新鲜、名字不同 → 绝不静默合并两台真机")
+        reg2.update(dict(base, id="phone-b", name="小红的手机",
+                         device_id="dev-b", instance_id="inst-b"), "192.168.0.101")
+        reg2.update(dict(base, id="phone-a", name="小明的手机",
+                         device_id="dev-a", instance_id="inst-a"), "192.168.0.101")
+        self.assertEqual(len(reg2.all()), 2, "deviceId 不同的两台真机同样不合并")
+
+    # ---- 第 2 条（c）：对端在线时不能报成"关机 / 没消息" ----
+    def test_an_offline_duplicate_id_sends_to_the_live_alias_instead_of_alarming(self) -> None:
+        node = self._node()
+        try:
+            self._peer(node, "new-id", "M332BF-b1fb", "192.168.0.100")
+            old = self._peer(node, "old-id", "M332BF-da71", "192.168.0.100")
+            old.last_seen = time.time() - 29.0     # 现场那张"29 秒没有消息"的卡
+            node.set_routes([{"id": "r-send", "from": [node.node_id],
+                              "to": ["old-id"]}], persist=False)
+            target = node._matching_nodes(["old-id"])
+            self.assertEqual([t.node_id for t in target], ["new-id"],
+                             "同一 IP 上有在线记录 → 必须换成活的，不能继续对着死 ID 发")
+            key = "r-send|new-id"
+            self.assertEqual([k for k, t, _r in node.desired_senders() if t.node_id == "new-id"],
+                             [key])
+            self.assertNotIn(key, node._senders_blocked,
+                             "对端明明在线 → 不许产生「没消息」的告警")
+            self.assertFalse(any("关机" in str(v.get("text") or "")
+                                for v in node._senders_blocked.values()),
+                             "告警文案不能把「换 ID」写成「关机」")
+            sent = node.desired_senders()
+            self.assertTrue(sent and sent[0][1].node_id == "new-id")
+        finally:
+            node.stop()
+
+    # ---- 第 3 条：蓝牙提示按真实状态分支 ----
+    def test_bluetooth_empty_reason_distinguishes_each_real_state(self) -> None:
+        from audiomixing import bluetooth as bt
+
+        cases = []
+        with mock.patch.object(bt, "available", return_value=True), \
+                mock.patch.object(bt, "radio_state",
+                                  return_value={"present": False, "state": "unknown",
+                                                "name": ""}):
+            cases.append(bt.empty_reason())
+        with mock.patch.object(bt, "available", return_value=True), \
+                mock.patch.object(bt, "radio_state",
+                                  return_value={"present": True, "state": "off",
+                                                "name": "Intel Bluetooth"}):
+            cases.append(bt.empty_reason())
+        with mock.patch.object(bt, "available", return_value=True), \
+                mock.patch.object(bt, "radio_state",
+                                  return_value={"present": True, "state": "on",
+                                                "name": "Intel Bluetooth"}):
+            cases.append(bt.empty_reason())
+        self.assertIn("没有检测到蓝牙适配器", cases[0])
+        self.assertIn("蓝牙已关闭", cases[1])
+        self.assertNotIn("配对", cases[1], "蓝牙没开时不能叫用户去配对")
+        self.assertIn("还没有配对", cases[2])
+        self.assertIn("Intel Bluetooth", cases[2], "开着时要能说出适配器型号")
+        self.assertEqual(len(set(cases)), 3, "四种状态必须给四种不同的话")
+        html = _strip_markup((ROOT / "audiomixing" / "ui" / "index.html")
+                             .read_text(encoding="utf-8"))
+        self.assertNotIn("请先在 Windows 设置里把手机配对", html,
+                         "前端不许再写死「没配对」这条误导文案")
+
+    # ---- 第 4 条：送声音改成循环键，第 2 档不做、不碰系统音量 ----
+    def test_the_phone_send_button_cycles_and_never_touches_system_volume(self) -> None:
+        src = (ROOT / "android" / "app" / "src" / "main" / "java" /
+               "com" / "audiomixing" / "app" / "MainActivity.java").read_text(encoding="utf-8")
+        code = _strip_markup(src)
+        self.assertNotIn("showSendModeDialog", code, "三档弹窗必须删掉")
+        self.assertIn("engine.setSendMode(0)", code,
+                      "第 2 档（送声+手机静音）再按一下回到第 0 档")
+        self.assertIn("engine.setSendMode(2)", code,
+                      "第 1 档再按一下进入第 2 档（送声+手机静音）")
+        self.assertIn("手机静音", code)
+        self.assertIn("SEND_MODE_SILENT_NOTE", code,
+                      "长按要把静音语义、还原路径与副作用说清")
+        android = (ROOT / "android" / "app" / "src" / "main" / "java" /
+                   "com" / "audiomixing" / "app")
+        for path in android.glob("*.java"):
+            live = _strip_markup(path.read_text(encoding="utf-8"))
+            self.assertNotIn("setStreamMute(", live,
+                             "用户硬约束：一处都不许改系统静默（%s）" % path.name)
+            if path.name == "Engine.java":
+                # ★ 2026-11-04 用户授权：第 2 档允许把 STREAM_MUSIC 临时降到 0，
+                #   但只允许集中在 applySilentVolume 一处（便于审计）。
+                self.assertEqual(live.count("am.setStreamVolume("), 2,
+                                 "Engine 里只允许「置 0 + 还原」两处音量调用")
+            else:
+                self.assertNotIn("setStreamVolume(", live,
+                                 "系统音量只允许第 2 档那一处（%s）" % path.name)
+
+    # ---- 第 5 条：双判据挂断后状态回落待命，诊断可读两个数 ----
+    def test_dual_criteria_hang_keeps_the_manual_route_and_returns_to_standby(self) -> None:
+        node = self._node(smart=["手机A"])
+        try:
+            peer = self._peer(node)
+            node.set_routes([{"id": "manual-listen", "from": ["peer-1"],
+                              "to": [node.node_id]}], persist=False)
+            node._auto_listen_granted["peer-1"] = {
+                "node_id": "peer-1", "name": "手机A", "host": "198.51.100.10",
+                "route_id": "manual-listen", "created": False,
+                "at": time.time(), "last_audio": time.monotonic() - 10.0}
+            peer.last_seen = time.time() - 10.0
+            node._sweep_auto_listen_hangs()
+            self.assertEqual([r["id"] for r in node.routes], ["manual-listen"],
+                             "用户自己建的收听路由保留，只把状态收回到待命")
+            self.assertEqual(node._auto_listen_granted, {}, "自动收听状态必须清空")
+            hang = node._auto_listen_hangs["peer-1"]
+            self.assertTrue(hang["route_kept"])
+            self.assertGreaterEqual(hang["audio_silence_s"], 4.0)
+            self.assertGreaterEqual(hang["heartbeat_s"], 4.0)
+            card = next(p for p in self._api(node).peers()["peers"]
+                        if p["node_id"] == "peer-1")
+            self.assertIsNotNone(card["listen_hung"], "卡片要能看到「已挂断·待命」")
+            self.assertGreaterEqual(float(card["listen_audio_s"]), 4.0,
+                                    "诊断要显示音频静默秒数")
+            self.assertGreaterEqual(float(card["listen_heartbeat_s"]), 4.0,
+                                    "诊断要显示心跳秒数")
+            self.assertFalse(card["smart_auto"], "智连状态要回落到「不是自动收听」")
+            self.assertEqual(node.auto_listen_state()["items"], [])
+        finally:
+            node.stop()
+
+    # ---- 第 6 条：APK 交付名一律带版本号 ----
+    def test_apk_delivery_names_carry_the_phone_version_everywhere(self) -> None:
+        from audiomixing import __phone_version__, webui
+
+        self.assertEqual(__phone_version__, "2.20")
+        self.assertEqual(webui.apk_display_name(), "AudioMixing-手机版-v2.20.apk")
+        self.assertIn("AudioMixing-手机版-v2.20.apk", webui._APK_NAMES)
+        init_py = (ROOT / "audiomixing" / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn('__phone_version__ = "2.20"', init_py)
+        check = (ROOT / "tools" / "check_apk.py").read_text(encoding="utf-8")
+        self.assertIn('REQUIRED_VERSION = "2.20"', check,
+                      "check_apk --release 的版本门槛必须一起改成当前手机版本")
+        self.assertIn("AudioMixing-手机版-v2.20.apk", check,
+                      "交付副本与 installer payload 的路径必须带版本号")
+        bat = (ROOT / "tools" / "installer_payload" / "install.bat").read_text(encoding="utf-8")
+        self.assertIn("AudioMixing-手机版-v*.apk", bat,
+                      "安装脚本要按带版本号的名字取包")
+        app = (ROOT / "audiomixing" / "ui" / "app.html").read_text(encoding="utf-8")
+        self.assertIn("AudioMixing-手机版-v版本号.apk", app,
+                      "二维码说明页要写清文件名带版本号")
+
+    # ---- 第 7 条：接收方开智连 → 对方一送就自动收听（端到端） ----
+    def test_smart_link_starts_listening_on_the_first_send_end_to_end(self) -> None:
+        node = self._node(smart=["手机A"])
+        try:
+            self._peer(node)
+            node.set_routes([], persist=False)
+            node.receiver.control_messages.append(
+                {"t": "stats", "node": "peer-1", "name": "手机A", "_type": "STATS",
+                 "_from": "198.51.100.10:47831", "_at": time.monotonic(),
+                 "send_mode": 1, "broadcast": False, "sending": True,
+                 "want_listen": True})
+            node._handle_peer_requests()
+            auto = [r for r in node.routes if r.get("auto")]
+            self.assertEqual(len(auto), 1, "接收方开了智连 → 对方一送就必须自动开始收听")
+            self.assertEqual(auto[0]["from"], ["peer-1"])
+            self.assertEqual(node._auto_listen_granted["peer-1"]["route_id"], auto[0]["id"])
+            self.assertIn(auto[0]["id"], node.routes_for_sender("peer-1"),
+                          "自动建的路由要立刻挂到这路流上，不用等重启")
+            self.assertTrue(node._stream_is_accepted("peer-1"))
+
+            engine_java = (ROOT / "android" / "app" / "src" / "main" / "java" /
+                           "com" / "audiomixing" / "app" / "Engine.java").read_text(encoding="utf-8")
+            start = engine_java.index("private boolean smartOnLocked")
+            body = engine_java[start:engine_java.index("\n    }", start)]
+            self.assertIn("smartHosts.contains(host)", body)
+            self.assertIn("smartHosts.contains(idOf(p))", body, "手机侧不能只按 IP 判智连")
+            self.assertIn("smartHosts.contains(name)", body, "设备名也要能命中")
+        finally:
+            node.stop()
+
+    # ---- 第 8 条：「测连通」按钮与接口都下线 ----
+    def test_the_ping_button_and_api_are_gone_from_every_page(self) -> None:
+        from audiomixing import webui
+
+        self.assertFalse(hasattr(webui.AudioMixingApi, "ping"))
+        for name in ("index.html", "phone.html", "app.html"):
+            text = _strip_markup((ROOT / "audiomixing" / "ui" / name).read_text(encoding="utf-8"))
+            self.assertNotIn("测连通", text, "前端按钮必须删掉：%s" % name)
+            self.assertNotIn("pingPeer", text)
+        src = (ROOT / "audiomixing" / "webui.py").read_text(encoding="utf-8")
+        live = "\n".join(line for line in src.splitlines()
+                         if not line.lstrip().startswith("#"))
+        self.assertNotIn("/api/ping", live, "服务端路由必须删掉，不留死接口")
+
+    # ---- 第 9 条：一台手机两条链路并成一个节点，图上不自环 ----
+    def test_one_phone_with_two_links_is_one_node_and_never_self_loops(self) -> None:
+        reg = DiscoveryRegistry("self-node")
+        base = {"wl": 1, "name": "手机", "audio_port": 47831, "web_port": 0,
+                "device_id": "dev-1", "instance_id": "install-a"}
+        reg.update(dict(base, id="M332BF-5e65"), "192.168.0.100")
+        reg.update(dict(base, id="瘾控"), "192.168.0.100")
+        self.assertEqual(len(reg.all()), 1, "同一 deviceId 的 WiFi/蓝牙链路必须是一个节点")
+        self.assertIs(reg.get("M332BF-5e65"), reg.get("瘾控"))
+
+        reg2 = DiscoveryRegistry("self-node")
+        reg2.update(dict(base, id="phone-a", device_id="dev-a", instance_id="a"), "192.168.0.20")
+        reg2.update(dict(base, id="phone-b", device_id="dev-b", instance_id="b"), "192.168.0.21")
+        self.assertEqual(len(reg2.all()), 2, "两台真机绝不静默并成一个节点")
+
+        html = (ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("identityCanonId", html, "图上必须先做身份归一")
+        self.assertIn("observed_bt_mac", html, "蓝牙 MAC 是合并的强证据之一")
+        self.assertIn("nameCount[nm] === 1", html,
+                      "名字证据只允许「唯一一台」时使用，防止误合并")
+        self.assertIn("if(!u || !v || u === v) return;", html,
+                      "归一后同一台设备的边不算回环")
+        self.assertIn("if(u === v) return;", html,
+                      "归一后同一台设备不画自环")
+
+    # ---- 第 10 条：超时后真 ghost **从图上消失**，只留在路由表并可一键清理 ----
+    def test_a_stale_route_is_marked_missing_and_purgeable(self) -> None:
+        """★ 2026-11-04（第四轮，用户截图）：missing 不能再画成红虚线幽灵卡片 ——
+        它必须从关系图上消失，只剩路由表里的记录 + 「清理失效路由」入口。"""
+        node = self._node()
+        try:
+            node.set_routes([{"id": "r-ghost", "from": ["b1fbc20c-b560-48"],
+                              "to": [node.node_id]}], persist=False)
+            node._unknown_route_since["r-ghost"] = time.monotonic() - 90.0
+            node._refresh_route_staleness()
+            row = node.routes_json()[0]
+            self.assertTrue(row["stale"])
+            self.assertEqual(row["state"], "missing")
+            html = (ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8")
+            self.assertIn("if(String(r.state || '') === 'missing' || r.stale) return;", html,
+                          "missing 路由不进关系图（用户截图里的幽灵卡片就是这么来的）")
+            self.assertIn("清理失效路由", html, "必须给用户一键清理入口")
+            self.assertIn("purgeStaleRoutes", html)
+            self.assertIn("/api/routes/purge-stale",
+                          (ROOT / "audiomixing" / "webui.py").read_text(encoding="utf-8"))
+        finally:
+            node.stop()
+
+    # ---- 第 11 条：「本机播放」按钮与接口彻底下线，兜底路径要写给用户 ----
+    def test_the_local_play_button_is_gone_and_the_fallback_is_documented(self) -> None:
+        from audiomixing import webui
+
+        node = self._node()
+        try:
+            self.assertFalse(hasattr(node, "set_bluetooth_local_play"))
+            self.assertFalse(hasattr(node, "bluetooth_local_playing"))
+            self.assertFalse(hasattr(webui.AudioMixingApi, "bluetooth_local"))
+        finally:
+            node.stop()
+        src = (ROOT / "audiomixing" / "webui.py").read_text(encoding="utf-8")
+        live = "\n".join(line for line in src.splitlines()
+                         if not line.lstrip().startswith("#"))
+        self.assertNotIn("/api/bluetooth/local", live)
+        self.assertIn("本机直通", src, "驱动不出声时的兜底路径要在诊断里告诉用户")
+        index = _strip_markup((ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8"))
+        self.assertNotIn("本机播放", index)
+        self.assertNotIn("btLocal(", index)
+        self.assertIn("本机直通", index, "界面上要留着频道 → 音源 + 本机直通这条路")
+
+
+class Test20261104V224(unittest.TestCase):
+    """★ 2026-11-04（v2.24 / 手机 2.14）：本轮 4 项修复 + 第 2 档（用户已授权）。"""
+
+    def _node(self):
+        from audiomixing.config import Config
+        from audiomixing.engine import AudioMixingNode
+
+        cfg = Config()
+        cfg.node_id = "self-v224"
+        cfg.name = "本机"
+        cfg.routes = []
+        cfg.codec = "pcm_s16"
+        cfg.smart_link = []
+        node = AudioMixingNode(cfg, audio_port=free_udp_port(),
+                               discovery_port=free_udp_port(), simulate=True)
+        node.devices = []
+        return node
+
+    # ---- 第 1 条回退：三态判定，只有真 missing 才是 stale ----
+    def test_repeat_three_states_missing_no_data_offline(self) -> None:
+        node = self._node()
+        try:
+            node.registry.update({"wl": 1, "id": "live-phone", "name": "live-phone",
+                                  "audio_port": 47831, "web_port": 0}, "192.168.0.100")
+            node.set_routes([{"id": "r-live", "from": ["live-phone"], "to": ["self"]}],
+                            persist=False)
+            with mock.patch.object(node, "_route_has_traffic", lambda rid: False):
+                node._refresh_route_staleness()
+            item = node.status()["routes"][0]
+            self.assertEqual(item["state"], "no_data",
+                             "两端在线但没有音频流 → no_data，必须保持实线")
+            self.assertFalse(item["stale"], "no_data 绝不能反过来画成虚线")
+            with mock.patch.object(node, "_route_has_traffic", lambda rid: True):
+                node._refresh_route_staleness()
+            self.assertEqual(node.status()["routes"][0]["state"], "ok")
+
+            # 见过面的真设备掉线：offline，不是 missing
+            node.registry.get("live-phone").last_seen = time.time() - 120.0
+            node._refresh_route_staleness()
+            item = node.status()["routes"][0]
+            self.assertEqual(item["state"], "offline")
+            self.assertFalse(item["stale"], "真设备关机/换网不能当幽灵清掉")
+
+            # 从未见过的旧 id：60 秒后才是 missing
+            node.set_routes([{"id": "r-old", "from": ["b1fbc20c-b560-48"], "to": ["self"]}],
+                            persist=False)
+            node._refresh_route_staleness()
+            self.assertFalse(node.status()["routes"][0]["stale"], "先观察，不能立即判死")
+            node._unknown_route_since["r-old"] = time.monotonic() - 90.0
+            node._refresh_route_staleness()
+            item = node.status()["routes"][0]
+            self.assertTrue(item["stale"], "真 ghost 才画虚线并进入清理清单")
+            self.assertEqual(item["state"], "missing")
+        finally:
+            node.stop()
+
+    def test_purge_only_removes_true_missing(self) -> None:
+        node = self._node()
+        try:
+            node.registry.update({"wl": 1, "id": "live-phone", "name": "live-phone",
+                                  "audio_port": 47831, "web_port": 0}, "192.168.0.100")
+            node.set_routes([
+                {"id": "r-live", "from": ["live-phone"], "to": ["self"]},
+                {"id": "r-old", "from": ["old-id-never-seen"], "to": ["self"]},
+            ], persist=False)
+            node._unknown_route_since["r-old"] = time.monotonic() - 90.0
+            node._refresh_route_staleness()
+            result = node.purge_stale_routes()
+            ids = [r["id"] for r in node.routes]
+            self.assertNotIn("r-old", ids, "真 missing 才可以清")
+            self.assertIn("r-live", ids, "活路由一律不能动")
+            self.assertEqual(result.get("removed"), ["r-old"])
+        finally:
+            node.stop()
+
+    # ---- 第 8 条：挂断后卡片/诊断/实际秒数对齐 ----
+    def test_hang_seconds_keep_ticking_and_clear_when_audio_returns(self) -> None:
+        node = self._node()
+        try:
+            node._auto_listen_hangs["p-1"] = {
+                "node_id": "p-1", "name": "phone", "audio_silence_s": 4.2,
+                "heartbeat_s": 4.5, "threshold_s": 4.0, "at": time.time() - 26.0,
+                "route_kept": True,
+            }
+            hang = node.auto_listen_state()["hangs"][0]
+            self.assertGreaterEqual(hang["audio_silence_s"], 29.0,
+                                    "截图过了 30 秒，诊断数字必须跟着涨，不能停在判定那一刻")
+            self.assertIn("heartbeat_s", hang)
+            # 新的音频包一到 → 旧的挂断记录必须立刻作废（否则一直显示"已挂断"）
+            node.config.smart_link = ["p-1"]
+            node._queue_auto_listen("p-1", "phone", "192.168.0.100")
+            self.assertNotIn("p-1", node._auto_listen_hangs)
+        finally:
+            node.stop()
+
+    def test_ui_listening_label_follows_actual_audio(self) -> None:
+        html = (ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("flows.in_receiving ? '✓ 收听中'", html,
+                      "只有真的在收音频才显示「收听中」")
+        self.assertIn("已连 · 等数据", html, "有路由但没数据要单独标注，不能冒充收听中")
+        self.assertIn("已挂断 · 待命", html)
+
+    # ---- 第 11 条：首个请求/首包即接，不等二十秒 ----
+    def test_pc_pushes_listen_req_immediately_when_sender_starts(self) -> None:
+        src = (ROOT / "audiomixing" / "engine.py").read_text(encoding="utf-8")
+        i = src.index("self.sender.add(rid, session)")
+        j = src.index("except Exception as exc:", i)
+        self.assertIn("push_peer_stats_now()", src[i:j],
+                      "建好发送会话就立刻推 listen_req，不能等 2 秒统计节流")
+        self.assertIn("and not force", src, "强制推送要允许首包未发时就带 listen_req")
+
+    def test_phone_applies_smart_immediately_on_toggle(self) -> None:
+        java = (ROOT / "android" / "app" / "src" / "main" / "java" / "com" /
+                "audiomixing" / "app" / "Engine.java").read_text(encoding="utf-8")
+        self.assertIn("applySmartNow(host)", java,
+                      "打开智连的瞬间要按缓存统计立即开收")
+        self.assertIn("if (nowOn) {", java)
+
+    # ---- 第 14 条：左进右出 + 颜色只跟链路种类 + 自环不画 ----
+    def test_graph_is_left_to_right_and_state_coloured(self) -> None:
+        html = (ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8")
+        # ★ v2.28（用户第 4 条）：层级改为"以本机为参照的双向 BFS"（v2.27 的 Tarjan strong(v) 已删）。
+        for token in ("relComputeRank", "let queue = [selfKey];",
+                      "rank[v] = rank[u] - 1", "rank[v] = rank[u] + 1",
+                      "marker-end=\"url(#' + relArrowId(l)", "if(u === v) return;"):
+            self.assertIn(token, html, "缺少左进右出/自环/箭头：%s" % token)
+        # ★ 第四轮：颜色 = 链路种类，状态只改变线型/透明度（不再覆盖 stroke）。
+        self.assertIn("#relSvg .ln.wifi{stroke:#38bdf8}", html)
+        self.assertIn("#relSvg .ln.bt{stroke:#34d399}", html)
+        self.assertIn("#relSvg .ln.bc{stroke:#fbbf24}", html)
+        self.assertIn("#relSvg .ln.nodata{opacity:.55}", html, "no_data 只压透明度，不改色")
+        self.assertIn("#relSvg .ln.offline{opacity:.3}", html, "offline 只压透明度，不改色")
+        self.assertNotIn("#relSvg .ln.nodata{stroke:", html)
+        self.assertNotIn("#relSvg .ln.offline{stroke:", html)
+        self.assertNotIn("#relSvg .ln.missing{stroke:", html)
+        # 状态不再换箭头颜色：箭头只按链路种类 + 回环专用红色。
+        self.assertNotIn("arr-nodata", html)
+        self.assertNotIn("arr-offline", html)
+        self.assertNotIn("arr-missing", html)
+        self.assertIn("arr-cycle", html, "回环箭头仍为红色（红色是回环专用）")
+
+    # ---- 第 2 档：手机静音但继续送（用户已授权，唯一允许动系统音量的一条路径）----
+    def test_tier2_volume_zero_is_the_only_place_touching_stream_volume(self) -> None:
+        java = (ROOT / "android" / "app" / "src" / "main" / "java" / "com" /
+                "audiomixing" / "app" / "Engine.java").read_text(encoding="utf-8")
+        self.assertNotIn("am.setStreamMute(", java, "静音必须用音量归零，不许锁 mute 标志")
+        self.assertEqual(java.count("am.setStreamVolume("), 2,
+                         "只允许 applySilentVolume 里两处真正的调用：置 0 + 还原原值")
+        self.assertIn("AudioManager.STREAM_MUSIC, 0, 0", java)
+        self.assertIn("AudioManager.STREAM_MUSIC, orig, 0", java)
+
+    def test_tier2_stream_keeps_running(self) -> None:
+        java = (ROOT / "android" / "app" / "src" / "main" / "java" / "com" /
+                "audiomixing" / "app" / "Engine.java").read_text(encoding="utf-8")
+        i = java.index("public void setSendMode(int mode)")
+        body = java[i:java.index("public static final String SEND_MODE_SILENT_NOTE", i)]
+        self.assertNotIn("stopSender()", body, "第 2 档绝不许停发送")
+        self.assertNotIn("stopReceiver()", body)
+        self.assertIn("syncSilentVolume();", body)
+
+    def test_tier2_restore_on_stop_switch_and_destroy(self) -> None:
+        java = (ROOT / "android" / "app" / "src" / "main" / "java" / "com" /
+                "audiomixing" / "app" / "Engine.java").read_text(encoding="utf-8")
+        i = java.index("public void stop()")
+        body = java[i:java.index("\n    }", i) + 6]
+        self.assertIn("syncSilentVolume();", body, "退出/服务销毁必须还原音量")
+        self.assertIn("syncSilentVolume();", java[java.index("public void setSending"):],
+                      "停止送声必须还原")
+
+    def test_tier2_crash_marker_restores_on_next_launch(self) -> None:
+        java = (ROOT / "android" / "app" / "src" / "main" / "java" / "com" /
+                "audiomixing" / "app" / "Engine.java").read_text(encoding="utf-8")
+        ctor = java[java.index("private Engine(Context ctx)"):]
+        self.assertIn("restoreSilentVolumeIfNeeded();", ctor[:400],
+                      "下次启动必须先还原残留标记")
+        self.assertIn("PREF_SILENT_ACTIVE", java)
+        self.assertIn(".commit();", java, "先同步落盘再静音，崩在下一行也能还原")
+
+    def test_tier2_cycle_order_and_zero_mode_has_no_mute(self) -> None:
+        act = (ROOT / "android" / "app" / "src" / "main" / "java" / "com" /
+               "audiomixing" / "app" / "MainActivity.java").read_text(encoding="utf-8")
+        i = act.index("if (engine.isSending(p))")
+        body = act[i:act.index("return;", act.index("engine.setSendMode(0)") + 10)]
+        self.assertIn("engine.setSendMode(2)", body)
+        self.assertIn("engine.setSendMode(0)", body)
+        self.assertIn("手机静音", act)
+        self.assertIn("SEND_MODE_SILENT_NOTE", act)
+        engine = (ROOT / "android" / "app" / "src" / "main" / "java" / "com" /
+                  "audiomixing" / "app" / "Engine.java").read_text(encoding="utf-8")
+        zero = engine[engine.index("public void setSendMode(int mode)"):]
+        zero = zero[:zero.index("public static final String SEND_MODE_SILENT_NOTE")]
+        self.assertIn("if (m == 0) {", zero)
+        self.assertIn("sendIds.clear();", zero, "第 0 档要清空送声目标（随后还原音量）")
+        self.assertIn("syncSilentVolume();", zero, "第 0 档必须恢复音量，不残留静音")
+
+
+class Test20261104V225(unittest.TestCase):
+    """★ 2026-11-04（PC v2.25）：用户截图「先把这个最重要的、显而易见的修掉。这个颜色也不对呀」。
+
+    截图里的现象：本机在左，右边挂着两张 `不在线 / 不可达` 的幽灵卡片，两条**红色虚线**
+    从本机指过去。两件事都不对：
+      1. `missing`（身份确实不存在）的路由根本不该出现在关系图上 —— 它只该留在路由表里，
+         等用户点「清理失效路由」；
+      2. 颜色被状态抢走了 —— 红虚线本来是"回环"的语义，Wi-Fi 链路却被画成红色。
+         颜色必须只表示链路种类，状态只用线型/透明度表达。
+    """
+
+    def _html(self) -> str:
+        return (ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8")
+
+    def test_missing_routes_never_create_ghost_cards(self) -> None:
+        """截图里那两张 `不在线 / 不可达` 是 keyForId 现造的；现在查不到端点就不画边。"""
+        html = self._html()
+        i = html.index("function relBuild(")
+        body = html[i:html.index("function relComputeRank(", i)]
+        self.assertIn("return keyOf[t] || '';", body, "查不到的端点不画边")
+        self.assertNotIn("'不在线 / 不可达'", body, "不再现造幽灵卡片")
+        self.assertNotIn("const key = 'x:' + t;", body)
+        # 漏网越过 skip 的边也不会被画出来：类名是 missing（本色 + 虚线 + 压淡）。
+        self.assertIn("if(l.state === 'missing') return cls + ' missing';", html)
+
+    def test_missing_routes_do_not_fake_a_cycle_warning(self) -> None:
+        """指向幽灵节点的边不能参与回环判定，否则顶部警告会凭空出现。"""
+        html = self._html()
+        i = html.index("function routeCycleInfo(")
+        body = html[i:html.index("function identityDisplay(", i)]
+        self.assertIn("if(String(r.state || '') === 'missing' || r.stale) return;", body,
+                      "回环判定也必须跳过 missing 路由")
+
+    def test_link_colour_is_stable_and_state_only_changes_opacity(self) -> None:
+        """颜色 = 链路种类；状态类里不许再出现 `stroke:`。"""
+        html = self._html()
+        for line in ("#relSvg .ln.wifi{stroke:#38bdf8}",
+                     "#relSvg .ln.bt{stroke:#34d399}",
+                     "#relSvg .ln.bc{stroke:#fbbf24}"):
+            self.assertIn(line, html, "链路颜色固定：%s" % line)
+        i = html.index("#relSvg .ln.nodata")
+        j = html.index("#relSvg .ln.cycle")
+        state_css = html[i:j]
+        for token in ("#relSvg .ln.nodata{opacity:.55}", "#relSvg .ln.offline{opacity:.3}",
+                      "#relSvg .ln.missing{stroke-dasharray:7 6;opacity:.4}"):
+            self.assertIn(token, state_css, "状态只用线型/透明度：%s" % token)
+        self.assertNotIn("stroke:#", state_css, "状态类绝对不许抢链路颜色")
+        # 红色是回环专用，其余状态不再出现红/琥珀/灰的 stroke 覆盖。
+        self.assertNotIn("stroke:#f87171;stroke-dasharray:7 6", html)
+
+    def test_arrow_colour_follows_link_kind_not_state(self) -> None:
+        html = self._html()
+        i = html.index("function relArrowId(")
+        body = html[i:html.index("/** 箭头（", i)]
+        self.assertIn("if(l.cycle) return 'arr-cycle';", body)
+        self.assertIn("return l.kind === 'bt' ? 'arr-bt'", body)
+        self.assertIn("(l.kind === 'bc' ? 'arr-bc' : 'arr-wifi')", body)
+        for dead in ("arr-nodata", "arr-offline", "arr-missing"):
+            self.assertNotIn(dead, html, "状态不再单独换箭头：%s" % dead)
+
+    def test_sources_sit_on_the_left_and_targets_on_the_right(self) -> None:
+        """左进右出的判定依据：`relComputeRank` 以本机为参照做双向 BFS（上游为负、下游为正），
+        `relAutoPos` 用 `x = 22 + (rank - minRank) * span` 定列号（源在左、本机在右）；
+        画线时按**层级**选端口（正向：源右边缘 → 目标左边缘，反向走返回弧）。"""
+        html = self._html()
+        auto = html[html.index("function relAutoPos("):html.index("function relLinkClass(")]
+        self.assertIn("x: Math.round(22 + (r - minRank) * span)", auto,
+                      "列号 = 层级（上游左、本机右、下游更右）")
+        rank = html[html.index("function relComputeRank("):html.index("function relLinkClass(")]
+        self.assertIn("rank[v] = rank[u] - 1", rank, "上游（送到本机）层级递减 → 源在左")
+        self.assertIn("rank[v] = rank[u] + 1", rank, "下游（本机送出）层级递增 → 去向在右")
+        self.assertIn("if(rank[v] === undefined)", rank, "同层/回边不覆盖已定层级")
+        draw = html[html.index("function relDrawLinks("):html.index("function relNameOf(")]
+        i = draw.index("else if(rb > ra){")
+        self.assertIn("relPath(a.x + REL_W, y1, b.x, y2)", draw[i:i + 90],
+                      "正向边从源右边缘画到目标左边缘")
+        i = draw.index("} else {")
+        self.assertIn("relReturnPath(a.x, y1, b.x + REL_W, y2)", draw[i:i + 110],
+                      "反向边（回环）走返回弧，不从右侧钻进去")
+        self.assertIn("marker-end=\"url(#' + relArrowId(l)", draw, "箭头指向接收方")
+
+    def test_legend_states_the_colour_rule(self) -> None:
+        html = self._html()
+        self.assertIn("颜色 = 链路种类，同一条链路永远同色", html)
+        self.assertIn("失效路由（身份不存在）不上图", html)
+        self.assertIn("清理失效路由", html)
+
+
+
+
+class Test20261104V226(unittest.TestCase):
+    """★ 2026-11-04（PC v2.26）：真机 v2.25 诊断包里的 4 条。
+
+    1) 监控页仍有两条指向旧身份的幽灵路由（b1fbc20c / 5e65addb），只空转；
+    2) 手机 2.14 明明发 vol，PC 却显示"未上报"（键没对齐）；
+    3) 蓝牙 4 条交叉命名，端点按子串匹配挂到别的设备名下；
+    4) 回环提示是英文，用户不知道怎么处置。
+    """
+
+    def _node(self):
+        from audiomixing.config import Config
+        from audiomixing.engine import AudioMixingNode
+
+        cfg = Config()
+        cfg.node_id = "20e66011-94c5-4fd2-98ab-6a5c488ed993"
+        cfg.name = "本机"
+        cfg.routes = []
+        cfg.codec = "pcm_s16"
+        cfg.smart_link = []
+        node = AudioMixingNode(cfg, audio_port=free_udp_port(),
+                               discovery_port=free_udp_port(), simulate=True)
+        node.devices = []
+        return node
+
+    def _phone(self, node, first_id="b1fbc20c-b560-4885-8ed4-62296354d54a"):
+        """先登记旧身份，再登记当前身份（同一 device_id / 同一 host）→ aliasIds 生效。"""
+        node.registry.update({"wl": 1, "id": first_id, "name": "M332BF-e9b8",
+                              "audio_port": 47831, "web_port": 0,
+                              "device_id": "dev-m332bf"}, "192.168.0.100")
+        node.registry.update({"wl": 1, "id": "5e65addb-2edb-47dd-94c8-1398a7a9843e",
+                              "name": "M332BF-e9b8", "audio_port": 47831, "web_port": 0,
+                              "device_id": "dev-m332bf"}, "192.168.0.100")
+        node.registry.update({"wl": 1, "id": "e9b8cc51-f1a3-4aae-9bb9-b2a47bb0797a",
+                              "name": "M332BF-e9b8", "audio_port": 47831, "web_port": 0,
+                              "device_id": "dev-m332bf"}, "192.168.0.100")
+        return node
+
+    # ---- 第 1 条：旧身份路由自动改写 + 合并重复 + 监控页可操作 ----
+    def test_ghost_routes_are_rewritten_to_live_identity_and_deduped(self) -> None:
+        node = self._node()
+        try:
+            self._phone(node)
+            node.set_routes([
+                {"id": "68c622a3", "from": [node.node_id],
+                 "to": ["b1fbc20c-b560-4885-8ed4-62296354d54a"]},
+                {"id": "4eecefd4", "from": [node.node_id],
+                 "to": ["5e65addb-2edb-47dd-94c8-1398a7a9843e"]},
+            ], persist=False)
+            result = node.normalize_route_identities()
+            self.assertGreaterEqual(result["changed"], 1, "旧 id 必须被改写")
+            self.assertEqual(len(node.routes), 1,
+                             "改写后两条完全相同的路由必须只留一条，否则手机会收到两份")
+            self.assertEqual(node.routes[0]["to"], ["dev-m332bf"],
+                             "改写目标 = identity 归一的 device_id")
+            log = node.status()["identity"]["route_rewrites"]
+            self.assertTrue(any(item.get("old") in
+                                ("b1fbc20c-b560-4885-8ed4-62296354d54a",
+                                 "5e65addb-2edb-47dd-94c8-1398a7a9843e") for item in log),
+                            "诊断里能查到被改写的旧 id")
+        finally:
+            node.stop()
+
+    def test_missing_route_can_be_repaired_to_the_only_online_peer(self) -> None:
+        node = self._node()
+        try:
+            node.registry.update({"wl": 1, "id": "e9b8cc51-f1a3-4aae-9bb9-b2a47bb0797a",
+                                  "name": "M332BF-e9b8", "audio_port": 47831, "web_port": 0,
+                                  "device_id": "dev-m332bf"}, "192.168.0.100")
+            node.set_routes([{"id": "ghost", "from": [node.node_id],
+                              "to": ["b1fbc20c-b560-4885-8ed4-62296354d54a"]}],
+                            persist=False)
+            result = node.repair_route_identity("ghost")
+            self.assertTrue(result.get("ok"), "只有一台在线对端时必须允许一键修复")
+            self.assertEqual(result.get("target"), "dev-m332bf", "改写目标是归一后的 device_id")
+            self.assertEqual(node.routes[0]["to"], ["dev-m332bf"])
+            self.assertTrue(any(item.get("field") == "manual-repair"
+                                for item in node.status()["identity"]["route_rewrites"]),
+                            "人工确认的修复也要记进诊断")
+        finally:
+            node.stop()
+
+    def test_monitor_missing_route_is_actionable_not_a_bare_unreachable_row(self) -> None:
+        from audiomixing.webui import AudioMixingApi
+
+        node = self._node()
+        try:
+            node.set_routes([{"id": "ghost", "from": [node.node_id],
+                              "to": ["dead-beef-0000-0000-000000000000"]}],
+                            persist=False)
+            # missing 要连续 60 秒解析不到才成立（见 _refresh_route_staleness 注释）。
+            node._unknown_route_since["ghost"] = time.monotonic() - 61
+            node._refresh_route_staleness()
+            flows = AudioMixingApi(node).monitor().get("flows") or []
+            ghost = [f for f in flows if str(f.get("route_id")) == "ghost"]
+            self.assertTrue(ghost, "失效路由仍要出现在监控页（否则用户没法清）")
+            row = ghost[0]
+            self.assertNotIn("不可达", str(row.get("state")), "不允许裸的不可达行")
+            self.assertIn("可清理", str(row.get("state")), "必须明确告诉用户能清理")
+            self.assertEqual(row.get("action"), "清理失效路由", "按钮必须写清是清理")
+            self.assertTrue(row.get("disconnect"), "必须有可点击的清理动作")
+            self.assertIn("不会动 Windows 蓝牙配对", str(row.get("hint")),
+                          "清理只删本机配置，表达要准确")
+        finally:
+            node.stop()
+
+    # ---- 第 2 条：vol 在 identity 改名后仍能命中 ----
+    def test_peer_volume_follows_alias_identity_and_reports_hit_key(self) -> None:
+        node = self._node()
+        try:
+            self._phone(node)
+            node._handled_stats_at = 0.0
+            node._control_messages = lambda: [{
+                "_type": "STATS", "_at": 1.0,
+                "_from": "192.168.0.100:47831",
+                # stats 用**当前** node id，而列表里的记录 node_id 仍是先登记的旧 id。
+                "node": "e9b8cc51-f1a3-4aae-9bb9-b2a47bb0797a",
+                "vol": 0.25, "name": "M332BF-e9b8",
+            }]
+            node._handle_peer_requests()
+            peers = node.status()["peers"]
+            phone = [p for p in peers if str(p.get("host")) == "192.168.0.100"][0]
+            self.assertEqual(phone["media_vol"], 0.25,
+                             "identity 改名后 vol 仍必须命中（不能显示未上报）")
+            self.assertTrue(phone["media_vol_key"], "诊断必须写出命中的键")
+            self.assertIn(phone["media_vol_key"], phone["media_vol_keys"],
+                          "命中键必须包含在查过的键列表里")
+            self.assertTrue(phone["media_vol_keys"], "诊断要列出查过的全部键")
+            # host 兜底：只写 host 键也要能取到（stats 的 node 完全陌生时靠它）。
+            node._peer_volume.clear()
+            node._peer_volume[str(phone["host"])] = (0.3, time.monotonic())
+            self.assertEqual(node._peer_media_volume_for_node(phone["node_id"]), 0.3,
+                             "只按 host 存的 vol 也必须能查到")
+            dbg = node.status()["peer_volume_debug"]
+            self.assertEqual(dbg["last"]["vol"], 0.25, "最近一次原始上报要能查到")
+            self.assertIn("192.168.0.100", dbg["last"]["keys"], "原始上报的存储键要能查到")
+        finally:
+            node.stop()
+
+    # ---- 第 3 条：蓝牙同 MAC 合并、端点按词边界匹配、只清本程序记录 ----
+    def test_bt_merge_same_address_and_keep_different_names_apart(self) -> None:
+        from audiomixing.bluetooth import merge_paired_devices
+
+        rows = [
+            {"id": "old-1", "address": "AA:BB:CC:DD:EE:FF", "name": "瘾控",
+             "state": "Closed", "held": False, "endpoint": False, "hfp": False, "link": "off"},
+            {"id": "new-1", "address": "aa-bb-cc-dd-ee-ff", "name": "瘾控",
+             "state": "Closed", "held": False, "endpoint": False, "hfp": False, "link": "off"},
+            {"id": "pad", "address": "11:22:33:44:55:66", "name": "瘾控的Redmi Pad SE",
+             "state": "Closed", "held": False, "endpoint": False, "hfp": False, "link": "off"},
+        ]
+        merged = merge_paired_devices(rows)
+        self.assertEqual(len(merged), 2, "同 MAC 的两条必须合并；不同名字/地址不合并")
+        group = [m for m in merged if m["name"] == "瘾控"][0]
+        self.assertEqual(group["merged_count"], 2)
+        self.assertEqual(sorted(group["ids"]), ["new-1", "old-1"])
+        self.assertFalse(any(m["name"] == "瘾控的Redmi Pad SE" and m.get("merged_count", 1) > 1
+                             for m in merged), "名字包含关系不是强证据，不能误合并")
+
+    def test_bt_endpoint_matching_uses_a_word_boundary_not_substring(self) -> None:
+        text = (ROOT / "audiomixing" / "bluetooth.py").read_text(encoding="utf-8")
+        self.assertNotIn('-like ("*" + $d.Name + "*")', text,
+                         "子串匹配会把 '瘾控的Redmi Pad SE A2DP SNK' 挂到 '瘾控' 名下")
+        self.assertIn("$pattern = '(^|\\s|\\()'", text, "必须按词边界匹配端点名")
+        self.assertIn('(\\s|\\)|$)', text)
+
+    def test_bt_cleanup_is_honest_about_windows_pairings(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from audiomixing import bluetooth
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            # 助手状态文件名 = _key(device_id)（sha1 前 12 位），不是原始 id。
+            (state / ("%s.keep" % bluetooth._key("old-1"))).write_text("", encoding="utf-8")
+            (state / ("%s.status" % bluetooth._key("new-1"))).write_text("{}", encoding="utf-8")
+            with mock.patch.object(bluetooth, "_STATE_DIR", state), \
+                    mock.patch.object(bluetooth, "list_devices",
+                                      return_value=[{"id": "new-1", "name": "瘾控"}]):
+                result = bluetooth.cleanup_stale_records()
+            self.assertEqual(result["removed"], 1, "只清当前列表里已不存在的旧记录")
+            self.assertIn("Windows", result["note"], "必须写明 Windows 配对要用户自己去删")
+            self.assertIn("设置", result["note"], "给出具体去处")
+
+    # ---- 第 4 条：英文回环提示改中文 ----
+    def test_echo_hint_is_chinese_with_an_action(self) -> None:
+        text = (ROOT / "audiomixing" / "engine.py").read_text(encoding="utf-8")
+        self.assertNotIn("pick a different output to avoid the echo", text,
+                         "不能继续给用户英文提示")
+        i = text.index("同时也是本机默认的采集设备")
+        body = text[i:i + 240]
+        self.assertIn("换一个输出设备", body, "要给处置建议")
+        self.assertIn("没有开采集", body, "要说明可忽略的条件")
+
+class TestV27Regressions(unittest.TestCase):
+    """★ v2.27 回归：音量只乘一次、重复路由收敛、广播只走频道、关系合并/拆分、自启隔离。"""
+
+    def _node(self):
+        cfg = Config()
+        cfg.node_id = "self-node"
+        cfg.name = "本机"
+        cfg.routes = []
+        cfg.codec = "pcm_s16"
+        node = AudioMixingNode(cfg, audio_port=free_udp_port(),
+                               discovery_port=free_udp_port(), simulate=True)
+        node.devices = []
+        return node
+
+    # ---- Bug-1：手机声明「采集已在音量之后」→ 电脑不能再乘 vol ----
+    def test_declared_capture_volume_is_not_multiplied_again(self) -> None:
+        node = self._node()
+        try:
+            node.receiver.control_messages.append({
+                "t": "stats", "node": "phone-1", "name": "手机", "_type": "STATS",
+                "_from": "198.51.100.10:47831", "_at": time.monotonic(),
+                "vol": 0.5, "vol_in_capture": True,
+            })
+            node._handle_peer_requests()
+            self.assertTrue(node._peer_vol_declared.get("phone-1"),
+                            "手机 2.16 的声明必须落地")
+            factor, note = node._volume_factor_for(
+                0.5, node._volume_verdict_for(["phone-1"]))
+            self.assertEqual(factor, 1.0, "采集端已带音量 → 电脑的乘数必须是 1.0（不再平方衰减）")
+            self.assertIn("已衰减", note)
+            # 对照组：没声明的老手机仍是 vol 乘一次（行为不变）
+            self.assertEqual(node._volume_factor_for(0.5, None)[0], 0.5)
+        finally:
+            node.stop()
+
+    # ---- 2026-11-08（用户方案）：外放档 / 静音档都由手机处理一次，电脑恒不叠乘 ----
+    def test_external_and_silent_send_modes_are_never_multiplied_again(self) -> None:
+        node = self._node()
+        try:
+            for source, in_capture in (("external", False), ("silent", True)):
+                node.receiver.control_messages.append({
+                    "t": "stats", "node": "phone-mode", "name": "手机", "_type": "STATS",
+                    "_from": "198.51.100.12:47831", "_at": time.monotonic(),
+                    "vol": 0.5, "vol_in_capture": in_capture,
+                    "vol_mode": source, "vol_source": source,
+                    "vol_policy": "internal_only",
+                })
+                node._handle_peer_requests()
+                self.assertEqual(node._peer_vol_source.get("phone-mode"), source)
+                self.assertTrue(node._peer_vol_declared.get("phone-mode"))
+                factor, note = node._volume_factor_for(
+                    0.5, node._volume_verdict_for(["phone-mode"]), source)
+                self.assertEqual(factor, 1.0,
+                                 "%s 档手机已经处理过一次，电脑必须恒为 1.0" % source)
+                self.assertIn("不叠加", note)
+            # 切档后声明和字段必须同步变化（模拟手机端下一轮统计包）
+            node.receiver.control_messages.append({
+                "t": "stats", "node": "phone-mode", "name": "手机", "_type": "STATS",
+                "_from": "198.51.100.12:47831", "_at": time.monotonic(),
+                "vol": 0.5, "vol_in_capture": False,
+                "vol_mode": "external", "vol_source": "external",
+                "vol_policy": "last_nonzero",
+            })
+            node._handle_peer_requests()
+            self.assertEqual(node._peer_vol_source.get("phone-mode"), "external")
+            self.assertEqual(node._peer_vol_policy.get("phone-mode"), "last_nonzero")
+        finally:
+            node.stop()
+
+    def test_silent_volume_policy_setting_pushes_a_control_packet(self) -> None:
+        node = self._node()
+        try:
+            self.assertEqual(node.config.phone_silent_vol_policy, "internal_only",
+                             "默认必须是 internal_only（静音档 STREAM_MUSIC=0 无信息量）")
+            self.assertEqual(node.set_phone_silent_vol_policy("last_nonzero"), "last_nonzero")
+            self.assertEqual(node.config.phone_silent_vol_policy, "last_nonzero")
+            self.assertGreaterEqual(node._silent_policy_seq, 1)
+            self.assertEqual(node.set_phone_silent_vol_policy("bogus"), "internal_only")
+        finally:
+            node.stop()
+
+    def test_peer_row_exposes_send_mode_and_multiplier_source(self) -> None:
+        node = self._node()
+        try:
+            node.registry.update({"wl": 1, "id": "phone-row", "name": "手机",
+                                  "audio_port": 47831, "web_port": 0}, "198.51.100.13")
+            node.receiver.control_messages.append({
+                "t": "stats", "node": "phone-row", "name": "手机", "_type": "STATS",
+                "_from": "198.51.100.13:47831", "_at": time.monotonic(),
+                "vol": 0.25, "vol_in_capture": True,
+                "vol_mode": "silent", "vol_source": "silent",
+                "vol_policy": "internal_only",
+            })
+            node._handle_peer_requests()
+            row = next(p for p in node._peers_with_media_volume()
+                       if p["node_id"] == "phone-row")
+            self.assertEqual(row["vol_source"], "silent")
+            self.assertEqual(row["vol_mode"], "silent")
+            self.assertEqual(row["vol_policy"], "internal_only")
+            self.assertTrue(row["vol_in_capture"], "静音档必须报 true")
+            self.assertEqual(row["volume_factor"], 1.0)
+            self.assertIn("静音档", row["volume_note"])
+        finally:
+            node.stop()
+
+    # ---- Bug-3.1：同端点重复路由收敛，删一次就干净 ----
+    def test_duplicate_routes_collapse_and_one_delete_clears_them(self) -> None:
+        node = self._node()
+        try:
+            node.set_routes([
+                {"id": "old", "from": ["peer-1"], "to": ["self"]},
+                {"id": "new", "from": ["peer-1"], "to": ["self"]},
+            ], persist=False)
+            self.assertEqual([r["id"] for r in node.routes], ["old"],
+                             "语义相同的两条路由只能留一条")
+            node.set_routes([], persist=False)
+            self.assertEqual(node.routes, [], "取消收听点一次就该清干净")
+        finally:
+            node.stop()
+
+    # ---- Bug-3.2：广播时只认频道「只听」，不被具名/自动路由绕过 ----
+    def test_broadcast_peer_only_uses_the_channel_route(self) -> None:
+        node = self._node()
+        try:
+            node.registry.update({"wl": 1, "id": "phone-1", "name": "手机",
+                                  "audio_port": 47831, "web_port": 0}, "198.51.100.10")
+            node.set_routes([
+                {"id": "chan", "from": ["*"], "to": ["self"]},
+                {"id": "named", "from": ["phone-1"], "to": ["self"]},
+            ], persist=False)
+            node.receiver.control_messages.append({
+                "t": "stats", "node": "phone-1", "_type": "STATS",
+                "_from": "198.51.100.10:47831", "_at": time.monotonic(),
+                "send_mode": 1, "broadcast": True,
+            })
+            node._handle_peer_requests()
+            self.assertEqual(node.routes_for_sender("phone-1"), {"chan"},
+                             "广播时必须只走频道那条；残留具名路由不能再放一遍")
+            # 没开「只听」时，广播流一条路由都不该命中（否则就是「没开只听也能听到」）
+            node.set_routes([{"id": "named", "from": ["phone-1"], "to": ["self"]}],
+                            persist=False)
+            self.assertEqual(node.routes_for_sender("phone-1"), set(),
+                             "广播没有频道路由 → 静音，不能借具名路由偷放")
+        finally:
+            node.stop()
+
+    # ---- ★ 2026-11-06（Q2）：广播 → 只听，必须有明确证据，不能靠"猜" ----
+    def test_broadcast_beacon_alone_is_accepted_by_a_listening_node(self) -> None:
+        """手机的 STATS 可能只发给"它正在送的目标"，切换瞬间本机可能还拿着旧的
+        "点对点"声明。信标里自报的 broadcast 必须能单独把准入打开。"""
+        node = self._node()
+        try:
+            node.registry.update({"wl": 1, "id": "phone-1", "name": "手机",
+                                  "audio_port": 47831, "web_port": 0,
+                                  "send_mode": 1, "broadcast": True}, "198.51.100.10")
+            node.set_routes([{"id": "chan", "from": ["*"], "to": ["self"]}],
+                            persist=False)
+            # 5 秒前的旧控制消息说"点对点"，信标是刚收到的"广播" → 取信标
+            node.receiver.control_messages.append({
+                "t": "stats", "node": "phone-1", "_type": "STATS",
+                "_from": "198.51.100.10:47831", "_at": time.monotonic() - 5.0,
+                "send_mode": 1, "broadcast": False,
+            })
+            node._handle_peer_requests()
+            self.assertTrue(node._stream_is_accepted("phone-1"),
+                            "信标明确写着广播 → 只听必须放行（不能拿旧点对点声明拒收）")
+            # 同一台设备改成点对点且没有具名路由 → 必须拒收（只听≠放行点对点）
+            node.registry.update({"wl": 1, "id": "phone-1", "name": "手机",
+                                  "audio_port": 47831, "web_port": 0,
+                                  "send_mode": 1, "broadcast": False}, "198.51.100.10")
+            self.assertFalse(node._stream_is_accepted("phone-1"),
+                             "点对点没有具名路由时必须拦住")
+        finally:
+            node.stop()
+
+    def test_send_mode_declaration_matches_through_identity_aliases(self) -> None:
+        """现场做过身份归一（旧 id → 新 id）。声明按旧 id 存、音频包按新 id 查时，
+        旧实现查不到就退回"按点对点拒收"。现在必须能通过别名互相命中。"""
+        node = self._node()
+        try:
+            node.registry.update({"wl": 1, "id": "phone-new", "name": "手机",
+                                  "audio_port": 47831, "web_port": 0}, "198.51.100.10")
+            peer = node.registry.get("phone-new")
+            node.registry._add_alias(peer, "phone-old")
+            node.set_routes([{"id": "chan", "from": ["*"], "to": ["self"]}],
+                            persist=False)
+            node.receiver.control_messages.append({
+                "t": "stats", "node": "phone-old", "_type": "STATS",
+                "_from": "198.51.100.10:47831", "_at": time.monotonic(),
+                "send_mode": 1, "broadcast": True,
+            })
+            node._handle_peer_requests()
+            self.assertTrue(node._stream_is_accepted("phone-new"),
+                            "按新 id 查也必须看到旧 id 存下的广播声明")
+            self.assertTrue(node._stream_is_accepted("phone-old"))
+        finally:
+            node.stop()
+
+    # ---- ★ 2026-11-06（Q5）：蓝牙卡片"未到"与布尔 True 不能同时出现 ----
+    def test_closed_bt_channel_never_reports_media_link_true(self) -> None:
+        from audiomixing import bluetooth
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = pathlib.Path(tmp)
+            key = bluetooth._key("dev-1")
+            (state / ("%s.keep" % key)).write_text("", encoding="utf-8")
+            (state / ("%s.pid" % key)).write_text(str(os.getpid()), encoding="utf-8")
+            (state / ("%s.status" % key)).write_text("open:Closed", encoding="utf-8")
+            row = {"id": "dev-1", "name": "瘾控", "link": "off", "held": False,
+                   "endpoint": True, "state": "Closed"}
+            with mock.patch.object(bluetooth, "_STATE_DIR", state), \
+                    mock.patch.object(bluetooth, "_endpoint_state_from_registry",
+                                      return_value=False):
+                out = bluetooth._apply_live_states([dict(row)])[0]
+            self.assertEqual(out["link"], "waiting")
+            self.assertFalse(out["endpoint"],
+                             "文案说'媒体音频未到'时，手机媒体链路不能还是 True")
+            self.assertTrue(out["held"], "辅助进程还在，这个布尔可以保留")
+            with mock.patch.object(bluetooth, "_STATE_DIR", state), \
+                    mock.patch.object(bluetooth, "_endpoint_state_from_registry",
+                                      return_value=True):
+                out = bluetooth._apply_live_states([dict(row)])[0]
+            self.assertEqual(out["link"], "connected",
+                             "注册表里端点 active → 媒体音频确实到了，必须报连接")
+            self.assertTrue(out["endpoint"])
+
+    # ---- 第 6 条：拖动合并 / 拆开 ----
+    def test_relation_merge_and_split_round_trip(self) -> None:
+        node = self._node()
+        try:
+            node.registry.update({"wl": 1, "id": "peer-1", "name": "手机",
+                                  "audio_port": 47831, "web_port": 0}, "198.51.100.10")
+            out = node.relation_merge("bt:手机蓝牙", "peer-1")
+            self.assertTrue(out.get("ok"), out)
+            self.assertEqual(out.get("kind"), "relation")
+            self.assertEqual(node.config.relation_merges[-1]["peer"], "peer-1")
+            self.assertEqual(node.config.relation_merges[-1]["bt"], "手机蓝牙")
+            self.assertIn("relation_merges", node.status().get("identity", {}),
+                          "状态接口要把合并结果交给页面回填")
+            out = node.relation_split("bt:手机蓝牙")
+            self.assertTrue(out.get("ok"), out)
+            self.assertEqual(node.config.relation_merges, [])
+        finally:
+            node.stop()
+
+    # ---- Bug-3.1：手动删掉收听路由后，智连必须一起关，下一包统计不能再建回来 ----
+    def test_deleting_a_listen_route_turns_smart_link_off(self) -> None:
+        from audiomixing import webui
+
+        node = self._node()
+        try:
+            node.config.smart_link = ["peer-1"]
+            node.set_routes([{"id": "mine", "from": ["peer-1"], "to": ["self"]}],
+                            persist=False)
+            api = webui.AudioMixingApi.__new__(webui.AudioMixingApi)
+            api.node = node
+            api._note_manual_auto_close(list(node.routes))
+            self.assertNotIn("peer-1", node.config.smart_link,
+                             "删掉收听路由必须同时关智连，否则 2 秒后又被自动建回来")
+            node.set_routes([], persist=False)      # 页面上的删除动作
+            node.receiver.control_messages.append({
+                "t": "stats", "node": "peer-1", "_type": "STATS",
+                "_from": "198.51.100.10:47831", "_at": time.monotonic(),
+                "want_listen": True,
+            })
+            node._handle_peer_requests()
+            self.assertEqual(node.routes, [],
+                             "智连关掉后，对端继续请求也不能再偷偷打开收听")
+        finally:
+            node.stop()
+
+    # ---- 新 UI：开机自启动默认关，开启才写 HKCU Run，关闭要删值 ----
+    def test_autostart_only_touches_the_run_key_when_enabled(self) -> None:
+        node = self._node()
+        try:
+            self.assertFalse(node.config.launch_at_login)
+            self.assertFalse(node.config.to_json()["launch_at_login"])
+        finally:
+            node.stop()
+
+        from audiomixing import webui
+
+        written: dict[str, str] = {}
+
+        class _Key:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def _open_key(root, path, reserved=0, access=0):
+            return _Key()
+
+        # ★ 2026-11-06（Q4）：Windows 注册表值名**不区分大小写**。旧的 fake 用普通
+        #   dict（区分大小写），于是 `DeleteValue("audiomixing")` 被当成没命中、
+        #   真机上却会把刚写进去的 `AudioMixing` 一起删掉。这里按小写键模拟真机，
+        #   旧实现会在这条用例上直接报 [WinError 2]。
+        def _set_value_ex(key, name, reserved, typ, value):
+            written[str(name).lower()] = value
+
+        def _delete_value(key, name):
+            k = str(name).lower()
+            if k not in written:
+                raise FileNotFoundError(name)
+            del written[k]
+
+        def _query_value_ex(key, name):
+            k = str(name).lower()
+            if k not in written:
+                raise FileNotFoundError(name)
+            return written[k], 1
+
+        fake = types.SimpleNamespace(
+            HKEY_CURRENT_USER=1, KEY_SET_VALUE=2, KEY_QUERY_VALUE=4, REG_SZ=1,
+            OpenKey=_open_key, SetValueEx=_set_value_ex, DeleteValue=_delete_value,
+            QueryValueEx=_query_value_ex)
+        with mock.patch.dict(sys.modules, {"winreg": fake}), \
+                mock.patch.object(webui.sys, "platform", "win32"):
+            ok, err = webui.set_windows_autostart(True)
+            self.assertTrue(ok, err)
+            self.assertIn("serve", written[webui._AUTOSTART_VALUE.lower()],
+                          "登录后启动必须用 serve（后台就绪，不弹面板）")
+            ok, err = webui.set_windows_autostart(False)
+            self.assertTrue(ok, err)
+            self.assertEqual(written, {}, "关闭自启动必须删掉 Run 值")
+
+    # ---- ★ 2026-11-06（第 5 条）：自启动必须写外层 exe，不能写 onefile 临时目录 ----
+    def test_autostart_uses_the_outer_exe_not_the_onefile_temp_python(self) -> None:
+        """真机根因：Nuitka 不设 sys.frozen，旧代码走开发分支写进 onefile 临时目录。
+
+        临时目录退出即删，所以注册表里那条 `...\\onefile_xxx\\python.exe ... launcher.py`
+        下次开机必然不存在 —— 用户勾了自启动、开机不起。这里验证修复后写的是
+        **外层 exe**，且带引号、带 `serve`。
+        """
+        from audiomixing import webui
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = pathlib.Path(tmp) / "Audio Mixing v2.29.exe"
+            exe.write_bytes(b"fake")
+            ghost = pathlib.Path(tmp) / "onefile_123" / "python.exe"
+            ghost.parent.mkdir()
+            ghost.write_bytes(b"fake")
+
+            class _Compiled:
+                original_argv0 = str(exe)
+
+            webui.__compiled__ = _Compiled()
+            try:
+                with mock.patch.object(sys, "executable", str(ghost)), \
+                        mock.patch.object(sys, "argv", [str(exe), "serve"]), \
+                        mock.patch.dict(os.environ, {"NUITKA_ONEFILE_PARENT": ""}):
+                    self.assertEqual(webui._program_exe_path(), str(exe),
+                                     "必须认出外层的 exe，而不是临时 python.exe")
+                    cmd = webui._autostart_command()
+                    self.assertEqual(cmd, '"%s" serve' % exe)
+                    self.assertNotIn("onefile_", cmd)
+                    self.assertNotIn("python.exe", cmd)
+            finally:
+                del webui.__compiled__
+
+    # ---- ★ 2026-11-06（第 3 条）：采集"有数据但一直静音"要如实报出来 ----
+    def test_a_device_that_streams_only_silence_is_reported_as_silent(self) -> None:
+        """蓝牙端点"连上了、包在走、全是 0"以前显示健康，用户听到的是没声。"""
+        from audiomixing.audio.capture import SILENT_AFTER_S
+
+        node = self._node()
+        try:
+            state, reason, definite = node._capture_data_state({
+                "name": "麦克风 (手机 A2DP SNK)",
+                "blocks_read": 120, "last_data_age_s": 0.2, "alive_for_s": 60.0,
+                "peak": 0.0, "silent_for_s": SILENT_AFTER_S + 5.0, "silent": True,
+            })
+            self.assertEqual(state, "silent")
+            self.assertIn("没有电平", reason)
+            self.assertFalse(definite, "用户可能只是暂停了播放，不能据此自动换设备")
+            state2, _reason2, _d2 = node._capture_data_state({
+                "name": "扬声器", "blocks_read": 120, "last_data_age_s": 0.2,
+                "alive_for_s": 60.0, "peak": 0.4, "silent_for_s": 0.2, "silent": False,
+            })
+            self.assertEqual(state2, "ok")
+        finally:
+            node.stop()
+
+
+# --------------------------------------------------------------------------
+# ★ 2026-11-06（UI 残留）：把"肉眼能看出来的错误"变成门禁。
+# --------------------------------------------------------------------------
+
+def _load_ui_gate():
+    path = ROOT / "tools" / "check_ui_residue.py"
+    spec = importlib.util.spec_from_file_location("check_ui_residue", path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestUiResidueGate(unittest.TestCase):
+    def test_test_node_names_are_rejected(self) -> None:
+        gate = _load_ui_gate()
+        for bad in ("自启动复验", "test", "probe", "selftest", "peer-1",
+                    "self-node", "demo", "example", "我的 test 设备"):
+            self.assertIsNotNone(gate.bad_name(bad, set()), bad)
+        for good in ("2024TSJ", "我的手机", "OPPO Enco Air4", "瘾控的Redmi Pad SE"):
+            self.assertIsNone(gate.bad_name(good, set()), good)
+        # 白名单是精确名字：用户明确允许的测试名可以放行（--allow）。
+        self.assertIsNone(gate.bad_name("test-tone", {"test-tone"}))
+
+    def test_shipped_ui_has_no_residue_and_hides_the_local_card(self) -> None:
+        gate = _load_ui_gate()
+        problems = gate.check_ui_source(set())
+        self.assertEqual(problems, [], "页面源码里还有 UI 残留：%r" % problems)
+
+    def test_every_self_identity_is_filtered_from_the_lan_list(self) -> None:
+        """本机不能靠"只比 node_id"逃过过滤：device_id/别名/地址都要算。"""
+        from audiomixing import webui
+
+        keys = {"node-x", "dev-x", "inst-x", "alias-x", "192.168.0.105"}
+        for item in ({"node_id": "node-x"}, {"device_id": "dev-x"},
+                     {"instance_id": "inst-x"}, {"alias_ids": ["alias-x"]},
+                     {"hosts": ["192.168.0.105"]}, {"host": "192.168.0.105"},
+                     {"local": True}):
+            self.assertTrue(webui._peer_is_self(item, keys), item)
+        self.assertFalse(webui._peer_is_self({"node_id": "other", "host": "192.168.0.100"}, keys))
+
+    def test_two_nodes_on_one_machine_are_not_hidden(self) -> None:
+        """★ 双节点自检回归：同一台机器上的两个节点 host 相同，但不是本机。
+
+        只按地址判会把 selftest 的 A/B 互相过滤，控制台 peers 直接变成 []。
+        """
+        from audiomixing import webui
+
+        keys = {"self-node-id", "192.168.0.105", "127.0.0.1"}
+        self.assertFalse(webui._peer_is_self(
+            {"node_id": "peer-a", "host": "127.0.0.1"}, keys))
+        self.assertFalse(webui._peer_is_self(
+            {"node_id": "peer-b", "host": "192.168.0.105",
+             "device_id": "peer-dev"}, keys))
+
+    def test_self_identity_collects_config_aliases(self) -> None:
+        from audiomixing import webui
+
+        config = types.SimpleNamespace(device_id="dev-x", instance_id="inst-x",
+                                       alias_ids=["alias-old"])
+        node = types.SimpleNamespace(node_id="node-x", config=config)
+        keys = webui._self_identity_keys(node)
+        self.assertIn("node-x", keys)
+        self.assertIn("dev-x", keys)
+        self.assertIn("inst-x", keys)
+        self.assertIn("alias-old", keys)

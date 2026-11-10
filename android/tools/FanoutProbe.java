@@ -1,6 +1,7 @@
 import android.os.SystemClock;
 
 import com.audiomixing.app.SendFanout;
+import com.audiomixing.app.Proto;
 
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -128,7 +129,7 @@ public final class FanoutProbe {
         fan.close();
 
         System.out.println();
-        System.out.println("== 8. ★ 逐目标增益（「我送它的」滑杆）：只改那一路，别人收原包 ==");
+        System.out.println("== 8. ★ 逐目标增益（「我送它的」滑杆）：只记录/只影响电平，缩放由接收端做 ==");
         // 注意：增益是"按设备"（host）记的 —— 真实局域网里一台设备就是一个 IP，
         // 所以这里必须用两个不同的回环地址当两台设备（127.0.0.1 / 127.0.0.2），
         // 否则"两个目标同一个 host"会被同一条滑杆一起改掉（那其实是正确行为）。
@@ -145,10 +146,19 @@ public final class FanoutProbe {
         check("设完是 0.50", Math.abs(fan2.targetGain("127.0.0.1") - 0.5f) < 0.001f);
         int n8 = fan2.send(flat, flat.length, 0.5f);
         check("两个目标都发出去了（返回 " + n8 + "）", n8 == 2);
-        int aSample = firstSample(gA);
-        int bSample = firstSample(gB);
-        check("A（127.0.0.1，设了 0.50）收到缩放后的 500，实测 " + aSample, aSample == 500);
-        check("B（127.0.0.2，没设）收到原样本 1000，实测 " + bSample, bSample == 1000);
+        byte[] pa = receivePacket(gA);
+        byte[] pb = receivePacket(gB);
+        int aSample = sampleAt(pa);
+        int bSample = sampleAt(pb);
+        // ★ 2026-11-01 回归：增益只能乘 PCM 负载，绝不能碰 28 字节包头。
+        //   旧实现从第 0 字节开始乘，魔数被改坏，电脑端把整包判成"不是我们的包"丢掉 ——
+        //   用户看到的现象就是"只有 1.00 有声音"。这条断言必须看真包头。
+        check("A 的整包仍能被协议解析（包头没被增益改坏）",
+                pa != null && Proto.decode(pa, 0, pa.length) != null);
+        // ★ 2026-11-02：共享增益只在**接收端**乘一次（PC sink / 手机 AudioRecv#hostGain）。
+        //   发送端再乘一次会让 0.50 实际变成 0.25；这里明确钉住"发送端原样发"。
+        check("A（设了 0.50）收到原样本 1000（缩放由接收端做），实测 " + aSample, aSample == 1000);
+        check("B（没设）收到原样本 1000，实测 " + bSample, bSample == 1000);
         boolean sawHalf = false;
         for (SendFanout.TargetStats t : fan2.stats()) {
             if (Math.abs(t.gain - 0.5f) < 0.001f) {
@@ -158,11 +168,15 @@ public final class FanoutProbe {
         check("逐目标统计里带着各自的增益值", sawHalf);
 
         System.out.println();
-        System.out.println("== 9. 削顶保护：增益 1.5 时大声样本不会回绕成爆音 ==");
-        fan2.setTargetGain("127.0.0.1", 1.5f);        byte[] loud = flatPcmPacket(30000);          // 30000 × 1.5 = 45000 > 32767 → 必须削成 32767
+        System.out.println("== 9. 增益上限与包头保护：发送端不再缩放样本 ==");
+        fan2.setTargetGain("127.0.0.1", 1.5f);
+        byte[] loud = flatPcmPacket(30000);
         fan2.send(loud, loud.length, 1f);
-        int clipped = firstSample(gA);
-        check("30000 × 1.50 → 削顶成 32767（不是回绕的负数），实测 " + clipped, clipped == 32767);
+        byte[] clippedPkt = receivePacket(gA);
+        check("设了 1.50 后包头同样没被改坏",
+                clippedPkt != null && Proto.decode(clippedPkt, 0, clippedPkt.length) != null);
+        int clipped = sampleAt(clippedPkt);
+        check("发送端原样发 30000（削顶由接收端 scalePcm16 做），实测 " + clipped, clipped == 30000);
         fan2.setTargetGain("127.0.0.1", 9f);         // 越界值必须被夹住（夹到 2.0，和两端上限一致）
         check("越界的增益被夹到 2.00（实测 " + fan2.targetGain("127.0.0.1") + "）",
                 Math.abs(fan2.targetGain("127.0.0.1") - 2f) < 0.001f);
@@ -185,30 +199,44 @@ public final class FanoutProbe {
         System.exit(failures == 0 ? 0 : 1);
     }
 
-    /** 造一个"每个样本都是 v"的 PCM16 包（1948 字节），缩放结果一眼能算出来。 */
+    /** 造一个带<b>合法 28 字节包头</b>、每个样本都是 v 的 PCM16 包（1948 字节）。
+     *
+     * <p>旧版这里把包头留空，并注明"头内容无关" —— 那正好把 2026-11-01 那个
+     * "增益把包头一起乘坏"的 bug 放过去了（0 乘任何数还是 0）。现在头必须是真的。
+     */
     private static byte[] flatPcmPacket(int v) {
-        byte[] pkt = new byte[1948];
-        // 28 字节包头留空（本探针直接调 SendFanout，不经过解码，所以头内容无关）
-        for (int i = 28; i + 1 < pkt.length; i += 2) {
-            pkt[i] = (byte) v;
-            pkt[i + 1] = (byte) (v >> 8);
+        Proto.Pkt p = new Proto.Pkt(Proto.T_AUDIO);
+        p.seq = 7;
+        p.ssrc = 0x12345678;
+        p.samples = Proto.FRAME_SAMPLES;
+        p.tsNs = 1L;
+        byte[] payload = new byte[Proto.FRAME_SAMPLES * Proto.CHANNELS * 2];
+        for (int i = 0; i + 1 < payload.length; i += 2) {
+            payload[i] = (byte) v;
+            payload[i + 1] = (byte) (v >> 8);
         }
-        return pkt;
+        p.payload = payload;
+        return Proto.encode(p);
     }
 
-    /** 收一包、返回负载第一个样本（超时返回 Integer.MIN_VALUE）。 */
-    private static int firstSample(DatagramSocket s) throws Exception {
+    /** 收一包原样返回（超时返回 null）。 */
+    private static byte[] receivePacket(DatagramSocket s) {
         byte[] buf = new byte[4096];
         DatagramPacket p = new DatagramPacket(buf, buf.length);
         try {
             s.receive(p);
         } catch (Exception e) {
+            return null;
+        }
+        return Arrays.copyOf(buf, p.getLength());
+    }
+
+    /** 负载第一个样本（从 28 字节之后读，超时/太短返回 Integer.MIN_VALUE）。 */
+    private static int sampleAt(byte[] p) {
+        if (p == null || p.length < 30) {
             return Integer.MIN_VALUE;
         }
-        if (p.getLength() < 30) {
-            return Integer.MIN_VALUE;
-        }
-        return (short) ((buf[28] & 0xFF) | ((buf[29] & 0xFF) << 8));
+        return (short) ((p[28] & 0xFF) | ((p[29] & 0xFF) << 8));
     }
 
     /** 开一个"设备端"接收 socket：先把接收缓冲开大再 bind（默认 64KB 太小，连发会被内核丢）。 */

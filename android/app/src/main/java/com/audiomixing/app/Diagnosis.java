@@ -61,7 +61,15 @@ public final class Diagnosis {
      * 所以界面线程读到一半也不会看到"半新半旧"的字段。
      */
     public static final class PeerStats implements LinkPolicy.LinkFields {
-        /** 报告方的地址（Engine 按来源填，负载里的 target 只是它自己以为的对端）。 */
+        /**
+         * 报告方的节点 id（负载里的 {@code node}）。电脑端一直带，手机端 2.5 起也带。
+         *
+         * <p>★ 2026-11-01：收端必须按它认设备，不能只看来源 IP —— 电脑有双网卡 / VPN 时，
+         * 统计包从哪块网卡发出去、信标里报的是哪块地址，两者可能不是同一个，
+         * 按 IP 存下来的音量就会写进一个界面永远不读的键（用户报的"电脑调音量手机不同步"）。
+         */
+        public String node = "";
+        /** 报告方的地址（Engine 填，是**按 node 反查发现层后**的 peer.host）。 */
         public String host = "";
         /** 报告方的名字。 */
         public String name = "";
@@ -91,6 +99,30 @@ public final class Diagnosis {
          * <p>幂等：只要它还在送就一直为 true；它停了就自然变 false，不需要额外的"取消"消息。
          */
         public boolean wantListen;
+        /**
+         * ★ 2026-11-04（A）：电脑发来的**显式**「请开始/停止接收」。
+         * {@code listenReq} = "start"/"stop"；{@code listenReqId} 单调递增，
+         * 同一个号只处理一次。手机处理完要在自己的统计里回
+         * {@code listen_ack_id / listen_ack_action / listen_ack_reason}，
+         * 让电脑知道请求到底被做了没有 —— 不能再单向。
+         */
+        public String listenReq = "";
+        public long listenReqId = 0;
+
+        /**
+         * ★ 2026-11-08（用户方案）：电脑发来的"静音档乘数策略"命令
+         * （{@code internal_only} / {@code last_nonzero}）。空串 = 老电脑没发。
+         * {@code silentPolicyReq} 单调递增，手机端只认比上次大的号；
+         * {@code silentPolicyOnly} = 纯设置包，不参与收听/增益判定。
+         */
+        public String silentPolicy = "";
+        public long silentPolicyReq = 0;
+        public boolean silentPolicyOnly;
+
+        /** 我回给对端的 ack（手机端统计里带出去；电脑端读它做诊断）。 */
+        public long listenAckId = 0;
+        public String listenAckAction = "";
+        public String listenAckReason = "";
         /**
          * 这条链路（对端→我）的<b>共享音量</b>，0.00~2.00，两端同一个值。
          * 老版本不发这个字段时按 {@link #GAIN_UNSET} 处理（= 没同步过，保持各自的本地值）。
@@ -199,8 +231,88 @@ public final class Diagnosis {
                               long recv, long lost, int bufMs, int streams, String target,
                               boolean wantListen, float gain, long gainTs,
                               float gainRx, long gainRxTs, boolean wantBt) {
+        return json("", name, sent, bytes, sending, recv, lost, bufMs, streams, target,
+                wantListen, gain, gainTs, gainRx, gainRxTs, wantBt);
+    }
+
+    /**
+     * ★ 2026-11-01：把本机的 node id 也报上去（`"node"` 字段）。
+     *
+     * <p>电脑端（v2.12 也是）一直优先读 `node`，读不到才按来源 IP 去发现表反查。
+     * 反查要求"信标里的地址 == 统计包的来源地址"，换网卡 / 走 VPN / 手机改了 Wi-Fi
+     * 时这条就会落空 —— 后果是**两端音量条不同步、智连也收不到**（用户截图里
+     * 电脑 1.00 / 手机 0.59 就是这个）。手机自己把 id 报上来，这条路不依赖 IP 反查，
+     * 旧电脑也能立刻用上。
+     */
+    public static byte[] json(String nodeId, String name, long sent, long bytes, boolean sending,
+                              long recv, long lost, int bufMs, int streams, String target,
+                              boolean wantListen, float gain, long gainTs,
+                              float gainRx, long gainRxTs, boolean wantBt) {
+        return json(nodeId, name, sent, bytes, sending, recv, lost, bufMs, streams, target,
+                wantListen, gain, gainTs, gainRx, gainRxTs, wantBt, -1f);
+    }
+
+    /**
+     * ★ 2026-11-03 Q3：多带一个 {@code "vol"} —— 手机当前的**媒体/App 音量**（0.00~1.00）。
+     *
+     * <p>用途：手机在「送声音」时，电脑端把"我听它的"增益再乘以这个值，
+     * 于是手机按音量键/拖 App 音量条，PC 耳机里听到的手机声音会同步变化。
+     * 它只是一个"衰减系数"（≤1），所以永远不会超过用户在电脑上设的音量上限。
+     *
+     * <p>协议上仍然只是 T_STATS 的 JSON 多一个键，不改包头、不新增包类型；
+     * 老电脑把它当未知字段忽略，老手机不发这个键时电脑按 1.0 处理 —— 新旧混跑行为不变。
+     */
+    public static byte[] json(String nodeId, String name, long sent, long bytes, boolean sending,
+                              long recv, long lost, int bufMs, int streams, String target,
+                              boolean wantListen, float gain, long gainTs,
+                              float gainRx, long gainRxTs, boolean wantBt, float mediaVolume) {
+        return json(nodeId, name, sent, bytes, sending, recv, lost, bufMs, streams, target,
+                wantListen, gain, gainTs, gainRx, gainRxTs, wantBt, mediaVolume, -1, false);
+    }
+
+    /**
+     * ★ 2026-11-04（Q3）：多带 {@code "send_mode"}（0/1/2）与 {@code "broadcast"}。
+     *
+     * <p>这是电脑端准入判据的**显式声明**：广播就是广播，点对点就是点对点 ——
+     * 电脑不再拿 {@code want_listen} 去推断（那个字段在广播时可能残留为 true，
+     * 曾把广播流误判成"未接受的点对点"直接丢掉）。
+     *
+     * <p>老电脑把它当未知键忽略（解析只读认识的键）；老手机不发时电脑按
+     * "拿不到声明" 处理 —— 退化行为必须是**能听**（详见电脑端 engine.py 的注释）。
+     */
+    public static byte[] json(String nodeId, String name, long sent, long bytes, boolean sending,
+                              long recv, long lost, int bufMs, int streams, String target,
+                              boolean wantListen, float gain, long gainTs,
+                              float gainRx, long gainRxTs, boolean wantBt, float mediaVolume,
+                              int sendMode, boolean broadcast) {
+        return json(nodeId, name, sent, bytes, sending, recv, lost, bufMs, streams, target,
+                wantListen, gain, gainTs, gainRx, gainRxTs, wantBt, mediaVolume, sendMode,
+                broadcast, "", "", "");
+    }
+
+    /**
+     * ★ 2026-11-08：把"音量乘数由送声档位决定"这件事显式报给电脑。
+     *
+     * <ul>
+     *   <li>{@code vol_mode}/{@code vol_source}：{@code external}（外放档，手机乘了
+     *       STREAM_MUSIC）或 {@code silent}（静音档，手机不再叠加）；</li>
+     *   <li>{@code vol_in_capture}：按档位**真实取值** —— 外放档 false、静音档 true；</li>
+     *   <li>{@code vol_policy}：静音档乘数策略（internal_only / last_nonzero）。</li>
+     * </ul>
+     * 电脑端看到 {@code vol_source} 就知道"手机已经处理过"，系数恒为 1.0 ——
+     * 两端合计只乘一次。老手机不发这些键时保持 {@code vol_in_capture:true}（v2.28 行为）。
+     */
+    public static byte[] json(String nodeId, String name, long sent, long bytes, boolean sending,
+                              long recv, long lost, int bufMs, int streams, String target,
+                              boolean wantListen, float gain, long gainTs,
+                              float gainRx, long gainRxTs, boolean wantBt, float mediaVolume,
+                              int sendMode, boolean broadcast,
+                              String volMode, String volSource, String volPolicy) {
         StringBuilder sb = new StringBuilder(256);
         sb.append("{\"t\":\"").append(TAG_STATS).append("\",\"v\":1");
+        if (nodeId != null && nodeId.length() > 0) {
+            sb.append(",\"node\":\"").append(escape(nodeId)).append('"');
+        }
         sb.append(",\"name\":\"").append(escape(name)).append('"');
         sb.append(",\"sent\":").append(sent);
         sb.append(",\"bytes\":").append(bytes);
@@ -223,6 +335,33 @@ public final class Diagnosis {
         if (gainRx != GAIN_UNSET) {
             sb.append(",\"gain_rx\":").append(gainText(gainRx));
             sb.append(",\"gain_rx_ts\":").append(gainRxTs);
+        }
+        // ★ 2026-11-03 Q3：媒体/App 音量（0..1）。老电脑忽略即可。
+        if (mediaVolume >= 0f && mediaVolume <= 1f) {
+            sb.append(",\"vol\":").append(gainText(mediaVolume));
+            // ★ 2026-11-08：手机显式声明"这一级是怎么处理的"（外放档乘、静音档不乘）。
+            //   电脑端看 vol_source 就知道已经处理过，系数恒为 1.0 —— 合计只乘一次。
+            String src = SendVolume.MODE_SILENT.equals(volSource)
+                    ? SendVolume.MODE_SILENT
+                    : (SendVolume.MODE_EXTERNAL.equals(volSource) ? SendVolume.MODE_EXTERNAL : "");
+            if (src.isEmpty()) {
+                sb.append(",\"vol_in_capture\":true");
+            } else {
+                boolean silent = SendVolume.MODE_SILENT.equals(src);
+                sb.append(",\"vol_mode\":\"").append(silent
+                        ? SendVolume.MODE_SILENT : SendVolume.MODE_EXTERNAL).append('"');
+                sb.append(",\"vol_source\":\"").append(src).append('"');
+                // 按档位真实取值：外放档 false（手机乘了系统音量）、静音档 true（手机不再叠加）。
+                sb.append(",\"vol_in_capture\":").append(silent);
+                String policy = SendVolume.normalizePolicy(volPolicy);
+                sb.append(",\"vol_policy\":\"").append(policy).append('"');
+            }
+        }
+        // ★ 2026-11-04（Q3）：显式声明送声音档位与"是不是广播线路"。
+        //   电脑端准入只认这两个键，不再从 want_listen 推断（广播时那个字段可能残留 true）。
+        if (sendMode >= 0) {
+            sb.append(",\"send_mode\":").append(sendMode);
+            sb.append(",\"broadcast\":").append(broadcast);
         }
         sb.append(",\"ts\":").append(System.currentTimeMillis());
         sb.append('}');
@@ -262,6 +401,9 @@ public final class Diagnosis {
                 return null;                     // 自称是别的类型（以后可能有别的控制包）
             }
             PeerStats ps = new PeerStats();
+            // ★ 2026-11-01：电脑的统计包一直带 node；手机自己也会带。
+            //   收端按它认设备，不再依赖"来源 IP == 信标 IP"（多网卡/VPN 时那两条会不一样）。
+            ps.node = nz(str(s, "node"));
             ps.name = nz(str(s, "name"));
             ps.sent = num(s, "sent", 0);
             ps.bytes = num(s, "bytes", 0);
@@ -272,6 +414,17 @@ public final class Diagnosis {
             ps.streams = (int) clamp(num(s, "streams", 0), 0, 10000);
             ps.target = nz(str(s, "target"));
             ps.reportTsMs = num(s, "ts", 0);
+            // ★ 2026-11-04（A）：显式接收请求 + 请求号（老电脑没有这两个键 → 空/0）。
+            ps.listenReq = nz(str(s, "listen_req"));
+            ps.listenReqId = num(s, "listen_req_id", 0);
+            // ★ 2026-11-08：电脑切换"静音档乘数策略"用同一份 T_STATS 负载。
+            ps.silentPolicy = nz(str(s, "silent_vol_policy"));
+            ps.silentPolicyReq = num(s, "silent_vol_policy_req", 0);
+            ps.silentPolicyOnly = bool(s, "silent_vol_policy_only", false);
+            // 对端回给我的 ack（手机端自己发统计时也会带；电脑端读它）。
+            ps.listenAckId = num(s, "listen_ack_id", 0);
+            ps.listenAckAction = nz(str(s, "listen_ack_action"));
+            ps.listenAckReason = nz(str(s, "listen_ack_reason"));
             // ★ 新字段（want_listen / gain / gain_ts / gain_rx / gain_rx_ts）交给 LinkPolicy 读：
             //   那段是纯逻辑，有专门的离线门禁逐条断言；老版本没有这些键时它什么都不做。
             LinkPolicy.readLinkFields(s, ps);

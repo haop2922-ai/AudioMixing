@@ -48,3 +48,19 @@ android/local.properties
 # 打包产物：20MB 级二进制不进仓库（历史里已提交的不再追改）
 release/**/*.exe
 dist_nuitka/
+
+# ── 2026-11-10 补：发布整理时发现遗漏 ──────────────────────────
+# 宣传片工程（813MB，视频素材不进代码仓库）
+promo/
+# release 子目录里的二进制（原来的 release/*.apk 只覆盖第一层）
+release/**/*.apk
+release/**/*.exe
+release/**/*.zip
+# 历史版本归档目录（体积大、且是旧包）
+release/GOGO/手机端-历史/
+release/GOGO/电脑端-历史/
+# adb 抓的日志
+tools/adb-logs/
+# UI 目录里误放的安装包、安装器载荷里的逐版 APK（走 Release，不进仓库）
+audiomixing/ui/*.apk
+tools/installer_payload/*.apk

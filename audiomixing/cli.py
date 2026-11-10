@@ -28,6 +28,28 @@ from .net import discovery as disc
 from .net.rtpaudio import JitterBuffer, Receiver, SenderSession
 
 
+def _ordered_lan_ips(node: Any, report: dict[str, Any]) -> list[str]:
+    """按「对端最可能连得上」的顺序排私网地址。
+
+    ★ 2026-11-06（真实启动自查）：`lan_report()` 的接口顺序 = Windows 网卡枚举顺序，
+    这台机器第一项是 WSL/Hyper-V 的 172.23.128.1。启动横幅原来照这个顺序打印，
+    还把第一项拿去 `--open-browser` 打开 —— 手机在 192.168.0.x，根本连不上。
+    这里复用面板那套选择规则（`_best_local_address`），把推荐地址排到第一位。
+    """
+    from .webui import _best_local_address
+
+    ips = [str(i.get("address") or "") for i in (report.get("interfaces") or [])
+           if i.get("kind") == "private" and i.get("address")]
+    try:
+        best = _best_local_address(node, report)
+    except Exception:
+        best = ""
+    if best in ips:
+        ips.remove(best)
+        ips.insert(0, best)
+    return ips
+
+
 def _print(obj: Any) -> None:
     print(json.dumps(obj, indent=2, ensure_ascii=False, default=str))
 
@@ -199,7 +221,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
         cfg.sink_device = args.sink_device
     if args.web_port:
         cfg.web_port = args.web_port
-    cfg.save()
+    # ★ 2026-11-01：这次运行实际用的音频/发现端口也要同步到内存里的 config。
+    #   否则「设置」页保存时 previous_ports 读到的是文件里的旧默认值，
+    #   自动重启 / 查重都会按错误的端口算（仍然不写盘）。
+    if args.audio_port:
+        cfg.audio_port = args.audio_port
+    if args.discovery_port:
+        cfg.discovery_port = args.discovery_port
+    # 端口是「这一次运行」的参数，不写回配置：
+    # 以前 --web-port 跑一次就把以后双击的端口也改掉，用户完全不知道。
+    # 要长期改端口，走面板「设置」页（保存后会自动重启，见 webui._schedule_restart）。
+    if not (args.web_port or args.audio_port or args.discovery_port):
+        cfg.save()
 
     node = AudioMixingNode(cfg, audio_port=args.audio_port or cfg.audio_port, discovery_port=args.discovery_port or cfg.discovery_port,
                         simulate=args.simulate)
@@ -245,7 +278,20 @@ def cmd_serve(args: argparse.Namespace) -> int:
         print("  请关闭占用它的程序后重启 Audio Mixing。")
         print()
 
-    ui = WebUI(node, host=args.host, port=cfg.web_port)
+    # ★ 2026-11-01：exe serve 也支持保存端口后自动重启（源码运行会因未打包而跳过）。
+    #   重启命令行**不带端口参数** —— 新端口已经写进配置文件，下一次启动从那里读；
+    #   带了旧端口参数会把用户刚保存的新值又顶掉。
+    restart_argv = ["serve", "--host", str(args.host)]
+    for flag, value in (("--name", args.name), ("--codec", args.codec),
+                        ("--source-device", args.source_device),
+                        ("--sink-device", args.sink_device)):
+        if value:
+            restart_argv.extend([flag, str(value)])
+    if args.simulate:
+        restart_argv.append("--simulate")
+    if args.open_browser:
+        restart_argv.append("--open-browser")
+    ui = WebUI(node, host=args.host, port=cfg.web_port, restart_argv=restart_argv)
     node.start()
     # 面板上"声音大小"那根条 / 圆心那个百分比来自**直读当前输出设备**的电平表。
     # 只在这里（真正的服务进程）打开；单元测试不会去碰真实声卡。
@@ -263,7 +309,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # address would look like a valid choice to the user and then fail on the other
     # machine -- exactly the kind of dead end this printout exists to prevent.
     lan_report = disc.lan_report()
-    lan_ips = [i["address"] for i in lan_report["interfaces"] if i["kind"] == "private"]
+    lan_ips = _ordered_lan_ips(node, lan_report)
     skipped = [i["address"] for i in lan_report["interfaces"] if i["kind"] != "private"]
     local_url = "http://127.0.0.1:%d" % port
     lan_urls = ["http://%s:%d" % (ip, port) for ip in lan_ips]

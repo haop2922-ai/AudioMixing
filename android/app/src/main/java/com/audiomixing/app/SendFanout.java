@@ -213,40 +213,19 @@ public final class SendFanout {
 
     /** 用户设过的增益（目标还没上线也要记住）。 */
     private final Map<String, Float> desiredGain = new java.util.HashMap<String, Float>();
-    /** 按增益缓存"缩放后的包"（跨包复用，避免每 10ms 分配）。 */
-    private java.util.Map<Float, byte[]> scaledBufs;
-
-    /**
-     * 把 PCM16 样本乘上增益；超过 32767 削顶（回绕会变成刺耳的爆音）。
-     *
-     * <p>和接收侧那套（{@code AudioRecv.Stream#scalePcm16}）是同一个数学，
-     * 但两边各自独立 —— 一处是"我听它的"，一处是"我送它的"。
-     */
-    private static void scalePcm16(byte[] src, byte[] dst, int len, float g) {
-        for (int i = 0; i + 1 < len; i += 2) {
-            int v = (short) ((src[i] & 0xFF) | ((src[i + 1] & 0xFF) << 8));
-            int out = Math.round(v * g);
-            if (out > 32767) {
-                out = 32767;
-            } else if (out < -32768) {
-                out = -32768;
-            }
-            dst[i] = (byte) out;
-            dst[i + 1] = (byte) (out >> 8);
-        }
-    }
 
     /**
      * 把同一包发给所有目标。
      *
-     * <p><b>快路径（绝大多数情况）</b>：所有目标的增益都是 1.00 → 一包编码一次，
-     * 所有目标发的是<b>同一个数组</b>，零额外拷贝。
-     * <b>慢路径</b>：某个目标设了自己的增益（"我送它的"滑杆），那就为那一路准备一份
-     * 缩放后的包（同一个增益值的目标共用一份），其余目标照旧用原包。
+     * <p><b>快路径（绝大多数情况）</b>：所有目标发的是<b>同一个数组</b>，零额外拷贝。
+     *
+     * <p><b>2026-11-02 起不再按目标缩放样本</b>：这条链路的共享增益只在接收端乘一次
+     * （PC 的 sink / 手机的 AudioRecv#hostGain）。发送端再乘一次会让 0.40 实际变成
+     * 0.16，用户感觉滑杆"像没效果"。每目标的 gain 仍保留在 {@link Target} 里给界面/诊断。
      *
      * @param pkt  已经编码好的整包
      * @param len  有效长度
-     * @param peak 这一包的电平（1.00 的目标用它；设了增益的目标按增益折算）
+     * @param peak 这一包的电平
      * @return 成功发出去的目标数
      */
     public int send(byte[] pkt, int len, float peak) {
@@ -267,29 +246,11 @@ public final class SendFanout {
         }
         long now = SystemClock.elapsedRealtime();
         int ok = 0;
-        // 这一包用到的"按增益缩放过的副本"（同一个增益只做一份，缓冲跨包复用，不产生垃圾）
-        if (scaledBufs == null) {
-            scaledBufs = new java.util.HashMap<Float, byte[]>(4);
-        }
 
         for (Target t : list) {
-            float g = t.gain;
             byte[] data = pkt;
-            float p = peak;
-            if (g != 1f) {
-                data = scaledBufs.get(g);
-                if (data == null || data.length < len) {
-                    data = new byte[len];
-                    scaledBufs.put(g, data);
-                    if (scaledBufs.size() > 8) {
-                        // 增益种类太多（不可能）：清掉重来，防止无限长
-                        scaledBufs.clear();
-                        scaledBufs.put(g, data);
-                    }
-                }
-                scalePcm16(pkt, data, len, g);
-                p = Math.min(1f, peak * g);
-            }
+            // 样本不缩放（只在接收端乘一次），但「送」电平仍按这一路最终听到的大小显示。
+            float p = Math.min(1f, peak * t.gain);
             try {
                 if (t.addr == null) {
                     t.addr = InetAddress.getByName(t.host);

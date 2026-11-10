@@ -6,3 +6,5 @@ dependencyResolutionManagement {
 }
 rootProject.name = "AudioMixing"
 include(":app")
+// ★ 2026-11-08：自建测试源（独立模块，只出 debug APK，不进正式交付）。
+include(":testapp")

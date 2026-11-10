@@ -1,0 +1,26 @@
+plugins { id 'com.android.application' }
+
+// ★ 2026-11-08：自建测试源（**独立模块，不混进正式 App**）。
+//   用途：判定任意第三方 App 属于「滑杆=系统媒体音量（类型 A）」还是
+//   「滑杆=内部增益（类型 B）」，并给 AudioMixing 采集链路当对照源。
+//   刻意保持零依赖、零网络、零后台服务：只在界面可见时出声。
+android {
+    namespace 'com.audiomixing.testapp'
+    compileSdk 34
+    defaultConfig {
+        applicationId "com.audiomixing.testapp"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    buildTypes { release { minifyEnabled false } }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = "UTF-8"
+}

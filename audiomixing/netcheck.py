@@ -136,27 +136,18 @@ def main(argv: list[str] | None = None) -> int:
     line("%s python      : %s" % (INFO, sys.version.split()[0]))
     line("%s config file : %s" % (INFO, config_path()))
     line("%s saved ports : web=%d audio=%d discovery=%d" % (INFO, cfg.web_port, cfg.audio_port, cfg.discovery_port))
-    # Non-default ports are the number one cause of "I typed 17800 and it does not work":
-    # the config remembers whatever a previous `--web-port` run used.
-    defaults = (17800, 47830, 47831)
+    # 非默认端口不再是"上次运行留下的痕迹"——v2.10 起「设置」页允许用户自己改。
+    # 这里只如实提示手机要用下面打印的端口，不再当成故障。
+    defaults = (17800, 17830, 47831)
     actual = (cfg.web_port, cfg.discovery_port, cfg.audio_port)
     if actual != defaults:
-        line("%s these differ from the defaults %s" % (WARN, defaults))
-        line("       a previous run with --web-port/--audio-port was saved here.")
-        line("       the phone must use the port printed below, not 17800.")
-        line("       to go back to the defaults, delete the saved config file printed above")
-        problems.append("ports changed by a previous run (web=%d)" % cfg.web_port)
+        line("%s 自定义端口：web=%d / 发现=%d / 音频=%d" % (INFO, *actual))
+        line("       手机/别的电脑必须用下面打印的端口，不是 17800。")
     line()
 
     # ---- 1. is the node running? ----------------------------------------
     line("--- 1. node status ---")
     status = probe_health(web_port)
-    if status is None and web_port != 17800:
-        if probe_health(17800) is not None:
-            line("%s nothing on port %d, but a node answers on 17800" % (WARN, web_port))
-            problems.append("saved port (%d) does not match the running node (17800)" % web_port)
-            web_port = 17800
-            status = probe_health(web_port)
     if status is None:
         line("%s no Audio Mixing node answers on port %d" % (BAD, web_port))
         line("       -> start it first: dist\\AudioMixing.exe  (or python -m audiomixing serve)")

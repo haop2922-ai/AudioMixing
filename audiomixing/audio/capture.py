@@ -21,6 +21,10 @@ from typing import Any, Callable
 # its reader thread is parked inside a source whose read() never returns.
 WEDGED_AFTER_S = 6.0
 
+# ★ 2026-11-06（第 3 条）：低于这个电平就当这一块是静音（16 位满量程约 -40dB）。
+SILENCE_PEAK = 0.01
+SILENT_AFTER_S = 20.0
+
 from .format import CHANNELS, SAMPLE_RATE, as_float_array
 
 TAP_BUFFER_BLOCKS = 64
@@ -40,6 +44,8 @@ class _Capture:
         self.error = ""
         self.blocks_read = 0
         self.frames_read = 0
+        self.peak = 0.0                 # 最近的衰减峰值（判断"在出数据但全是静音"）
+        self.last_loud_at = 0.0         # 最后一次 peak ≥ SILENCE_PEAK 的时间
         self.name = getattr(source, "name", str(spec.get("device", "")))
         self.closed = False
 
@@ -92,9 +98,19 @@ class _Capture:
                 self.next_index += 1
                 self.blocks_read += 1
                 self.frames_read += len(block) // CHANNELS
+                # ★ 2026-11-06（第 3 条）：只数"块数"会把蓝牙端点持续送 0 当成健康。
+                #   这里同时记电平，面板才能区分"有数据"和"有数据但一直是静音"。
+                try:
+                    pk = max(abs(float(v)) for v in block) if block else 0.0
+                except Exception:
+                    pk = 0.0
+                self.peak = max(pk, self.peak * 0.92)
+                now = time.monotonic()
+                if pk >= SILENCE_PEAK:
+                    self.last_loud_at = now
                 # 记下"最后一次真的收到音频"的时间。这是判断一块音源是不是空的最直接
                 # 依据，而且与设备类型无关（蓝牙/有线/USB/虚拟声卡一视同仁）。
-                self.last_block_at = time.monotonic()
+                self.last_block_at = now
                 self.lock.notify_all()
         with self.lock:
             self.closed = True
@@ -118,7 +134,9 @@ class _Capture:
         面板和诊断报告据此显示"这块音源是空的还是有数据"，不做任何设备类型的假设。
         """
         last = float(getattr(self, "last_block_at", 0.0) or 0.0)
+        loud = float(getattr(self, "last_loud_at", 0.0) or 0.0)
         now = time.monotonic()
+        silent_for = (now - loud) if loud > 0 else (now - float(getattr(self, "created_at", now) or now))
         return {
             "name": self.endpoint_name(),
             "spec": dict(self.spec),
@@ -130,6 +148,12 @@ class _Capture:
             # 一直没有数据时是 None，界面据此显示"没有音频数据"
             "last_data_age_s": round(max(0.0, now - last), 1) if last > 0 else None,
             "alive_for_s": round(max(0.0, now - float(getattr(self, "created_at", now) or now)), 1),
+            # ★ 2026-11-06（第 3 条）：这块设备"到底有没有声音"。
+            #   只数块数会把蓝牙端点持续送 0 当成健康（现场就是这样：包在走、全是静音，
+            #   面板显示"正常"，用户听到的却是没声）。peak 是衰减峰值，silent 是结论。
+            "peak": round(float(getattr(self, "peak", 0.0) or 0.0), 4),
+            "silent_for_s": round(max(0.0, silent_for), 1),
+            "silent": bool(self.blocks_read > 0 and silent_for > SILENT_AFTER_S),
         }
 
 

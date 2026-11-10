@@ -7,6 +7,8 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.text.InputType;
+import android.util.Log;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Canvas;
@@ -21,6 +23,7 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.media.AudioManager;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -293,6 +296,11 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        // ★ 2026-11-02：手机音量键要作用在媒体流上。
+        //   以前没有 setVolumeControlStream，界面在前台时音量键可能落到铃声/通知流，
+        //   表现为"按音量键声音不变"。我们播放用的就是 STREAM_MUSIC（AudioTrack 的
+        //   USAGE_MEDIA），这里明确把音量键指向它；绝不主动改系统音量。
+        setVolumeControlStream(AudioManager.STREAM_MUSIC);
         engine = Engine.get(this);
         ui = new Handler(Looper.getMainLooper());
         // ★ 系统媒体音量现在只在「详细」档和诊断报告里出现（引擎那边读的），
@@ -327,7 +335,17 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        // 故意不 stop 引擎：界面被回收不代表传输要断，那是前台服务在管的事。
+        // ★ 2026-11-01：用户按返回键/关掉界面（isFinishing）＝"关 App"，
+        //   这时必须把前台服务一起停掉，否则它会继续持有 MediaProjection，
+        //   系统状态栏一直显示「正在获取屏幕」。
+        //   按 Home 或切到别的 App 不算 finishing，后台传输照旧由服务负责。
+        if (isFinishing()) {
+            try {
+                stopService(new Intent(this, MixService.class));
+            } catch (Throwable t) {
+                Log.w("AM-Main", "关闭界面时停止前台服务失败", t);
+            }
+        }
         ui.removeCallbacks(tick);
         super.onDestroy();
     }
@@ -548,6 +566,7 @@ public class MainActivity extends Activity {
                 + (engine.localNameIsCustom() ? "（名字：用户自定义）" : "（名字：默认）"));
         put("ip", engine.localIpsText());
         put("port", engine.audioPort() + "（UDP，收发都用它）");
+        put("disc_port", engine.discoveryPort() + "（UDP，发现/控制；要和电脑一致）");
         put("found", engine.peers().size() + " 台");
         put("conn", "收听 " + engine.listeningCount() + " 台 / 送声 " + engine.sendingCount() + " 台");
         // ★ 「实际收到哪几路」：开关是意图，这一行才是事实（放最前面，跟"已连接"挨着）
@@ -555,6 +574,7 @@ public class MainActivity extends Activity {
         // ★ 发出去：几台、逐台发了多少、带宽是多少（不藏代价）
         put("send", engine.sendStatsText());
         put("volume", engine.volumeText() + "\n" + engine.systemVolumeText());
+        put("volmode", engine.volumeModeText());
         put("recv", engine.statsText());
         put("send", engine.sendStatsText());
         // 对端回话：这是"哪一端没在发"最直接的证据（对方自己说的）。
@@ -584,8 +604,26 @@ public class MainActivity extends Activity {
         //   所以这里**不再**因为"正在广播"去拦着逐台那个按钮 —— 广播是电台，
         //   逐台「送声音」是点对点，两条线互不相干：广播开着也能单独补送给某台。
         if (engine.isSending(p)) {
-            engine.setSending(p, false);
-            toast("已停止送给 " + p.label());
+            // ★ 2026-11-04（第 4 条 + 第 2 档）：用户要求"按一下换一下"的循环，**不弹窗**。
+            //   顺序固定 0 → 1 → 2 → 0：
+            //     第 1 档（送声+外放）→ 再按一次进入第 2 档（送声+手机静音）；
+            //     第 2 档 → 再按一次回到第 0 档（停止送声，并还原系统媒体音量）。
+            int mode = engine.sendMode();
+            if (mode >= 2) {
+                engine.setSendMode(0);      // 内部会把音量还原
+                toast("已停止送声音：" + p.label() + "（第 0 档）");
+            } else {
+                engine.setSendMode(2);
+                toast("第 2 档：手机会静音，声音仍在传给电脑");
+            }
+            refreshNow();
+            return;
+        }
+        // 已经在送别的设备（档位 1/2）：把这一台加进目标，保持当前档位。
+        // 这就是"多送一台只是多一个收包人"，不重建采集。
+        if (engine.sendMode() >= 1 && engine.sourceEnabled()) {
+            engine.setSending(p, true);
+            toast("开始送声音：" + p.label() + "（第 " + engine.sendMode() + " 档）");
             refreshNow();
             return;
         }
@@ -678,6 +716,8 @@ public class MainActivity extends Activity {
         }
         d.show();
     }
+
+    // ★ 2026-11-04（第 4 条）：三档弹窗已删除，改为「按一下换一下」的循环按键（0↔1）。
 
     /**
      * ★ ④ 请**电脑**去连我的蓝牙（用户原话：「手机确认走蓝牙后应当由电脑发送蓝牙请求
@@ -1274,6 +1314,7 @@ public class MainActivity extends Activity {
         kv("本机名称", "name");
         kv("本机 IP", "ip");
         kv("音频端口", "port");
+        kv("发现端口", "disc_port");
         kv("已发现", "found");
         kv("已连接", "conn");
         kv("实际收到", "streams");
@@ -1283,7 +1324,176 @@ public class MainActivity extends Activity {
         // ★ 对端自己报的统计（两台设备互报的"我发了多少/我收了你多少"）
         kv("对端回话", "peers");
         kv("发现统计", "disc");
+
+        // ★ 2026-11-08（用户方案）：音量乘数绑在送声档位上；这里只暴露"静音档乘数策略"。
+        kv("音量乘数", "volmode");
+
+        // ★ 2026-11-01 用户：手机端没有端口修改，电脑改端口后手机连不上。
+        //   这里放在「详细」档，和电脑的「设置 → 端口设置」对应：
+        //   · 发现端口：要和电脑一致，否则收不到对方的信标/控制消息；
+        //   · 音频端口：本机接收声音的 UDP 端口，电脑按信标里的这个值发过来。
+        detailWrap.addView(buildPortSettings(), margins(MATCH, WRAP, 0, dpi(14), 0, 0));
+        detailWrap.addView(buildVolumePolicySettings(), margins(MATCH, WRAP, 0, dpi(14), 0, 0));
         return card;
+    }
+
+    /**
+     * ★ 2026-11-08（用户方案）：静音档乘数策略 —— 两个选项，中文写清。
+     *
+     * <p>外放档永远乘当前系统媒体音量，与本项无关；静音档里 {@code STREAM_MUSIC} 被我们
+     * 锁在 0，默认 {@code internal_only}（乘 1.0，只保留 App 内部增益）。
+     * 两条限制也写在下面，不能让用户自己猜。
+     */
+    private View buildVolumePolicySettings() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+
+        box.addView(text("静音档音量乘数（只影响第 2 档；外放档永远乘系统媒体音量）", 11.5f, DIM, false));
+
+        final TextView status = text(engine.volumeModeText(), 11.5f, DIM, false);
+        status.setLineSpacing(dp(2), 1f);
+        box.addView(status, margins(MATCH, WRAP, 0, dpi(4), 0, dpi(6)));
+
+        final TextView internal = chip("只用 App 内部音量（推荐）");
+        final TextView last = chip("沿用进静音前的音量");
+        final Runnable paint = new Runnable() {
+            @Override
+            public void run() {
+                boolean useLast = SendVolume.POLICY_LAST.equals(engine.silentVolPolicy());
+                styleChip(internal, !useLast, "只用 App 内部音量（推荐）");
+                styleChip(last, useLast, "沿用进静音前的音量");
+                setTextIfChanged(status, engine.volumeModeText());
+            }
+        };
+        internal.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                engine.setSilentVolPolicy(SendVolume.POLICY_INTERNAL, true);
+                paint.run();
+                toast("静音档改为：只用 App 内部音量（乘 1.0）");
+            }
+        });
+        last.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                engine.setSilentVolPolicy(SendVolume.POLICY_LAST, true);
+                paint.run();
+                toast("静音档改为：沿用进静音前的音量");
+            }
+        });
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dpi(40), 1f);
+        row.addView(internal, lp);
+        LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(0, dpi(40), 1f);
+        lp2.leftMargin = dpi(8);
+        row.addView(last, lp2);
+        box.addView(row);
+
+        TextView limits = text("注意：静音档乘 1.0 时耳机侧相当于满格放，从外放档切过来可能明显变响；"
+                + "滑杆本身改系统媒体音量的 App（B 站、抖音这类）在静音档里调音量无效，要用滑杆请切外放档；"
+                + "内部增益类 App（YouTube 播放器这类）不受影响。", 11.5f, DIM, false);
+        limits.setLineSpacing(dp(2), 1f);
+        box.addView(limits, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+
+        paint.run();
+        return box;
+    }
+
+    /** 「详细」档里的端口设置：发现/音频两个输入框 + 保存。 */
+    private View buildPortSettings() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+
+        TextView title = text("发现端口设置（手机/电脑必须一致；保存后自动重启发现服务）", 11.5f, DIM, false);
+        title.setLineSpacing(dp(2), 1f);
+        box.addView(title);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        EditText disc = new EditText(this);
+        disc.setInputType(InputType.TYPE_CLASS_NUMBER);
+        disc.setText(String.valueOf(engine.configuredDiscoveryPort()));
+        disc.setHint("发现端口 17830");
+        disc.setTextSize(12f);
+        disc.setTextColor(FG);
+        disc.setSingleLine(true);
+        row.addView(disc, new LinearLayout.LayoutParams(0, dpi(42), 1f));
+
+        TextView save = chip("💾 保存端口");
+        save.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                int d;
+                try {
+                    d = Integer.parseInt(disc.getText().toString().trim());
+                } catch (Throwable t) {
+                    toast("端口必须是数字");
+                    return;
+                }
+                if (!engine.savePorts(d)) {
+                    toast("端口不合法：范围 1024–65534");
+                    return;
+                }
+                // ★ 2026-11-01 用户：「修改端口号后自动重启」。
+                //   发现端口是启动时绑死的，保存后必须真的重绑；不再让用户手动重启 App。
+                toast("已保存发现端口 " + d + "，正在自动重启…");
+                restartDiscovery(d);
+            }
+        });
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(WRAP, dpi(42));
+        slp.leftMargin = dpi(8);
+        row.addView(save, slp);
+
+        box.addView(row, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
+        TextView auto = text("音频端口：自动选择（信标里公布，电脑按它发过来），不需要手填。",
+                10.5f, DIM, false);
+        auto.setLineSpacing(dp(2), 1f);
+        box.addView(auto, margins(MATCH, WRAP, 0, dpi(4), 0, 0));
+        TextView hint = text("只有「发现端口」需要和电脑端一致；面板端口/音频端口由电脑自动选择，"
+                + "手机通过发现信标读取。", 10.5f, DIM, false);
+        hint.setLineSpacing(dp(2), 1f);
+        box.addView(hint, margins(MATCH, WRAP, 0, dpi(4), 0, 0));
+        return box;
+    }
+
+    /**
+     * 保存发现端口后自动重启引擎（2026-11-01 用户要求）。
+     *
+     * <p>为什么必须 stop→start：发现 socket 在启动那一刻就绑死了，只改
+     * SharedPreferences 不会换端口。放在后台线程里做，避免 UI 卡在
+     * Discovery/AudioRecv 的 join 上；重启期间界面照常显示，完成后刷新一次。
+     */
+    private void restartDiscovery(final int wantPort) {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    engine.stop();
+                    engine.start();
+                } catch (Throwable t) {
+                    Log.w("AudioMixing", "端口保存后的自动重启失败", t);
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            toast("自动重启失败：" + t);
+                        }
+                    });
+                    return;
+                }
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        toast("发现端口 " + wantPort + " 已生效");
+                        refreshNow();
+                    }
+                });
+            }
+        }, "am-port-restart").start();
     }
 
     /** ★ 监控档：一屏读完的实时数字面板（全部来自 Engine 已有的查询接口，不另算一套）。 */
@@ -1528,14 +1738,57 @@ public class MainActivity extends Activity {
 
             @Override
             public void onStopTrackingTouch(SeekBar sb) {
+                // ★ 2026-11-01 真机自测：拖动过程按 120ms 节流，松手时补发一次**最终值**。
+                //   否则一次快速拖动的最后一个值可能被电脑端的 1.2 秒防抢挡掉，
+                //   两端会停在中间值（实测松手 0.51，几秒后又弹回 1.45）。
+                engine.pokeStats();
             }
         });
         return row;
     }
 
-    /** 「送声音」按钮上的字：图标直接表达当前音源（🔊 本机声音 / 🎤 麦克风）。 */
+    /**
+     * 未激活的可调音量条要和 PC 端长得一样：灰掉、不能拖、数值写「—」。
+     *
+     * <p>只改"表现"，不改引擎里的值 —— 链路一旦连上，下一帧 {@code sync()} 会恢复成
+     * 真实值。PC 端（index.html 的 {@code gainTargetFor}）就是"没有那条路由/目标时
+     * target 为 null → 滑杆 disabled"，这里用的是同一套判据。
+     */
+    private void styleGainBar(SeekBar bar, boolean active, float value) {
+        if (bar == null) {
+            return;
+        }
+        bar.setEnabled(active);
+        bar.setAlpha(active ? 1f : 0.35f);
+        Object tag = bar.getTag();
+        if (tag instanceof TextView) {
+            TextView shown = (TextView) tag;
+            shown.setAlpha(active ? 1f : 0.35f);
+            setTextIfChanged(shown, active
+                    ? String.format(Locale.US, "%.2f", value) : "—");
+        }
+    }
+
+    /**
+     * 「送声音」按钮上的字：图标表达当前音源（🔊 本机声音 / 🎤 麦克风），后缀表达档位。
+     *
+     * ★ 2026-11-04（Q3 + 第 2 档）：同一颗按钮表达档位，循环 0 → 1 → 2 → 0。
+     * 用户要求"别新加一排按钮"。
+     */
+    private static String sendChipLabel(int kind, int mode) {
+        String src = (kind == AudioSend.SRC_PLAYBACK) ? "🔊" : "🎤";
+        if (mode >= 2) {
+            return src + " 送声中 · 手机静音";
+        }
+        if (mode == 1) {
+            return src + " 送声中 · 外放";
+        }
+        return src + " 送声音";
+    }
+
+    /** 兼容旧调用：只看音源，按第 0 档文字。 */
     private static String sendChipLabel(int kind) {
-        return kind == AudioSend.SRC_PLAYBACK ? "🔊 送声音" : "🎤 送声音";
+        return sendChipLabel(kind, 0);
     }
 
     private View buildEmptyCard() {
@@ -1630,6 +1883,21 @@ public class MainActivity extends Activity {
         pill.setTextColor(color);
     }
 
+    /**
+     * ★ 2026-11-04（A 硬规则）：广播开着时「智连」按钮置灰 + 写明原因。
+     * 只改按钮可用性/透明度/文案，不碰任何路由开关（广播不碰用户已勾的选择）。
+     */
+    private void applySmartAvailability(TextView chip, boolean available) {
+        if (chip == null) {
+            return;
+        }
+        chip.setEnabled(available);
+        chip.setAlpha(available ? 1f : 0.45f);
+        chip.setText(available ? "智连" : "智连·广播中不可用");
+        chip.setContentDescription(available ? "智连"
+                : "广播模式不能和智连组合：智连只服务具名点对点");
+    }
+
     /** 开关按钮：关 = 透明底 + 细描边；开 = 蓝紫渐变实底（对齐网页版 .seg button.sel）。 */
     private void styleChip(TextView v, boolean on, String label) {
         GradientDrawable d = new GradientDrawable();
@@ -1709,7 +1977,12 @@ public class MainActivity extends Activity {
         private boolean styledListen;
         private boolean styledSend;
         private boolean styledSmart;
+        // ★ 2026-11-04（A 硬规则）：广播开着时「智连」不可用；记住上次的可用状态，
+        //   只在变化时改按钮，避免每 150ms 反复 setAlpha/setEnabled。
+        private boolean styledSmartAvail = true;
         private int styledSrc = -1;
+        /** ★ 2026-11-04（Q3）：这颗按钮上一次显示的档位（0/1/2），只在变化时重建。 */
+        private int styledSendMode = -1;
 
         PeerRow(Discovery.Peer p) {
             this.peer = p;
@@ -1796,10 +2069,21 @@ public class MainActivity extends Activity {
             llp.weight = 1f;
             btns.addView(listenChip, llp);
 
-            sendChip = chip(sendChipLabel(engine.sourceKind()));            sendChip.setOnClickListener(new View.OnClickListener() {
+            sendChip = chip(sendChipLabel(engine.sourceKind()));
+            sendChip.setOnClickListener(new View.OnClickListener() {
                 @Override
                 public void onClick(View v) {
                     onSendClick(peer);
+                }
+            });
+            // ★ 2026-11-04（第 4 条 + 第 2 档）：长按把三档顺序、静音语义、还原路径
+            //   与副作用一次说全 —— 用户明确要求"详情/长按里写清"。
+            sendChip.setOnLongClickListener(new View.OnLongClickListener() {
+                @Override
+                public boolean onLongClick(View v) {
+                    toast("送声音按一下换一档：0 停止 → 1 送声+外放 → 2 送声+手机静音 → 0。"
+                            + Engine.SEND_MODE_SILENT_NOTE);
+                    return true;
                 }
             });
             LinearLayout.LayoutParams slp = margins(0, dpi(44), dpi(8), 0, 0, 0);
@@ -1814,6 +2098,11 @@ public class MainActivity extends Activity {
             smartChip.setOnClickListener(new View.OnClickListener() {
                 @Override
                 public void onClick(View v) {
+                    // ★ 广播和智连不能组合：点击时再挡一次（即使按钮因刷新延迟还亮着）。
+                    if (engine.isBroadcasting()) {
+                        toast("广播模式不能和智连组合：智连只服务具名点对点。请先关闭广播。");
+                        return;
+                    }
                     boolean on = engine.toggleSmart(peer.host);
                     toast(on ? ("已开「智连」：" + peer.label() + " 送声音过来会自动收听")
                              : ("已关「智连」：" + peer.label() + " 以后要自己点「🎧 收听」"));
@@ -1833,30 +2122,43 @@ public class MainActivity extends Activity {
             boolean send = engine.isSending(peer);
             // 按钮上的图标直接表达"送的是什么"：🔊 本机声音 / 🎤 麦克风。
             int src = engine.sourceKind();
+            // ★ 2026-11-04（Q3）：档位只对"正在送这台"有意义；没送时显示第 0 档的文字。
+            int sendMode = send ? engine.sendMode() : 0;
             boolean smart = engine.isSmart(peer.host);
-            // 只在状态真的变了才重建背景（每 150ms 重来一次会一直产生垃圾对象）
+            // ★ 2026-11-04（A 硬规则）：广播模式和智连不能组合。广播开着时按钮置灰、
+            //   文案写"广播中不可用"，点击给出原因；关掉广播立刻恢复。UI 和引擎双保险
+            //   （引擎 setSmart 也会拒绝，防止旧界面绕过）。
+            boolean smartAvail = !engine.isBroadcasting();
             if (!styledOnce) {
                 styledOnce = true;
                 styledListen = listen;
                 styledSend = send;
                 styledSrc = src;
+                styledSendMode = sendMode;
                 styledSmart = smart;
+                styledSmartAvail = smartAvail;
                 styleChip(listenChip, listen, "🎧 收听");
-                styleChip(sendChip, send, sendChipLabel(src));
+                styleChip(sendChip, send, sendChipLabel(src, sendMode));
                 styleChip(smartChip, smart, "智连");
+                applySmartAvailability(smartChip, smartAvail);
             } else {
                 if (listen != styledListen) {
                     styledListen = listen;
                     styleChip(listenChip, listen, "🎧 收听");
                 }
-                if (send != styledSend || src != styledSrc) {
+                if (send != styledSend || src != styledSrc || sendMode != styledSendMode) {
                     styledSend = send;
                     styledSrc = src;
-                    styleChip(sendChip, send, sendChipLabel(src));
+                    styledSendMode = sendMode;
+                    styleChip(sendChip, send, sendChipLabel(src, sendMode));
                 }
                 if (smart != styledSmart) {
                     styledSmart = smart;
                     styleChip(smartChip, smart, "智连");
+                }
+                if (smartAvail != styledSmartAvail) {
+                    styledSmartAvail = smartAvail;
+                    applySmartAvailability(smartChip, smartAvail);
                 }
             }
 
@@ -1901,18 +2203,28 @@ public class MainActivity extends Activity {
 
             // ★ 两条可调滑杆跟着引擎里的真实值走（对方重新上线、接收器重建之后不会"跳回 1.00"）；
             //   正在被用户拖的那条不动（否则会跟手指打架）。
+            float recvGain = engine.peerRecvGain(peer.host);
+            float sendGain = engine.peerSendGain(peer.host);
             if (recvGainBar != null && !recvGainBar.isPressed()) {
-                int want = Math.round(engine.peerRecvGain(peer.host) * 100);
+                int want = Math.round(recvGain * 100);
                 if (recvGainBar.getProgress() != want) {
                     recvGainBar.setProgress(want);
                 }
             }
             if (sendGainBar != null && !sendGainBar.isPressed()) {
-                int want = Math.round(engine.peerSendGain(peer.host) * 100);
+                int want = Math.round(sendGain * 100);
                 if (sendGainBar.getProgress() != want) {
                     sendGainBar.setProgress(want);
                 }
             }
+            // ★ 2026-11-01 用户：「未激活的音量条应该像 PC 端一样是灰色的，手机端依旧是可调」。
+            //   PC 端的判据是"这条链路现在有没有对象"：没有路由就灰掉、写「—」、不能拖。
+            //   手机照抄同一套：
+            //     · 我听它的 —— 只有真的有一条"它→我"的收听才可调；
+            //     · 我送它的 —— 只有真的在送它（或广播覆盖到它）才可调。
+            //   不能只看"这台设备在线"，否则会出现"调了一个根本不存在的音量"。
+            styleGainBar(recvGainBar, listen, recvGain);
+            styleGainBar(sendGainBar, getsMySound, sendGain);
 
             String st;
             int color;

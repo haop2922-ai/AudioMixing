@@ -59,7 +59,7 @@
 fetch('/api/app', {cache:'no-store'}).then(r => r.json()).then(d => {
   if(!d.available){
     document.getElementById('dlCard').innerHTML =
-      '<div class="dim">这台电脑上还没有手机端安装包（<span class="mono">AudioMixing-手机版.apk</span>）。<br>'
+      '<div class="dim">这台电脑上还没有手机端安装包（文件名应形如 <span class="mono">AudioMixing-手机版-v版本号.apk</span>）。<br>'
       + '把它放到<b>程序（Audio Mixing.exe）旁边</b>，然后刷新本页。</div>';
     return;
   }

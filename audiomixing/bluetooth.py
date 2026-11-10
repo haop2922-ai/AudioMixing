@@ -87,8 +87,14 @@ foreach ($d in $devs) {
   try { $c = $apcT::TryCreateFromId($d.Id); if ($c) { $state = $c.State.ToString() } } catch { }
   $active = $false
   $hfp = $false
+  # ★ v2.26 第 3 条：原来用 "*名字*" 做子串匹配 —— 短名字 A 会把
+  #   "A的平板 A2DP SNK" 也认成自己的端点，于是一张卡下挂了好几个
+  #   别的设备的端点（用户诊断包里的"端点交叉命名"）。改成**按词边界**匹配：
+  #   名字前面必须是开头/空格/左括号，后面必须是空格/右括号/结尾。
+  #   "麦克风 (A A2DP SNK)" 仍然命中；"A的平板..." 因为后面是"的"而不再命中。
+  $pattern = '(^|\s|\()' + [regex]::Escape([string]$d.Name) + '(\s|\)|$)'
   foreach ($e in $endpoints) {
-    if ($e.FriendlyName -like ("*" + $d.Name + "*") -and $e.Status -eq "OK") {
+    if ($e.FriendlyName -match $pattern -and $e.Status -eq "OK") {
       if ($e.FriendlyName -like "*A2DP*") { $active = $true }
       if ($e.FriendlyName -like "*Hands-Free*") { $hfp = $true }
     }
@@ -141,6 +147,137 @@ def available() -> bool:
     return sys.platform == "win32" and bool(POWERSHELL)
 
 
+def _radio_from_registry() -> str:
+    """直接从 PnP 注册表读蓝牙无线电模块的名字（不启动 PowerShell）。
+
+    ★ 2026-10-26 现场：打包版第一次诊断时 PowerShell 那条路 9.8 秒还返回空，
+      同一次请求里后续再查一次却正常。诊断页不该为了一行型号等十秒，也不该
+      第一次就显示「未知」。蓝牙适配器在 `Enum\\USB` 里的 `ClassGUID` 是固定的
+      Bluetooth 类 GUID、`Service` 是 BTHUSB，`DeviceDesc` 里带真实型号；
+      读注册表只要几毫秒，也不受 PowerShell/杀软第一次拦截影响。
+    """
+    if sys.platform != "win32":
+        return ""
+    try:
+        import winreg
+    except ImportError:
+        return ""
+    bt_class = "{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}"
+
+    def clean(value: Any) -> str:
+        text = str(value or "").strip()
+        if ";" in text:
+            text = text.rsplit(";", 1)[-1].strip()
+        if not text or text.startswith("@"):
+            return ""
+        return text
+
+    for bus in ("USB", "PCI"):
+        try:
+            root = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SYSTEM\CurrentControlSet\Enum\%s" % bus)
+        except OSError:
+            continue
+        try:
+            index = 0
+            while True:
+                try:
+                    vendor = winreg.EnumKey(root, index)
+                except OSError:
+                    break
+                index += 1
+                try:
+                    vendor_key = winreg.OpenKey(root, vendor)
+                except OSError:
+                    continue
+                try:
+                    child = 0
+                    while True:
+                        try:
+                            instance = winreg.EnumKey(vendor_key, child)
+                        except OSError:
+                            break
+                        child += 1
+                        try:
+                            dev = winreg.OpenKey(vendor_key, instance)
+                        except OSError:
+                            continue
+                        try:
+                            service = guid = desc = friendly = ""
+                            for value_name in ("Service", "ClassGUID", "DeviceDesc", "FriendlyName"):
+                                try:
+                                    value, _typ = winreg.QueryValueEx(dev, value_name)
+                                except OSError:
+                                    value = ""
+                                if value_name == "Service":
+                                    service = str(value or "")
+                                elif value_name == "ClassGUID":
+                                    guid = str(value or "")
+                                elif value_name == "DeviceDesc":
+                                    desc = clean(value)
+                                else:
+                                    friendly = clean(value)
+                            if service.lower() != "bthusb" and guid.lower() != bt_class:
+                                continue
+                            name = desc or friendly
+                            if name:
+                                return name
+                        finally:
+                            dev.Close()
+                finally:
+                    vendor_key.Close()
+        finally:
+            root.Close()
+    return ""
+
+
+def radio_name() -> str:
+    """本机蓝牙适配器的名字（诊断用）。拿不到就空串。
+
+    ★ 2026-10-26 用户（图1）：AMD 机器的诊断里这一行写「未知」。根因不是没适配器，
+      而是旧实现取的是 `Get-PnpDevice -Class Bluetooth` 里第一个 Status=OK 的设备 ——
+      那通常是「对象推送服务」「蓝牙外围设备」之类的协议服务，有的机器（例如
+      MediaTek/Realtek 模块）适配器本身根本不在这个 Class 里，于是什么也取不到。
+      现在按 PnP 实体全表找名字含 Bluetooth/蓝牙、但不含“服务/枚举/外围…”的那一条，
+      优先 `USB\\VID...` 的真实无线电模块（Intel / MediaTek / Realtek 模块都是这种）。
+    """
+    # 注册表这条最快、最稳，优先用它；拿不到才退回 PowerShell 枚举。
+    registry = _radio_from_registry()
+    if registry:
+        return registry
+    if not available():
+        return ""
+    # ★ 2026-10-26 现场：脚本文件里的中文会让 Windows PowerShell 5.1 的
+    #   “无 BOM UTF-8 按 ANSI 读”把整段解析坏掉（实测：`适配器` 那一行一加进去，
+    #   同一份脚本立刻从有输出变成空输出）。所以脚本里**一个中文都不写**：
+    #   “蓝牙”用两个字符码拼出来，其余筛选用英文关键字。
+    script = r"""
+$btWord = [string][char]0x84DD + [string][char]0x7259
+$all = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object {
+  $_.Status -eq 'OK' -and
+  $_.FriendlyName -match ('Bluetooth|' + $btWord) -and
+  $_.FriendlyName -notmatch 'Service|Enumerator|RFCOMM|Rfcomm|Profile|Device Information|Generic|Personal Area|Phonebook|SIM|Gateway|Serial|XINPUT|HID|Chat|PAN|AVRCP|Transport'
+})
+$radio = $all | Where-Object { $_.InstanceId -match '^USB\\VID' } | Select-Object -First 1
+if (-not $radio) {
+  $radio = $all | Where-Object { $_.FriendlyName -match 'Adapter' } | Select-Object -First 1
+}
+if (-not $radio) { $radio = $all | Select-Object -First 1 }
+if ($radio) { $radio.FriendlyName }
+"""
+    # 打包版第一次诊断偶发空结果（第一次 PowerShell/WMI 被安全软件拦下，或
+    # WMI 提供程序尚未预热）。空结果重试一次，成功就返回。
+    for attempt in range(2):
+        try:
+            text = (_run(script, timeout=20 if attempt == 0 else 8) or "").strip()
+        except Exception:
+            text = ""
+        if text:
+            return text
+    return ""
+
+
 def _run(script: str, timeout: float = 25.0) -> str:
     with tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False, encoding="utf-8") as fh:
         fh.write(script)
@@ -157,6 +294,79 @@ def _run(script: str, timeout: float = 25.0) -> str:
             os.unlink(path)
         except OSError:
             pass
+
+
+_RADIO_CACHE: dict[str, Any] = {"at": 0.0, "present": False, "state": "unknown", "name": ""}
+
+
+def radio_state(force: bool = False) -> dict[str, Any]:
+    """蓝牙无线电的**实际状态**（第 3 条）：有没有适配器、开没开。
+
+    为什么需要它：面板原来只要"配对列表为空"就写「没有可用于接收音频的蓝牙设备，
+    请先配对」—— 可用户现场是**蓝牙开关没开**，按这句话去配对当然配不了，
+    文案直接把方向指错了。这里区分：
+      · present=False           → 这台机器没有蓝牙模块（或驱动未装）
+      · state=off / disabled    → 有适配器，但蓝牙开关是关的
+      · state=on                → 有适配器且开着，此时列表为空才是"还没配对"
+    只读、不弹窗、不改任何系统设置；读不到就如实返回 unknown（面板据它说"读不到"，
+    不编结论）。
+    """
+    with _LOCK:
+        now = time.monotonic()
+        cached = dict(_RADIO_CACHE)
+        if not force and now - float(cached.get("at") or 0.0) < 30.0 and cached.get("at"):
+            return cached
+    name = radio_name()
+    present = bool(name)
+    state_text = "unknown"
+    if present and available():
+        # 只取状态；脚本里不写中文（PowerShell 5.1 无 BOM 时会把中文解析坏）。
+        script = r"""
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+try {
+  $null = [Windows.Devices.Radios.Radio,Windows.Devices.Radios,ContentType=WindowsRuntime]
+  $op = [Windows.Devices.Radios.Radio]::GetRadiosAsync()
+  $n = 0
+  while ($op.Status -ne 1 -and $n -lt 200) { Start-Sleep -Milliseconds 10; $n++ }
+  $radios = $op.GetResults()
+  $bt = $radios | Where-Object { "$($_.Kind)" -eq 'Bluetooth' } | Select-Object -First 1
+  if ($bt) { "$($bt.State)" } else { "None" }
+} catch { "Unknown" }
+"""
+        try:
+            state_text = (_run(script, timeout=8) or "").strip() or "unknown"
+        except Exception:
+            state_text = "unknown"
+        low = state_text.lower()
+        state_text = ("on" if low == "on" else "off" if low == "off"
+                      else "disabled" if low == "disabled" else "unknown")
+    elif not present:
+        state_text = "absent"
+    result = {"at": time.monotonic(), "present": present,
+              "state": state_text, "name": name}
+    with _LOCK:
+        _RADIO_CACHE.update(result)
+    return result
+
+
+def empty_reason() -> str:
+    """配对列表为空时，**按真实原因**给一句该怎么做的提示（第 3 条）。"""
+    if not available():
+        return "这台电脑不是 Windows（或找不到 PowerShell），无法读取蓝牙设备。"
+    rs = radio_state()
+    name = str(rs.get("name") or "").strip()
+    if not rs.get("present"):
+        return ("没有检测到蓝牙适配器：这台电脑没有蓝牙模块，或蓝牙驱动没装好。"
+                "台式机可以插一个 USB 蓝牙适配器后再试。")
+    if rs.get("state") in ("off", "disabled"):
+        return ("蓝牙已关闭：先打开 Windows 的蓝牙开关（设置 → 蓝牙和其他设备），"
+                "再回到这里刷新。")
+    if rs.get("state") == "unknown":
+        return ("检测到蓝牙适配器（%s），但读不到蓝牙开关状态。请先确认 Windows 蓝牙开关已打开，"
+                "再在 Windows 设置里配对手机一次（手机端不用装任何 App）。" % (name or "未知型号"))
+    return ("蓝牙已打开（%s），但还没有配对过能送声音的手机："
+            "到 Windows 设置 → 蓝牙和其他设备 → 添加设备，把手机配对一次"
+            "（手机端不用装任何 App）。" % (name or "未知型号"))
 
 
 def list_devices() -> list[dict[str, Any]]:
@@ -228,11 +438,112 @@ def list_devices() -> list[dict[str, Any]]:
             "hfp": hfp,
             "link": link,
         })
-    return out
+    return merge_paired_devices(out)
+
+
+def merge_paired_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    '''把**同一台物理设备**的多条历史配对记录合成一张卡。
+
+    ★ v2.26 第 3 条：用户诊断包里是 4 条历史配对，全 Closed，端点还交叉命名。
+      Windows 的 AudioPlaybackConnection 会为同一台手机重装/换用不同配对通道
+      留下多条记录。这里只按**强证据**合并：
+
+        · 同一个蓝牙地址（device_address 取出的 12 位 MAC）—— 同 MAC 一定是同一台；
+        · 没有地址时，名字归一后完全相同。
+
+      刻意**不**按"名字是另一个名字的前缀/包含关系"合并：`A` 和 `A的平板`
+      很像，但完全可能是手机和平板两台真实设备，合并错了比多一张卡更糟
+      （项目里一直用"宁可多一张卡"的原则）。那些按词边界不再交叉命中的端点，
+      会在各自的卡片上正确显示。
+
+    合并后的卡带 `ids`（全部历史配对 id）与 `merged_count`，断开时要把它们都断掉，
+    否则另一条历史记录还会把链路拉起来。
+    '''
+    groups: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for device in devices:
+        address = "".join(ch for ch in str(device.get("address") or "")
+                          if ch.isalnum()).upper()
+        name = " ".join(str(device.get("name") or "").split()).casefold()
+        if address:
+            key = "mac:" + address
+        elif name:
+            key = "name:" + name
+        else:
+            key = "id:" + str(device.get("id") or "")
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(device)
+
+    def rank(device: dict[str, Any]) -> tuple[int, int]:
+        link = str(device.get("link") or "")
+        return ({'connected': 0, 'waiting': 1, 'hfp': 2}.get(link, 3),
+                -int(device.get("endpoint") or 0))
+
+    merged: list[dict[str, Any]] = []
+    for key in order:
+        items = sorted(groups[key], key=rank)
+        primary = dict(items[0])
+        ids = []
+        for item in items:
+            value = str(item.get("id") or "")
+            if value and value not in ids:
+                ids.append(value)
+        names = []
+        for item in items:
+            label = str(item.get("name") or "")
+            if label and label not in names:
+                names.append(label)
+        primary["ids"] = ids
+        primary["merged_count"] = len(items)
+        primary["aliases"] = names[1:]
+        primary["held"] = any(bool(item.get("held")) for item in items)
+        primary["endpoint"] = any(bool(item.get("endpoint")) for item in items)
+        primary["hfp"] = any(bool(item.get("hfp")) for item in items)
+        if len(items) > 1:
+            # 两条历史配对里只要有一条还连着，这张卡就按连着的那条显示。
+            primary["state"] = next((str(item.get("state")) for item in items
+                                     if str(item.get("link")) == "connected"),
+                                    primary.get("state"))
+        merged.append(primary)
+    return merged
+
+
+def cleanup_stale_records() -> dict[str, Any]:
+    '''清理**本程序自己**留下的旧蓝牙记录（临时目录里的 .keep/.pid/.status）。
+
+    ★ v2.26 第 3 条：用户要求"历史失效配对能够清理"。这里必须诚实：
+      Windows 的配对记录在注册表 / 系统设置里，本程序**只读不写**，删不掉。
+      所以这个按钮只清我们自己的 helper 状态文件；Windows 里那 4 条配对记录
+      需要用户到「设置 → 蓝牙和其他设备」手动删除（界面按钮下会写明这一点）。
+    '''
+    removed = 0
+    # 助手状态文件的名字是 `_key(device_id)`（sha1 前 12 位），不是原始 id。
+    keep = {_key(str(item.get("id") or "")) for item in list_devices()}
+    try:
+        files = list(_STATE_DIR.glob("*"))
+    except OSError:
+        files = []
+    for path in files:
+        if not path.is_file():
+            continue
+        stem = path.name.split('.', 1)[0]
+        if stem in keep:
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return {"removed": removed,
+            "note": ("已清理本程序自己的 %d 个旧蓝牙记录。Windows 的配对记录本程序只读不写，"
+                     "如果列表里还有失效的旧配对，请到 Windows 设置 → 蓝牙和其他设备里删除。"
+                     % removed)}
 
 
 def device_address(instance_id: str) -> str:
-    """从 Windows 的设备实例 ID 里取出蓝牙地址，形如 5C:A0:6C:CA:0A:6E。
+    r"""从 Windows 的设备实例 ID 里取出蓝牙地址，形如 5C:A0:6C:CA:0A:6E。
 
     实例 ID 长这样，中间那 12 位十六进制**就是地址本身**：
         \\?\BTHENUM#{...}_VID&..._PID&...#b&62612bf&0&5CA06CCA0A6E_C00000000#{...}\SNK
@@ -299,7 +610,7 @@ def _forget(device_id: str) -> None:
     that owned it, or the panel would keep promising a connection that is not there.
     """
     key = _key(device_id)
-    for suffix in ("keep", "pid", "status", "log"):
+    for suffix in ("keep", "pid", "status", "log", "ps1"):
         try:
             (_STATE_DIR / ("%s.%s" % (key, suffix))).unlink(missing_ok=True)
         except OSError:
@@ -418,7 +729,8 @@ def connect(device_id: str) -> dict[str, Any]:
             _stop_helper(pid_file)
         # A previous attempt may have left files behind; start from a clean slate so a
         # stale "open:..." can never make the panel claim a connection that is gone.
-        for stale in (sentinel, status_file, pid_file, log_file):
+        for stale in (sentinel, status_file, pid_file, log_file,
+                      _STATE_DIR / ("%s.ps1" % key)):
             try:
                 stale.unlink(missing_ok=True)
             except OSError:
@@ -426,9 +738,10 @@ def connect(device_id: str) -> dict[str, Any]:
                 pass
         sentinel.write_text("1", encoding="utf-8")
         status_file.write_text("starting", encoding="utf-8")
-        with tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False, encoding="utf-8") as fh:
-            fh.write(_HOLD_SCRIPT)
-            script = fh.name
+        # 脚本落在插件自己的状态目录里（按设备哈希命名），不再往 %TEMP% 里
+        # 每次连接丢一个 .ps1 —— 那些临时文件以前从来没被删过。
+        script_path = _STATE_DIR / ("%s.ps1" % key)
+        script_path.write_text(_HOLD_SCRIPT, encoding="utf-8-sig")
         env = dict(os.environ)
         env.update({
             "AUDIOMIXING_BT_ID": device_id,
@@ -445,7 +758,7 @@ def connect(device_id: str) -> dict[str, Any]:
             # the log stays locked and a later reconnect cannot clean up.
             with open(log_file, "wb") as log:
                 proc = subprocess.Popen(
-                    [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script],
+                    [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
                     env=env, creationflags=flags, close_fds=True, stdout=log, stderr=subprocess.STDOUT,
                     cwd=str(_STATE_DIR),
                 )
@@ -622,6 +935,117 @@ def held_count() -> int:
 
 
 
+def _norm_device_text(text: object) -> str:
+    """设备名比较用：去掉所有空白并转小写。
+
+    ★ 2026-10-26 用户现场：手机蓝牙已经出声、Windows 也在播放，面板却报
+      「媒体音频未到」。旧判断对设备名做的是**大小写敏感的子串匹配**，而
+      Windows 有些机器返回的端点名是全大写/带不同空格，于是明明有端点也匹配不上。
+    """
+    return "".join(str(text or "").split()).lower()
+
+
+def mmdevice_endpoints(name: str = "") -> list[dict[str, Any]]:
+    """列出 MMDevices 里和设备名有关的音频端点（Capture + Render 都看）。
+
+    `name` 为空时返回所有带 A2DP/SNK 字样的端点（诊断用）；给了名字就只返回
+    名字包含它的端点。每项带 `flow`（Capture/Render）、`name`、`state`、`active`。
+    只读注册表，几毫秒，不碰蓝牙连接。
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        import winreg
+    except ImportError:
+        return []
+    want = _norm_device_text(name)
+    out: list[dict[str, Any]] = []
+    for flow in ("Capture", "Render"):
+        base = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\%s" % flow
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as root:
+                index = 0
+                while True:
+                    try:
+                        guid = winreg.EnumKey(root, index)
+                    except OSError:
+                        break
+                    index += 1
+                    friendly = ""
+                    state = None
+                    try:
+                        with winreg.OpenKey(root, guid) as dev:
+                            try:
+                                state, _ = winreg.QueryValueEx(dev, "DeviceState")
+                            except OSError:
+                                pass
+                            try:
+                                with winreg.OpenKey(dev, "Properties") as props:
+                                    try:
+                                        friendly, _ = winreg.QueryValueEx(
+                                            props, "{b3f8fa53-0004-438e-9003-51a46e139bfc},6")
+                                    except OSError:
+                                        pass
+                            except OSError:
+                                pass
+                    except OSError:
+                        continue
+                    text = str(friendly or "")
+                    if not text:
+                        continue
+                    norm = _norm_device_text(text)
+                    bluetooth = ("a2dp" in norm) or ("snk" in norm)
+                    if not bluetooth and not want:
+                        continue
+                    if want and want not in norm:
+                        continue
+                    try:
+                        state_value = int(state) if state is not None else None
+                    except (TypeError, ValueError):
+                        state_value = None
+                    out.append({
+                        "flow": flow,
+                        "name": text,
+                        "state": state_value,
+                        "active": state_value == 1,
+                        "bluetooth": bluetooth,
+                        # ★ 2026-10-26：部分机器（Intel/Realtek 驱动）的 A2DP SNK 端点
+                        #   在注册表里是 active，但 WASAPI 的 ACTIVE 枚举里看不到它。
+                        #   把完整 MMDevice id 带出去，采集端可以按 id 直接 GetDevice。
+                        "endpoint_id": (("{0.0.1.00000000}." if flow == "Capture"
+                                         else "{0.0.0.00000000}.") + guid),
+                    })
+        except OSError:
+            continue
+    return out
+
+
+def endpoint_report(name: str = "") -> list[dict[str, Any]]:
+    """诊断报告用：这台设备在 MMDevice 里的端点实况（只读）。"""
+    return mmdevice_endpoints(name)
+
+
+def _endpoint_state_from_registry(name: str) -> bool | None:
+    """读 Windows MMDevice 注册表，判断这台手机的媒体音频端点是否 active。
+
+    ★ 2026-10-26 用户现场：手机蓝牙已经在播放、电脑也听得到，面板却仍写
+      「手机已连接，但媒体音频未到」。根因不是连接，是这里：
+        · 旧代码只扫 Capture，且要求名字里必须出现 "A2DP SNK"；
+        · 名字比较大小写敏感、空格敏感；
+        · 找不到时返回 None，调用方就沿用枚举缓存里的 False。
+      现在 Capture/Render 都扫，名字归一化后匹配；优先看 A2DP/SNK 端点，
+      没有这种名字时退回任何含设备名的端点。找不到任何端点才返回 None。
+    """
+    if not name:
+        return None
+    entries = mmdevice_endpoints(str(name))
+    if not entries:
+        return None
+    preferred = [e for e in entries if e.get("bluetooth")]
+    chosen = preferred or entries
+    return any(bool(e.get("active")) for e in chosen)
+
+
 def _apply_live_states(devices: list[dict]) -> list[dict]:
     """把我们自己握着的连接状态合并进去，并让没有依据的"已连接"过期。
 
@@ -644,9 +1068,14 @@ def _apply_live_states(devices: list[dict]) -> list[dict]:
                 held_keys.add(keep.stem)
     except OSError:
         pass
+    def device_keys(device: dict) -> set[str]:
+        # ★ v2.26 第 3 条：合并卡的主 id 可能不是真正握着连接的那条历史配对。
+        values = device.get("ids") or [device.get("id")]
+        return {_key(str(x)) for x in values if x}
+
     for device in out:
         if str(device.get("link") or "") == "connected":
-            if _key(str(device.get("id") or "")) not in held_keys:
+            if not (device_keys(device) & held_keys):
                 device["link"] = "off"
                 device["held"] = False
     try:
@@ -662,14 +1091,38 @@ def _apply_live_states(devices: list[dict]) -> list[dict]:
             if not text:
                 continue
             for device in out:
-                if _key(str(device.get("id") or "")) != key:
+                if key not in device_keys(device):
                     continue
                 device["held"] = True
                 device["state"] = text
                 if text == "open:Opened" or text.startswith("open:Opened:"):
-                    device["link"] = "connected"
+                    # ★ 2026-10-21 用户现场：“控制台显示正在接收手机声音，但一点声音都没有”。
+                    #   helper 把 sink 打开（open:Opened）并不等于手机把 **A2DP 媒体音频**
+                    #   送过来了：手机可能只挂着连接/控制通路。此时 Windows 的
+                    #   `麦克风 (<手机名> A2DP SNK)` 采集端点还没起来（endpoint=False），
+                    #   本工具自然没有可播的声音。必须报 waiting（黄色提示），不能报
+                    #   connected —— 否则面板会骗用户“正在接收”，而实际是静音。
+                    #   反过来，用户打开手机「媒体音频」后端点会变成 active，而设备枚举
+                    #   缓存 10 分钟才刷新一次；这里补一次**注册表级**的低成本实时判断。
+                    live_endpoint = _endpoint_state_from_registry(str(device.get("name") or ""))
+                    if live_endpoint is not None:
+                        device["endpoint"] = live_endpoint
+                    device["link"] = "connected" if bool(device.get("endpoint")) else "waiting"
                 elif text.startswith("open:"):
-                    device["link"] = "waiting"
+                    # ★ 2026-11-06（Q5）：现场同一张卡同时写「手机已连接，但媒体音频未到」
+                    #   和「sink=True｜手机媒体链路=True」—— 因为这一支只把 link 改成
+                    #   waiting，却沿用了枚举缓存里的 endpoint=True。现在统一以**注册表
+                    #   实时值**为准：端点真的 active 就报 connected；读不到/未激活就
+                    #   把 endpoint 一并置 False，绝不出现"说没到、布尔却是 True"。
+                    live_endpoint = _endpoint_state_from_registry(str(device.get("name") or ""))
+                    device["endpoint"] = bool(live_endpoint) if live_endpoint is not None else False
+                    if bool(device.get("endpoint")):
+                        device["link"] = "connected"
+                        device["state_note"] = ("接收通道 state=%s，但 Windows 媒体端点已激活"
+                                                "（声音由系统端点直接送达）" % text)
+                    else:
+                        device["link"] = "waiting"
+                        device["state_note"] = ""
                 elif text.startswith("error:"):
                     device["link"] = "error"
                 else:

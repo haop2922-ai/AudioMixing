@@ -1,0 +1,55 @@
+Audio Mixing v2.19 —— 版本说明（电脑端；配套手机端 2.9）
+构建时间：2026-11-02 21:02
+
+━━━ 这一版修了什么 ━━━
+
+① 电脑在手机 / 别的电脑上显示成「本机」
+   现象：手机设备列表里电脑卡片标题是「本机」，副标题却是
+   Windows-11 · 192.168.0.111 · 有网页面板 —— 分不清哪台是自己。
+   原因：default_node_name() 早就是主机名，但老配置里把默认名写死成了「本机」，
+   Config.load 只读不迁移。
+   修法：Config.load 发现 name 是旧默认值（「本机 / 我的电脑 / 电脑」）时，
+   替换成主机名并落盘；用户自己起的名字（例如「客厅电脑」）一律不动。
+   下一次启动信标里就是 2024TSJ，手机卡片会跟着变。
+
+② 电脑端其余代码与 2.18 相同；重新打包内置手机 2.9（「App 音量」支持）。
+
+━━━ 用户该测什么 ━━━
+
+① 双击「Audio Mixing v2.19.exe」；面板应显示 v2.19 / 2026-11-02 21:02。
+② 手机装 2.9；电脑设备卡片应显示 2.9。
+③ 手机设备列表里，这台电脑的标题应变成 2024TSJ，不再是「本机」。
+   若仍显示「本机」，请关掉电脑端再启动一次（名字迁移在 Config.load 时落盘）。
+④ 手机播放声音时，音量面板的「App 音量」里应出现 Audio Mixing（详见手机端 2.9 说明）。
+
+━━━ 文件 ━━━
+
+  Audio Mixing v2.19.exe
+    21,964,288 字节
+    sha256  600ee88924f4787e85444bc13ed4ba0f8d0caeca59a246e82f5eefe4a5ab0ced
+    构建自检：channel='exe' version='2.19' build_time='2026-11-02 21:02' 中文配置落盘=True
+    AVX-512(zmm) 指令 0 条 => PASS
+
+  AudioMixing-手机版.apk（配套手机端 2.9）
+    158,103 字节 / versionCode 23 / versionName 2.9
+    sha256  3005946f1c70f53be42843ecec74fcac65ccf5010d8ad681e0917fd6af333ed3
+
+  同一份 EXE：
+      Desktop\Audio Mixing v2.19.exe
+      release\GOGO\Audio Mixing v2.19.exe
+      版本备份\电脑端\v2.19-20261102-0905\成品\Audio Mixing v2.19.exe
+
+  同一份 APK：
+      release\GOGO\AudioMixing-手机版.apk
+      release\AudioMixing-mic.apk
+      tools\installer_payload\AudioMixing-mic.apk
+      版本备份\电脑端\v2.19-20261102-0905\成品\AudioMixing-手机版.apk
+      v2.19 EXE 内部
+
+━━━ 验证基线 ━━━
+
+  PC：378 项 unittest OK；verify_exe 13/13；selftest_twonode 19/19；
+      audit_leftovers 0 error；check_ui_syntax PASS。
+  手机：七条离线门禁全 PASS（beacon 28 / fanout 36 / jitter 31 / policy 72 /
+      recv 39 / resampler 18 / source 22）；check_apk PASS（2.9 / 23）。
+  真机：App 音量是否出现、电脑名是否变为 2024TSJ —— 需要你在真机上确认。

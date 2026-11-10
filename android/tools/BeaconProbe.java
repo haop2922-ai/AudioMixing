@@ -51,20 +51,38 @@ public final class BeaconProbe {
         System.out.println();
         System.out.println("== 2. 信标里必须有非空的 id（电脑端就是靠它去重的）==");
         String beacon = d1.beaconPreview();
+        // ★ 2026-11-04：信标新增 device_id / instance_id / ext 后超过 320 字的预览窗口，
+        //   后半段（ctl / disc_port）被截断。断言必须对着**完整 JSON** 做，不能靠预览。
+        String full = beaconJson(d1);
+        String dev1 = strField(full, "device_id");
+        String inst1 = strField(full, "instance_id");
         System.out.println("   本机信标：" + beacon);
+        System.out.println("   完整信标：" + full);
         check("信标里带 id 且非空", beacon.contains("\"id\":\"" + id1 + "\""));
         check("信标里有 wl=1（协议版本）", beacon.contains("\"wl\":1"));
         check("信标里有 audio_port=47831", beacon.contains("\"audio_port\":47831"));
         check("信标里有名字和平台", beacon.contains("\"name\":\"") && beacon.contains("\"platform\":\""));
         // ★ 用户反馈：手机装的是新版，电脑端卡片上却写着 1.0.0 —— 因为 "version" 原来写死成协议版本。
-        //   现在它读 BuildConfig.VERSION_NAME（本测试的桩把它定成 "2.1"，对齐 build.gradle）。
+        //   现在它读 BuildConfig.VERSION_NAME（本测试的桩把它定成 "2.12"，对齐 build.gradle）。
         check("★ 信标里的 version 报的是 App 版本，不再是写死的 1.0.0",
-                beacon.contains("\"version\":\"2.1\"") && !beacon.contains("\"version\":\"1.0.0\""));
+                beacon.contains("\"version\":\"2.12\"") && !beacon.contains("\"version\":\"1.0.0\""));
         check("信标里有 sources / sinks（电脑端据此判断对端能力）",
                 beacon.contains("\"sources\":[") && beacon.contains("\"sinks\":["));
-        check("信标里有 ctl=1（对端据此把控制消息发到这一层）", beacon.contains("\"ctl\":1"));
-        check("信标里有 disc_port=47830（对端按它发控制消息）",
-                beacon.contains("\"disc_port\":47830"));
+        check("信标里有 ctl=1（对端据此把控制消息发到这一层）", hasNum(full, "ctl", 1));
+        check("信标里有 disc_port=17830（对端按它发控制消息）",
+                hasNum(full, "disc_port", 17830));
+        check("★ 信标里有 device_id（同一台手机的 WiFi/蓝牙合并主键）", !dev1.isEmpty());
+        check("device_id 长得像 UUID（36 字符、4 个连字符）",
+                dev1.length() == 36 && dev1.chars().filter(c -> c == '-').count() == 4);
+        check("★ 信标里有 instance_id（换机搬数据时识破「两台真机共用一个 device_id」）",
+                !inst1.isEmpty());
+        check("重启后 device_id 不变（合并主键必须稳定）",
+                dev1.equals(strField(beaconJson(d2), "device_id")));
+        check("重启后 instance_id 不变（安装级标识）",
+                inst1.equals(strField(beaconJson(d2), "instance_id")));
+        check("换一台设备 device_id 不同", !dev1.equals(strField(beaconJson(d4), "device_id")));
+        check("换一台设备 instance_id 不同", !inst1.equals(strField(beaconJson(d4), "instance_id")));
+        check("★ 信标里有 ext=1（声明能解析音频扩展段的 originId/hop）", hasNum(full, "ext", 1));
         int bytes = reportedBytes(beacon);
         check("信标不超过协议上限 1200 字节（实测 " + bytes + "）", bytes > 0 && bytes < 1200);
 
@@ -90,7 +108,7 @@ public final class BeaconProbe {
      * ④ 收到的控制消息走 {@code onControl}，而且【绝不会】变成设备列表里的一台假设备。
      */
     private static void controlPlane() throws Exception {
-        String beacon = "{\"wl\":1,\"id\":\"abc\",\"name\":\"手机\",\"ctl\":1,\"disc_port\":47830}";
+        String beacon = "{\"wl\":1,\"id\":\"abc\",\"name\":\"手机\",\"ctl\":1,\"disc_port\":17830}";
         check("信标（ctl 是数字）不被判成控制消息", Discovery.controlBodyOf(beacon) == null);
 
         String body = "{\"t\":\"stats\",\"name\":\"电脑\",\"want_listen\":true,\"gain\":0.75}";
@@ -166,6 +184,29 @@ public final class BeaconProbe {
         Field f = Discovery.class.getDeclaredField(name);
         f.setAccessible(true);
         f.set(d, value);
+    }
+
+    /** 直接调私有的 buildBeacon()，拿到**完整** JSON（beaconPreview 只给前 320 字）。 */
+    private static String beaconJson(Discovery d) throws Exception {
+        Method m = Discovery.class.getDeclaredMethod("buildBeacon");
+        m.setAccessible(true);
+        byte[] raw = (byte[]) m.invoke(d);
+        return new String(raw, StandardCharsets.UTF_8);
+    }
+
+    /** 从完整信标里取字符串字段（值里没有引号，UUID/名字都安全）。 */
+    private static String strField(String json, String key) {
+        String needle = "\"" + key + "\":\"";
+        int a = json.indexOf(needle);
+        if (a < 0) {
+            return "";
+        }
+        int b = json.indexOf('"', a + needle.length());
+        return b < 0 ? "" : json.substring(a + needle.length(), b);
+    }
+
+    private static boolean hasNum(String json, String key, int value) {
+        return json.contains("\"" + key + "\":" + value);
     }
 
     /** 从"…（共 N 字节）"里把 N 抠出来。 */

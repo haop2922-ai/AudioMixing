@@ -5,6 +5,9 @@
 
 手机扫电脑上的二维码就能当喇叭用；也可以装手机端 App，音质更好。
 
+> 每次修复的逐条明细（位置 / 原因 / 修法 / 回归测试）见
+> [docs/BUG修复明细.md](docs/BUG修复明细.md)。复刻或对照旧版本时以它为准。
+
 ---
 
 ## 它和"手机当音响"类软件有什么不同
@@ -42,7 +45,7 @@
 | 文件 | 装在哪 | 用途 |
 |---|---|---|
 | `AudioMixing.exe` | 每台电脑 | 主程序，双击运行 |
-| `AudioMixing-mic.apk` | 安卓手机 | 把手机的声音送进来，或者让手机当喇叭 |
+| `AudioMixing-手机版-v2.16.apk` | 安卓手机 | 把手机的声音送进来，或者让手机当喇叭 |
 
 > 二进制文件在 [Releases](../../releases) 里下载，不放在仓库里。
 
@@ -78,13 +81,13 @@
 
 ```bash
 # 环境：Windows + Python 3.11+
-pip install pyinstaller pyogg qrcode pillow opuslib_next
+pip install nuitka numpy pyogg qrcode pillow opuslib_next
 
-# 跑测试（102 项）
+# 跑测试（370 项）
 python -m unittest discover -s tests
 
 # 打包（会自动先跑语法检查 + 单元测试 + 页面脚本检查，任一不过就不产出 exe）
-python tools/build_exe.py
+python tools/build_nuitka.py --test
 ```
 
 代码结构：
@@ -93,7 +96,7 @@ python tools/build_exe.py
 audiomixing/
   engine.py          核心：设备、路由、播放端、本机直通、多设备输出
   net/rtpaudio.py    RTP 收发、抖动缓冲、时钟对齐
-  net/discovery.py   局域网发现（UDP 47830）
+  net/discovery.py   局域网发现（UDP 17830，两端一致；音频端口由信标协商）
   audio/             WASAPI 采集与播放、Opus、采集共享、多设备输出
   webui.py           控制台、监控页、诊断报告的 HTTP 服务
   ui/                控制台与各页面的前端

@@ -1,5 +1,6 @@
 package com.audiomixing.app;
 
+import android.bluetooth.BluetoothAdapter;
 import android.content.Context;
 import android.net.wifi.WifiManager;
 import android.os.Build;
@@ -31,7 +32,7 @@ import java.util.Map;
  *
  * <p><b>为什么不做配对/房间号/二维码</b>：用户要的是"打开就该看见对方"。
  * 所以这里一句话都不需要用户输入 —— 每 2 秒发一份 JSON 信标到组播组
- * {@code 239.255.77.120:47830}，<b>同时</b>再往子网广播地址发一份：
+ * {@code 239.255.77.120:17830}，<b>同时</b>再往子网广播地址发一份：
  * 很多家用/商用 Wi-Fi 的 AP 隔离组播（IGMP snooping 配置烂、或者干脆挡组播），
  * 只发组播会出现"一台能看见另一台、反过来看不见"的诡异现象，广播是兜底通道。
  *
@@ -47,7 +48,7 @@ import java.util.Map;
  *  "version":"2.1","audio_port":47831,"web_port":0,
  *  "sources":[{"id":"mic","name":"麦克风","detail":"mic"}],
  *  "sinks":[{"id":"speaker","name":"本机扬声器","detail":"render"}],
- *  "busy":false,"scope":"lan","ts":1700000000,"ctl":1,"disc_port":47830}
+ *  "busy":false,"scope":"lan","ts":1700000000,"ctl":1,"disc_port":17830}
  * </pre>
  *
  * <p><b>★ 同一个 socket 上还跑第二种包：控制消息（2026-10-15）★</b>
@@ -129,6 +130,10 @@ public final class Discovery {
         public volatile int webPort;
         public volatile String platform = "";
         public volatile String version = "";
+        /** ★ 2026-11-04（B 第一阶段）：对端的稳定主键 / 安装标识 / 扩展段能力。 */
+        public volatile String deviceId = "";
+        public volatile String instanceId = "";
+        public volatile boolean ext = false;
         /** 对端正在传输时置真，界面可以显示"忙"。 */
         public volatile boolean busy;
         /** 对端能提供的音源名字（手机就是"麦克风"）。 */
@@ -150,7 +155,7 @@ public final class Discovery {
          */
         public volatile boolean ctl;
         /**
-         * 对端发现端口的实际端口（信标里的 {@code disc_port}，端口被占时可能不是 47830）。
+         * 对端发现端口的实际端口（信标里的 {@code disc_port}，端口被占时可能不是 17830）。
          * 缺失/为 0 时按默认处理。
          */
         public volatile int discPort = Proto.DEFAULT_DISCOVERY_PORT;
@@ -201,6 +206,9 @@ public final class Discovery {
 
     private final Context appCtx;              // 可能为 null（拿不到 WifiManager 时也能发现，只是容易丢包）
     private final String nodeId;
+    /** ★ 2026-11-04（B 第一阶段）：稳定设备主键 + 本次安装标识（字段初始化见构造函数）。 */
+    final String deviceId;
+    final String instanceId;
     private final Object lock = new Object();
     private final Object socketLock = new Object();
     /** 按 nodeId 索引；LinkedHashMap 只是让 peers() 的顺序稳定一点（界面不闪）。 */
@@ -215,6 +223,8 @@ public final class Discovery {
     private volatile boolean running;
     private volatile MulticastSocket sock;
     private volatile int boundPort = Proto.DEFAULT_DISCOVERY_PORT;
+    /** 用户设置的发现端口（默认 17830）。绑定失败时才退回默认/临时端口。 */
+    private volatile int preferredPort = Proto.DEFAULT_DISCOVERY_PORT;
     private volatile List<String> localIps = Collections.emptyList();
     private volatile Listener listener;
     private volatile String lastError = "";
@@ -273,6 +283,11 @@ public final class Discovery {
     private static final String PREFS_NAME = "audiomixing";
     private static final String KEY_NODE_ID = "node_id";
     private static final String KEY_NAME = "node_name";
+    // ★ 2026-11-04（B 第一阶段）：device_id = 设备稳定主键（同一台手机的多条链路
+    //   WiFi/蓝牙靠它合并成一个节点）；instance_id = 本次安装生成，用于识破
+    //   "换机把旧配置搬过来、两台真机共用同一个 deviceId"。
+    private static final String KEY_DEVICE_ID = "device_id";
+    private static final String KEY_INSTANCE_ID = "instance_id";
 
     /** 名字最长多少字符（信标有 1200 字节上限，名字不该把它撑爆，也不该在列表里占半屏）。 */
     private static final int MAX_NAME_LEN = 24;
@@ -296,6 +311,50 @@ public final class Discovery {
         } catch (Throwable t) {
             // 存不了就只能退回"每次新建"（旧行为），但要让日志/诊断看得见。
             Log.w(TAG, "节点 ID 存不下来（这次会是临时的）：" + t);
+            return java.util.UUID.randomUUID().toString();
+        }
+    }
+
+    /** 取持久化的稳定设备主键；老安装没有就先生成并保存（老 node_id 继续做别名）。 */
+    private static String loadOrCreateDeviceId(Context ctx, String fallback) {
+        if (ctx == null) {
+            return fallback == null ? "" : fallback;
+        }
+        try {
+            android.content.SharedPreferences sp =
+                    ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            String id = sp.getString(KEY_DEVICE_ID, "");
+            if (id != null && !id.trim().isEmpty()) {
+                return id.trim();
+            }
+            String fresh = fallback != null && !fallback.trim().isEmpty()
+                    ? fallback.trim() : java.util.UUID.randomUUID().toString();
+            sp.edit().putString(KEY_DEVICE_ID, fresh).apply();
+            Log.i(TAG, "首次生成 device_id 并保存：" + fresh);
+            return fresh;
+        } catch (Throwable t) {
+            Log.w(TAG, "device_id 存不下来（这次用临时值）：" + t);
+            return fallback == null ? "" : fallback;
+        }
+    }
+
+    /** 本次安装的 instance_id：用于发现两台真机共用同一个 deviceId（绝不据此自动合并）。 */
+    private static String loadOrCreateInstanceId(Context ctx) {
+        if (ctx == null) {
+            return java.util.UUID.randomUUID().toString();
+        }
+        try {
+            android.content.SharedPreferences sp =
+                    ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            String id = sp.getString(KEY_INSTANCE_ID, "");
+            if (id != null && !id.trim().isEmpty()) {
+                return id.trim();
+            }
+            String fresh = java.util.UUID.randomUUID().toString();
+            sp.edit().putString(KEY_INSTANCE_ID, fresh).apply();
+            return fresh;
+        } catch (Throwable t) {
+            Log.w(TAG, "instance_id 存不下来（这次用临时值）：" + t);
             return java.util.UUID.randomUUID().toString();
         }
     }
@@ -335,6 +394,10 @@ public final class Discovery {
         this.appCtx = context == null ? null : context.getApplicationContext();
         this.nodeId = (nodeId != null && !nodeId.isEmpty())
                 ? nodeId : loadOrCreateNodeId(this.appCtx);
+        // ★ 2026-11-04（B 第一阶段）身份层：device_id 持久化、跨链路稳定；
+        //   instance_id 每次安装生成。老 node_id 仍然保留，只降级为别名。
+        this.deviceId = loadOrCreateDeviceId(this.appCtx, this.nodeId);
+        this.instanceId = loadOrCreateInstanceId(this.appCtx);
         if (nodeName != null && !nodeName.isEmpty()) {
             this.nodeName = nodeName;           // 显式传进来的名字（测试/特殊用途）
             this.customName = true;
@@ -446,6 +509,16 @@ public final class Discovery {
         return nodeId;
     }
 
+    /** ★ 2026-11-04：本机稳定设备主键（信标同名字段）。 */
+    public String deviceId() {
+        return deviceId;
+    }
+
+    /** ★ 2026-11-04：本次安装标识（用于发现"两台真机共用 deviceId"）。 */
+    public String instanceId() {
+        return instanceId;
+    }
+
     /**
      * 本机信标的原文（诊断报告里贴一行）。
      *
@@ -515,9 +588,16 @@ public final class Discovery {
         return localIps;
     }
 
-    /** 实际绑定的发现端口（正常就是 47830）。 */
+    /** 实际绑定的发现端口（正常就是 17830）。 */
     public int boundPort() {
         return boundPort;
+    }
+
+    /** 设置发现端口；必须在 {@link #start()} 之前调用。 */
+    public void setDiscoveryPort(int port) {
+        if (port > 0) {
+            preferredPort = port;
+        }
     }
 
     public long beaconsSent() {
@@ -635,6 +715,8 @@ public final class Discovery {
         sb.append("本机网卡：").append(ifaceText()).append('\n');
         // ★ 节点身份：持久化之后每次启动都一样，电脑端才不会把同一台手机记成好几台。
         sb.append("我的节点 ID：").append(nodeId)
+                .append("  ·  device_id：").append(deviceId)
+                .append("  ·  instance_id：").append(instanceId)
                 .append("（持久化保存，重启不变 ✓）\n");
         if (lastBadFrameSample.length() > 0) {
             sb.append("非信标帧：").append(lastBadFrameSample).append('\n');
@@ -823,7 +905,7 @@ public final class Discovery {
      * 已经见过面的设备地址（单播信标用）：{地址, 端口}。有上限 16 台（局域网里不会有这么多，
      * 防的是被人乱刷撑爆）。
      *
-     * <p>端口用对端信标里公布的 {@code disc_port}（端口被占时它可能不是 47830）。
+     * <p>端口用对端信标里公布的 {@code disc_port}（端口被占时它可能不是 17830）。
      * 写死默认端口的话，换过端口的那一台就永远收不到我们的单播信标 ——
      * 而那正是"经常丢设备"最容易藏起来的一种原因。
      */
@@ -857,11 +939,14 @@ public final class Discovery {
 
     /** 组播一份 + 受限广播一份 + 每个本机 /24 的定向广播一份。 */
     private List<InetSocketAddress> beaconTargets() {
+        // 必须发到"我们自己实际在听的那个端口"：用户把发现端口改成 47832 后，
+        // 还发到默认 17830 的话，对端（同样改成 47832）永远收不到。
+        int sendPort = boundPort > 0 ? boundPort : preferredPort;
         List<InetSocketAddress> out = new ArrayList<>(8);
-        out.add(new InetSocketAddress(groupAddress(), Proto.DEFAULT_DISCOVERY_PORT));
+        out.add(new InetSocketAddress(groupAddress(), sendPort));
         // 受限广播：有些 AP 放行这个但不放行组播。
         try {
-            out.add(new InetSocketAddress(InetAddress.getByName("255.255.255.255"), Proto.DEFAULT_DISCOVERY_PORT));
+            out.add(new InetSocketAddress(InetAddress.getByName("255.255.255.255"), sendPort));
         } catch (IOException ignored) {
         }
         // 定向广播（192.168.1.255）：比受限广播更可靠，路由器不会丢。
@@ -872,7 +957,7 @@ public final class Discovery {
             }
             try {
                 out.add(new InetSocketAddress(
-                        InetAddress.getByName(ip.substring(0, dot) + ".255"), Proto.DEFAULT_DISCOVERY_PORT));
+                        InetAddress.getByName(ip.substring(0, dot) + ".255"), sendPort));
             } catch (IOException ignored) {
             }
         }
@@ -891,11 +976,41 @@ public final class Discovery {
         }
     }
 
+    /**
+     * ★ 2026-11-06（Q2）：信标里自报"我现在是在广播还是在点对点送"。
+     *
+     * <p>为什么加在信标而不只靠 STATS：STATS 只发给"正在送的目标"，切换那一瞬间
+     * 电脑可能还拿着上一轮的"点对点"声明，把广播包整条拒收（现场 3512 个）。
+     * 信标每 ~2 秒面向全网发一次，电脑端随时能拿到最新、且与身份别名无关。
+     */
+    private volatile int beaconSendMode = 0;
+    private volatile boolean beaconBroadcast = false;
+
+    /** 引擎在档位/广播/目标变化时调用（幂等；值没变就不动）。 */
+    public void setSendState(int mode, boolean broadcast) {
+        int m = Math.max(0, Math.min(2, mode));
+        if (beaconSendMode != m || beaconBroadcast != broadcast) {
+            beaconSendMode = m;
+            beaconBroadcast = broadcast;
+        }
+    }
+
     private byte[] buildBeacon() {
         try {
             JSONObject o = new JSONObject();
             o.put("wl", 1);
             o.put("id", nodeId);
+            // ★ 2026-11-06（Q2）：显式送声身份。老电脑不认识这两个键就忽略，
+            //   不会因此改变任何旧行为。
+            o.put("send_mode", beaconSendMode);
+            o.put("broadcast", beaconBroadcast);
+            // ★ 身份层（2026-11-04）：device_id 是合并主键；instance_id 识破"换机搬配置"。
+            //   老电脑忽略这两个键，照样按 id 认设备（向后兼容）。
+            o.put("device_id", deviceId);
+            o.put("instance_id", instanceId);
+            // ★ 扩展段能力位：1 = 我能安全解析音频包里多出来的 8 字节 originId/hop。
+            //   只有声明了 1，电脑才会发扩展段；没声明就永远收老包。
+            o.put("ext", 1);
             o.put("name", nodeName);
             o.put("platform", defaultPlatform());
             o.put("version", APP_VERSION);
@@ -912,7 +1027,17 @@ public final class Discovery {
             //   恒为 1 —— 这一层的收发本来就是每台节点一直在做的事，没有"有时支持"的中间态。
             //   电脑端的信标里是同一个键（见 audiomixing/net/discovery.py），两边对称。
             o.put("ctl", 1);
-            // 我实际绑定的发现端口（被占时可能不是 47830）：对端按它发控制消息，
+            // ★ 2026-11-04（第 9 条）：手机自报**蓝牙身份**。电脑靠它把"同一台手机的
+            //   WiFi 卡片"和"蓝牙卡片"合成一个节点（原来的名字 `M332BF-…` 与蓝牙名
+            //   `瘾控` 毫无关系，只按 id 永远合不到一起）。取不到就发空串，电脑端不合并。
+            o.put("bt_name", localBtName());
+            o.put("bt_mac", localBtMac());
+            // ★ 「智连」能力位（2026-11-01）：1 = 本机收到 want_listen 时，由**本机自己**
+            //   的「智连」开关决定要不要自动收听。电脑端看到它就可以放心把请求发过来，
+            //   不必再拿电脑自己的「智连」替手机做决定。
+            //   旧版本没有这个键 → 电脑端维持原来的保守做法（只有电脑开了智连才请求）。
+            o.put("smart", 1);
+            // 我实际绑定的发现端口（被占时可能不是 17830）：对端按它发控制消息，
             // 写死默认端口的话换过端口的那一台就再也收不到。
             o.put("disc_port", boundPort);
             // scope/ts 是电脑端就有的字段，手机也带上，双方解析逻辑就完全对称了。
@@ -924,6 +1049,31 @@ public final class Discovery {
             note("信标组装失败：" + e);
             return ("{\"wl\":1,\"id\":\"" + nodeId + "\",\"name\":\"" + nodeName
                     + "\",\"audio_port\":" + audioPort + "}").getBytes(StandardCharsets.UTF_8);
+        }
+    }
+
+    /** 本机蓝牙名（例如「瘾控」）；没开蓝牙/没权限/没有适配器时返回空串。 */
+    private String localBtName() {
+        try {
+            BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+            if (adapter == null) return "";
+            String name = adapter.getName();
+            return name == null ? "" : name.trim();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /** 本机蓝牙 MAC。安卓 6+ 对普通应用一律返回 02:00:00:00:00:00，这种值不发。 */
+    private String localBtMac() {
+        try {
+            BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+            if (adapter == null) return "";
+            String mac = adapter.getAddress();
+            if (mac == null || "02:00:00:00:00:00".equals(mac)) return "";
+            return mac.trim();
+        } catch (Exception e) {
+            return "";
         }
     }
 
@@ -1067,6 +1217,11 @@ public final class Discovery {
                 peer.platform = platform;
             }
             peer.version = o.optString("version", peer.version);
+            // ★ 身份层：手机侧也记下对端的 device_id / ext 能力（诊断和日志用；
+            //   老电脑没有这些键 → 空串/false，行为不变）。
+            peer.deviceId = o.optString("device_id", peer.deviceId);
+            peer.instanceId = o.optString("instance_id", peer.instanceId);
+            peer.ext = o.optInt("ext", 0) == 1;
             int ap = o.optInt("audio_port", 0);
             if (ap > 0) {
                 peer.audioPort = ap;
@@ -1295,7 +1450,13 @@ public final class Discovery {
                 s.setReuseAddress(true);   // 和电脑端同时开着时也能各收各的
                 s.setBroadcast(true);      // 不设这个，广播那份信标会被内核拒掉
                 boolean bound = false;
-                for (int port : new int[]{Proto.DEFAULT_DISCOVERY_PORT, 0}) {
+                int wanted = preferredPort > 0 ? preferredPort : Proto.DEFAULT_DISCOVERY_PORT;
+                // 先试用户设的端口；自定义端口失败再退回默认（让默认网络的设备还能找到）；
+                // 最后 0 = 随便给一个，至少 App 不崩（此时发现基本不可用，界面会显示端口）。
+                int[] candidates = wanted == Proto.DEFAULT_DISCOVERY_PORT
+                        ? new int[]{wanted, 0}
+                        : new int[]{wanted, Proto.DEFAULT_DISCOVERY_PORT, 0};
+                for (int port : candidates) {
                     try {
                         s.bind(new InetSocketAddress(port));
                         boundPort = s.getLocalPort();
