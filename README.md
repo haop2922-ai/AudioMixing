@@ -118,7 +118,16 @@ tools/               打包、自检、回收站等工具
 
 ## 许可
 
-MIT，见 `LICENSE`。
+**个人与非商业用途免费；商业用途需事先取得书面授权。**
+
+采用 [PolyForm Noncommercial License 1.0.0](LICENSE)，全文见 `LICENSE`。
+商业授权范围、申请方式与“什么算商业用途”的判定见
+[LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md)。
+
+- ✅ 免费：个人自用、家庭、教学科研、非营利、开源项目、评测与教程视频
+- 💼 需授权：公司内部部署、客户交付、随硬件/软件捆绑、SaaS 与托管服务、OEM 白牌、以本项目变现
+- ⚠️ 旧版本：**v2.32 及更早为 MIT 许可**，已发布的副本无法收回（MIT 不可撤回）；
+  新许可只约束本提交之后发布的版本
 
 HWHHYN 用 DEEPSEEK 制作
 
