@@ -110,6 +110,9 @@ PORT_DISCOVERY = 17830
 # 旧默认发现端口：升级时把"从没改过"的 47830 搬到 17830（见 Config.load）。
 LEGACY_PORT_DISCOVERY = 47830
 PORT_AUDIO = 47831
+# ★ 2.42.2（第 2 条）：广播与点对点必须分端口、分准入。
+#   47831 = 点对点（具名路由）；47832 = 频道广播（只由「听广播」开关决定）。
+PORT_BROADCAST = 47832
 PORT_WEB = 17800
 DISCOVERY_GROUP = "239.255.77.120"
 MDNS_GROUP = "224.0.0.251"

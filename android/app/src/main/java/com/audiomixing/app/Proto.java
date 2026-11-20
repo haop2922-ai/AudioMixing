@@ -84,6 +84,13 @@ public final class Proto {
 
     public static final int DEFAULT_AUDIO_PORT = 47831;
     /**
+     * ★ 2.42.2（第 2 条）：广播专用接收端口，和点对点 47831 完全分开。
+     *
+     * <p>广播口只由「听广播」开关控制；点对点口只由每台设备的「收听」控制。
+     * 两个接收器各自绑定一个 UDP socket，一条的放行/拒收不会影响另一条。
+     */
+    public static final int DEFAULT_BROADCAST_PORT = 47832;
+    /**
      * ★ 2026-11-01 用户：两端默认发现端口统一为 17830。
      * 这个值必须和电脑端 {@code audiomixing/proto.py} 的 {@code PORT_DISCOVERY} 一致 —
      * 它是两端**唯一**需要手填的端口；音频端口由信标协商，不需要管。

@@ -14,69 +14,60 @@ import threading
 import time
 from typing import Any
 
-from .format import CHANNELS, SAMPLE_RATE, apply_gain, as_float_array
+from array import array
+
+from .format import CHANNELS, SAMPLE_RATE, as_float_array
 
 
 # HWHHYN 用 DEEPSEEK 制作
-def _dc_block(samples, state: list, cutoff_hz: float = 25.0):
-    """One-pole high-pass, one state per channel.
+def _apply_gain_ramp(samples, state: list, gain_from: float, gain_to: float,
+                     cutoff_hz: float = 25.0):
+    """直流阻断 + 逐样本线性增益过渡 + 柔和限幅，一次循环做完。
 
-    Loopback captures can carry a DC offset or sub-audio rumble. It is inaudible on a big
-    speaker and turns into a loud rattle on a phone, which is what made a perfectly
-    ordinary capture sound like noise.
+    ★ 2026-11-17：用户「两路同时出声时调单路音量会出高频杂音」。原来增益一变就
+      整块乘上去（`apply_gain`），块与块之间是阶跃；拖动滑杆时每块一个台阶，
+      听感就是沙沙/咔咔的高频杂音。这里在**一块之内**把增益从 gain_from 线性
+      过渡到 gain_to（通常 10ms 左右），台阶消失，不需要重开设备。
+      块内过渡也不会产生新的设备格式或缓冲变化，所以另一路完全不受影响。
     """
     if not samples:
         return samples
     import math
 
     channels = max(1, len(state))
-    # y[n] = a*(y[n-1] + x[n] - x[n-1]) with a just below 1 gives a gentle high-pass
-    # near the cutoff. Writing it as 1/(1+fs/2*pi*fc) inverts the coefficient and moves the
-    # corner up to several kHz, which deletes the audio instead of the rumble - the loop
-    # test caught exactly that.
+    frames = max(1, len(samples) // channels)
+    step = (gain_to - gain_from) / frames
     alpha = 1.0 - (2.0 * math.pi * max(1.0, cutoff_hz) / 48000.0)
-    out = []
+    knee = 0.95 * 0.7
+    span = max(1e-6, 0.95 - knee)
+    out = array("f")
     for index, value in enumerate(samples):
         slot = index % channels
         previous_in, previous_out = state[slot]
         current = alpha * (previous_out + value - previous_in)
         state[slot] = (value, current)
-        out.append(current)
-    return out
-
-
-def _soft_limit(samples, ceiling: float = 0.95):
-    """Keep peaks under the ceiling without the crunch of hard clipping.
-
-    The channel gain is a user setting and 1.4 is a normal thing to type, but multiplying
-    past full scale then clamping produces the harsh, "broken speaker" distortion that a
-    listener hears as terrible quality. Above the knee the signal is compressed smoothly
-    instead, so a loud source stays loud without turning into square waves.
-    """
-    if not samples:
-        return samples
-    out = []
-    knee = ceiling * 0.7
-    span = max(1e-6, ceiling - knee)
-    for value in samples:
-        magnitude = value if value >= 0 else -value
-        if magnitude <= knee:
-            out.append(value)
-        else:
+        gain = gain_from + step * (index // channels)
+        v = current * gain
+        magnitude = v if v >= 0 else -v
+        if magnitude > knee:
             over = (magnitude - knee) / span
             shaped = knee + span * (over / (1.0 + over))
-            out.append(shaped if value >= 0 else -shaped)
+            v = shaped if v >= 0 else -shaped
+        out.append(v)
     return out
 
 
 class LocalLoop(threading.Thread):
     """Capture -> render, both on this machine, paced by the capture device."""
 
-    def __init__(self, source, sink, *, gain: float = 1.0, tap=None, name: str = "本机直通") -> None:
+    def __init__(self, source, sink, *, gain: float = 1.0, tap=None, name: str = "本机广播监听") -> None:
         super().__init__(daemon=True, name="audiomixing-local")
         self.source = source
         self.sink = sink
         self.gain = float(gain)
+        # ★ 2026-11-17：滑杆只改这个目标值，绝不重开设备；播放线程每块线性靠过去。
+        self.gain_target = float(gain)
+        self._gain_lock = threading.Lock()
         self._dc_state = [(0.0, 0.0), (0.0, 0.0)]
         self.short_writes = 0
         self.slow_writes = 0
@@ -127,8 +118,10 @@ class LocalLoop(threading.Thread):
                     break
                 if not block:
                     continue
-                if self.gain != 1.0:
-                    block = _soft_limit(apply_gain(_dc_block(block, self._dc_state), self.gain))
+                if self.gain != 1.0 or self.gain_target != 1.0:
+                    target = self.gain_target
+                    block = _apply_gain_ramp(block, self._dc_state, self.gain, target)
+                    self.gain = target
                 # Instrumented, because "accepted 100% of frames" does not prove the
                 # device was fed *evenly*: writing in bursts starves the endpoint's own
                 # small buffer, and that is heard as a stutter while every counter here
@@ -166,6 +159,16 @@ class LocalLoop(threading.Thread):
                     closer()
                 except Exception:
                     pass
+
+    def set_gain(self, gain: float) -> None:
+        """只改目标增益：不 stop、不重开、不碰采集和其它输出。"""
+        try:
+            value = float(gain)
+        except (TypeError, ValueError):
+            return
+        value = max(0.0, min(4.0, value))
+        with self._gain_lock:
+            self.gain_target = value
 
     def stop(self) -> None:
         self._stop.set()

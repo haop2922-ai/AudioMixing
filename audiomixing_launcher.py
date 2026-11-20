@@ -188,6 +188,91 @@ def _raise_window(handle: int) -> None:
         pass
 
 
+def _panel_windows() -> list[int]:
+    """所有可见的「Audio Mixing」窗口句柄，按 z 序（最上面的在前）。
+
+    ★ Q1（2026-11-16）：以前只用一个 `_window_handle()` 找第一个窗口，
+      但已经堆起来的重复窗口没人收拾；这里把全部句柄列出来，供去重使用。
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        handles: list[int] = []
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def callback(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(hwnd, buf, 256)
+            if _monitor_window_title(buf.value):
+                handles.append(int(hwnd))
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(callback), 0)
+        return handles
+    except Exception:
+        return []
+
+
+def panel_open_action(window_count: int, monitor_process: bool) -> str:
+    """该对面板窗做什么：raise（提已有的）/ skip（进程在但标题认不出）/ open（新开）。
+
+    纯函数，便于单测；真正的 Win32 调用在 `open_monitor()` 里。
+    """
+    if int(window_count) > 0:
+        return "raise"
+    if monitor_process:
+        return "skip"
+    return "open"
+
+
+def extra_panel_windows(handles: list[int], keep: int) -> list[int]:
+    """除保留的那个之外，其余都是重复窗口。纯函数，便于单测。"""
+    return [h for h in handles if int(h) != int(keep)]
+
+
+def panel_allowed(env: dict[str, str]) -> bool:
+    """这个进程允许弹出面板窗吗。
+
+    ★ Q1（2026-11-16）：自检/验证进程（`verify_exe.py`、单测）会带
+      `AUDIOMIXING_HOME` 指到临时沙箱；它们如果也弹面板，每跑一次验证
+      就在用户桌面上留一个指向死端口的窗口。显式开关 `AUDIOMIXING_NO_PANEL`
+      也可以强制关掉。
+    """
+    if str(env.get("AUDIOMIXING_NO_PANEL") or "").strip() not in ("", "0", "false", "False"):
+        return False
+    return not env.get("AUDIOMIXING_HOME")
+
+
+def _close_window(handle: int) -> None:
+    if not handle or sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.user32.PostMessageW(int(handle), 0x0010, 0, 0)  # WM_CLOSE
+    except Exception:
+        pass
+
+
+def _dedupe_panel_windows() -> int:
+    """把已经堆起来的重复面板窗关掉，只留最上面那个。返回关掉的数量。"""
+    handles = _panel_windows()
+    if len(handles) <= 1:
+        return 0
+    extra = extra_panel_windows(handles, handles[0])
+    for handle in extra:
+        _close_window(handle)
+    _log("已关闭 %d 个重复面板窗（保留最上面一个）" % len(extra))
+    return len(extra)
+
+
 def _port_owner(port: int) -> int:
     if sys.platform != "win32":
         return 0
@@ -626,20 +711,23 @@ def open_monitor(address: str, page: str = "monitor") -> None:
     if sys.platform == "win32":
         lock = _acquire_monitor_open_lock(15000)
         if not lock:
-            existing = _window_handle()
-            if existing:
-                _raise_window(existing)
+            handles = _panel_windows()
+            if handles:
+                _raise_window(handles[0])
                 _log("监控窗已在打开/已存在，提到最前面")
             else:
                 _log("另一个实例正在打开监控窗，本进程不再重复开")
             return
         try:
-            existing = _window_handle()
-            if existing:
-                _raise_window(existing)
+            handles = _panel_windows()
+            action = panel_open_action(len(handles), False if handles else _monitor_process_exists())
+            if action == "raise":
+                if len(handles) > 1:
+                    _dedupe_panel_windows()
+                _raise_window(handles[0])
                 _log("监控窗已存在，提到最前面")
                 return
-            if _monitor_process_exists():
+            if action == "skip":
                 _log("已有监控窗进程（标题未识别），不再开第二个")
                 return
             _open_monitor_unlocked(address, page)
@@ -787,7 +875,12 @@ def run_service() -> int:
         except Exception as exc:
             _log("取局域网地址失败: %s" % exc)
         _log("服务已启动 %s" % address)
-        open_monitor(address)
+        # ★ Q1（2026-11-16）：自检/沙箱进程不弹面板 —— 否则每跑一次验证就在
+        #   用户桌面上多留一个指向临时端口的窗口。
+        if panel_allowed(dict(os.environ)):
+            open_monitor(address)
+        else:
+            _log("自检/沙箱进程：跳过自动打开面板窗")
 
         def stop_everything() -> None:
             """托盘菜单里选退出时走这里：先停服务，再结束进程。"""

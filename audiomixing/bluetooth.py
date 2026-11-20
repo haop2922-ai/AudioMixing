@@ -140,6 +140,91 @@ try {
 }
 """
 
+# ★ v2.41.3「常开」；★ 2.42.1：按下「打开」时主动尝试连接这台手机**一次**。
+#   微软文档对这两个方法的原话正好就是两种语义：
+#     · StartAsync —— "configures the system to allow connections from the remote
+#       audio source"（让系统长期放行这台手机的声音，不连接）；
+#     · Open      —— "attempts to connect the underlying device"（主动连接）。
+#   2.42.1 用户要求「按下打开时电脑主动尝试连接一次，省一步人工操作」，所以这里在
+#   第一次 StartAsync 之后调一次 Open()（和 connect()/_HOLD_SCRIPT 用的是同一条链路），
+#   之后仍然回到"长期放行、等手机自己连"的循环；Open 失败不影响常驻。
+#   助手常驻：手机自己连上来、自己断开，它都不退出，继续等下一次；
+#   状态只写文件，面板按文件读，不再为了问状态去枚举设备（枚举会扰动正在保持的连接）。
+_ALWAYS_SCRIPT = _AWAIT + r"""
+$deviceId = $env:AUDIOMIXING_BT_ID
+$sentinel = $env:AUDIOMIXING_BT_SENTINEL
+$status   = $env:AUDIOMIXING_BT_STATUS
+$triedOpen = $false
+function Write-Status($s) {
+  try {
+    $tmp = $status + ".tmp"
+    [System.IO.File]::WriteAllText($tmp, $s)
+    Move-Item -Force -Path $tmp -Destination $status
+  } catch { }
+}
+try {
+  # 常驻：手机没开机、StartAsync 暂时失败都不退出，隔一会儿再挂一次 ——
+  # 「常开」要的就是电脑这边一直等着，手机什么时候连上来都行。
+  while (Test-Path $sentinel) {
+    $conn = $apcT::TryCreateFromId($deviceId)
+    if (-not $conn) {
+      Write-Status "always:error:no-connection-object"
+      Start-Sleep -Milliseconds 3000
+      continue
+    }
+    try {
+      Write-Status "always:starting"
+      AwaitAction ($conn.StartAsync()) 15000
+      # ★ 2.42.1：只尝试一次主动连接（与 connect() 的 StartAsync+Open 同一条链路）。
+      #   成功/失败都继续常驻等待，不会因为手机没开机就退出。
+      if (-not $triedOpen) {
+        $triedOpen = $true
+        try { $conn.Open() } catch { }
+      }
+      Write-Status ("always:ready:" + $conn.State.ToString())
+      # ★ 2.44.2：A2DP 的 State=Opened 不等于“还在出声”。WinRT 连接对象长时间挂着后
+      #   底层流会假死（表现：面板一直 open:Opened，但手机放歌电脑没声；断开重连就好）。
+      #   这里加两道保活：
+      #   1) State 连续 5 次（约 3.5 秒）不是 Opened → 跳出内层，外层重建连接；
+      #   2) Opened 连续 20 分钟 → 主动回收一次（手机重连只要 1 秒左右），避免假死拖到半小时。
+      #   回收时把 $triedOpen 复位，外层会对新连接再 Open 一次。
+      $openedAt = Get-Date
+      $notOpen = 0
+      while (Test-Path $sentinel) {
+        Start-Sleep -Milliseconds 700
+        $state = $conn.State.ToString()
+        if ($state -eq "Opened") {
+          $notOpen = 0
+          if (((Get-Date) - $openedAt).TotalMinutes -ge 20) {
+            Write-Status "always:recycle:stale"
+            $triedOpen = $false
+            break
+          }
+          Write-Status ("always:open:" + $state)
+        } else {
+          $notOpen++
+          Write-Status ("always:ready:" + $state)
+          if ($notOpen -ge 5) {
+            Write-Status "always:recycle:state"
+            $triedOpen = $false
+            break
+          }
+        }
+      }
+    } catch {
+      Write-Status ("always:error:" + $_.Exception.Message)
+      Start-Sleep -Milliseconds 1500
+    }
+    try { $conn.Close() } catch { }
+  }
+  Write-Status "closing"
+  Write-Status "closed"
+} catch {
+  Write-Status ("always:error:" + $_.Exception.Message)
+  exit 3
+}
+"""
+
 
 # HWHHYN 用 DEEPSEEK 制作
 def available() -> bool:
@@ -414,8 +499,17 @@ def list_devices() -> list[dict[str, Any]]:
         # are reported separately and honestly.
         hfp = bool(item.get("hfp"))
         endpoint_active = bool(item.get("endpoint"))
-        if state.startswith("error:"):
+        always = state.startswith("always:")
+        if state.startswith("error:") or state.startswith("always:error:"):
             link = "error"
+        elif always:
+            # ★ v2.41.3「常开」：系统已经长期放行、接收端挂着；只有手机自己连上来、
+            #   媒体音频真的到了（端点 active，或连接对象自己变成 Opened）才算 connected。
+            #   否则报 always（待机等手机），不能沿用 waiting 的「手机未连接」——
+            #   常开本来就不主动连手机，写 waiting 会让人以为功能坏了。
+            link = ("connected"
+                    if (endpoint_active or state.startswith("always:open:Opened"))
+                    else "always")
         elif held and endpoint_active:
             # Both halves must be true: we opened the sink, and the phone actually
             # brought up its A2DP media link. Either one alone was a false "connected".
@@ -436,6 +530,7 @@ def list_devices() -> list[dict[str, Any]]:
             "held": held,
             "endpoint": endpoint_active,
             "hfp": hfp,
+            "always": always,
             "link": link,
         })
     return merge_paired_devices(out)
@@ -478,7 +573,7 @@ def merge_paired_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     def rank(device: dict[str, Any]) -> tuple[int, int]:
         link = str(device.get("link") or "")
-        return ({'connected': 0, 'waiting': 1, 'hfp': 2}.get(link, 3),
+        return ({'connected': 0, 'waiting': 1, 'always': 2, 'hfp': 3}.get(link, 4),
                 -int(device.get("endpoint") or 0))
 
     merged: list[dict[str, Any]] = []
@@ -501,6 +596,7 @@ def merge_paired_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
         primary["held"] = any(bool(item.get("held")) for item in items)
         primary["endpoint"] = any(bool(item.get("endpoint")) for item in items)
         primary["hfp"] = any(bool(item.get("hfp")) for item in items)
+        primary["always"] = any(bool(item.get("always")) for item in items)
         if len(items) > 1:
             # 两条历史配对里只要有一条还连着，这张卡就按连着的那条显示。
             primary["state"] = next((str(item.get("state")) for item in items
@@ -705,6 +801,66 @@ def connect_by_name(name: str) -> dict[str, Any]:
             "error": "「%s」不在蓝牙列表里 —— 要先在 Windows 蓝牙设置里配对一次" % name}
 
 
+def _launch(device_id: str, script_text: str, initial_status: str) -> dict[str, Any]:
+    """给一台设备起一个 helper 子进程（调用方负责持有 `_LOCK`）。
+
+    `connect()`（手机点「走蓝牙」时的主动连接）与 `always_on()`（「打开」的常驻接收）共用这一段：清旧文件、写哨兵、
+    落脚本、起进程、记 pid。两种模式的区别只在脚本内容（是否调 Open）。
+    """
+    _STATE_DIR.mkdir(parents=True, exist_ok=True)
+    key = _key(device_id)
+    sentinel = _STATE_DIR / ("%s.keep" % key)
+    status_file = _STATE_DIR / ("%s.status" % key)
+    pid_file = _STATE_DIR / ("%s.pid" % key)
+    log_file = _STATE_DIR / ("%s.log" % key)
+    # A previous attempt may have left files behind; start from a clean slate so a
+    # stale "open:..." can never make the panel claim a connection that is gone.
+    for stale in (sentinel, status_file, pid_file, log_file,
+                  _STATE_DIR / ("%s.ps1" % key)):
+        try:
+            stale.unlink(missing_ok=True)
+        except OSError:
+            # A helper that is still shutting down can hold its log for a moment.
+            pass
+    sentinel.write_text("1", encoding="utf-8")
+    status_file.write_text(initial_status, encoding="utf-8")
+    # 脚本落在插件自己的状态目录里（按设备哈希命名），不再往 %TEMP% 里
+    # 每次连接丢一个 .ps1 —— 那些临时文件以前从来没被删过。
+    script_path = _STATE_DIR / ("%s.ps1" % key)
+    script_path.write_text(script_text, encoding="utf-8-sig")
+    env = dict(os.environ)
+    env.update({
+        "AUDIOMIXING_BT_ID": device_id,
+        "AUDIOMIXING_BT_SENTINEL": str(sentinel),
+        "AUDIOMIXING_BT_STATUS": str(status_file),
+    })
+    # A fully detached process (DETACHED_PROCESS) could not bring up WinRT and
+    # silently died before writing anything; CREATE_NO_WINDOW alone is enough to
+    # keep it invisible, and its output goes to a log so a failure is visible.
+    flags = _NO_WINDOW
+    try:
+        # The child inherits this handle; the parent must let go of its own copy or
+        # the log stays locked and a later reconnect cannot clean up.
+        with open(log_file, "wb") as log:
+            proc = subprocess.Popen(
+                [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
+                env=env, creationflags=flags, close_fds=True, stdout=log, stderr=subprocess.STDOUT,
+                cwd=str(_STATE_DIR),
+            )
+    except OSError:
+        sentinel.unlink(missing_ok=True)
+        raise
+    pid_file.write_text(str(proc.pid), encoding="utf-8")
+    return {"key": key, "pid_file": pid_file, "log_file": log_file, "proc": proc}
+
+
+def _log_tail(log_file: pathlib.Path) -> str:
+    try:
+        return log_file.read_text(encoding="utf-8", errors="replace").strip()[-400:]
+    except OSError:
+        return ""
+
+
 def connect(device_id: str) -> dict[str, Any]:
     """Open the A2DP sink for `device_id` and keep it open in a helper process."""
     if not available():
@@ -712,12 +868,9 @@ def connect(device_id: str) -> dict[str, Any]:
     if not device_id:
         return {"ok": False, "error": "缺少设备 id"}
     with _LOCK:
-        _STATE_DIR.mkdir(parents=True, exist_ok=True)
         key = _key(device_id)
         sentinel = _STATE_DIR / ("%s.keep" % key)
-        status_file = _STATE_DIR / ("%s.status" % key)
         pid_file = _STATE_DIR / ("%s.pid" % key)
-        log_file = _STATE_DIR / ("%s.log" % key)
         # Already open? Then this is a no-op, not a restart: reconnecting a live phone
         # would drop the audio it is sending right now.
         if sentinel.is_file() and pid_file.is_file():
@@ -726,46 +879,14 @@ def connect(device_id: str) -> dict[str, Any]:
             # 否则按「连接」只会被当成已连接而复用，用户点什么都没反应。
             if current.startswith("open:") and "Closed" not in current:
                 return {"ok": True, "state": current, "pid": _pid(pid_file), "reused": True}
+            # 常开助手也占着同一台设备，要先停掉它，否则两个 helper 抢同一条链路。
             _stop_helper(pid_file)
-        # A previous attempt may have left files behind; start from a clean slate so a
-        # stale "open:..." can never make the panel claim a connection that is gone.
-        for stale in (sentinel, status_file, pid_file, log_file,
-                      _STATE_DIR / ("%s.ps1" % key)):
-            try:
-                stale.unlink(missing_ok=True)
-            except OSError:
-                # A helper that is still shutting down can hold its log for a moment.
-                pass
-        sentinel.write_text("1", encoding="utf-8")
-        status_file.write_text("starting", encoding="utf-8")
-        # 脚本落在插件自己的状态目录里（按设备哈希命名），不再往 %TEMP% 里
-        # 每次连接丢一个 .ps1 —— 那些临时文件以前从来没被删过。
-        script_path = _STATE_DIR / ("%s.ps1" % key)
-        script_path.write_text(_HOLD_SCRIPT, encoding="utf-8-sig")
-        env = dict(os.environ)
-        env.update({
-            "AUDIOMIXING_BT_ID": device_id,
-            "AUDIOMIXING_BT_SENTINEL": str(sentinel),
-            "AUDIOMIXING_BT_STATUS": str(status_file),
-        })
-        # A fully detached process (DETACHED_PROCESS) could not bring up WinRT and
-        # silently died before writing anything; CREATE_NO_WINDOW alone is enough to
-        # keep it invisible, and its output goes to a log so a failure is visible.
-        log_file = _STATE_DIR / ("%s.log" % key)
-        flags = _NO_WINDOW
         try:
-            # The child inherits this handle; the parent must let go of its own copy or
-            # the log stays locked and a later reconnect cannot clean up.
-            with open(log_file, "wb") as log:
-                proc = subprocess.Popen(
-                    [POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script_path)],
-                    env=env, creationflags=flags, close_fds=True, stdout=log, stderr=subprocess.STDOUT,
-                    cwd=str(_STATE_DIR),
-                )
+            started = _launch(device_id, _HOLD_SCRIPT, "starting")
         except OSError as exc:
-            sentinel.unlink(missing_ok=True)
             return {"ok": False, "error": "启动 helper 失败: %s" % exc}
-        pid_file.write_text(str(proc.pid), encoding="utf-8")
+        proc = started["proc"]
+        log_file = started["log_file"]
     # Give the helper a moment to report; the phone itself connects asynchronously.
     deadline = time.time() + 8.0
     while time.time() < deadline:
@@ -776,13 +897,84 @@ def connect(device_id: str) -> dict[str, Any]:
     state = status(device_id) or "starting"
     result = {"ok": not state.startswith("error:"), "state": state, "pid": proc.pid}
     if not state.startswith("open:"):
-        try:
-            tail = log_file.read_text(encoding="utf-8", errors="replace").strip()[-400:]
-        except OSError:
-            tail = ""
+        tail = _log_tail(log_file)
         if tail:
             result["log"] = tail
     return result
+
+
+def always_on(device_id: str) -> dict[str, Any]:
+    """「常开」：让 Windows 长期放行这台手机的音频，并在打开时**主动连一次**。
+
+    和 `connect()`（手机请求的主动连接）的关系：
+      · 2.42.1 起「打开」会在第一次 StartAsync 之后调一次 Open()，和 connect() 用的是
+        **同一条链路、同一对调用**；区别只在于失败后不退出，继续常驻等待。
+      · 之后仍是"长期放行"：手机断开后助手不退出，继续等下一次；
+        手机自己连上来就开始传声音。
+    """
+    if not available():
+        return {"ok": False, "error": "这台机器不是 Windows，或找不到 powershell.exe"}
+    if not device_id:
+        return {"ok": False, "error": "缺少设备 id"}
+    with _LOCK:
+        key = _key(device_id)
+        sentinel = _STATE_DIR / ("%s.keep" % key)
+        pid_file = _STATE_DIR / ("%s.pid" % key)
+        if sentinel.is_file() and pid_file.is_file():
+            current = status(device_id)
+            if (current.startswith("always:") and not current.startswith("always:error:")
+                    and _alive(_pid(pid_file))):
+                return {"ok": True, "state": current, "pid": _pid(pid_file), "reused": True}
+            _stop_helper(pid_file)
+        try:
+            started = _launch(device_id, _ALWAYS_SCRIPT, "always:starting")
+        except OSError as exc:
+            return {"ok": False, "error": "启动常开接收端失败: %s" % exc}
+        proc = started["proc"]
+        log_file = started["log_file"]
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        state = status(device_id)
+        if state.startswith("always:ready:") or state.startswith("always:error:"):
+            break
+        time.sleep(0.3)
+    state = status(device_id) or "always:starting"
+    if state == "starting":
+        state = "always:starting"
+    result = {"ok": not state.startswith("always:error:"), "state": state, "pid": proc.pid,
+              # ★ 2.42.1：告诉上层"这次打开已经主动尝试连接过一次"，失败也继续常驻。
+              "connect_attempt": True,
+              "connect": {"ok": not state.startswith("always:error:"), "state": state,
+                          "mode": "one-shot-open"}}
+    if state.startswith("always:error:"):
+        if "no-connection-object" in state:
+            result["error"] = ("这台手机在 Windows 里没有可用的配对记录：请先到 Windows 设置 → "
+                               "蓝牙和其他设备 里配对一次（本程序不做应用内配对）。")
+        else:
+            result["error"] = state
+        tail = _log_tail(log_file)
+        if tail:
+            result["log"] = tail
+    return result
+
+
+def always_off(device_id: str) -> dict[str, Any]:
+    """关掉「常开」：删哨兵让常驻助手退出，并清掉它的状态文件。"""
+    key = _key(device_id or "")
+    try:
+        (_STATE_DIR / ("%s.keep" % key)).unlink(missing_ok=True)
+    except OSError:
+        pass
+    _stop_helper(_STATE_DIR / ("%s.pid" % key))
+    _forget(device_id)
+    return {"ok": True, "state": "off"}
+
+
+def always_status(device_id: str) -> str:
+    """常开接收端的实时状态：只读助手写的状态文件，**不做任何设备枚举**。"""
+    text = status(device_id)
+    return text if text.startswith("always:") else ""
+
 
 
 def _pid(pid_file: pathlib.Path) -> int | None:
@@ -1095,6 +1287,22 @@ def _apply_live_states(devices: list[dict]) -> list[dict]:
                     continue
                 device["held"] = True
                 device["state"] = text
+                if text.startswith("always:"):
+                    # ★ v2.41.3「常开」：助手只做了 StartAsync（长期放行），没有 Open
+                    #   （主动连接）。手机自己连上来、媒体端点真的 active 才算 connected；
+                    #   否则报 always（常开待机），不报 waiting —— 常开不主动连手机是设计。
+                    device["always"] = True
+                    if text.startswith("always:error:"):
+                        device["link"] = "error"
+                        continue
+                    live_endpoint = _endpoint_state_from_registry(str(device.get("name") or ""))
+                    if live_endpoint is not None:
+                        device["endpoint"] = live_endpoint
+                    if text.startswith("always:open:Opened") or bool(device.get("endpoint")):
+                        device["link"] = "connected"
+                    else:
+                        device["link"] = "always"
+                    continue
                 if text == "open:Opened" or text.startswith("open:Opened:"):
                     # ★ 2026-10-21 用户现场：“控制台显示正在接收手机声音，但一点声音都没有”。
                     #   helper 把 sink 打开（open:Opened）并不等于手机把 **A2DP 媒体音频**

@@ -44,6 +44,10 @@ AUDCLNT_STREAMFLAGS_CROSSPROCESS = 0x00010000
 AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
 AUDCLNT_STREAMFLAGS_EVENTCALLBACK = 0x00040000
 AUDCLNT_STREAMFLAGS_NOPERSIST = 0x00080000
+# ★ 2026-11-16 按 App 采音：官方进程回环示例必须带 AUTOCONVERTPCM，
+#   否则 Initialize 能过、读到的却是全程静音。
+AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM = 0x80000000
+AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY = 0x08000000
 
 AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY = 0x1
 AUDCLNT_BUFFERFLAGS_SILENT = 0x2
@@ -171,9 +175,100 @@ def _endpoint_devices(data_flow: int, kind: str) -> list[AudioDevice]:
                     dev.release()
         finally:
             collection.release()
+        # ★ 2.42.3 修复（真机第 1 条）：A2DP SNK 采集端点在注册表里 DeviceState=1，
+        #   但 WASAPI 的 ACTIVE 枚举不返回它 —— 手机蓝牙连着、helper 也 Open 了，
+        #   应用却连"有这块音源"都看不到，用户没法选中，表现就是"蓝牙传不了声音"。
+        #   这里把注册表 active 的 A2DP/SNK 采集端点补进列表，id 按 MMDevices 规则拼，
+        #   和 _find_endpoint 打开它时用的 id 完全一致。
+        if kind == KIND_SOURCE and data_flow == eCapture:
+            _merge_registry_a2dp_capture(enum, out)
     finally:
         enum.release()
     return out
+
+
+def _registry_a2dp_capture_endpoints() -> list[tuple[str, str]]:
+    """注册表里 DeviceState=1 的 A2DP/SNK 采集端点：[(guid, friendly_name)]。"""
+    if sys.platform != "win32":
+        return []
+    try:
+        import winreg
+    except ImportError:
+        return []
+    base = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Capture"
+    found: list[tuple[str, str]] = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as root:
+            index = 0
+            while True:
+                try:
+                    guid = winreg.EnumKey(root, index)
+                except OSError:
+                    break
+                index += 1
+                try:
+                    with winreg.OpenKey(root, guid) as dev:
+                        try:
+                            state, _ = winreg.QueryValueEx(dev, "DeviceState")
+                        except OSError:
+                            continue
+                        if int(state) != 1:
+                            continue
+                        friendly = ""
+                        try:
+                            with winreg.OpenKey(dev, "Properties") as props:
+                                friendly, _ = winreg.QueryValueEx(
+                                    props, "{b3f8fa53-0004-438e-9003-51a46e139bfc},6")
+                        except OSError:
+                            pass
+                except OSError:
+                    continue
+                norm = _name_key(friendly)
+                if "a2dp" not in norm and "snk" not in norm:
+                    continue
+                found.append((guid, str(friendly or "")))
+    except OSError:
+        return []
+    return found
+
+
+def _merge_registry_a2dp_capture(enum: wc.IMMDeviceEnumerator, out: list[AudioDevice]) -> None:
+    """把 ACTIVE 枚举漏掉的 A2DP/SNK 采集端点补进 `out`（按 id 去重）。"""
+    have = {d.id.lower() for d in out}
+    for guid, reg_name in _registry_a2dp_capture_endpoints():
+        dev_id = "{0.0.1.00000000}." + guid
+        if dev_id.lower() in have:
+            continue
+        dev = None
+        try:
+            dev = enum.get_device(dev_id)
+            if not dev.valid:
+                continue
+            name = wc.device_friendly_name(dev) or reg_name or dev_id
+            info = _mix_format_of(dev)
+            out.append(
+                AudioDevice(
+                    id=dev_id,
+                    name=name,
+                    kind=KIND_SOURCE,
+                    backend="wasapi",
+                    kind_detail="capture",
+                    channels=info.get("channels", CHANNELS),
+                    sample_rate=info.get("sample_rate", SAMPLE_RATE),
+                    is_default=False,
+                    extra={
+                        "data_flow": "capture",
+                        "sample_format": info.get("sample_format", ""),
+                        "bits": info.get("bits", 0),
+                    },
+                )
+            )
+            have.add(dev_id.lower())
+        except OSError:
+            continue
+        finally:
+            if dev is not None:
+                dev.release()
 
 
 def _mix_format_of(dev: wc.IMMDevice) -> dict:
@@ -264,7 +359,13 @@ def _a2dp_registry_endpoint_id(selector: str, data_flow: int) -> str:
                     continue
                 text = str(friendly or "")
                 norm = _name_key(text)
-                if not norm or want not in norm:
+                if not norm:
+                    continue
+                # ★ 2.42.3 修复（真机第 1 条）：设备枚举里显示的名字来自 IMMDevice
+                #   （`麦克风 (<手机名> A2DP SNK)`），注册表里只有 `<手机名> A2DP SNK`。
+                #   只允许 "want ⊂ norm" 时，用户从面板选中的那块端点按名字永远打不开。
+                #   采集端允许反方向包含（selector 比注册表名长），仍然要求名字带 A2DP/SNK。
+                if want not in norm and not (data_flow == eCapture and norm in want):
                     continue
                 # ★ 2026-11-06（第 3 条）：渲染端点（送声/回环）不需要名字里带 A2DP/SNK。
                 #   蓝牙耳机在 Windows 里的渲染端点常叫「耳机 (某蓝牙耳机)」；
@@ -784,7 +885,15 @@ class WasapiBackend(BackendBase):
         return devices
 
     @classmethod
-    def open_source(cls, spec: dict[str, Any]) -> WasapiSource:
+    def open_source(cls, spec: dict[str, Any]) -> "object":
+        # ★ 2026-11-17 真机 bug：用户只给 AIR4 连了 QQ音乐，却还能听到系统声音。
+        #   根因就在这里 —— 以前不管 spec 写什么，一律返回 WasapiSource（桌面回环），
+        #   `kind: "app"` 被完全忽略，ProcessLoopbackSource 从来没被接上。
+        #   现在按 App 采音真的走进程回环；打不开会抛错，由 MultiOut 回落并写明原因。
+        if str(spec.get("kind") or "") == "app":
+            from .process_loopback import ProcessLoopbackSource
+
+            return ProcessLoopbackSource(spec)
         return WasapiSource(spec)
 
     @classmethod

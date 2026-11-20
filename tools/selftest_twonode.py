@@ -72,6 +72,12 @@ def api(port: int, path: str, body: dict | None = None):
 
 
 def tone_player(seconds: float, device: str = "@default") -> threading.Thread:
+    """★ 2026-11-17：真机出声只在 --real-audio 时启用。
+
+    用户反馈「调节音量有高频杂音 / 蓝牙卡顿」后自查发现：这个自检原来会在
+    **用户真实的默认播放设备**（这次是蓝牙耳机）上播 14 秒 880Hz，且 B 节点
+    也往真实默认设备播放。门禁必须隔离，不能碰用户设备。
+    """
     def run() -> None:
         sink = audio_base.open_sink({"backend": "wasapi", "device": device})
         sink.start()
@@ -100,6 +106,7 @@ def tone_player(seconds: float, device: str = "@default") -> threading.Thread:
 
 def main() -> int:
     audio_port_a, audio_port_b = 48401, 48402
+    broadcast_port_a, broadcast_port_b = 48403, 48404
     disc_port_a, disc_port_b = 48411, 48412
     web_a, web_b = 17901, 17902
 
@@ -107,6 +114,7 @@ def main() -> int:
     cfg_a.node_id = "selftest-node-a"
     cfg_a.name = "自检-A（采集端）"
     cfg_a.audio_port = audio_port_a
+    cfg_a.broadcast_port = broadcast_port_a
     cfg_a.discovery_port = disc_port_a
     cfg_a.web_port = web_a
     cfg_a.routes = []
@@ -116,13 +124,24 @@ def main() -> int:
     cfg_b.node_id = "selftest-node-b"
     cfg_b.name = "自检-B（播放端）"
     cfg_b.audio_port = audio_port_b
+    cfg_b.broadcast_port = broadcast_port_b
     cfg_b.discovery_port = disc_port_b
     cfg_b.web_port = web_b
     cfg_b.routes = []
     cfg_b.manual_peers = []
 
-    node_a = AudioMixingNode(cfg_a, audio_port=audio_port_a, discovery_port=disc_port_a)
-    node_b = AudioMixingNode(cfg_b, audio_port=audio_port_b, discovery_port=disc_port_b)
+    node_a = AudioMixingNode(cfg_a, audio_port=audio_port_a, broadcast_port=broadcast_port_a, discovery_port=disc_port_a)
+    node_b = AudioMixingNode(cfg_b, audio_port=audio_port_b, broadcast_port=broadcast_port_b, discovery_port=disc_port_b)
+    # ★ 2026-11-17：默认不碰真实声卡。假采集源 + 空播放端就能验证整条链路；
+    #   要真实出声必须显式 --real-audio（默认门禁不带这个参数）。
+    real_audio = "--real-audio" in sys.argv
+    if not real_audio:
+        node_a.default_source_spec = lambda: {"backend": "null", "device": "tone:880"}
+        node_b.default_source_spec = lambda: {"backend": "null", "device": "tone:880"}
+        node_a.default_sink_spec = lambda: {"backend": "null", "device": "null"}
+        node_b.default_sink_spec = lambda: {"backend": "null", "device": "null"}
+    print("音频设备: %s" % ("真实声卡（--real-audio）" if real_audio else "隔离（null，不碰真实设备）"),
+          flush=True)
     ui_a = WebUI(node_a, host="127.0.0.1", port=web_a)
     ui_b = WebUI(node_b, host="127.0.0.1", port=web_b)
 
@@ -140,6 +159,9 @@ def main() -> int:
     try:
         print("=" * 70)
         check("两个节点启动", node_a.receiver.port == audio_port_a and node_b.receiver.port == audio_port_b)
+        check("广播端口独立绑定", node_a.receiver.broadcast_port == broadcast_port_a
+              and node_b.receiver.broadcast_port == broadcast_port_b,
+              "A=%d B=%d" % (node_a.receiver.broadcast_port, node_b.receiver.broadcast_port))
         check("控制台 A 可访问", bool(api(port_a, "/healthz")["ok"]), "http://127.0.0.1:%d" % port_a)
         check("控制台 B 可访问", bool(api(port_b, "/healthz")["ok"]), "http://127.0.0.1:%d" % port_b)
 
@@ -182,7 +204,7 @@ def main() -> int:
         # A's capture start-up is occasionally slow (WASAPI initialisation right after
         # a route appears can take a second or two), so keep the tone alive across the
         # whole window instead of playing it once and hoping the timing lines up.
-        tone = tone_player(14.0)
+        tone = tone_player(14.0) if real_audio else None
         deadline = time.time() + 12
         packets = 0
         frames = 0
@@ -194,7 +216,8 @@ def main() -> int:
             if packets > 200 and frames > 48000:
                 break
             time.sleep(0.3)
-        tone.join(timeout=20)
+        if tone is not None:
+            tone.join(timeout=20)
         check("B 收到 A 的音频包", packets > 200, "packets=%d" % packets)
         check("B 实际播放了 A 的音频", frames > 48000, "played_frames=%d (%.1f s)" % (frames, frames / float(SAMPLE_RATE)))
 
@@ -269,8 +292,8 @@ def main() -> int:
                 time.sleep(0.05)
             return False
 
-        def send_audio(ssrc: int, count: int) -> None:
-            """从 A 的地址发 count 个真实音频包到 B 的音频端口。"""
+        def send_audio(ssrc: int, count: int, port: int = audio_port_b) -> None:
+            """从 A 的地址发 count 个真实音频包到 B 的指定端口（点对点 / 广播）。"""
             payload = _proto.encode_pcm_s16([0.05, -0.05] * 480)   # 480 帧立体声
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
@@ -278,7 +301,7 @@ def main() -> int:
                     pkt = _proto.Packet(type=_proto.T_AUDIO, payload=payload,
                                         codec=_proto.CODEC_PCM_S16, seq=i & 0xFFFF,
                                         ssrc=ssrc, samples=480, ts_ns=_proto.now_ns())
-                    s.sendto(pkt.encode(), ("127.0.0.1", audio_port_b))
+                    s.sendto(pkt.encode(), ("127.0.0.1", port))
                     time.sleep(0.004)
             finally:
                 s.close()
@@ -308,38 +331,34 @@ def main() -> int:
             return ssrc in node_b.receiver.streams
 
         def streams_from_a() -> int:
-            # ★「混音只挂一路」的正确判据：同一个发送方在流表里只能有一条。
-            #   发送端换 ssrc（重启/换路由）时接收端会顶掉旧的那条（_evict_superseded），
-            #   所以总数可能不变 —— 不能拿"总数 +1"当判据。
+            # ★「混音只挂一路」的正确判据：同一个发送方在**同一个端口**的流表里只能有一条。
+            #   ★ 2.42.2：广播口那条（info.channel=True）单独算，不混进点对点口径。
             return sum(1 for info in node_b.receiver.streams.values()
-                       if (info.node_id or "") == "selftest-node-a")
+                       if (info.node_id or "") == "selftest-node-a"
+                       and not bool(getattr(info, "channel", False)))
 
-        check("A 声明「广播」被 B 收到", send_stats(broadcast=True))
-        wild = api(port_b, "/api/routes/add", {"route": {"from": ["*"], "to": ["self"],
-                                                         "codec": "pcm_s16", "gain": 1.0}})
-        check("B 挂上频道通配路由（= 勾「只听」）", bool(wild.get("ok")),
-              json.dumps(wild.get("routes"), ensure_ascii=False)[:100])
-        time.sleep(0.8)
+        # ★ 2.42.1（自检隔离）：这台机器上可能同时跑着真实节点（桌面上的
+        #   AudioMixing exe），它们也从 127.0.0.1 发信标。接收端按 IP 反查身份时
+        #   可能认到那台，导致"同一发送方只有一条流"统计成 0（20e66011 那条真实
+        #   节点就抢过这个映射）。本节只验"一条流混一路"，来源固定成 A。
+        node_b.receiver.resolve_source = lambda _host: "selftest-node-a"
+        check("A 声明「点对点」被 B 收到", send_stats(broadcast=False))
+        # ★ 2.42.2（第 2 条）：广播走独立端口 + 独立准入（只看 config.listen）。
+        node_b.config.listen = True
+        time.sleep(1.2)
+        b0 = node_b.receiver.broadcast_packets_received
+        send_audio(0xB0A5, 40, broadcast_port_b)
+        b1 = node_b.receiver.broadcast_packets_received
+        check("广播口：勾「听广播」后音频被接住", b1 - b0 >= 30, "Δbroadcast_rx=%d" % (b1 - b0))
+        check("广播口：这条流进了流表且标记为 channel",
+              wait_stream(0xB0A5, True)
+              and bool(getattr(node_b.receiver.streams.get(0xB0A5), "channel", False)),
+              detail())
+        node_b.config.listen = False
+        time.sleep(1.2)
 
-        d0, r0, s0 = snapshot()
-        send_audio(0xB0A5, 40)
-        d1, r1, s1 = snapshot()
-        check("广播→只听：音频被接住", r1 - r0 >= 30, "Δreceived=%d" % (r1 - r0))
-        check("广播→只听：packets_denied 不增长", d1 == d0, "denied %d→%d" % (d0, d1))
-        check("广播→只听：这条流进了流表", wait_stream(0xB0A5, True), detail())
-        check("广播→只听：混音只挂一路（同一发送方只有一条流）", streams_from_a() == 1,
-              "streams_from_A=%d" % streams_from_a())
-
-        # ★ 2026-11-08（偶发失败定位）：B 加的通配路由会被 broadcast_routes 原样推给 A，
-        #   A 看到 "from * → B" 就按频道发送规则**真的重新开一路采集发送**；真实流的
-        #   ssrc 和下面注入的测试流属于同一个 owner，接收端按 _evict_superseded 只留
-        #   一条 —— 谁后到谁留下。于是 7c 偶尔看到的是真实流 3a959cbf、注入的 0xB0A7
-        #   被顶掉，报"点名收听：同一条点对点流被接住"失败（2/5 次）。
-        #   这不是产品缺陷，是测试自己没隔离干净：用完通配路由立刻删掉（removed 会
-        #   一并推给 A），并等 A 的真实发送会话收干净，再做后面的点对点注入。
-        wild_id = str((wild.get("routes") or [{}])[-1].get("id") or "")
-        if wild_id:
-            api(port_b, "/api/routes/delete", {"id": wild_id})
+        # ★ 2026-11-08（偶发失败定位）：等 A 的真实发送会话收干净，再做后面的点对点注入，
+        #   避免真实流和注入流抢同一个 owner 的 ssrc。
         deadline = time.time() + 8.0
         while time.time() < deadline and node_a.sender.sessions:
             time.sleep(0.2)
@@ -370,28 +389,138 @@ def main() -> int:
             elif time.time() - stable_since >= 0.8:
                 break
 
-        d0, r0, s0 = snapshot()
-        send_audio(0xB0A6, 40)
-        d1, r1, s1 = snapshot()
-        check("点对点未开「收听」：被拒收并计入 packets_denied", d1 - d0 >= 30,
-              "denied %d→%d" % (d0, d1))
-        check("点对点未开「收听」：不进流表", wait_stream(0xB0A6, False, 1.0), detail())
-        check("点对点未开「收听」：不算作已接收", r1 - r0 <= 2, "Δreceived=%d" % (r1 - r0))
+        # ★ v2.42 门禁稳定性（两条，都是测试隔离，不改产品判据）：
+        #   ① 上面"等收包静止"最多 5 秒，而发送端的模式声明只有 PEER_TARGETED_TTL_S
+        #      （6 秒）新鲜度；等完声明可能刚好过期，B 会把点对点当成"认不出来源"放行。
+        #      真实发送端每 ~2 秒会再报一次，这里补发一次等价于真实节奏。
+        #   ② 这台机器上可能同时跑着真实节点（比如桌面上的 AudioMixing-v2.41.exe），
+        #      它们也从 127.0.0.1 发信标；接收端按 IP 反查身份时可能认到那台，
+        #      于是"点对点拒收"变成"来源认不出 → 放行"。这一节只验 B 的准入规则，
+        #      所以临时把来源解析固定成 A，避免被同机真实节点干扰。
+        original_resolve = node_b.receiver.resolve_source
+        node_b.receiver.resolve_source = lambda _host: "selftest-node-a"
+        try:
+            # ★ v2.42：第 2 步那条路由的删除是异步推送的。这台机器上同时跑着
+            #   别的真实节点时，偶尔 8 秒内没清干净（B.sinks 已关，但 B 的
+            #   desired_sinks 里还留着"来自 A"的具名路由）—— 它会让下面的
+            #   "未开收听必须拒收"被这条残留路由放行。这一节只验准入规则，
+            #   所以先显式清掉 B 表里来自 A 的残留，并等准入真的回到"没有具名路由"。
+            node_b.set_routes([r for r in node_b.routes
+                               if "selftest-node-a" not in (r.get("from") or [])])
+            deadline = time.time() + 5.0
+            while time.time() < deadline and node_b._accepted_routes_for("selftest-node-a"):
+                time.sleep(0.2)
 
-        named = api(port_b, "/api/routes/add", {"route": {"from": ["selftest-node-a"],
-                                                          "to": ["self"], "codec": "pcm_s16",
-                                                          "gain": 1.0}})
-        check("B 为 A 点名开「收听」", bool(named.get("ok")),
-              json.dumps(named.get("routes"), ensure_ascii=False)[:220])
-        time.sleep(1.0)
-        d0, r0, s0 = snapshot()
-        send_audio(0xB0A7, 40)
-        admitted = wait_stream(0xB0A7, True)
-        d1, r1, s1 = snapshot()
-        check("点名收听：同一条点对点流被接住", admitted, detail())
-        check("点名收听：混合表里该发送方仍只有一条", streams_from_a() == 1,
-              "streams_from_A=%d" % streams_from_a())
-        check("点名收听：packets_denied 不增长", d1 == d0, "denied %d→%d" % (d0, d1))
+            send_stats(broadcast=False)
+            time.sleep(0.3)
+
+            d0, r0, s0 = snapshot()
+            send_audio(0xB0A6, 40)
+            d1, r1, s1 = snapshot()
+            check("点对点未开「收听」：被拒收并计入 packets_denied", d1 - d0 >= 30,
+                  "denied %d→%d" % (d0, d1))
+            check("点对点未开「收听」：不进流表", wait_stream(0xB0A6, False, 1.0), detail())
+            check("点对点未开「收听」：不算作已接收", r1 - r0 <= 2, "Δreceived=%d" % (r1 - r0))
+
+            named = api(port_b, "/api/routes/add", {"route": {"from": ["selftest-node-a"],
+                                                              "to": ["self"], "codec": "pcm_s16",
+                                                              "gain": 1.0}})
+            check("B 为 A 点名开「收听」", bool(named.get("ok")),
+                  json.dumps(named.get("routes"), ensure_ascii=False)[:220])
+            time.sleep(1.0)
+            d0, r0, s0 = snapshot()
+            send_audio(0xB0A7, 40)
+            admitted = wait_stream(0xB0A7, True)
+            d1, r1, s1 = snapshot()
+            check("点名收听：同一条点对点流被接住", admitted, detail())
+            check("点名收听：混合表里该发送方仍只有一条", streams_from_a() == 1,
+                  "streams_from_A=%d" % streams_from_a())
+            check("点名收听：packets_denied 不增长", d1 == d0, "denied %d→%d" % (d0, d1))
+        finally:
+            node_b.receiver.resolve_source = original_resolve
+
+        # 8. ★ 2.42.2（第 2 条）：广播 / 点对点四组合端口隔离（双节点等价实测）。
+        #    手机真机不在线，这里用同一套协议、两个真实 UDP 端口做等价验证：
+        #    B 的 47832 只由 config.listen 决定，47831 只由具名路由决定。
+        print("-" * 70)
+        print("四组合：广播口 %d / 点对点口 %d" % (broadcast_port_b, audio_port_b), flush=True)
+        node_b.receiver.resolve_source = lambda _host: "selftest-node-a"
+        try:
+            def b_rx() -> int:
+                return node_b.receiver.broadcast_packets_received
+
+            def b_den() -> int:
+                return node_b.receiver.broadcast_packets_denied
+
+            def p_rx() -> int:
+                return node_b.receiver.packets_received
+
+            def p_den() -> int:
+                return node_b.receiver.packets_denied
+
+            def clear_streams() -> None:
+                with node_b.receiver._lock:
+                    node_b.receiver.streams.clear()
+                    node_b.receiver.buffers.clear()
+
+            def has_named() -> bool:
+                return bool(node_b._accepted_routes_for("selftest-node-a"))
+
+            def set_named(on: bool) -> None:
+                if on:
+                    api(port_b, "/api/routes/add", {"route": {
+                        "from": ["selftest-node-a"], "to": ["self"],
+                        "codec": "pcm_s16", "gain": 1.0}})
+                else:
+                    for r in list(node_b.routes):
+                        if "selftest-node-a" in (r.get("from") or []):
+                            api(port_b, "/api/routes/delete", {"id": r.get("id")})
+                deadline = time.time() + 5.0
+                while time.time() < deadline and has_named() != on:
+                    time.sleep(0.1)
+
+            def set_listen(on: bool) -> None:
+                node_b.config.listen = bool(on)
+                time.sleep(0.9)
+
+            def combo(name: str, listen: bool, named: bool, bssrc: int, pssrc: int) -> None:
+                clear_streams()
+                set_named(named)
+                set_listen(listen)
+                send_stats(broadcast=False)
+                br0, bd0, pr0, pd0 = b_rx(), b_den(), p_rx(), p_den()
+                send_audio(bssrc, 30, broadcast_port_b)
+                send_audio(pssrc, 30, audio_port_b)
+                brd, bdd = b_rx() - br0, b_den() - bd0
+                prd, pdd = p_rx() - pr0, p_den() - pd0
+                with node_b.receiver._lock:
+                    ch = [s for s, i in node_b.receiver.streams.items()
+                          if bool(getattr(i, "channel", False))]
+                    pt = [s for s, i in node_b.receiver.streams.items()
+                          if not bool(getattr(i, "channel", False))]
+                evidence = ("broadcast: rx+%d denied+%d ch_streams=%s | "
+                            "point: rx+%d denied+%d p2p_streams=%s"
+                            % (brd, bdd, ",".join("%08x" % s for s in ch),
+                               prd, pdd, ",".join("%08x" % s for s in pt)))
+                print("  [%s] %s" % (name, evidence), flush=True)
+                check("%s：广播口只收到该收的" % name,
+                      (brd >= 25 and bssrc in ch) if listen else (brd == 0 and bssrc not in ch),
+                      evidence)
+                check("%s：点对点口只收到该收的" % name,
+                      (prd >= 25 and pssrc in pt) if named else (prd == 0 and pssrc not in pt),
+                      evidence)
+                check("%s：拒收只落在自己那一路" % name,
+                      (bdd >= 25 if not listen else bdd == 0)
+                      and (pdd >= 25 if not named else pdd == 0), evidence)
+
+            combo("只开广播收听", True, False, 0xB201, 0xB202)
+            combo("只开点对点收听", False, True, 0xB203, 0xB204)
+            combo("两者都开", True, True, 0xB205, 0xB206)
+            combo("两者都关", False, False, 0xB207, 0xB208)
+            set_listen(False)
+            set_named(False)
+        finally:
+            node_b.receiver.resolve_source = original_resolve
     finally:
         ui_a.stop()
         ui_b.stop()

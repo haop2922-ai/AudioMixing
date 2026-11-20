@@ -105,8 +105,66 @@ def _find_edge() -> str:
     return ""
 
 
+def _is_panel_title(text: str) -> bool:
+    """窗口标题是不是我们打开的面板窗（排除普通浏览器标签页）。"""
+    t = str(text or "").strip()
+    if not t.startswith("Audio Mixing"):
+        return False
+    return not any(s in t for s in (" - Microsoft", " - Google Chrome", " - Mozilla", " - Edge"))
+
+
+def _panel_windows() -> list[tuple[int, str]]:
+    """当前所有可见顶层窗口的 (HWND, 标题)，按 z 序。"""
+    if sys.platform != "win32":
+        return []
+    try:
+        user32 = ctypes.windll.user32
+        rows: list[tuple[int, str]] = []
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def callback(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(hwnd, buf, 256)
+            rows.append((int(hwnd), buf.value))
+            return True
+
+        user32.EnumWindows(WNDENUMPROC(callback), 0)
+        return rows
+    except Exception:
+        return []
+
+
+def pick_panel_window(windows: list[tuple[int, str]]) -> int:
+    """从窗口列表里挑出第一个面板窗；没有返回 0。纯函数，便于单测。"""
+    for hwnd, title in windows:
+        if _is_panel_title(title):
+            return int(hwnd)
+    return 0
+
+
+def _raise_window(handle: int) -> None:
+    if not handle or sys.platform != "win32":
+        return
+    try:
+        user32 = ctypes.windll.user32
+        user32.ShowWindow(int(handle), 9)
+        user32.SetForegroundWindow(int(handle))
+    except Exception:
+        pass
+
+
 def _open_url(url: str) -> None:
-    """用应用模式打开页面；不行就退回默认浏览器。"""
+    """用应用模式打开页面；已有面板窗就提窗，绝不再开第二个。
+
+    ★ Q1（2026-11-16）：这里原来每次都直接 `Edge --app` 开新窗，完全绕过去重。
+      托盘在没有注入启动器 opener 时会走到这里，于是每点一次多一个窗口。
+    """
+    existing = pick_panel_window(_panel_windows())
+    if existing:
+        _raise_window(existing)
+        return
     edge = _find_edge()
     if edge:
         try:
@@ -129,6 +187,11 @@ def _open_url(url: str) -> None:
         webbrowser.open(url)
     except Exception:
         pass
+
+
+def open_url_fallback(url: str) -> None:
+    """给 cli/启动器用的兜底入口：应用模式 + 去重（不再直接开普通浏览器窗）。"""
+    _open_url(url)
 
 
 _PANEL_OPENER = None
@@ -345,7 +408,7 @@ def recover_audio(address: str) -> None:
     if data.get("ok"):
         _message_box("已重开 %s 路播放端%s。"
                      % (data.get("restarted") or 0,
-                        "，本机直通也重建了" if data.get("loop_stopped") else ""))
+                        "，本机广播监听也重建了" if data.get("loop_stopped") else ""))
     else:
         _message_box("恢复声音失败：%s" % (data.get("error") or "未知"))
 

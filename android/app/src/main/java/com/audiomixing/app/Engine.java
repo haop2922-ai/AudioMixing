@@ -85,6 +85,16 @@ public final class Engine {
     private volatile AudioSend sender;
     /** 一个 UDP 端口收，收到几台就混几台 —— 这本来就是个"混音"工具。 */
     private volatile AudioRecv receiver;
+    /**
+     * ★ 2.42.2（第 2 条）：广播专用接收器，只绑定 {@link #broadcastPort}（默认 47832）。
+     *
+     * <p>它和 {@link #receiver} 是两个独立的 UDP socket、两套独立准入：
+     * 广播只看「听广播」开关（{@code setChannelMode(true)} 跳过点对点名单），
+     * 点对点只看每台设备的「收听」。一条的放行/拒收不会影响另一条。
+     */
+    private volatile AudioRecv channelReceiver;
+    /** ★ 2.42.3：广播接收器绑口失败后的重试节流（避免 150ms 一轮地反复 bind）。 */
+    private volatile long channelReceiverRetryAtMs;
 
     // ── ★ 送什么声音（用户指出过方向性缺陷：手机端不能只当对讲机）──
 
@@ -158,13 +168,13 @@ public final class Engine {
     private volatile boolean sendingActive;
 
     /**
-     * ★ 2026-11-08（用户方案）：静音档乘数策略 —— {@code internal_only}（默认，1.0）
-     * 或 {@code last_nonzero}（沿用进入静音前最后一次非零系统音量）。
+     * ★ 2.42.3 修复（真机第 3 条）：静音档乘数改为**跟随手机音量**（{@code last_nonzero}）。
+     * 旧默认 {@code internal_only} 固定乘 1.0，真机症状是「静音档传音，手机调音量电脑那头不变」。
+     * 现在手机/电脑两端的旧值都会归一到 last_nonzero；乘数为 0 时退回 1.0，不会哑。
      *
-     * <p>外放档永远乘当前系统媒体音量；这个开关只影响静音档。手机界面与电脑设置
-     * 共用这一份状态（电脑通过 T_STATS 下发）。
+     * <p>外放档永远乘当前系统媒体音量；这个开关只影响静音档。
      */
-    private volatile String silentVolPolicy = SendVolume.POLICY_INTERNAL;
+    private volatile String silentVolPolicy = SendVolume.POLICY_LAST;
     /** 每台电脑发来的静音档策略请求号（同一个号只处理一次）。 */
     private final Map<String, Long> silentPolicyReqSeen = new java.util.HashMap<String, Long>();
 
@@ -258,6 +268,16 @@ public final class Engine {
     private volatile boolean sawPeer;      // 这次运行里至少见过一台设备（用于判断"目标是真的走了"）
     private volatile float volume = 1f;
     private volatile int audioPort = Proto.DEFAULT_AUDIO_PORT;
+    /** ★ 2.42.2（第 2 条）：广播端口，和点对点 audioPort 必须分开。 */
+    private volatile int broadcastPort = Proto.DEFAULT_BROADCAST_PORT;
+    /**
+     * ★ 2.42.3：本机性能预算档位（smooth / balanced / high）。
+     *
+     * <p>手机端没有编码器（PCM16），档位主要落在两处：① 收听端抖动缓冲目标；
+     * ② 随信标公布给电脑，电脑按「两端较低那档」决定发多细的包、多大码率。
+     * 默认均衡 = 2.42.2 行为。
+     */
+    private volatile String qualityPreset = "balanced";
     private volatile String lastSendError = "";
 
     private volatile AudioRecv.Stats statsCache;
@@ -319,6 +339,12 @@ public final class Engine {
             // ★ 2026-11-01 用户：手机端没有端口修改，电脑改端口后手机就连不上。
             //   本机端口现在从设置里读（发现端口默认 17830，音频端口固定自动选）。
             audioPort = configuredAudioPort();
+            broadcastPort = Proto.DEFAULT_BROADCAST_PORT;
+            if (broadcastPort == audioPort) {
+                broadcastPort = audioPort + 1;
+            }
+            // ★ 2.42.3：档位从设置里恢复（第一次装 = 均衡）。
+            qualityPreset = savedText("quality_preset", "balanced");
             // ★ 接收器这次【不再】一开机就常驻。
             //
             // 上一个版本为了收对端那句"我在给你发声音、请收听我"（T_STATS 的 want_listen），
@@ -332,6 +358,10 @@ public final class Engine {
             try {
                 Discovery d = new Discovery(app, null, null, audioPort, 0);
                 d.setDiscoveryPort(configuredDiscoveryPort());
+                // ★ 2.42.2：信标里如实公布广播端口，电脑才知道往 47832 发。
+                d.setBroadcastPort(broadcastPort);
+                // ★ 2.42.3：档位也随信标公布（两端按较低那档协商）。
+                d.setQuality(qualityPreset);
                 // 回调在发现线程上，这里只做一件事：把列表存下来，别在这里碰界面。
                 d.setListener(new Discovery.Listener() {
                     @Override
@@ -387,6 +417,7 @@ public final class Engine {
             sendingActive = false;      // 先摘掉"真的在送"这个条件，否则 sync 会以为还在送、又压回去
             syncSilentVolume();
             stopReceiver();
+            stopChannelReceiver();
             stopSender();
             // 采集停了就把投屏授权也放掉：一直攥着它，系统状态栏会一直挂着"正在投放"的提示。
             releaseProjection();
@@ -549,13 +580,15 @@ public final class Engine {
                 return;
             }
             channelListen = on;
+            // ★ 2.42.2（第 2 条）：只启停**广播接收器**（47832）。
+            //   点对点接收器（47831）的名单和启停完全不受这里影响。
             if (on) {
-                ensureReceiver();       // 没有它一个包都收不到
-                applyAllowedHosts();    // 名单留空 = 谁的都听
+                ensureChannelReceiver();
             } else {
-                applyAllowedHosts();
-                stopReceiverIfIdle();
+                stopChannelReceiver();
             }
+            applyAllowedHosts();
+            stopReceiverIfIdle();
         }
     }
 
@@ -578,7 +611,8 @@ public final class Engine {
      * 是发到音频端口的，收不到那一句界面就只能显示"对方：等它回话"。
      */
     private void stopReceiverIfIdle() {
-        if (channelListen || sender != null || !listenIds.isEmpty()) {
+        // ★ 2.42.2：channelListen 现在由独立的 channelReceiver 承担，不再保活点对点接收器。
+        if (sender != null || !listenIds.isEmpty()) {
             return;
         }
         stopReceiver();
@@ -718,6 +752,7 @@ public final class Engine {
     private static final String PREF_SILENT_ORIG = "silent_vol_orig";
     private static final String PREF_SILENT_AT = "silent_vol_at";
 
+
     private void loadSendMode() {
         if (app == null) {
             return;
@@ -754,15 +789,15 @@ public final class Engine {
         }
         try {
             String v = app.getSharedPreferences("audiomixing", Context.MODE_PRIVATE)
-                    .getString(PREF_SILENT_VOL_POLICY, SendVolume.POLICY_INTERNAL);
+                    .getString(PREF_SILENT_VOL_POLICY, SendVolume.POLICY_LAST);
             silentVolPolicy = SendVolume.normalizePolicy(v);
         } catch (Throwable t) {
-            silentVolPolicy = SendVolume.POLICY_INTERNAL;
-            Log.w(TAG, "读静音档乘数策略失败（按 internal_only 处理）：" + t);
+            silentVolPolicy = SendVolume.POLICY_LAST;
+            Log.w(TAG, "读静音档乘数策略失败（按 last_nonzero 处理）：" + t);
         }
     }
 
-    /** 静音档乘数策略（internal_only / last_nonzero）。 */
+    /** 静音档乘数策略（唯一值 last_nonzero：跟随手机音量）。 */
     public String silentVolPolicy() {
         return silentVolPolicy;
     }
@@ -833,31 +868,21 @@ public final class Engine {
                             .putLong(PREF_SILENT_AT, System.currentTimeMillis())
                             .commit();          // 先落盘再静音：崩在下一行也能还原
                 } else {
-                    // ★ 2026-11-06（Q1）：现场「静音档下把 App 音量 100→10，耳机几乎不变」。
-                    //   根因就在这里：旧实现只在进入静音那一刻记一次 orig，之后永远拿
-                    //   这个旧值当乘数（实测 0.11 一直不动）。而我们的静音手段是把
-                    //   STREAM_MUSIC 钉在 0，用户/App 每次调整都会先落到这个值上 ——
-                    //   现在把它当成"用户最新想用的音量"记下来，再归零。
-                    //   · 绝对值（>1）→ 直接采信（App 自己的音量滑杆多半走 setStreamVolume）；
-                    //   · 系统已被钉在 0 时，硬件键一次只能抬到 1 档 → 这一档按"再加一档"
-                    //     解释，用户才能连续调节（否则按一次就到顶、怎么按都停在 0.11）。
+                    // ★ 2.29.3（复刻 2.18/2.26 的成功语义）：静音用 mute 标志，
+                    //   不再把 STREAM_MUSIC 清零。索引保留后，App 滑块/音量键调多少，
+                    //   这里就能读到多少，电脑那头才能连续跟随 0…1。
                     int cur = am.getStreamVolume(AudioManager.STREAM_MUSIC);
                     if (cur > 0) {
                         int user = sp.getInt(PREF_SILENT_ORIG, cur);
-                        int max = Math.max(1, am.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
-                        int next = cur;
-                        if (cur == 1 && user >= 1) {
-                            next = Math.min(max, user + 1);
-                        }
-                        next = Math.max(0, Math.min(max, next));
-                        if (next != user) {
-                            sp.edit().putInt(PREF_SILENT_ORIG, next).apply();
+                        if (cur != user) {
+                            sp.edit().putInt(PREF_SILENT_ORIG, cur).apply();
                         }
                     }
                 }
-                // 已经是 0 就不再重复写（本函数每 150ms 会被状态同步调到，不能去骚扰系统）。
-                if (am.getStreamVolume(AudioManager.STREAM_MUSIC) != 0) {
-                    am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0);
+                // 只压 mute 标志，不动音量索引；已经是 mute 就不再重复调。
+                if (!am.isStreamMute(AudioManager.STREAM_MUSIC)) {
+                    am.adjustStreamVolume(AudioManager.STREAM_MUSIC,
+                            AudioManager.ADJUST_MUTE, 0);
                 }
             } else {
                 restoreSilentVolumeIfNeeded();
@@ -880,8 +905,15 @@ public final class Engine {
             }
             int orig = sp.getInt(PREF_SILENT_ORIG, -1);
             AudioManager am = (AudioManager) app.getSystemService(Context.AUDIO_SERVICE);
-            if (am != null && orig >= 0) {
-                am.setStreamVolume(AudioManager.STREAM_MUSIC, orig, 0);
+            if (am != null) {
+                // 先解除 mute，再把索引还原到最后一次设定值。
+                if (am.isStreamMute(AudioManager.STREAM_MUSIC)) {
+                    am.adjustStreamVolume(AudioManager.STREAM_MUSIC,
+                            AudioManager.ADJUST_UNMUTE, 0);
+                }
+                if (orig >= 0) {
+                    am.setStreamVolume(AudioManager.STREAM_MUSIC, orig, 0);
+                }
             }
             sp.edit()
                     .remove(PREF_SILENT_ACTIVE)
@@ -901,6 +933,29 @@ public final class Engine {
     private void syncSilentVolume() {
         // 只有"真的在送"才压音量：目标都掉线/蓝牙断了/音源没授权时，手机不该继续哑着。
         applySilentVolume(sendModePref == 2 && sendingActive && sourceEnabled);
+    }
+
+    /**
+     * ★ 2026-11-20（真机第 4 条）：静音档音量后台跟踪，不再依赖界面 tick。
+     *
+     * <p>原来的轮询只挂在 Activity 的 150ms tick 上，而 {@code onPause()} 会把 tick 停掉。
+     * 用户切到视频/音乐 App 调音量时，这里一次都不会跑：既没把新音量记成乘数，
+     * 也没把 STREAM_MUSIC 重新压回 0 —— 现场表现就是「静音档下调 App 音量，
+     * 电脑那头一直不变」，手机自己反而会漏音。
+     *
+     * <p>统计线程随引擎常驻（和前台服务同生共死），把这一步挂进它的 100ms 小步里，
+     * 界面在不在前台都照样跟随。条件用"发送器真的在跑"，目标掉线时能自动还原音量。
+     */
+    private void silentVolumeTick() {
+        try {
+            boolean should = sendModePref == 2 && sourceEnabled;
+            AudioSend s = sender;
+            boolean running = s != null && s.isRunning();
+            sendingActive = running;
+            applySilentVolume(should && running);
+        } catch (Throwable t) {
+            // 跟踪失败绝不能影响统计/音频线程
+        }
     }
 
     /**
@@ -1056,10 +1111,27 @@ public final class Engine {
             }
             sendHosts.put(id, p.host);
             sendLastAliveMs.put(id, nowMs);
-            int port = p.audioPort > 0 ? p.audioPort : Proto.DEFAULT_AUDIO_PORT;
-            String ep = p.host + ":" + port;
-            if (!out.contains(ep)) {
-                out.add(ep);
+            // ★ 2.42.2（第 2 条）：广播和点对点走各自独立的端口。
+            //   广播 → 对端的 broadcast_port（47832）；点对点 → audio_port（47831）。
+            //   老版本对端不公布广播口时**不回落** audio_port，否则端口隔离又失效了。
+            if (broadcastOn) {
+                int bp = p.broadcastPort;
+                if (bp > 0) {
+                    String ep = p.host + ":" + bp;
+                    if (!out.contains(ep)) {
+                        out.add(ep);
+                    }
+                } else {
+                    gone.append("「").append(p.name).append("」版本过旧，没有广播端口（47832），")
+                            .append("这次不给它发广播；请升级对端。\n");
+                }
+            }
+            if (sendIds.contains(id)) {
+                int port = p.audioPort > 0 ? p.audioPort : Proto.DEFAULT_AUDIO_PORT;
+                String ep = p.host + ":" + port;
+                if (!out.contains(ep)) {
+                    out.add(ep);
+                }
             }
         }
         // ② 用户单独勾过、但发现列表里暂时没有的：看心跳（T_STATS）还在不在，
@@ -1413,12 +1485,16 @@ public final class Engine {
             if (changed && sendIds.isEmpty() && !broadcastOn) {
                 Log.i(TAG, "送声音的目标没了，发送器已停");
             }
-            // 自愈：只要还有收听目标（或开着听广播），接收器就必须活着（可能被别处停掉过）。
-            if ((!listenIds.isEmpty() || channelListen) && receiver == null) {
+            // ★ 2.42.2（第 2 条）：两档收听各管各的接收器，互不替代。
+            if (channelListen && !channelReceiverRunning()) {
+                ensureChannelReceiver();
+            } else if (!channelListen && channelReceiver != null) {
+                stopChannelReceiver();
+            }
+            if (!listenIds.isEmpty() && receiver == null) {
                 ensureReceiver();
-            } else if (listenIds.isEmpty() && sender == null && receiver != null && !channelListen) {
-                // 既不听也不送、也没开听广播：接收器只是刚才为了收对端统计才开着的，
-                // 可以收掉了（省电、放端口）。
+            } else if (listenIds.isEmpty() && sender == null && receiver != null) {
+                // 既不听也不送：点对点接收器只是刚才为了收对端统计才开着的，可以收掉了。
                 stopReceiver();
             }
             applyAllowedHosts();
@@ -1535,6 +1611,111 @@ public final class Engine {
         } catch (Throwable t) {
             return def;
         }
+    }
+
+    // ── ★ 2.42.3：三档性能预算（流畅 / 均衡 / 高音质）──
+
+    private String savedText(String key, String def) {
+        try {
+            String v = app.getSharedPreferences("audiomixing", Context.MODE_PRIVATE)
+                    .getString(key, def);
+            return v == null ? def : v;
+        } catch (Throwable t) {
+            return def;
+        }
+    }
+
+    /** 手机端抖动缓冲目标：流畅 100ms / 均衡 120ms（=旧默认）/ 高音质 180ms。 */
+    private static int targetMsFor(String preset) {
+        if ("smooth".equals(preset)) {
+            return 100;
+        }
+        if ("high".equals(preset)) {
+            return 180;
+        }
+        return AudioRecv.DEFAULT_TARGET_MS;
+    }
+
+    public String qualityPreset() {
+        return qualityPreset;
+    }
+
+    /** 当前协商生效的档位：本机与所有在线对端取最低那档（老对端按均衡）。 */
+    public String effectiveQuality() {
+        String eff = qualityPreset;
+        int rank = qualityRank(eff);
+        for (Discovery.Peer p : peers()) {
+            int r = qualityRank(p == null ? "" : p.quality);
+            if (r < rank) {
+                rank = r;
+                eff = qualityName(r);
+            }
+        }
+        return eff;
+    }
+
+    private static int qualityRank(String q) {
+        if ("smooth".equals(q)) return 0;
+        if ("high".equals(q)) return 2;
+        return 1;   // balanced / 空 / 未知（老版本）= 均衡
+    }
+
+    private static String qualityName(int rank) {
+        return rank <= 0 ? "smooth" : (rank >= 2 ? "high" : "balanced");
+    }
+
+    public String qualityLabel(String q) {
+        if ("smooth".equals(q)) return "流畅";
+        if ("high".equals(q)) return "高音质";
+        return "均衡";
+    }
+
+    /**
+     * 切档：立刻改两路接收器的抖动目标 + 更新信标（电脑据此调整发送参数）。
+     * 返回实际生效值（可能被性能更低的在线对端拉低）。
+     */
+    public String setQualityPreset(String value) {
+        String q = value == null ? "" : value.trim().toLowerCase();
+        if (!"smooth".equals(q) && !"balanced".equals(q) && !"high".equals(q)) {
+            q = "balanced";
+        }
+        synchronized (lock) {
+            qualityPreset = q;
+            try {
+                app.getSharedPreferences("audiomixing", Context.MODE_PRIVATE)
+                        .edit().putString("quality_preset", q).apply();
+            } catch (Throwable ignored) {
+            }
+            applyQualityToReceivers();
+            Discovery d = discovery;
+            if (d != null) {
+                d.setQuality(q);
+            }
+        }
+        return effectiveQuality();
+    }
+
+    private void applyQualityToReceivers() {
+        int ms = targetMsFor(qualityPreset);
+        AudioRecv r = receiver;
+        if (r != null) {
+            r.setTargetBufferMs(ms);
+        }
+        AudioRecv c = channelReceiver;
+        if (c != null) {
+            c.setTargetBufferMs(ms);
+        }
+    }
+
+    /** 面板上的一行字：本机档 + 协商结果。 */
+    public String qualityStateText() {
+        String eff = effectiveQuality();
+        String local = qualityLabel(qualityPreset);
+        if (!eff.equals(qualityPreset)) {
+            return "音质：" + local + " · 协同生效 " + qualityLabel(eff)
+                    + "（对端档位更低，按较低档协商）";
+        }
+        return "音质：" + local + " · 抖动目标 " + targetMsFor(qualityPreset) + "ms";
     }
 
     /**
@@ -1949,6 +2130,18 @@ public final class Engine {
         try {
             // 带 Context 的构造会拿 WifiLock：不收包时 Wi-Fi 进省电模式会把抖动缓冲冲垮。
             AudioRecv r = new AudioRecv(app, audioPort);
+            // ★ 2.42.3（第 1 条）：点对点接收器换口时不许抢占广播口 47832。
+            r.setReservedPort(broadcastPort);
+            // ★ 2.42.3：抖动目标跟随档位（均衡 = 120ms = 旧默认）。
+            r.setTargetBufferMs(targetMsFor(qualityPreset));
+            // ★ 2.42.3（第 1 条）：旧版本电脑仍把广播发到 47831；只对这类旧设备放行，
+            //   新设备走 47832，两档隔离不受影响。
+            r.setLegacyChannelJudge(new AudioRecv.LegacyChannelJudge() {
+                @Override
+                public boolean allow(String host) {
+                    return legacyChannelAllowed(host);
+                }
+            });
             // ★ 2026-11-04（B 第一阶段）：自回声过滤的基准。对自己 device_id 的哈希；
             //   收到 originId == 自己的帧直接丢并计数（诊断页显示"自回声丢弃 N"）。
             r.setSelfOriginId(selfOriginId());
@@ -2018,16 +2211,8 @@ public final class Engine {
         }
         try {
             r.clearAllowed();
-            if (channelListen) {
-                // ★ 听广播：名单留空 = 谁的都听（AudioRecv 的语义就是"空 = 全收"）。
-                //   这一行就是"手机能听电脑广播"的关键：原来这里一定会写进至少一个地址
-                //   （没有收听目标时写一个不可能命中的占位地址），于是广播包全被过滤掉。
-                //
-                //   为什么不能做得更"精确"：音频包里没有路由标记，接收端分不出
-                //   "广播给我的"和"点对点给我的"，所以只能如实按"谁来都听"实现。
-                Log.i(TAG, "听广播已打开：接收端不再按名单过滤（谁来都听）");
-                return;
-            }
+            // ★ 2.42.2（第 2 条）：这里只维护**点对点**名单。广播由独立的
+            //   channelReceiver（47832、channelMode=true）负责，不再靠"名单留空 = 全收"。
             int n = 0;
             for (String id : listenIds) {
                 String host = listenHosts.get(id);
@@ -2055,7 +2240,94 @@ public final class Engine {
                 Log.w(TAG, "停止收听失败", t);
             }
         }
-        releaseMediaSession();
+        // ★ 2.42.2：广播接收器还活着时，媒体会话不能拆。
+        if (channelReceiver == null) {
+            releaseMediaSession();
+        }
+    }
+
+    /**
+     * ★ 2.42.2（第 2 条）：拉起**广播专用**接收器（47832）。
+     *
+     * <p>它用 {@code setChannelMode(true)}，准入只看「听广播」开关，
+     * 不经过点对点名单；和 {@link #ensureReceiver()} 完全独立。
+     */
+    private void ensureChannelReceiver() {
+        if (channelReceiver != null && channelReceiver.isRunning()) {
+            return;
+        }
+        if (channelReceiver != null) {
+            // ★ 2.42.3（第 1 条）：上一次起来了但绑口失败（running=false）。不重建的话
+            //   它会一直挂在那里、再也收不到任何广播包 —— 重建一次才有机会恢复。
+            //   绑口失败后 3 秒内不重复尝试：端口被别人占着时，150ms 一轮地 bind 只是白烧 CPU。
+            long now = SystemClock.elapsedRealtime();
+            if (now < channelReceiverRetryAtMs) {
+                return;
+            }
+            channelReceiverRetryAtMs = now + 3000L;
+            stopChannelReceiver();
+        }
+        try {
+            AudioRecv r = new AudioRecv(app, broadcastPort);
+            // ★ 2.42.3（第 1 条）：广播接收器换口时不许抢占点对点口 47831。
+            r.setReservedPort(audioPort);
+            r.setTargetBufferMs(targetMsFor(qualityPreset));
+            r.setChannelMode(true);
+            r.setSelfOriginId(selfOriginId());
+            r.setStatsListener(new AudioRecv.StatsListener() {
+                @Override
+                public void onStats(String host, byte[] payload) {
+                    onPeerStats(host, payload);
+                }
+            });
+            r.setPortListener(new AudioRecv.PortListener() {
+                @Override
+                public void onPortChanged(int oldPort, int newPort) {
+                    broadcastPort = newPort;
+                    Discovery d = discovery;
+                    if (d != null) {
+                        try {
+                            d.setBroadcastPort(newPort);
+                        } catch (Throwable t) {
+                            Log.w(TAG, "同步广播端口到信标失败", t);
+                        }
+                    }
+                    Log.i(TAG, "广播端口已改为 " + newPort + "（原 " + oldPort + "），信标已同步");
+                }
+            });
+            r.start();
+            channelReceiver = r;
+            statsCache = null;
+            int actual = r.port();
+            if (actual > 0 && actual != broadcastPort && actual != audioPort) {
+                broadcastPort = actual;
+                Discovery d = discovery;
+                if (d != null) {
+                    d.setBroadcastPort(actual);
+                }
+            }
+            restoreRecvGains(r);
+            ensureMediaSession();
+            Log.i(TAG, "广播接收器已启动：" + broadcastPort + "（点对点 " + audioPort + " 不受影响）");
+        } catch (Throwable t) {
+            Log.w(TAG, "启动广播接收失败（端口 " + broadcastPort + " 可能被占）", t);
+        }
+    }
+
+    private void stopChannelReceiver() {
+        AudioRecv r = channelReceiver;
+        channelReceiver = null;
+        statsCache = null;
+        if (r != null) {
+            try {
+                r.stop();
+            } catch (Throwable t) {
+                Log.w(TAG, "停止广播接收失败", t);
+            }
+        }
+        if (receiver == null) {
+            releaseMediaSession();
+        }
     }
 
     /**
@@ -2855,6 +3127,8 @@ public final class Engine {
                 // 拆成 100ms 小步睡：stop() 时能立刻醒来，不用等满 2 秒；
                 // 谁刚动了音量（pokeStats）也能立刻醒来，不必把新值压到下一轮 2 秒。
                 for (int i = 0; i < STATS_INTERVAL_MS / 100 && statsRunning && !statsPoke; i++) {
+                    // ★ 2026-11-20：静音档音量跟随必须在后台也跑（界面 onPause 后 tick 会停）。
+                    silentVolumeTick();
                     synchronized (statsWake) {
                         try {
                             statsWake.wait(100);
@@ -3274,7 +3548,8 @@ public final class Engine {
      */
     public AudioRecv.Stats recvStats() {
         AudioRecv r = receiver;
-        if (r == null) {
+        AudioRecv c = channelReceiver;
+        if (r == null && c == null) {
             return null;
         }
         long now = System.currentTimeMillis();
@@ -3283,13 +3558,49 @@ public final class Engine {
             return st;
         }
         try {
-            st = r.stats();
+            // ★ 2.42.2（第 2 条）：上报给电脑的统计必须合并两个接收器 ——
+            //   否则手机在听广播时，电脑看到的 streams 仍是点对点那一路，
+            //   会误判成"未收听"。
+            st = mergeStats(r == null ? null : r.stats(), c == null ? null : c.stats());
             statsCache = st;
             statsCacheAt = now;
             return st;
         } catch (Throwable t) {
             return statsCache;
         }
+    }
+
+    private static AudioRecv.Stats mergeStats(AudioRecv.Stats a, AudioRecv.Stats b) {
+        if (a == null) {
+            return b;
+        }
+        if (b == null) {
+            return a;
+        }
+        a.received += b.received;
+        a.lost += b.lost;
+        a.late += b.late;
+        a.duplicates += b.duplicates;
+        a.badPackets += b.badPackets;
+        a.filtered += b.filtered;
+        a.controls += b.controls;
+        a.recoveries += b.recoveries;
+        a.trackErrors += b.trackErrors;
+        a.streamCount += b.streamCount;
+        a.badMagic += b.badMagic;
+        a.badVersion += b.badVersion;
+        a.badShort += b.badShort;
+        a.badCodec += b.badCodec;
+        a.badFrames += b.badFrames;
+        a.bufferedMs = Math.max(a.bufferedMs, b.bufferedMs);
+        a.targetMs = Math.max(a.targetMs, b.targetMs);
+        a.peak = Math.max(a.peak, b.peak);
+        if (b.streams != null && !b.streams.isEmpty()) {
+            List<AudioRecv.StreamStats> merged = new ArrayList<AudioRecv.StreamStats>(a.streams);
+            merged.addAll(b.streams);
+            a.streams = merged;
+        }
+        return a;
     }
 
     // ────────────────────────────── 统计 / 本机信息 ──────────────────────────────
@@ -3305,10 +3616,57 @@ public final class Engine {
         return sInstance;
     }
 
-    /** 接收器在跑吗（诊断报告和界面都要用）。 */
+    /** 点对点接收器在跑吗（诊断报告和界面都要用）。 */
     public boolean receiverRunning() {
         AudioRecv r = receiver;
         return r != null && r.isRunning();
+    }
+
+    /**
+     * ★ 2.42.3（第 1 条）：广播接收器在跑吗。
+     *
+     * <p>以前界面/诊断只看 {@link #receiverRunning()}（点对点那一个）。手机只开「听广播」时
+     * 点对点接收器本来就是停的，于是界面会误报「接收器没起来」—— 把一条正常的广播链路
+     * 说成坏的。现在两档分开问、分开报。
+     */
+    public boolean channelReceiverRunning() {
+        AudioRecv c = channelReceiver;
+        return c != null && c.isRunning();
+    }
+
+    /** 广播接收器实际绑定的端口（没起来时返回计划端口）。 */
+    public int channelReceiverPort() {
+        AudioRecv c = channelReceiver;
+        return c != null ? c.port() : broadcastPort;
+    }
+
+    /**
+     * ★ 2.42.3（第 1 条）：这个来源是不是「旧版本发送方」。
+     *
+     * <p>判据只认一条：它的信标里没有广播端口（{@code broadcastPort == 0}）。
+     * 这种电脑只可能把广播发到本机 47831，所以在「听广播」开着时允许从点对点口放行。
+     */
+    private boolean legacyChannelAllowed(String host) {
+        if (!channelListen || host == null || host.isEmpty()) {
+            return false;
+        }
+        for (Discovery.Peer p : peers()) {
+            if (p != null && host.equals(p.host)) {
+                return p.broadcastPort <= 0;
+            }
+        }
+        return false;
+    }
+
+    /** 在线但信标里没有广播端口的对端名字（界面要据此明确提示，绝不默默静音）。 */
+    public List<String> legacyBroadcastPeerNames() {
+        List<String> out = new ArrayList<String>();
+        for (Discovery.Peer p : peers()) {
+            if (p != null && p.broadcastPort <= 0) {
+                out.add(p.label());
+            }
+        }
+        return out;
     }
 
     /** 发送器在跑吗。注意 start() 之后麦克风还有可能打开失败，所以这里问的是它自己的状态。 */
@@ -3525,23 +3883,42 @@ public final class Engine {
         if (!channelListen) {
             return "没开：只有你点过「🎧 收听」的设备才会出声。";
         }
-        AudioRecv.Stats st = recvStats();
+        AudioRecv c = channelReceiver;
+        AudioRecv.Stats st = c == null ? null : c.stats();
         long recv = st == null ? 0 : st.received;
         int streams = st == null ? 0 : st.streamCount;
-        StringBuilder sb = new StringBuilder(200);
-        sb.append("正在听广播：谁往本机音频端口发声音就播谁（不用先点某台设备）。");
-        if (!receiverRunning()) {
-            sb.append("⚠ 接收器没起来（音频端口可能被别的 App 占了）。");
+        int boundPort = channelReceiverPort();
+        StringBuilder sb = new StringBuilder(240);
+        sb.append("正在听广播：谁往广播端口 ").append(boundPort).append(" 发声音就播谁。");
+        if (!channelReceiverRunning()) {
+            sb.append("⚠ 广播接收器没起来（端口 ").append(boundPort)
+                    .append(" 可能被别的 App 占了）；点一下「听广播」重开即可重试。");
         } else if (recv == 0) {
-            sb.append("已经收到 0 个音频包 —— 对面要开着「广播我的声音」，")
+            sb.append("广播口已绑定 ").append(boundPort)
+                    .append("，已经收到 0 个音频包 —— 对面要开着「广播我的声音」，")
                     .append("而且它得先能看见本机（点「详情」看发现自检那几行）。");
         } else if (streams == 0) {
-            sb.append("累计收到 ").append(recv).append(" 包，但当前没有活跃的流（对面可能刚停）。");
+            sb.append("广播口 ").append(boundPort).append(" 累计收到 ").append(recv)
+                    .append(" 包，但当前没有活跃的流（对面可能刚停）。");
         } else {
-            sb.append(recvStreamsText()).append("。");
-            if (st != null && st.dupRoutePackets > 0) {
-                sb.append("（另有同一台设备的重复流已被抑制，不会叠加播放）");
+            sb.append("广播口 ").append(boundPort).append(" 收到 ").append(recv)
+                    .append(" 包 · 活跃流 ").append(streams).append(" 条。");
+        }
+        if (c != null) {
+            AudioRecv.Stats s = c.stats();
+            if (s != null && s.filtered > 0 && s.received == 0) {
+                sb.append("（有 ").append(s.filtered).append(" 个包被准入挡下）");
             }
+        }
+        // ★ 2.42.3（第 1 条）：新旧混装时明确说清，不默默静音。
+        List<String> legacy = legacyBroadcastPeerNames();
+        if (!legacy.isEmpty()) {
+            sb.append("\n兼容旧版本发送方：");
+            for (int i = 0; i < legacy.size() && i < 3; i++) {
+                if (i > 0) sb.append('、');
+                sb.append('「').append(legacy.get(i)).append('」');
+            }
+            sb.append(" 的信标里没有广播端口，它的广播仍从 47831 收；升级对端后自动改走 47832。");
         }
         return sb.toString();
     }
@@ -3685,6 +4062,44 @@ public final class Engine {
     }
 
     /**
+     * ★ 2.29.4 诊断：一次列出各条流的音量，用来找出「App 自己的滑块」到底改的是哪一条。
+     * 用户现场：系统音量条有效、App 内滑块无效；如果 App 改的是 VOICE_CALL 等别的流，
+     * 这里能直接看出来。只读，不修改任何音量。
+     */
+    public String allStreamVolumeText() {
+        if (app == null) {
+            return "读不到（没有 Context）";
+        }
+        try {
+            AudioManager am = (AudioManager) app.getSystemService(Context.AUDIO_SERVICE);
+            if (am == null) {
+                return "读不到（没有音频服务）";
+            }
+            int[] streams = {
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.STREAM_VOICE_CALL,
+                    AudioManager.STREAM_SYSTEM,
+                    AudioManager.STREAM_RING,
+                    AudioManager.STREAM_ALARM,
+                    AudioManager.STREAM_NOTIFICATION};
+            String[] names = {"音乐", "通话", "系统", "铃声", "闹钟", "通知"};
+            StringBuilder sb = new StringBuilder("各流音量：");
+            for (int i = 0; i < streams.length; i++) {
+                try {
+                    sb.append(names[i]).append(' ')
+                            .append(am.getStreamVolume(streams[i])).append('/')
+                            .append(am.getStreamMaxVolume(streams[i])).append("  ");
+                } catch (Throwable ignored) {
+                }
+            }
+            sb.append("· 音乐静音=").append(am.isStreamMute(AudioManager.STREAM_MUSIC) ? "是" : "否");
+            return sb.toString();
+        } catch (Throwable t) {
+            return "读不到：" + t;
+        }
+    }
+
+    /**
      * ★ 2026-11-03 Q3 / v2.28（用户第 2 条）：当前系统媒体音量归一化到 0..1。
      *
      * <p>★ v2.28 为什么要改成"手机自己乘"：v2.27 假设 {@code AudioPlaybackCapture}
@@ -3726,6 +4141,8 @@ public final class Engine {
             android.content.SharedPreferences sp =
                     ctx.getSharedPreferences("audiomixing", Context.MODE_PRIVATE);
             if (sp.getBoolean(PREF_SILENT_ACTIVE, false)) {
+                // ★ 2.29.3：静音档用 mute 标志，索引保留；这里返回用户/App
+                //   最后一次设定的音量（2.18/2.26 的成功语义）。
                 int orig = sp.getInt(PREF_SILENT_ORIG, -1);
                 if (orig >= 0) {
                     cur = orig;

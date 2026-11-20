@@ -347,7 +347,10 @@ class CaptureHub:
         return audio_base.open_source(spec)
 
     def reader(self, spec: dict[str, Any], name: str = "") -> TapReader:
-        key = (str(spec.get("backend")), str(spec.get("device")))
+        # ★ 2026-11-16 按 App 采音：同一个后端/设备上，不同 App 是不同的采集源，
+        #   键里必须带 pid，否则"耳机 A 采 BILIBILI、耳机 B 采桌面"会共用一路。
+        key = (str(spec.get("backend")), str(spec.get("device")),
+               int(spec.get("pid") or 0))
         with self._lock:
             cap = self._captures.get(key)
             if cap is None or cap.closed:

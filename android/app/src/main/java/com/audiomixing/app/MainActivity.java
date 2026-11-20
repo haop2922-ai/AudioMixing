@@ -130,6 +130,11 @@ public class MainActivity extends Activity {
     private TextView broadcastChip;
     private TextView broadcastNow;
     private boolean lastBroadcastOn;
+    // ★ 2.42.3：三档性能预算（流畅 / 均衡 / 高音质）
+    private TextView qSmoothChip;
+    private TextView qBalancedChip;
+    private TextView qHighChip;
+    private TextView qualityNow;
     // ★ ④ 安全停发提示（"已停止向 XXX 发送…"，和自动收听是两件事，保留）。
     //   ★ 2026-10-18 用户第 6 条：全局的「自动收听路由声音」开关及其提示/一键收回已整段删掉 ——
     //     自动听不听改由每台设备卡片上的第 4 颗「智连」按钮各自决定（默认关），
@@ -475,6 +480,30 @@ public class MainActivity extends Activity {
             setTextIfChanged(suspendedLine, susp.length() > 0 ? ("⏸ " + susp) : "");
             suspendedLine.setVisibility(susp.length() > 0 ? View.VISIBLE : View.GONE);
         }
+        // ★ 2.42.3：档位按钮与生效值
+        String q = engine.qualityPreset();
+        if (qSmoothChip != null) styleChip(qSmoothChip, "smooth".equals(q), "流畅");
+        if (qBalancedChip != null) styleChip(qBalancedChip, "balanced".equals(q), "均衡");
+        if (qHighChip != null) styleChip(qHighChip, "high".equals(q), "高音质");
+        if (qualityNow != null) setTextIfChanged(qualityNow, engine.qualityStateText());
+    }
+
+    /** ★ 2.42.3：切换性能预算档位并把协商结果如实报给用户。 */
+    private void chooseQuality(String name) {
+        String eff = engine.setQualityPreset(name);
+        String msg;
+        if (!eff.equals(name)) {
+            msg = "已选「" + engine.qualityLabel(name) + "」；对端档位更低，协同生效「"
+                    + engine.qualityLabel(eff) + "」";
+        } else if ("smooth".equals(name)) {
+            msg = "已切到流畅：老机器/低配优先，CPU 占用最低";
+        } else if ("high".equals(name)) {
+            msg = "已切到高音质：音质优先，CPU 占用会上去";
+        } else {
+            msg = "已切回均衡（默认档）";
+        }
+        toast(msg);
+        refreshNow();
     }
 
     /**
@@ -573,13 +602,17 @@ public class MainActivity extends Activity {
         put("streams", engine.recvStreamsText());
         // ★ 发出去：几台、逐台发了多少、带宽是多少（不藏代价）
         put("send", engine.sendStatsText());
-        put("volume", engine.volumeText() + "\n" + engine.systemVolumeText());
+        put("volume", engine.volumeText() + "\n" + engine.systemVolumeText()
+                + "\n" + engine.allStreamVolumeText());
         put("volmode", engine.volumeModeText());
         put("recv", engine.statsText());
         put("send", engine.sendStatsText());
         // 对端回话：这是"哪一端没在发"最直接的证据（对方自己说的）。
         put("peers", Diagnosis.peersSummary(engine.peerStatsList(), SystemClock.elapsedRealtime()));
         put("disc", engine.discoveryStatsText());
+        // ★ 2.42.3（第 1 条）：广播这一条链的现场证据（端口 → 包数 → 活跃流）。
+        put("broadcast", engine.channelStateText());
+        put("quality", engine.qualityStateText());
     }
 
     private void put(String key, String value) {
@@ -1324,6 +1357,9 @@ public class MainActivity extends Activity {
         // ★ 对端自己报的统计（两台设备互报的"我发了多少/我收了你多少"）
         kv("对端回话", "peers");
         kv("发现统计", "disc");
+        // ★ 2.42.3（第 1 条）：广播链路实证 —— 实际绑定端口 / 收到多少包 / 活跃流。
+        kv("广播接收", "broadcast");
+        kv("音质档位", "quality");
 
         // ★ 2026-11-08（用户方案）：音量乘数绑在送声档位上；这里只暴露"静音档乘数策略"。
         kv("音量乘数", "volmode");
@@ -1338,67 +1374,35 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * ★ 2026-11-08（用户方案）：静音档乘数策略 —— 两个选项，中文写清。
+     * ★ 2026-11-08（用户方案）：静音档乘数策略 —— 只读展示。
      *
-     * <p>外放档永远乘当前系统媒体音量，与本项无关；静音档里 {@code STREAM_MUSIC} 被我们
-     * 锁在 0，默认 {@code internal_only}（乘 1.0，只保留 App 内部增益）。
-     * 两条限制也写在下面，不能让用户自己猜。
+     * <p>外放档永远乘当前系统媒体音量，与本项无关。静音档为了不让手机外放，
+     * 会把 {@code STREAM_MUSIC} 压到 0；但那个值只当作「你要多大」来用，
+     * 电脑那头仍按手机当前音量跟随（2.42.3 起固定 last_nonzero）。
+     *
+     * <p>★ v2.33（Q2）：这里改成**只读**。电脑面板「设置 → 静音档音量乘数」是唯一可写入口
+     * （Engine.handleSilentPolicy 会 persist=true 下发并落盘）；手机这边原来那两个 chip 是
+     * 第二个真源，谁后写谁生效，用户无法判断以谁为准。只读仍保留当前值与限制说明 ——
+     * 那是排障时要看的证据，不能删。
      */
     private View buildVolumePolicySettings() {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
 
-        box.addView(text("静音档音量乘数（只影响第 2 档；外放档永远乘系统媒体音量）", 11.5f, DIM, false));
+        box.addView(text("静音档音量（只影响第 2 档；外放档永远乘系统媒体音量）", 11.5f, DIM, false));
 
         final TextView status = text(engine.volumeModeText(), 11.5f, DIM, false);
         status.setLineSpacing(dp(2), 1f);
         box.addView(status, margins(MATCH, WRAP, 0, dpi(4), 0, dpi(6)));
+        box.addView(text("静音档下：手机用 mute 保持不响；App / 音量键调多少，"
+                + "电脑那头就跟随多少。", 11.5f, DIM, false),
+                margins(MATCH, WRAP, 0, 0, 0, dpi(6)));
 
-        final TextView internal = chip("只用 App 内部音量（推荐）");
-        final TextView last = chip("沿用进静音前的音量");
-        final Runnable paint = new Runnable() {
-            @Override
-            public void run() {
-                boolean useLast = SendVolume.POLICY_LAST.equals(engine.silentVolPolicy());
-                styleChip(internal, !useLast, "只用 App 内部音量（推荐）");
-                styleChip(last, useLast, "沿用进静音前的音量");
-                setTextIfChanged(status, engine.volumeModeText());
-            }
-        };
-        internal.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                engine.setSilentVolPolicy(SendVolume.POLICY_INTERNAL, true);
-                paint.run();
-                toast("静音档改为：只用 App 内部音量（乘 1.0）");
-            }
-        });
-        last.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                engine.setSilentVolPolicy(SendVolume.POLICY_LAST, true);
-                paint.run();
-                toast("静音档改为：沿用进静音前的音量");
-            }
-        });
-
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dpi(40), 1f);
-        row.addView(internal, lp);
-        LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(0, dpi(40), 1f);
-        lp2.leftMargin = dpi(8);
-        row.addView(last, lp2);
-        box.addView(row);
-
-        TextView limits = text("注意：静音档乘 1.0 时耳机侧相当于满格放，从外放档切过来可能明显变响；"
-                + "滑杆本身改系统媒体音量的 App（B 站、抖音这类）在静音档里调音量无效，要用滑杆请切外放档；"
-                + "内部增益类 App（YouTube 播放器这类）不受影响。", 11.5f, DIM, false);
+        TextView limits = text("说明：静音档不再把系统媒体音量清零（清零会把 App 滑杆的位置"
+                + "一起抹掉）；诊断里的 sys_q14 是实时音量索引。", 11.5f, DIM, false);
         limits.setLineSpacing(dp(2), 1f);
         box.addView(limits, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
 
-        paint.run();
         return box;
     }
 
@@ -1562,6 +1566,38 @@ public class MainActivity extends Activity {
         row.addView(broadcastChip, blp);
         card.addView(row);
 
+        // ★ 2.42.3：三档性能预算。老机器选流畅、一般选均衡、机器够好选高音质。
+        //   两端各自可设，不一致时按较低那档协商（下面那行会写出生效值）。
+        LinearLayout qrow = new LinearLayout(this);
+        qrow.setOrientation(LinearLayout.HORIZONTAL);
+        TextView qlb = text("音质", 12f, DIM, false);
+        qrow.addView(qlb, margins(0, WRAP, 0, 0, dpi(6), 0));
+        qSmoothChip = chip("流畅");
+        qSmoothChip.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { chooseQuality("smooth"); }
+        });
+        qBalancedChip = chip("均衡");
+        qBalancedChip.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { chooseQuality("balanced"); }
+        });
+        qHighChip = chip("高音质");
+        qHighChip.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { chooseQuality("high"); }
+        });
+        LinearLayout.LayoutParams qp = margins(0, dpi(40), dpi(6), 0, 0, 0);
+        qp.weight = 1f;
+        qrow.addView(qSmoothChip, qp);
+        LinearLayout.LayoutParams qp2 = margins(0, dpi(40), dpi(6), 0, 0, 0);
+        qp2.weight = 1f;
+        qrow.addView(qBalancedChip, qp2);
+        LinearLayout.LayoutParams qp3 = margins(0, dpi(40), 0, 0, 0, 0);
+        qp3.weight = 1f;
+        qrow.addView(qHighChip, qp3);
+        card.addView(qrow, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+
+        qualityNow = text(engine.qualityStateText(), 11.5f, DIM, false);
+        card.addView(qualityNow, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
+
         channelNow = text("", 12f, DIM, false);
         channelNow.setLineSpacing(dp(3), 1f);
         card.addView(channelNow, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
@@ -1590,7 +1626,8 @@ public class MainActivity extends Activity {
                 + "★ 广播和路由是【两条独立的线】，就像局域网里的 FM 电台：你想说就说、想听就听；"
                 + "它不会去开关别人的「听」「送」，也不会替你改动任何一台设备的路由状态"
                 + "（开着广播时，卡片上那些按钮还是你自己的选择）。\n"
-                + "同一台设备的声音如果从两条路都进来（电脑同时开着广播和点对点路由），只会播一路、不叠加。",
+                + "★ 2.42.2 起广播走独立端口 47832、点对点走 47831：两档收听各判各的，"
+                + "开「听广播」不会顺带放行点对点，反过来也一样。",
                 11.5f, DIM, false);
         hint.setLineSpacing(dp(3), 1f);
         registerLong(longTextViews, hint);      // 简洁档收起来

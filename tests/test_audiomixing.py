@@ -460,7 +460,11 @@ class TestAudioFormat(unittest.TestCase):
             self.assertGreater(float(max(abs(float(v)) for v in array("f", raw))), 0.3)
 
         # wasapi sink, only when real hardware is available
-        if audio_base.available_backends().get("wasapi"):
+        # ★ 2026-11-17：默认不碰真实默认设备（用户正在用蓝牙耳机）。原来这里会
+        #   打开 @default 写一块 440Hz，门禁一跑就会在用户耳机里响一下。
+        #   需要真机验证时显式设 AUDIOMIXING_REAL_AUDIO=1。
+        if (audio_base.available_backends().get("wasapi")
+                and os.environ.get("AUDIOMIXING_REAL_AUDIO") == "1"):
             try:
                 sink = audio_base.open_sink({"backend": "wasapi", "device": "@default"})
                 sink.start()
@@ -981,7 +985,9 @@ class TestRouting(unittest.TestCase):
 
     def _add_peer(self, node_id: str, name: str, audio_port: int) -> None:
         self.node.registry.update(
-            {"wl": 1, "id": node_id, "name": name, "audio_port": audio_port, "web_port": 1, "sinks": [{"name": "耳机", "id": "x"}]},
+            {"wl": 1, "id": node_id, "name": name, "audio_port": audio_port,
+             "broadcast_port": audio_port + 1, "web_port": 1,
+             "sinks": [{"name": "耳机", "id": "x"}]},
             "192.168.1.50",
         )
 
@@ -1186,9 +1192,71 @@ class TestRouting(unittest.TestCase):
         self._add_peer("peer-1", "伴侣电脑", 47990)
         self._add_peer("peer-2", "客厅音箱", 47991)
         self.node.config.broadcast = True
+        # ★ 2.42.2（第 1 条）：没有音源就不广播；这里显式选一块，验证广播发到广播端口。
+        self.node.config.channel_sources = ["扬声器 (Realtek) [loopback]"]
+        peers = {p.node_id: p for p in self.node.registry.all()}
+        ports = {k.split("|", 1)[1]: self.node._send_target_port(r, peers[k.split("|", 1)[1]])
+                 for k, _t, r in self.node.desired_senders()}
+        self.assertEqual(ports["peer-1"], 47991, "广播必须发到对端 broadcast_port")
+        self.assertEqual(ports["peer-2"], 47992, "广播必须发到对端 broadcast_port")
         keys = sorted(k for k, _t, _r in self.node.desired_senders())
         self.assertEqual(keys, ["channel|peer-1", "channel|peer-2"])
         self.assertNotIn("channel", self.node.desired_sinks(), "a station does not play itself")
+
+    def test_broadcast_without_sources_creates_no_sender_and_zero_packets(self):
+        """★ 2.42.2（第 1 条）：没选音源 = 一条流都不许建、发送 0 包。"""
+        self._add_peer("peer-1", "伴侣电脑", 47990)
+        self.node.config.broadcast = True
+        self.node.config.channel_sources = []
+        self.assertEqual(self.node.desired_senders(), [], "空音源不该产生任何广播发送端")
+        state = self.node.channel_state()
+        self.assertEqual(state["broadcast_sent"]["packets"], 0)
+        self.assertIn("未选音源", state["broadcast_blocked"])
+
+    def test_broadcast_source_spec_never_falls_back_to_desktop(self):
+        """★ 2.42.2（第 1 条）：广播源的兜底只能是静音，绝不能是桌面混音。"""
+        self.node.config.broadcast = True
+        self.node.config.channel_sources = []
+        spec = self.node._source_spec_for({"kind": "broadcast"})
+        self.assertEqual(spec.get("backend"), "null")
+        self.assertEqual(spec.get("device"), "silence")
+
+        # 选了但被排除，同样不许回落桌面。
+        self.node.config.channel_sources = ["某块采集设备"]
+        self.node.config.broadcast_excluded = ["某块采集设备"]
+        spec = self.node._source_spec_for({"kind": "broadcast"})
+        self.assertEqual(spec.get("backend"), "null")
+        self.assertEqual(spec.get("device"), "silence")
+
+    def test_broadcast_and_point_to_point_admission_are_independent(self):
+        """★ 2.42.2（第 2 条）：广播口只看「听广播」，点对点口只看具名路由。"""
+        self._add_peer("peer-1", "伴侣电脑", 47990)
+        # ★ 让对端显式声明「点对点送声」：只有声明了点对点、且没有具名路由时才应拒收。
+        self.node._peer_send_mode["peer-1"] = (1, False, time.monotonic())
+        self.node.config.listen = True
+        self.assertTrue(self.node._stream_is_accepted("peer-1", "channel"),
+                        "听广播打开时，广播口必须放行")
+        self.assertFalse(self.node._stream_is_accepted("peer-1", "p2p"),
+                         "点对点没开「收听」时，点对点口必须拒收 —— 不能被广播放行带过去")
+
+        self.node.config.listen = False
+        self.assertFalse(self.node._stream_is_accepted("peer-1", "channel"),
+                         "听广播关掉时，广播口必须拒收")
+        # 老版本/未声明点对点的来源仍按频道兼容放行 —— 这条只影响点对点口。
+        self.node._peer_send_mode.clear()
+        self.assertTrue(self.node._stream_is_accepted("peer-1", "p2p"),
+                        "未声明点对点的老来源按兼容放行（只影响点对点口）")
+
+    def test_old_peer_without_broadcast_port_gets_no_broadcast(self):
+        """★ 2.42.2：旧对端不公布 47832 时不发广播，也不回落到 audio_port。"""
+        self.node.registry.update(
+            {"wl": 1, "id": "old-peer", "name": "旧手机", "audio_port": 47990,
+             "web_port": 1}, "192.168.1.60")
+        self.node.config.broadcast = True
+        self.node.config.channel_sources = ["扬声器 [loopback]"]
+        self.assertEqual(self.node.desired_senders(), [])
+        blocked = [v for v in self.node._senders_blocked.values() if v.get("old_peer")]
+        self.assertTrue(blocked, "必须明确记下「版本过旧，没有广播端口」")
 
     def test_two_stations_mix_into_one_channel_route(self):
         """Every station stamps the same route id, so a listener gets one mixed block.
@@ -1387,11 +1455,68 @@ def _config_stub(name: str = "test", node_id: str = "node-test"):
 class TestEngineEndToEnd(unittest.TestCase):
     """Two nodes on this machine, engine to engine, using the built-in generators."""
 
+    def test_broadcast_without_sources_receiver_has_zero_streams(self):
+        """★ 2.42.2（第 1 条）：A 开广播但没选音源，B 开听广播也必须 0 流、0 包。"""
+        audio_port_a = free_udp_port()
+        audio_port_b = free_udp_port()
+        bcast_a = free_udp_port()
+        while bcast_a in (audio_port_a, audio_port_b):
+            bcast_a = free_udp_port()
+        bcast_b = free_udp_port()
+        while bcast_b in (audio_port_a, audio_port_b, bcast_a):
+            bcast_b = free_udp_port()
+        node_a = AudioMixingNode(_config_stub("A", "node-a"), audio_port=audio_port_a,
+                                 broadcast_port=bcast_a,
+                                 discovery_port=free_udp_port(), simulate=True)
+        node_b = AudioMixingNode(_config_stub("B", "node-b"), audio_port=audio_port_b,
+                                 broadcast_port=bcast_b,
+                                 discovery_port=free_udp_port(), simulate=True)
+        node_a.config.broadcast = True
+        node_a.config.channel_sources = []
+        node_b.config.listen = True
+        node_a.start(announce=False)
+        node_b.start(announce=False)
+        try:
+            node_a.registry.update({"wl": 1, "id": "node-b", "name": "B",
+                                    "audio_port": audio_port_b,
+                                    "broadcast_port": bcast_b, "web_port": 1},
+                                   "127.0.0.1", local=True)
+            node_b.registry.update({"wl": 1, "id": "node-a", "name": "A",
+                                    "audio_port": audio_port_a,
+                                    "broadcast_port": bcast_a, "web_port": 1},
+                                   "127.0.0.1", local=True)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                node_a.tick()
+                node_b.tick()
+                time.sleep(0.2)
+            sent = node_a.channel_state()["broadcast_sent"]
+            self.assertEqual(sent["packets"], 0, "未选音源时发送包数必须为 0")
+            self.assertEqual(sent["sessions"], 0, "未选音源时一条广播会话都不许建")
+            self.assertEqual(node_b.receiver.stats()["active_streams"], 0,
+                             "接收端 streams 必须为 0")
+            self.assertEqual(node_b.receiver.broadcast_packets_received, 0)
+        finally:
+            node_a.stop()
+            node_b.stop()
+
     def test_audio_flows_between_two_nodes(self):
         audio_port_a = free_udp_port()
         audio_port_b = free_udp_port()
-        node_a = AudioMixingNode(_config_stub("A", "node-a"), audio_port=audio_port_a, discovery_port=free_udp_port(), simulate=True)
-        node_b = AudioMixingNode(_config_stub("B", "node-b"), audio_port=audio_port_b, discovery_port=free_udp_port(), simulate=True)
+        # ★ 2.42.2：广播口必须显式给，且不能撞上另一台的 audio_port（Windows 的
+        #   SO_REUSEADDR 允许两个 UDP socket 绑同一端口，会静默抢包）。
+        bcast_a = free_udp_port()
+        while bcast_a in (audio_port_a, audio_port_b):
+            bcast_a = free_udp_port()
+        bcast_b = free_udp_port()
+        while bcast_b in (audio_port_a, audio_port_b, bcast_a):
+            bcast_b = free_udp_port()
+        node_a = AudioMixingNode(_config_stub("A", "node-a"), audio_port=audio_port_a,
+                                 broadcast_port=bcast_a,
+                                 discovery_port=free_udp_port(), simulate=True)
+        node_b = AudioMixingNode(_config_stub("B", "node-b"), audio_port=audio_port_b,
+                                 broadcast_port=bcast_b,
+                                 discovery_port=free_udp_port(), simulate=True)
         node_a.start(announce=False)
         node_b.start(announce=False)
         try:
@@ -1902,6 +2027,86 @@ class TestBluetoothBridge(unittest.TestCase):
         self.assertNotEqual(first, bt._key(device_id + "x"))
         self.assertTrue(first.isalnum(), "the temp filename must not carry path separators")
 
+    # ---- ★ v2.41.3「常开」 ---------------------------------------------------
+
+    def test_always_on_tries_one_connection_then_keeps_waiting(self):
+        """★ 2.42.1：按下「打开」主动尝试连接一次，然后继续常驻等待。
+
+        和 v2.42 的区别：v2.42 只 StartAsync（不主动连）；2.42.1 用户要求省一步人工操作，
+        所以第一次 StartAsync 之后调一次 Open()（与 connect()/_HOLD_SCRIPT 同一条链路），
+        失败也不退出，继续等手机自己连。
+        """
+        from audiomixing import bluetooth as bt
+
+        self.assertIn("StartAsync", bt._ALWAYS_SCRIPT)
+        self.assertEqual(bt._ALWAYS_SCRIPT.count("$conn.Open()"), 1,
+                         "「打开」只主动尝试连接一次，不能每轮都重连")
+        self.assertIn("$triedOpen", bt._ALWAYS_SCRIPT,
+                      "必须用一次性标记，保证只尝试一次")
+        self.assertIn("$conn.Open()", bt._HOLD_SCRIPT,
+                      "connect()/「智连」的主动连接链路仍然保留")
+
+    def test_always_status_reads_only_the_helper_file(self):
+        """常开状态只读助手写的状态文件，不做设备枚举（枚举会扰动正在保持的连接）。"""
+        from audiomixing import bluetooth as bt
+
+        original_dir, original_run = bt._STATE_DIR, bt._run
+        sandbox = pathlib.Path(tempfile.mkdtemp(prefix="audiomixing-bt-always-"))
+        try:
+            bt._STATE_DIR = sandbox
+
+            def no_enumerate(*a, **k):
+                raise AssertionError("常开状态读取不许枚举蓝牙设备")
+
+            bt._run = no_enumerate
+            key = bt._key("dev-A")
+            (sandbox / (key + ".status")).write_text("always:ready:Closed", encoding="utf-8")
+            self.assertEqual(bt.always_status("dev-A"), "always:ready:Closed")
+            self.assertEqual(bt.always_status("unknown"), "",
+                             "没有状态文件就是空，不许去枚举")
+        finally:
+            bt._STATE_DIR, bt._run = original_dir, original_run
+            shutil.rmtree(sandbox, ignore_errors=True)
+
+    def test_always_mode_is_its_own_link_state_not_waiting(self):
+        """常开待机不能显示成 waiting（「手机未连接」）—— 常开本来就不主动连手机。"""
+        from audiomixing import bluetooth as bt
+
+        original_dir = bt._STATE_DIR
+        sandbox = pathlib.Path(tempfile.mkdtemp(prefix="audiomixing-bt-always-"))
+        try:
+            bt._STATE_DIR = sandbox
+            key = bt._key("dev-A")
+            (sandbox / (key + ".keep")).write_text("1", encoding="utf-8")
+            (sandbox / (key + ".pid")).write_text(str(os.getpid()), encoding="utf-8")
+            (sandbox / (key + ".status")).write_text("always:ready:Closed", encoding="utf-8")
+            device = {"id": "dev-A", "name": "手机A", "state": "always:ready:Closed",
+                      "endpoint": False}
+            row = bt._apply_live_states([dict(device)])[0]
+            self.assertTrue(row["always"])
+            self.assertTrue(row["held"])
+            self.assertEqual(row["link"], "always", "常开待机是独立状态，不是 waiting")
+
+            device["endpoint"] = True
+            row = bt._apply_live_states([dict(device)])[0]
+            self.assertEqual(row["link"], "connected",
+                             "手机自己连上来、媒体音频到了才是 connected")
+        finally:
+            bt._STATE_DIR = original_dir
+            shutil.rmtree(sandbox, ignore_errors=True)
+
+    def test_the_open_roster_round_trips_and_smart_link_is_gone(self):
+        path = pathlib.Path(tempfile.mkdtemp()) / "config.json"
+        self.addCleanup(shutil.rmtree, str(path.parent), True)
+        cfg = Config()
+        cfg.bt_always = ["id-A", "id-B"]
+        cfg.save(path)
+        again = Config.load(path, create=False)
+        self.assertEqual(again.bt_always, ["id-A", "id-B"],
+                         "「打开」名单按设备 id 存，重启后仍生效")
+        self.assertFalse(hasattr(again, "autoconnect"),
+                         "★ v2.42：蓝牙「智连」整条下线，配置里不再有 autoconnect")
+
 
 class TestLocalLoop(unittest.TestCase):
     """The single-machine path: capture -> render on this PC, no LAN at all.
@@ -1958,12 +2163,11 @@ class TestLocalLoop(unittest.TestCase):
 
 
 class TestStartupPreset(unittest.TestCase):
-    """Startup presets: connect the chosen phones, restore the channel switches.
+    """Startup presets: arm the 「打开」 roster, restore the channel switches.
 
-    The channel switches (broadcast/listen/local) are plain config fields, so `start()`
-    already applies them through set_routes -> apply_routes. Only the Bluetooth half
-    needs new code, and it must never touch a phone the operator did not tick: opening
-    an A2DP sink resets that phone's link.
+    ★ v2.42：蓝牙「智连」(autoconnect) 已整条下线（和「打开」重复）。启动时唯一会碰
+    蓝牙的动作，就是按 bt_always（设备 id）挂常驻接收端，而且**不许枚举**
+    —— `bluetooth.py` 写明枚举会扰动正在保持的连接。手机连不连是手机那边的事。
     """
 
     def setUp(self):
@@ -1975,59 +2179,47 @@ class TestStartupPreset(unittest.TestCase):
         self.node = AudioMixingNode(cfg, simulate=True)
         self.addCleanup(self.node.stop)
 
-    def test_only_the_ticked_phones_are_connected(self):
+    def test_the_open_roster_arms_resident_receivers_without_enumerating(self):
         from audiomixing import bluetooth as bt
 
-        devices = [
-            {"id": "id-A", "name": "手机A", "link": "off", "held": False},
-            {"id": "id-B", "name": "手机B", "link": "off", "held": False},
-            {"id": "id-C", "name": "手机C", "link": "connected", "held": True},
-        ]
-        opened: list[str] = []
-        # The node reads the cached listing (a real one takes seconds), so the test has to
-        # stand in for both entry points.
-        original_list, original_connect = bt.list_devices, bt.connect
-        original_cached = bt.list_devices_cached
+        armed: list[str] = []
+        original_always, original_cached = bt.always_on, bt.list_devices_cached
+
+        def no_enumeration(*a, **k):
+            raise AssertionError("启动「打开」时不许枚举蓝牙设备")
+
         try:
-            bt.list_devices = lambda: devices
-            bt.list_devices_cached = lambda *a, **k: devices
-
-            def fake_connect(device_id):
-                opened.append(device_id)
-                return {"ok": True, "state": "open:Opened"}
-
-            bt.connect = fake_connect
-            self.cfg.autoconnect = ["手机A", "手机C", "不存在的手机"]
-            done = self.node.autoconnect_phones()
+            bt.always_on = lambda device_id: (
+                armed.append(device_id), {"ok": True, "state": "always:ready:Closed"})[1]
+            bt.list_devices_cached = no_enumeration
+            done = self.node._bt_always(["id-A", "id-B"])
         finally:
-            bt.list_devices, bt.connect = original_list, original_connect
-            bt.list_devices_cached = original_cached
+            bt.always_on, bt.list_devices_cached = original_always, original_cached
 
-        self.assertEqual(opened, ["id-A"], "only the ticked, present, not-yet-open phone")
-        self.assertEqual(sorted(done), ["手机A", "手机C"], "an already-open phone counts as done")
+        self.assertEqual(armed, ["id-A", "id-B"], "按持久名单逐个挂常驻接收端")
+        self.assertEqual(done, ["id-A", "id-B"])
 
-    def test_nothing_is_connected_when_nothing_is_ticked(self):
+    def test_an_empty_roster_touches_no_phone(self):
         from audiomixing import bluetooth as bt
 
-        opened: list[str] = []
-        original = bt.connect
+        armed: list[str] = []
+        original = bt.always_on
         try:
-            bt.connect = lambda device_id: (opened.append(device_id), {"ok": True})[1]
-            self.cfg.autoconnect = []
-            self.assertEqual(self.node.autoconnect_phones(), [])
+            bt.always_on = lambda device_id: (armed.append(device_id), {"ok": True})[1]
+            self.assertEqual(self.node._bt_always([]), [])
         finally:
-            bt.connect = original
-        self.assertEqual(opened, [], "an untouched install must not poke any phone")
+            bt.always_on = original
+        self.assertEqual(armed, [], "没点过「打开」的手机，一个都不许碰")
 
     def test_the_preset_survives_a_config_round_trip(self):
         path = pathlib.Path(tempfile.mkdtemp()) / "config.json"
         self.addCleanup(shutil.rmtree, str(path.parent), True)
-        self.cfg.autoconnect = ["瘾控", "悦瘾"]
+        self.cfg.bt_always = ["id-A", "id-B"]
         self.cfg.broadcast = True
         self.cfg.listen = True
         self.cfg.save(path)
         again = Config.load(path, create=False)
-        self.assertEqual(again.autoconnect, ["瘾控", "悦瘾"])
+        self.assertEqual(again.bt_always, ["id-A", "id-B"])
         self.assertTrue(again.broadcast and again.listen,
                         "the channel switches must come back on the next start")
 
@@ -2514,6 +2706,122 @@ class TestTodayRegressions(unittest.TestCase):
                 out.stop()
                 # 采集中心没有 close：后台线程是守护线程，跟着进程退出即可
 
+    def test_changing_one_gain_never_reopens_any_output(self) -> None:
+        """★ 2026-11-17：调一路音量只改增益，不重开设备、不影响另一路。
+
+        现场：两路同时出声时拖其中一路音量，会听到高频杂音。根因是 configure()
+        把 gain 也算进整体 key —— 音量一变就 `_stop_all()` 把所有设备停掉重开。
+        """
+        from audiomixing.audio.multiout import MultiOut
+
+        opened: list[str] = []
+
+        class _Sink:
+            def start(self) -> None:
+                pass
+
+        class _Loop:
+            instances: list = []
+
+            def __init__(self, reader, sink, *, gain=1.0, name="") -> None:
+                self.gain = float(gain)
+                self.gain_target = float(gain)
+                self.pre_roll_ms = 0.0
+                self.stopped = False
+                _Loop.instances.append(self)
+
+            def start(self) -> None:
+                pass
+
+            def stop(self) -> None:
+                self.stopped = True
+
+            def is_alive(self) -> bool:
+                return not self.stopped
+
+            def set_gain(self, gain) -> None:
+                self.gain_target = float(gain)
+
+        class _Hub:
+            def reader(self, spec, name=""):
+                return object()
+
+        def _open(spec):
+            opened.append(spec.get("device") or "")
+            return _Sink()
+
+        with mock.patch("audiomixing.audio.multiout.audio_base.open_sink", _open), \
+                mock.patch("audiomixing.audio.multiout.LocalLoop", _Loop):
+            out = MultiOut(_Hub())
+            spec = {"backend": "wasapi", "device": "扬声器", "loopback": True}
+            out.configure(spec, [{"device": "设备 A", "gain": 1.0},
+                                 {"device": "设备 B", "gain": 1.0}])
+            self.assertEqual(opened, ["设备 A", "设备 B"])
+            loop_a, loop_b = _Loop.instances
+            # 只调 A 的音量：两台设备都不许重开，B 的循环对象必须是原来那个。
+            out.configure(spec, [{"device": "设备 A", "gain": 0.4},
+                                 {"device": "设备 B", "gain": 1.0}])
+            self.assertEqual(opened, ["设备 A", "设备 B"], "调音量不许重开设备")
+            self.assertIs(_Loop.instances[0], loop_a)
+            self.assertIs(_Loop.instances[1], loop_b)
+            self.assertEqual(loop_a.gain_target, 0.4)
+            self.assertEqual(loop_b.gain_target, 1.0)
+            # 改 A 的延迟：只重开 A，B 仍不受影响。
+            out.configure(spec, [{"device": "设备 A", "gain": 0.4, "delay_ms": 50},
+                                 {"device": "设备 B", "gain": 1.0}])
+            self.assertEqual(opened, ["设备 A", "设备 B", "设备 A"],
+                             "只有改延迟的那一路重开")
+            self.assertIs(_Loop.instances[1], loop_b)
+            out.stop()
+
+    def test_app_capture_really_uses_process_loopback(self) -> None:
+        """★ 2026-11-17 真机 bug：给 AIR4 只连 QQ音乐，却听到整个系统声音。
+
+        根因：WasapiBackend.open_source() 不管 spec 的 kind，一律返回桌面回环，
+        `kind:"app"` 和 `pid` 被完全忽略，ProcessLoopbackSource 从未被接上。
+        """
+        from audiomixing.audio.backends.process_loopback import ProcessLoopbackSource
+        from audiomixing.audio.backends.wasapi import WasapiBackend
+
+        src = WasapiBackend.open_source(
+            {"backend": "wasapi", "kind": "app", "pid": 4321, "name": "QQ音乐"})
+        self.assertIsInstance(src, ProcessLoopbackSource)
+        self.assertEqual(src.pid, 4321)
+        # 桌面回环仍然按原样走
+        plain = WasapiBackend.open_source({"backend": "wasapi", "device": "@default",
+                                           "loopback": True})
+        self.assertNotIsInstance(plain, ProcessLoopbackSource)
+
+    def test_app_choice_is_not_dropped_just_because_it_is_paused(self) -> None:
+        """没在出声不等于要回落：进程回环对暂停的进程也能打开，只是先读到静音。"""
+        from audiomixing.audio.multiout import MultiOut, normalize_sources
+
+        class _Cap:
+            error = ""
+            blocks_read = 1
+
+        class _Reader:
+            def __init__(self) -> None:
+                self.capture = _Cap()
+
+            def stop(self) -> None:
+                pass
+
+        class _Hub:
+            def reader(self, spec, name=""):
+                return _Reader()
+
+        out = MultiOut(_Hub())
+        sources = normalize_sources({"app_pid": 777, "app_name": "QQ音乐"})
+        self.assertEqual(sources, [{"kind": "app", "pid": 777, "name": "QQ音乐"}])
+        with mock.patch("audiomixing.audio.apps.supported", return_value=(True, "")):
+            reader, kept, labels, fallbacks = out._open_reader(
+                sources, {"backend": "wasapi", "device": "@default", "loopback": True})
+        self.assertEqual(kept[0].get("kind"), "app")
+        self.assertEqual(int(kept[0].get("pid") or 0), 777)
+        self.assertEqual(fallbacks, [])
+        self.assertEqual(len(labels), 1)
+
     def test_the_default_sink_is_a_real_sound_card(self) -> None:
         """默认播放后端必须是真实声卡，绝不能是写文件。"""
         from audiomixing.audio import base as audio_base
@@ -2642,6 +2950,56 @@ class TestChannelSourceSafety(unittest.TestCase):
         texts = [w["text"] for w in report["warnings"]]
         self.assertTrue(any("现在用不了" in t and "M332BF" in t for t in texts),
                         "面板必须有一条说清这条音源用不了：%s" % texts)
+
+    def test_broadcast_receiver_list_says_who_is_listening(self) -> None:
+        """★ 2.42.1：广播页要能说清在线 / 已收听 / 未收听 / 被拒，且拿对端上报当证据。"""
+        now = time.monotonic()
+        self.node._peer_rx_report = {
+            "p-listen": {"node_id": "p-listen", "at": now, "recv": 42, "streams": 1},
+            "p-silent": {"node_id": "p-silent", "at": now, "recv": 0, "streams": 0},
+        }
+        self.node._peer_listen_ack = {
+            "p-reject": {"node_id": "p-reject", "action": "reject",
+                         "reason": "用户拒绝", "at": time.time()},
+        }
+        peers = [
+            {"node_id": "p-listen", "name": "手机-在听", "host": "10.0.0.2",
+             "age_s": 2.0, "online": True},
+            {"node_id": "p-silent", "name": "手机-没听", "host": "10.0.0.3",
+             "age_s": 3.0, "online": True},
+            {"node_id": "p-reject", "name": "手机-拒绝", "host": "10.0.0.4",
+             "age_s": 4.0, "online": True},
+        ]
+        with mock.patch.object(self.node.registry, "snapshot", return_value=peers):
+            state = self.node.broadcast_receiver_state()
+        rows = {r["node_id"]: r for r in state["receiver_list"]}
+        self.assertEqual(rows["p-listen"]["state"], "已收听")
+        self.assertEqual(rows["p-listen"]["recv"], 42)
+        self.assertIn("包", rows["p-listen"]["detail"])
+        self.assertEqual(rows["p-silent"]["state"], "未收听")
+        self.assertIn("流未建立", rows["p-silent"]["detail"])
+        self.assertEqual(rows["p-reject"]["state"], "被拒")
+
+    def test_broadcast_sent_counts_only_channel_sessions(self) -> None:
+        """★ 2.42.1：本机广播到底送出去没有，必须给出会话/包数/字节。"""
+        self.node.sender.sessions = {
+            "channel|p-listen": types.SimpleNamespace(
+                route_id="channel|p-listen", node_id="p-listen",
+                packets_sent=30, bytes_sent=3000),
+            "route-1": types.SimpleNamespace(
+                route_id="route-1", node_id="p-other",
+                packets_sent=999, bytes_sent=999999),
+        }
+        peers = [{"node_id": "p-listen", "name": "手机-在听", "host": "10.0.0.2",
+                  "age_s": 2.0, "online": True}]
+        with mock.patch.object(self.node.registry, "snapshot", return_value=peers):
+            self.node.config.broadcast = True
+            state = self.node.channel_state()
+        self.assertEqual(state["broadcast_sent"]["sessions"], 1)
+        self.assertEqual(state["broadcast_sent"]["packets"], 30)
+        self.assertEqual(state["broadcast_sent"]["bytes"], 3000)
+        self.assertEqual(state["broadcast_sent"]["targets"], 1)
+        self.assertEqual(state["receiver_list"][0]["sent_packets"], 30)
 
     def test_a_phone_that_stopped_sending_is_named_as_such(self) -> None:
         """手机之前送过声音、现在没在送 —— 要和"设备已拔出"分开报。"""
@@ -2995,6 +3353,26 @@ class TestChannelSourceSafety(unittest.TestCase):
                                     "audio_port": _FakeSession.port, "web_port": 0,
                                     "smart": 0}),
                          "旧对端没有智连能力时，本机没开智连就不该请求（保守口径）")
+
+    def test_smart_link_still_auto_listens_when_the_peer_asks(self) -> None:
+        """★ 2.42.1（E）：点对点「智联」没被砍 —— 对端发起、接受后无需手动点收听。"""
+        self.node.config.broadcast = False
+        self.node.config.smart_link = ["peer-1"]
+        self.node.routes = []
+        self.node._auto_listen_granted.clear()
+        self.node._grant_listen_request("peer-1", "手机", "198.51.100.10")
+        rule = next((r for r in self.node.routes
+                     if str(r.get("id") or "").startswith("auto-listen-")), None)
+        self.assertIsNotNone(rule, "开了智联就必须自动建收听路由")
+        self.assertIn(self.node.node_id, [str(t) for t in rule.get("to") or []])
+        self.assertIn("peer-1", [str(t) for t in rule.get("from") or []])
+
+        # 广播开着时不能替用户乱收听（现有规则）。
+        self.node.config.broadcast = True
+        self.node.routes = []
+        self.node._grant_listen_request("peer-2", "手机", "198.51.100.11")
+        self.assertFalse([r for r in self.node.routes
+                          if str(r.get("id") or "").startswith("auto-listen-")])
 
     def test_without_listening_an_unknown_sender_is_not_played(self) -> None:
         """反向：没开「只听」时，认不出身份的流绝不能被随便放进播放端（那是乱收别人的声音）。"""
@@ -3643,9 +4021,9 @@ class TestQuickStartAndVersion(unittest.TestCase):
         # ★ 2026-10-26 用户图1：AMD 机器也要有适配说明，不能只写「Intel 适配」。
         self.assertIn("CPU AMD（AuthenticAMD）", text)
         self.assertIn("这是 AMD 平台", text)
-        # ★ 2026-11-04（第 11 条）：诊断里的兜底提示改成「频道 → 音源 + 本机直通」，
+        # ★ 2026-11-04（第 11 条）：诊断里的兜底提示改成「频道 → 音源 + 本机广播监听」，
         #   不再提已经删掉的「本机播放」按钮。
-        self.assertIn("本机直通", text)
+        self.assertIn("本机广播监听", text)
         # 老问题的自愈证据要出现在报告里。
         self.assertIn("自动重开：0 次", text)
         self.assertIn("蓝牙适配器 Test Bluetooth(R) Adapter", text,
@@ -3970,7 +4348,8 @@ class TestQuickStartAndVersion(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             exe = pathlib.Path(tmp) / "Audio Mixing v9.9.exe"
             exe.write_bytes(b"fake")
-            (pathlib.Path(tmp) / "AudioMixing-手机版-v2.20.apk").write_bytes(b"fake-apk")
+            apk_name = "AudioMixing-手机版-v%s.apk" % webui.__phone_version__
+            (pathlib.Path(tmp) / apk_name).write_bytes(b"fake-apk")
             webui.__compiled__ = self._fake_nuitka(tmp, exe)
             try:
                 ghost = str(pathlib.Path(tmp) / "onefile_tmp" / "python.exe")
@@ -3980,14 +4359,14 @@ class TestQuickStartAndVersion(unittest.TestCase):
             finally:
                 del webui.__compiled__
         self.assertIsNotNone(found, "exe 旁边那颗 apk 必须被找到")
-        self.assertEqual(found.name, "AudioMixing-手机版-v2.20.apk",
+        self.assertEqual(found.name, apk_name,
                          "★ 第 6 条：交付名必须带版本号")
 
     def test_apk_lookup_knows_every_shipped_filename(self) -> None:
         from audiomixing import webui
 
-        self.assertIn("AudioMixing-手机版-v2.20.apk", webui._APK_NAMES,
-                      "★ 第 6 条：交付名必须带版本号")
+        self.assertIn("AudioMixing-手机版-v%s.apk" % webui.__phone_version__,
+                      webui._APK_NAMES, "★ 第 6 条：交付名必须带版本号")
         self.assertIn("AudioMixing-mic.apk", webui._APK_NAMES)
         src = (ROOT / "audiomixing" / "webui.py").read_text(encoding="utf-8")
         self.assertIn("/app/AudioMixing-手机版-v%s.apk", src, "下载路由要认带版本号的新文件名")
@@ -4069,6 +4448,27 @@ class TestDeviceCardUi(unittest.TestCase):
         self.assertIn("/api/routes/add", html)
         self.assertIn("/api/routes/delete", html)
 
+    def test_bluetooth_open_is_black_until_it_succeeds(self) -> None:
+        """★ 2.42.1：蓝牙卡不再有黄字提示；「打开」默认黑色，成功后才变蓝。"""
+        html = self._html()
+        self.assertNotIn("const hint = d.link === 'hfp'", html,
+                         "卡片下方那段黄字提示必须删掉")
+        self.assertNotIn("${hint}", html)
+        self.assertIn("let btOpenOk = new Set()", html)
+        self.assertIn("class=\"tiny ${openOk ? 'primary' : ''}\" onclick=\"btOpen",
+                      html, "打开按钮默认必须是黑色（没有 primary）")
+
+    def test_multiout_supports_multiple_sources_and_peer_audio_cards(self) -> None:
+        """★ 2.42.1：一路多音源、空音源静音、复杂档只列工作中的输出、对端 audio 卡片。"""
+        html = self._html()
+        for token in ("function sourcesOf(", "function sourceKey(",
+                      "未连音源 · 这一路静音", "renderPeerCards(wrap)",
+                      "sources: sourcesOf(cfg).map"):
+            self.assertIn(token, html)
+        self.assertIn("isPassthrough(name) || isChosen(name) || remSink.has(name)", html,
+                      "复杂档输出列必须过滤掉未启用设备")
+        self.assertNotIn("已回落桌面混音", html)
+
     def test_the_drag_based_route_builder_is_gone(self) -> None:
         """「拖两个框就是一条路由」那一套（高级区里的拖拽建路由）已经删干净了。
 
@@ -4111,7 +4511,9 @@ class TestDeviceCardUi(unittest.TestCase):
         电脑端如果还写着光秃秃的"频道音量"，用户就会以为它能改 Windows 的音量。
         """
         html = self._html()
-        self.assertIn("频道音量</label>", html, "频道滑杆的标签还在")
+        # ★ 2026-11-17：广播页改成卡片后，原来那行"频道音量"标签没了；
+        #   同一语义落在「本机广播监听」卡片里的滑杆标题上。
+        self.assertIn("本机广播监听这一份的音量", html, "本机监听那份的音量滑杆要写明只管我们这一层")
         # ★ 2026-10-16（图5）之后「已经连上的」那段路由列表删了，它里面那句
         #   「我们这一层的音量（不动 Windows 系统音量）」随之消失。同样的语义现在由
         #   设备卡片上那个滑动条的标题承担，这里改钉那一处。
@@ -4806,7 +5208,7 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
 
     # ---- ★ 2026-11-04（第 11 条）：删除「本机播放」与 /api/bluetooth/local ----
     def test_the_local_play_button_and_engine_path_are_gone(self) -> None:
-        """用户确认删掉这个入口；兜底改为「频道 → 音源 + 本机直通」，并在诊断里写明。"""
+        """用户确认删掉这个入口；兜底改为「频道 → 音源 + 本机广播监听」，并在诊断里写明。"""
         from audiomixing import webui
 
         self.assertFalse(hasattr(self.node, "set_bluetooth_local_play"))
@@ -4823,7 +5225,7 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         code = re.sub(r"/\*.*?\*/", "", code, flags=re.S)   # 注释里记录"已删除"不算残留
         self.assertNotIn("本机播放", code, "前端按钮必须删掉")
         self.assertNotIn("btLocal(", code)
-        self.assertIn("本机直通",
+        self.assertIn("本机广播监听",
                       pathlib.Path(webui.__file__).read_text(encoding="utf-8"),
                       "驱动不出声时的兜底路径要在诊断里告诉用户")
 
@@ -4956,9 +5358,9 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
         听得到），本工具不能再自动把这块 A2DP SNK 塞进「音源」—— 那会采第二遍、
         再放一遍，和系统播放叠在一起。
 
-        所以这里钉住：即使蓝牙卡片的「智连」（服务端 autoconnect）开着，
-        `_auto_play_sources()` 也不许改动 channel_sources。要转发手机声音时，
-        用户仍然可以手动在「音源」里选 A2DP SNK。
+        所以这里钉住：`_auto_play_sources()` 绝不改动 channel_sources
+        （★ v2.42：蓝牙「智连」已下线，本来也没有任何名单能让它这么做）。
+        要转发手机声音时，用户仍然可以手动在「音源」里选 A2DP SNK。
         """
         from audiomixing.engine import bt_sink_phone_name
 
@@ -4970,13 +5372,12 @@ class TestPeerLivenessAndAutoListen(unittest.TestCase):
             audio_base.AudioDevice("c1", "麦克风 (手机A A2DP SNK)",
                                    audio_base.KIND_SOURCE, "wasapi", "capture"),
         ]
-        self.node.config.autoconnect = ["手机A"]
         self.node.config.channel_sources = []
         self.node.config.local = False
         self.node._auto_play_sources()
         self.assertEqual(self.node.config.channel_sources, [],
                          "蓝牙音频由 Windows 直接播放，绝不能再自动收进音源")
-        self.assertFalse(self.node.config.local, "也不许因此打开本机直通")
+        self.assertFalse(self.node.config.local, "也不许因此打开本机广播监听")
 
     # ---- ★ 2026-10-19 孤儿路由（整条都是没见过的设备）清扫 --------------------
     def test_a_route_about_devices_we_never_met_is_swept(self) -> None:
@@ -5594,21 +5995,33 @@ class TestPanelLayoutAndSimpleMode(unittest.TestCase):
             self.assertIn(keep, html, "它的职责搬到设备卡片上了：%s" % keep)
 
     def test_the_multi_output_block_has_its_own_tab(self) -> None:
-        """第 5 条（2026-10-16 更版）：以前它挤在「本机状态」那张卡里，现在按用户图2
-        独立成二级菜单的一页（「多耳机」）。搬出来还有个好处：本机状态那张卡少了一整块，
-        高度降下来了 —— v1.27 遗留的"这张卡下不去"就有解了。"""
+        """第 5 条（2026-10-16 更版）：多耳机自己占一页（「多耳机」）。
+
+        ★ v2.42：那一页里原来还挂着一张「一台电脑，多个耳机」配置卡（设备清单/
+        勾选行/桌面混音下拉/应用/状态/说明）。用户确认它已经没有存在意义，整卡删除，
+        四样真有用的控件挪进画布卡的工具条。这里钉住"删干净了、工具条还在"。
+        """
         html = self._html()
-        # 只数 id，不数那句标题文字 —— 注释里也会提到它。
-        self.assertEqual(html.count('id="moList"'), 1, "整页只许有一份（id 唯一）")
-        self.assertEqual(html.count('id="moToggle"'), 1)
+        # 整卡与它的节点、脚本引用都不许留（用户明确不要折叠/隐藏版本）。
+        for gone in ('id="moList"', 'id="moApply"', 'id="moBody"', 'id="moSummary"',
+                     'data-card="multiout"', "getElementById('moApply')"):
+            self.assertNotIn(gone, html, "整块删除的东西不许半留着：%s" % gone)
         self.assertNotIn('id="multiOutCard"', html, "旧的那张独立卡片要真的没了")
-        self.assertIn('data-card="multiout" data-pane="multi"', html, "多耳机要自己占一页")
         status = html.index('data-card="status" data-pane="status"')
-        block = html.index('id="moList"')
-        self.assertLess(status, block, "多耳块排在本机状态之后")
-        self.assertLess(block, html.index("手机扫码", status), "多耳块要排在扫码之前")
-        for keep in ('id="moToggle"', 'id="moBody"', 'id="moSummary"', 'id="moApply"'):
-            self.assertIn(keep, html, "下面那段脚本按 id 取节点，一个都不许改：%s" % keep)
+        block = html.index('data-card="multiview" data-pane="multi"')
+        self.assertLess(status, block, "多耳机画布排在本机状态之后")
+        self.assertLess(block, html.index("手机扫码", status), "多耳机画布要排在扫码之前")
+        # 画布仍是那一页；四样有用控件在画布卡里、在卡片墙/画布之前。
+        self.assertNotIn('id="moToggle"', html, "独立页之后不再需要收起/展开控件")
+        self.assertNotIn('href="/multi"', html, "独立画布页已下线，不许留悬空入口")
+        section = html[block:html.index("手机扫码", block)]
+        self.assertIn('class="motools"', section, "工具条要在画布卡里")
+        for keep in ('id="moStop"', 'id="moRefresh"', 'id="moLockDevice"',
+                     'id="moRestore"', 'id="moStatus"', 'id="moLockInfo"',
+                     'id="moStage"', 'id="moModeSeg"'):
+            self.assertIn(keep, section, "工具条/画布按 id 取节点，一个都不许改：%s" % keep)
+        self.assertLess(section.index('class="motools"'), section.index('id="moCards"'),
+                        "工具条必须在卡片墙/画布之前")
 
     def test_no_auto_listen_warning_is_shown_any_more(self) -> None:
         """★ 2026-10-18 用户第 6 条：「这种警告就不要出现了」。整块删掉，一条都不许留。
@@ -6039,9 +6452,12 @@ class TestTask16PanelTexts(unittest.TestCase):
         self.assertIn("广播中不可用", html)
         self.assertIn("smartAvail", html)
         self.assertIn("kind:'route'", html)  # 别把卡片上的既有按钮删了
-        # 蓝牙那张卡片的「自启」并进同一个词（用户选了"局域网+蓝牙都加"）
-        self.assertIn("btAuto(", html)
-        self.assertIn(">${btAutoList.includes(d.name) ? '✓ 智连' : '智连'}</button>", html)
+        # ★ v2.42：蓝牙卡片只剩「打开 / 关闭 / 隐藏」；蓝牙「智连」整条下线
+        #   （它和「打开」重复，且只是"启动时主动连一次"）。
+        self.assertIn("async function btOpen(", html)
+        self.assertIn("async function btClose(", html)
+        for gone in ("btAuto(", "btToggle(", "btAlways(", "btAutoList"):
+            self.assertNotIn(gone, html, "蓝牙旧入口/旧名单不许残留：%s" % gone)
         # 旧的那一套必须真的没了
         for gone in ('id="autoListenBox"', 'id="autoAcceptListen"', 'id="autoListenState"',
                      "function revokeAutoListen(", "function allowAutoListen(",
@@ -6054,6 +6470,36 @@ class TestTask16PanelTexts(unittest.TestCase):
         #   那个全局勾（前端 id/函数 + 服务端 auto_play）整块删掉，行为改由「智连」逐台决定。
         for gone in ('id="autoPlay"', "saveAutoPlay", "auto_play"):
             self.assertNotIn(gone, html, "那个全局勾已经并进「智连」了，不许半留着：%s" % gone)
+
+    def test_the_bt_card_has_only_open_close_hide(self) -> None:
+        """★ 2.42.2（第 3 条）：蓝牙卡片只留三颗按钮，整段说明/黄字块必须删干净。"""
+        html = self._html()
+        self.assertIn("onclick=\"btOpen(${i})\"", html)
+        self.assertIn("onclick=\"btClose(${i})\"", html)
+        self.assertIn("onclick=\"btHide(${i})\"", html)
+        # 第三态「常开」已并入「打开」，状态词仍保留（读 helper 状态文件）
+        self.assertIn("always:    ['已打开·等手机自己连'", html)
+        self.assertIn("已打开待机", html)
+        # ★ 2.42.2：上一版只是把黄字改成灰字；用户要求整段删除，简洁档字数越少越好。
+        for gone in ("class=\"btrules\"", ".btrules{", "只剩两颗按钮",
+                     "一个蓝牙适配器同一时刻只能接一台手机", "两台手机同时「打开」",
+                     "adapterNote"):
+            self.assertNotIn(gone, html, "简洁档不该再有整段说明/黄字块：%s" % gone)
+
+    def test_peer_audio_card_sends_only_never_listens(self) -> None:
+        """★ 2.42.2（第 4 条）+ 2.42.3（第 2 条）：对端 audio 卡只做「送」，点卡片即送/停。"""
+        html = self._html()
+        start = html.find("function renderPeerCards")
+        self.assertGreater(start, 0, "找不到 renderPeerCards()")
+        nxt = html.find("\n        function ", start + 10)
+        body = html[start:nxt if nxt > start else len(html)]
+        # 2.42.3：卡片只显示设备本身，点卡片＝把本机声音送给它。
+        self.assertIn("card.onclick", body)
+        self.assertIn("to: [peer.node_id]", body)
+        for gone in ("收听它的", "停止收听", "to: ['self']", "peerRoute(peer, 'in')",
+                     "peer.sinks", "送声音到它", "本机扬声器"):
+            self.assertNotIn(gone, body, "对端卡不该再有「本机收听/挑对端扬声器」：%s" % gone)
+        self.assertIn("本机不做任何收听", html)
 
     def test_only_the_pc_side_of_the_graph_can_start_a_link(self) -> None:
         """★ 2026-10-18 用户第 2 条：「comfyui中应当只能控制电脑的主动发送声音。
@@ -6169,6 +6615,95 @@ class TestTask16PanelTexts(unittest.TestCase):
         self.assertIn("state.routes", body)
         self.assertNotIn("kind === 'bc'", body)
 
+    def test_cycle_detection_survives_a_manual_bt_merge(self) -> None:
+        """★ v2.33（Q1）：合并后仍要能判出「Wi-Fi 出 / 蓝牙回」的真回环。
+
+        根因：relBuild 早就按 `relation_merges` 把蓝牙卡并到宿主节点上，
+        `identityMap`/`routeCycleInfo` 却只认 `btSnapshot` 的 MAC/名字证据；
+        手动合并后回环边两端仍是两个身份，环就断了。另外蓝牙边本身不在
+        `state.routes` 里，旧实现根本没把它算进图。
+        """
+        html = self._html()
+        i = html.index("function identityMap(")
+        body = html[i:html.index("function identityCanonId(", i)]
+        self.assertIn("state.relation_merges", body, "人工合并记录必须参与身份归一")
+        self.assertIn("map['bt:' + bt] = key", body)
+        j = html.index("function routeCycleInfo(")
+        cyc = html[j:html.index("function identityDisplay(", j)]
+        self.assertIn("btSnapshot", cyc, "蓝牙边也要参与回环判定")
+        self.assertIn("d.link !== 'connected'", cyc, "未连接的蓝牙不能算环")
+        k = html.index("if(d.link === 'connected')")
+        self.assertIn("cycle: !!cyc[bu + '|self']", html[k:k + 400],
+                      "蓝牙边自己也要标红，不能只红 Wi-Fi 那条")
+
+    def test_simple_mode_does_not_render_diagnostics(self) -> None:
+        """★ v2.34：简洁档要"真的只有设备 + 送声/收听 + 广播 + 必要状态"。
+
+        用户第 2 次验收仍然看到设备卡片上的平台/IP/版本、档位长句、收/送/信号三条、
+        两条增益滑杆，以及左侧「设置」入口 —— 说明靠 CSS 藏是不够的。
+        这条钉住四件事：
+          · 设备卡在简单档走单独分支：音量条 + 信号条 + 两路增益滑杆必须在，
+            平台/IP/版本、档位长句、评分小字必须不在；
+          · 9 项指标 / 采集源明细 / 音源体检在简单档不渲染；
+          · 「设置」一级菜单与「常用例子」在简单档收起；
+          · 详细档仍然保留完整诊断（`.fullui` 分支没有被删）。
+
+        ★ v2.35 追加：上一版把三根条和两条滑杆一起删了，用户明确要回来 ——
+        这条用例现在同时钉「必须有」和「必须没有」，防止再判错一次。
+        """
+        html = self._html()
+        self.assertIn("function uiIsSimple(", html)
+        # 设备卡：简单档分支必须在拼诊断字段之前返回
+        card = html[html.index("function deviceCard("):html.index("function renderDeviceCards(", html.index("function deviceCard("))]
+        self.assertIn("if(uiIsSimple()){", card, "设备卡必须有简单档分支")
+        start = card.index("if(uiIsSimple()){")
+        simple = card[start:card.index("\n\n  return `<div class=\"dvcard", start)]
+        # 必须恢复：三根条（收/送/信号）+ 两路增益滑杆
+        self.assertIn('<span class="lbl">${inLabel}</span>', simple)
+        self.assertIn('<span class="lbl">送</span>', simple)
+        self.assertIn('<span class="lbl">信号</span>', simple)
+        self.assertIn("gainRow('in', '我听它的声音多大')", simple)
+        self.assertIn("gainRow('out', '我送给它多大')", simple)
+        # 必须仍然没有：诊断字段与评分小字
+        self.assertNotIn("extraNote", simple, "简单档不能显示档位/vol 长句")
+        self.assertNotIn("dvmeta", simple, "简单档不能显示平台·IP·版本")
+        self.assertNotIn("qNum", simple, "简单档不能显示「96 分 · 在线」这类评分小字")
+        # 诊断区不渲染
+        for fn in ("function renderInputs(", "function renderStreams(", "function renderLogs(d){"):
+            body = html[html.index(fn):html.index("\n}", html.index(fn)) + 2]
+            self.assertIn("uiIsSimple()", body, fn + " 必须在简单档直接返回")
+        status = html[html.index("function renderStatus("):html.index("function renderVersion(", html.index("function renderStatus("))]
+        self.assertIn("if(!uiIsSimple()){", status, "9 项指标/音源体检只在详细档生成")
+        # 设置入口 / 模板按钮在简单档收起
+        self.assertIn("html:not(.fullui) #railVer", html)
+        self.assertIn("html:not(.fullui) #templatesBtn", html)
+        self.assertIn('html:not(.fullui) .tabs a[href="/diagnose"]', html)
+        self.assertIn("html:not(.fullui) #testBtn", html)
+
+    def test_simple_mode_keeps_volume_and_signal_bars(self) -> None:
+        """★ v2.35：音量条与信号质量条必须留在简洁档。
+
+        v2.34 把它们当"配置/电平明细"一起收走，用户第 3 次验收直接点回来：
+        两路增益滑杆（我听它的 / 我送给它）和收/送/信号三根条是日常要看、要动的。
+        这条同时钉住"回来了"和"没把上一版删掉的东西带回来"。
+        """
+        html = self._html()
+        card = html[html.index("function deviceCard("):html.index("function renderDeviceCards(", html.index("function deviceCard("))]
+        start = card.index("if(uiIsSimple()){")
+        simple = card[start:card.index("\n\n  return `<div class=\"dvcard", start)]
+        # 三根条：收 / 送 / 信号，且只写百分比（不出现评分小字）
+        self.assertEqual(simple.count('class="dvlevel"'), 3, "简洁档必须保留收/送/信号三根条")
+        self.assertIn("pctTxt(qPct)", simple, "信号条要写百分比")
+        self.assertNotIn("qNum", simple, "不能把「96 分 · 在线」这类评分小字带回来")
+        # 两路滑杆：标签是一句人话
+        self.assertIn("gainRow('in', '我听它的声音多大')", simple)
+        self.assertIn("gainRow('out', '我送给它多大')", simple)
+        # 上一版删掉的仍然不能回来
+        self.assertNotIn("extraNote", simple)
+        self.assertNotIn("dvmeta", simple)
+        # 简洁档的滑杆标签要够宽（否则「我听它的声音多大」会被 52px 截断）
+        self.assertIn(".dvslide.wide .lbl", html)
+
     def test_the_auto_listen_switch_says_what_it_is_doing(self) -> None:
         """★ 2026-10-17 那一版的"全局总开关 + 常驻状态行"在 2026-10-18 被用户否掉了。
 
@@ -6207,20 +6742,20 @@ class TestTask16PanelTexts(unittest.TestCase):
 
         可静态验证的那一半（另外一半在浏览器里实测过）：
           · 每张卡片有自己的 DOM 节点 id，操作走"只换那一张"；
-          · btToggle 里**不再**有任何写进整个列表容器的语句 —— 那正是"整块刷新"的根因。
+          · btOpen / btClose 里**不再**有任何写进整个列表容器的语句 —— 那正是"整块刷新"的根因。
         """
         html = self._html()
         self.assertIn('id="btcard-${i}"', html, "每张蓝牙卡片要有自己的 DOM id")
         for fn in ("function btCardHtml(d, i){", "function btBusy(", "function btRefreshOne("):
             self.assertIn(fn, html)
-        i = html.index("async function btToggle(")
+        i = html.index("async function btOpen(")
         body = html[i:html.index("\n}", i)]
         self.assertNotIn("$('btList')", body, "不许再把整个蓝牙列表的 innerHTML 换掉")
         self.assertIn("btBusy(index,", body, "忙态只能落在被点的那一张卡片里")
-        j = html.index("async function btAuto(")
+        j = html.index("async function btClose(")
         body2 = html[j:html.index("\n}", j)]
-        self.assertNotIn("$('btList')", body2, "自启也只重画那一张")
-        self.assertIn("btCardHtml(d, index)", body2)
+        self.assertNotIn("$('btList')", body2, "关闭也只重画那一张")
+        self.assertIn("btRefreshOne(", body2)
 
     def test_the_relation_graph_can_really_build_a_route(self) -> None:
         """★ 2026-10-18 用户：「在版本号那边加入comefyui…支持拖拽，可以连线最好」。
@@ -6368,7 +6903,7 @@ class TestMonitorWindowReuse(unittest.TestCase):
 
         with mock.patch.object(launcher, "_acquire_monitor_open_lock", return_value=1), \
                 mock.patch.object(launcher, "_release_monitor_open_lock"), \
-                mock.patch.object(launcher, "_window_handle", return_value=4242), \
+                mock.patch.object(launcher, "_panel_windows", return_value=[4242]), \
                 mock.patch.object(launcher, "_raise_window") as raise_win, \
                 mock.patch.object(launcher.subprocess, "Popen") as popen:
             launcher.open_monitor("http://127.0.0.1:17800")
@@ -6383,7 +6918,7 @@ class TestMonitorWindowReuse(unittest.TestCase):
         # 第一次检查：没有窗口 → 开；第二次检查：窗口已经在了 → 只提窗。
         with mock.patch.object(launcher, "_acquire_monitor_open_lock", return_value=1), \
                 mock.patch.object(launcher, "_release_monitor_open_lock"), \
-                mock.patch.object(launcher, "_window_handle", side_effect=[0, 4242]), \
+                mock.patch.object(launcher, "_panel_windows", side_effect=[[], [4242]]), \
                 mock.patch.object(launcher, "_monitor_process_exists", return_value=False), \
                 mock.patch.object(launcher, "_raise_window") as raise_win, \
                 mock.patch.object(launcher, "_find_edge", return_value="msedge.exe"), \
@@ -6400,7 +6935,7 @@ class TestMonitorWindowReuse(unittest.TestCase):
         import audiomixing_launcher as launcher
 
         with mock.patch.object(launcher, "_acquire_monitor_open_lock", return_value=0), \
-                mock.patch.object(launcher, "_window_handle", return_value=0), \
+                mock.patch.object(launcher, "_panel_windows", return_value=[]), \
                 mock.patch.object(launcher.subprocess, "Popen") as popen:
             launcher.open_monitor("http://127.0.0.1:17800")
         popen.assert_not_called()
@@ -6416,7 +6951,7 @@ class TestMonitorWindowReuse(unittest.TestCase):
 
         with mock.patch.object(launcher, "_acquire_monitor_open_lock", return_value=1), \
                 mock.patch.object(launcher, "_release_monitor_open_lock"), \
-                mock.patch.object(launcher, "_window_handle", return_value=0), \
+                mock.patch.object(launcher, "_panel_windows", return_value=[]), \
                 mock.patch.object(launcher, "_monitor_process_exists", return_value=True), \
                 mock.patch.object(launcher.subprocess, "Popen") as popen:
             launcher.open_monitor("http://127.0.0.1:17800")
@@ -6434,7 +6969,7 @@ class TestMonitorWindowReuse(unittest.TestCase):
 
         with mock.patch.object(launcher, "_acquire_monitor_open_lock", return_value=1), \
                 mock.patch.object(launcher, "_release_monitor_open_lock"), \
-                mock.patch.object(launcher, "_window_handle", return_value=0), \
+                mock.patch.object(launcher, "_panel_windows", return_value=[]), \
                 mock.patch.object(launcher, "_monitor_process_exists", return_value=False), \
                 mock.patch.object(launcher, "_find_edge", return_value="msedge.exe"), \
                 mock.patch.object(launcher, "_wait_for_monitor_window", return_value=False), \
@@ -6606,6 +7141,7 @@ class TestTrayOpensAWindow(unittest.TestCase):
         from audiomixing import tray
 
         with mock.patch.object(tray, "_find_edge", return_value=r"C:\fake\msedge.exe"), \
+                mock.patch.object(tray, "_panel_windows", return_value=[]), \
                 mock.patch.object(tray.subprocess, "Popen") as popen:
             tray._open_url("http://127.0.0.1:17800/monitor")
         popen.assert_called_once()
@@ -6622,6 +7158,7 @@ class TestTrayOpensAWindow(unittest.TestCase):
 
         fake_browser = mock.Mock()
         with mock.patch.object(tray, "_find_edge", return_value=""), \
+                mock.patch.object(tray, "_panel_windows", return_value=[]), \
                 mock.patch.object(tray.subprocess, "Popen") as popen, \
                 mock.patch.dict(sys.modules, {"webbrowser": fake_browser}):
             tray._open_url("http://127.0.0.1:17800/monitor")
@@ -6950,7 +7487,7 @@ class TestOutputLevelAndBluetoothCleanup(unittest.TestCase):
     """2026-10-16 三件真机反馈的回归：
 
     * 「手机播放声音这个电平没有反应」—— 手机走蓝牙进来时，声音是 **Windows 直接播放**
-      的，本机直通那一路根本没有数据，所以面板上的电平恒为 0。修法是**直读当前输出
+      的，本机广播监听那一路根本没有数据，所以面板上的电平恒为 0。修法是**直读当前输出
       设备的峰值表**（不采集、不播放、不动系统音量），见 engine.output_level()。
     * 「电脑手机现在都只有送/收两个条」—— 那两根条要改成**音量**条，不是码率条
       （静音也照样按 1536kbps 出数据）。所以 sender / receiver 各自报出 peak。
@@ -8395,7 +8932,8 @@ class TestApkReleaseGate(unittest.TestCase):
         apk = mod.DEFAULT
         if not apk.is_file():
             self.skipTest("本机没有构建产物，跳过（打包机才会跑）")
-        self.assertTrue(mod._manifest_has_version(apk, "2.20"), "交付版本必须是 2.20")
+        self.assertTrue(mod._manifest_has_version(apk, mod.REQUIRED_VERSION),
+                        "交付版本必须是 %s" % mod.REQUIRED_VERSION)
         self.assertFalse(mod._manifest_has_version(apk, "2.16"), "2.16 的旧包必须被拦下")
         self.assertFalse(mod._manifest_has_version(apk, "2.12"), "2.12 的包必须被拦下")
         self.assertFalse(mod._manifest_has_version(apk, "2.14"), "2.14 的旧包必须被拦下")
@@ -8720,7 +9258,7 @@ class Test20261104SmartLinkAndIdentity(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
-# ★ 2026-11-04（PC v2.24 / 手机 2.14）：用户真机第二轮 11 条，逐条一条回归
+# ★ 2026-11-04（PC v2.26 / 手机 2.14）：用户真机第二轮 11 条，逐条一条回归
 # --------------------------------------------------------------------------
 
 def _strip_markup(text: str) -> str:
@@ -8908,10 +9446,12 @@ class TestRoundTwoRegressions(unittest.TestCase):
             self.assertNotIn("setStreamMute(", live,
                              "用户硬约束：一处都不许改系统静默（%s）" % path.name)
             if path.name == "Engine.java":
-                # ★ 2026-11-04 用户授权：第 2 档允许把 STREAM_MUSIC 临时降到 0，
-                #   但只允许集中在 applySilentVolume 一处（便于审计）。
-                self.assertEqual(live.count("am.setStreamVolume("), 2,
-                                 "Engine 里只允许「置 0 + 还原」两处音量调用")
+                # ★ 2.30.1：静音改用 mute 标志（保留音量索引），setStreamVolume 只剩还原一处；
+                #   mute/unmute 各一处，仍集中在 applySilentVolume 里便于审计。
+                self.assertEqual(live.count("am.setStreamVolume("), 1,
+                                 "Engine 里 setStreamVolume 只允许还原这一处")
+                self.assertEqual(live.count("am.adjustStreamVolume("), 2,
+                                 "静音/还原各一处 adjustStreamVolume（mute/unmute）")
             else:
                 self.assertNotIn("setStreamVolume(", live,
                                  "系统音量只允许第 2 档那一处（%s）" % path.name)
@@ -8952,15 +9492,15 @@ class TestRoundTwoRegressions(unittest.TestCase):
     def test_apk_delivery_names_carry_the_phone_version_everywhere(self) -> None:
         from audiomixing import __phone_version__, webui
 
-        self.assertEqual(__phone_version__, "2.20")
-        self.assertEqual(webui.apk_display_name(), "AudioMixing-手机版-v2.20.apk")
-        self.assertIn("AudioMixing-手机版-v2.20.apk", webui._APK_NAMES)
+        name = "AudioMixing-手机版-v%s.apk" % __phone_version__
+        self.assertEqual(webui.apk_display_name(), name)
+        self.assertIn(name, webui._APK_NAMES)
         init_py = (ROOT / "audiomixing" / "__init__.py").read_text(encoding="utf-8")
-        self.assertIn('__phone_version__ = "2.20"', init_py)
+        self.assertIn('__phone_version__ = "%s"' % __phone_version__, init_py)
         check = (ROOT / "tools" / "check_apk.py").read_text(encoding="utf-8")
-        self.assertIn('REQUIRED_VERSION = "2.20"', check,
+        self.assertIn('REQUIRED_VERSION = "%s"' % __phone_version__, check,
                       "check_apk --release 的版本门槛必须一起改成当前手机版本")
-        self.assertIn("AudioMixing-手机版-v2.20.apk", check,
+        self.assertIn(name, check,
                       "交付副本与 installer payload 的路径必须带版本号")
         bat = (ROOT / "tools" / "installer_payload" / "install.bat").read_text(encoding="utf-8")
         self.assertIn("AudioMixing-手机版-v*.apk", bat,
@@ -9076,15 +9616,15 @@ class TestRoundTwoRegressions(unittest.TestCase):
         live = "\n".join(line for line in src.splitlines()
                          if not line.lstrip().startswith("#"))
         self.assertNotIn("/api/bluetooth/local", live)
-        self.assertIn("本机直通", src, "驱动不出声时的兜底路径要在诊断里告诉用户")
+        self.assertIn("本机广播监听", src, "驱动不出声时的兜底路径要在诊断里告诉用户")
         index = _strip_markup((ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8"))
         self.assertNotIn("本机播放", index)
         self.assertNotIn("btLocal(", index)
-        self.assertIn("本机直通", index, "界面上要留着频道 → 音源 + 本机直通这条路")
+        self.assertIn("本机广播监听", index, "界面上要留着频道 → 音源 + 本机广播监听这条路")
 
 
 class Test20261104V224(unittest.TestCase):
-    """★ 2026-11-04（v2.24 / 手机 2.14）：本轮 4 项修复 + 第 2 档（用户已授权）。"""
+    """★ 2026-11-04（v2.26 / 手机 2.14）：本轮 4 项修复 + 第 2 档（用户已授权）。"""
 
     def _node(self):
         from audiomixing.config import Config
@@ -9228,11 +9768,14 @@ class Test20261104V224(unittest.TestCase):
     def test_tier2_volume_zero_is_the_only_place_touching_stream_volume(self) -> None:
         java = (ROOT / "android" / "app" / "src" / "main" / "java" / "com" /
                 "audiomixing" / "app" / "Engine.java").read_text(encoding="utf-8")
-        self.assertNotIn("am.setStreamMute(", java, "静音必须用音量归零，不许锁 mute 标志")
-        self.assertEqual(java.count("am.setStreamVolume("), 2,
-                         "只允许 applySilentVolume 里两处真正的调用：置 0 + 还原原值")
-        self.assertIn("AudioManager.STREAM_MUSIC, 0, 0", java)
+        self.assertNotIn("am.setStreamMute(", java, "不许用 setStreamMute 锁死，必须走可还原的 mute 标志")
+        self.assertEqual(java.count("am.setStreamVolume("), 1,
+                         "setStreamVolume 只允许还原原值这一处")
+        self.assertEqual(java.count("am.adjustStreamVolume("), 2,
+                         "静音与还原各一处 adjustStreamVolume（ADJUST_MUTE / ADJUST_UNMUTE）")
         self.assertIn("AudioManager.STREAM_MUSIC, orig, 0", java)
+        self.assertIn("AudioManager.ADJUST_MUTE", java)
+        self.assertIn("AudioManager.ADJUST_UNMUTE", java)
 
     def test_tier2_stream_keeps_running(self) -> None:
         java = (ROOT / "android" / "app" / "src" / "main" / "java" / "com" /
@@ -9280,7 +9823,7 @@ class Test20261104V224(unittest.TestCase):
 
 
 class Test20261104V225(unittest.TestCase):
-    """★ 2026-11-04（PC v2.25）：用户截图「先把这个最重要的、显而易见的修掉。这个颜色也不对呀」。
+    """★ 2026-11-04（PC v2.26）：用户截图「先把这个最重要的、显而易见的修掉。这个颜色也不对呀」。
 
     截图里的现象：本机在左，右边挂着两张 `不在线 / 不可达` 的幽灵卡片，两条**红色虚线**
     从本机指过去。两件事都不对：
@@ -9370,7 +9913,7 @@ class Test20261104V225(unittest.TestCase):
 
 
 class Test20261104V226(unittest.TestCase):
-    """★ 2026-11-04（PC v2.26）：真机 v2.25 诊断包里的 4 条。
+    """★ 2026-11-04（PC v2.26）：真机 v2.26 诊断包里的 4 条。
 
     1) 监控页仍有两条指向旧身份的幽灵路由（b1fbc20c / 5e65addb），只空转；
     2) 手机 2.14 明明发 vol，PC 却显示"未上报"（键没对齐）；
@@ -9634,12 +10177,15 @@ class TestV27Regressions(unittest.TestCase):
     def test_silent_volume_policy_setting_pushes_a_control_packet(self) -> None:
         node = self._node()
         try:
-            self.assertEqual(node.config.phone_silent_vol_policy, "internal_only",
-                             "默认必须是 internal_only（静音档 STREAM_MUSIC=0 无信息量）")
+            # ★ 2.42.3 修复（真机第 3 条）：默认 last_nonzero —— 静音档要跟随手机音量。
+            self.assertEqual(node.config.phone_silent_vol_policy, "last_nonzero",
+                             "默认必须是 last_nonzero（静音档乘手机当前音量）")
             self.assertEqual(node.set_phone_silent_vol_policy("last_nonzero"), "last_nonzero")
             self.assertEqual(node.config.phone_silent_vol_policy, "last_nonzero")
             self.assertGreaterEqual(node._silent_policy_seq, 1)
-            self.assertEqual(node.set_phone_silent_vol_policy("bogus"), "internal_only")
+            self.assertEqual(node.set_phone_silent_vol_policy("bogus"), "last_nonzero")
+            # 旧值 internal_only 也归一到 last_nonzero（老配置/老面板都还能调）。
+            self.assertEqual(node.set_phone_silent_vol_policy("internal_only"), "last_nonzero")
         finally:
             node.stop()
 
@@ -9923,6 +10469,1203 @@ class TestV27Regressions(unittest.TestCase):
             finally:
                 del webui.__compiled__
 
+    # ---- ★ v2.36（用户）：两种自启动方式互斥，换方式先清旧的，别开机起两次 ----
+    def test_autostart_methods_are_mutually_exclusive(self) -> None:
+        from audiomixing import webui
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = pathlib.Path(tmp) / "AudioMixing-v2.36.exe"
+            exe.write_bytes(b"fake")
+            startup_dir = pathlib.Path(tmp) / "Startup"
+
+            class _Compiled:
+                original_argv0 = str(exe)
+
+            order: list[str] = []
+
+            def _del_reg():
+                order.append("reg-del")
+                return True, ""
+
+            def _del_lnk():
+                order.append("lnk-del")
+                return True, ""
+
+            def _write_lnk(spec):
+                order.append("lnk-write")
+                return True, ""
+
+            webui.__compiled__ = _Compiled()
+            written: dict[str, str] = {}
+
+            class _Key:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            def _set_value_ex(key, name, reserved, typ, value):
+                written[str(name).lower()] = value
+
+            def _delete_value(key, name):
+                written.pop(str(name).lower(), None)
+
+            def _query_value_ex(key, name):
+                k = str(name).lower()
+                if k not in written:
+                    raise FileNotFoundError(name)
+                return written[k], 1
+
+            fake = types.SimpleNamespace(
+                HKEY_CURRENT_USER=1, KEY_SET_VALUE=2, KEY_QUERY_VALUE=4, REG_SZ=1,
+                OpenKey=lambda *a, **k: _Key(), SetValueEx=_set_value_ex,
+                DeleteValue=_delete_value, QueryValueEx=_query_value_ex)
+            try:
+                with mock.patch.dict(sys.modules, {"winreg": fake}), \
+                        mock.patch.object(webui.sys, "platform", "win32"), \
+                        mock.patch.dict(os.environ, {"AUDIOMIXING_STARTUP_DIR": str(startup_dir)}), \
+                        mock.patch.object(webui, "_delete_registry_values", _del_reg), \
+                        mock.patch.object(webui, "_delete_startup_lnk", _del_lnk), \
+                        mock.patch.object(webui, "_write_startup_lnk", _write_lnk), \
+                        mock.patch.object(webui, "startup_state",
+                                          lambda: {"ok": True, "exists": True, "problem": ""}):
+                    # 切到启动文件夹：必须先删注册表值，再写 .lnk
+                    order.clear()
+                    ok, err = webui.set_windows_autostart(True, "startup")
+                    self.assertTrue(ok, err)
+                    self.assertEqual(order, ["reg-del", "lnk-write"],
+                                     "换方式必须先清掉注册表值，再写快捷方式")
+
+                    # 切回注册表：必须先删 .lnk，再写 Run 值
+                    order.clear()
+                    ok, err = webui.set_windows_autostart(True, "registry")
+                    self.assertTrue(ok, err)
+                    self.assertEqual(order[0], "lnk-del",
+                                     "换方式必须先清掉启动文件夹快捷方式")
+                    self.assertIn(webui._AUTOSTART_VALUE.lower(), written)
+
+                    # 关闭：两种方式都清（这里两个删除函数是打桩的，只看调用顺序）
+                    order.clear()
+                    ok, err = webui.set_windows_autostart(False, "registry")
+                    self.assertTrue(ok, err)
+                    self.assertEqual(order, ["reg-del", "lnk-del"])
+            finally:
+                del webui.__compiled__
+
+    # ---- ★ v2.36：快捷方式 target 必须是外层 exe，绝不能进 onefile_ / Temp ----
+    def test_startup_shortcut_target_never_points_into_onefile_temp(self) -> None:
+        from audiomixing import webui
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = pathlib.Path(tmp) / "AudioMixing-v2.36.exe"
+            exe.write_bytes(b"fake")
+            ghost = pathlib.Path(tmp) / "onefile_123" / "python.exe"
+            ghost.parent.mkdir()
+            ghost.write_bytes(b"fake")
+
+            class _Compiled:
+                original_argv0 = str(exe)
+
+            webui.__compiled__ = _Compiled()
+            try:
+                with mock.patch.object(sys, "executable", str(ghost)), \
+                        mock.patch.object(sys, "argv", [str(exe), "serve"]), \
+                        mock.patch.dict(os.environ, {"NUITKA_ONEFILE_PARENT": ""}):
+                    spec = webui._startup_spec()
+                    self.assertEqual(spec.get("target"), str(exe),
+                                     "target 必须是用户双击的那颗 exe")
+                    self.assertEqual(spec.get("arguments"), "serve")
+                    self.assertEqual(spec.get("workdir"), str(exe.parent))
+                    low = spec["target"].lower()
+                    self.assertNotIn("onefile_", low)
+                    self.assertNotIn("python.exe", low)
+                    self.assertFalse(webui._in_onefile_temp(spec["target"]),
+                                     "快捷方式 target 不能是 onefile 临时目录")
+            finally:
+                del webui.__compiled__
+
+            # 认不出外层 exe 时宁可不写：绝不允许把临时目录写进启动文件夹。
+            webui.__compiled__ = types.SimpleNamespace(original_argv0=str(ghost))
+            try:
+                with mock.patch.object(sys, "argv", [str(ghost)]), \
+                        mock.patch.object(sys, "executable", str(ghost)):
+                    self.assertEqual(webui._startup_spec(), {})
+            finally:
+                del webui.__compiled__
+
+    # ---- ★ v2.36：真实状态读取（注册表 + 启动文件夹各读一遍） ----
+    def test_autostart_state_reads_real_registry_and_startup_folder(self) -> None:
+        from audiomixing import webui
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = pathlib.Path(tmp) / "AudioMixing-v2.36.exe"
+            exe.write_bytes(b"fake")
+            startup_dir = pathlib.Path(tmp) / "Startup"
+            startup_dir.mkdir()
+            lnk = startup_dir / webui._STARTUP_LNK_NAME
+
+            class _Compiled:
+                original_argv0 = str(exe)
+
+            written = {"audiomixing": '"%s" serve' % exe}
+
+            class _Key:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            def _query_value_ex(key, name):
+                k = str(name).lower()
+                if k not in written:
+                    raise FileNotFoundError(name)
+                return written[k], 1
+
+            fake = types.SimpleNamespace(
+                HKEY_CURRENT_USER=1, KEY_SET_VALUE=2, KEY_QUERY_VALUE=4, REG_SZ=1,
+                OpenKey=lambda *a, **k: _Key(), QueryValueEx=_query_value_ex,
+                SetValueEx=lambda *a, **k: None, DeleteValue=lambda *a, **k: None)
+            webui.__compiled__ = _Compiled()
+            try:
+                with mock.patch.dict(sys.modules, {"winreg": fake}), \
+                        mock.patch.object(webui.sys, "platform", "win32"), \
+                        mock.patch.dict(os.environ, {"AUDIOMIXING_STARTUP_DIR": str(startup_dir)}):
+                    state = webui.autostart_state("registry")
+                    self.assertTrue(state["registry"]["exists"])
+                    self.assertTrue(state["registry"]["ok"])
+                    self.assertFalse(state["startup"]["exists"])
+                    self.assertTrue(state["enabled"])
+                    self.assertTrue(state["ok"])
+
+                    # 启动文件夹里有快捷方式但指向别处 → 必须如实报"不一致"
+                    lnk.write_bytes(b"fake lnk")
+                    with mock.patch.object(
+                            webui, "_powershell",
+                            lambda script, timeout=25.0: (0, '{"target":"C:\\\\Other\\\\x.exe","arguments":"serve"}')):
+                        state = webui.autostart_state("startup")
+                    self.assertTrue(state["startup"]["exists"])
+                    self.assertFalse(state["startup"]["ok"])
+                    self.assertIn("不是当前程序", state["startup"]["problem"])
+                    self.assertIn("两种方式同时存在", state["problem"])
+                    self.assertFalse(state["ok"])
+            finally:
+                del webui.__compiled__
+
+    # ---- ★ v2.37：serve 模式（开机自启）必须留下"已启动"日志，否则无法验证 ----
+    def test_service_log_writes_launcher_log(self) -> None:
+        from audiomixing import cli
+        from audiomixing.config import config_path
+
+        log = config_path().with_name("launcher.log")
+        if log.exists():
+            log.unlink()
+        cli._service_log("单元测试：已启动 http://127.0.0.1:17800")
+        self.assertTrue(log.exists(), "serve 模式应把启动记录写进 launcher.log")
+        text = log.read_text(encoding="utf-8")
+        self.assertIn("[serve]", text)
+        self.assertIn("已启动 http://127.0.0.1:17800", text)
+
+    # ---- ★ Q1（2026-11-16）：面板窗口无限多开 ----
+    def test_panel_open_action_prefers_raise_then_skip(self) -> None:
+        import audiomixing_launcher as launcher
+
+        self.assertEqual(launcher.panel_open_action(0, False), "open")
+        self.assertEqual(launcher.panel_open_action(0, True), "skip",
+                         "Edge 进程在但标题认不出时只能跳过，不能再开一个")
+        self.assertEqual(launcher.panel_open_action(1, False), "raise")
+        self.assertEqual(launcher.panel_open_action(3, True), "raise")
+
+    def test_extra_panel_windows_keeps_one(self) -> None:
+        import audiomixing_launcher as launcher
+
+        self.assertEqual(launcher.extra_panel_windows([11, 22, 33], 11), [22, 33])
+        self.assertEqual(launcher.extra_panel_windows([11], 11), [])
+        self.assertEqual(launcher.extra_panel_windows([], 0), [])
+
+    def test_panel_not_allowed_for_sandbox_or_explicit_flag(self) -> None:
+        import audiomixing_launcher as launcher
+
+        self.assertTrue(launcher.panel_allowed({}), "用户正常运行时允许弹面板")
+        self.assertTrue(launcher.panel_allowed({"AUDIOMIXING_NO_PANEL": "0"}))
+        self.assertFalse(launcher.panel_allowed({"AUDIOMIXING_HOME": "C:\\tmp\\sandbox"}),
+                         "验证/单测沙箱不许在桌面留窗口")
+        self.assertFalse(launcher.panel_allowed({"AUDIOMIXING_NO_PANEL": "1"}))
+        self.assertFalse(launcher.panel_allowed({"AUDIOMIXING_NO_PANEL": "true"}))
+
+    def test_tray_pick_panel_window_ignores_normal_browser(self) -> None:
+        from audiomixing import tray
+
+        windows = [
+            (1, "微信"),
+            (2, "Audio Mixing 监控 - 个人 - Microsoft Edge"),
+            (3, "Audio Mixing · 局域网声音投射"),
+            (4, "Audio Mixing 监控"),
+        ]
+        self.assertEqual(tray.pick_panel_window(windows), 3)
+        self.assertEqual(tray.pick_panel_window([(1, "微信"), (2, "记事本")]), 0)
+
+    def test_tray_open_url_raises_existing_window_without_spawning(self) -> None:
+        from audiomixing import tray
+
+        raised: list[int] = []
+        with mock.patch.object(tray, "_panel_windows", return_value=[(77, "Audio Mixing 监控")]), \
+                mock.patch.object(tray, "_raise_window", side_effect=raised.append), \
+                mock.patch.object(tray.subprocess, "Popen",
+                                  side_effect=AssertionError("已经有一个面板窗，不该再起新进程")):
+            tray._open_url("http://127.0.0.1:17800/monitor")
+        self.assertEqual(raised, [77])
+
+    def test_serve_panel_opener_goes_through_launcher_dedupe(self) -> None:
+        """serve 模式的托盘 opener 不许再直接 webbrowser.open（Q1 根因）。"""
+        import inspect
+
+        from audiomixing import cli
+
+        src = inspect.getsource(cli.cmd_serve)
+        self.assertIn("open_monitor", src)
+        self.assertNotIn("webbrowser.open(local_url)", src)
+
+    # ---- ★ Q2（2026-11-16）：多耳机画布页 + 锁系统默认播放 ----
+    def _bare_node(self, config):
+        from audiomixing.engine import AudioMixingNode
+
+        node = AudioMixingNode.__new__(AudioMixingNode)
+        node.config = config
+        node._notes = []
+        node.note = lambda text: node._notes.append(str(text))
+        node.save_config = lambda *a, **k: None
+        node._lock_audit = lambda text: node._notes.append(str(text))
+        return node
+
+    def test_multi_lock_default_device_name(self) -> None:
+        from audiomixing.config import Config
+
+        # ★ Q2 改：默认设备改为「直出」，锁默认设备降级为可选，所以默认不锁。
+        self.assertEqual(Config().multi_lock_device, "")
+        self.assertFalse(Config().multi_lock_active)
+        self.assertEqual(Config().multi_lock_original, {})
+
+    def test_lock_with_empty_target_touches_nothing(self) -> None:
+        """不锁（默认）时绝不碰系统默认播放，也不报错。"""
+        from audiomixing.audio import defaultdev
+        from audiomixing.config import Config
+
+        node = self._bare_node(Config())
+        with mock.patch.object(defaultdev, "set_default_render",
+                               side_effect=AssertionError("不锁时绝不能改系统默认")), \
+                mock.patch.object(defaultdev, "find_render_endpoint",
+                                  side_effect=AssertionError("不锁时不该去找设备")):
+            result = node.lock_multi_default()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result.get("optional"))
+        self.assertFalse(node.config.multi_lock_active)
+
+    def test_split_multi_devices_turns_default_into_passthrough(self) -> None:
+        from audiomixing.engine import split_multi_devices
+
+        devices = [{"device": "耳机 A", "gain": 0.7, "delay_ms": 30},
+                   {"device": "耳机 B", "gain": 1.0, "delay_ms": 0},
+                   {"device": "耳机 A", "gain": 1.0, "delay_ms": 0}]
+        wanted, passthrough = split_multi_devices(devices, "耳机 A")
+        self.assertEqual([d["device"] for d in wanted], ["耳机 B"])
+        self.assertTrue(passthrough["passthrough"])
+        self.assertEqual(passthrough["name"], "耳机 A")
+        # 清单里重复的默认设备也只能留下一条直出，不许再有复制记录。
+        self.assertEqual(sum(1 for d in devices if d["device"] == "耳机 A"), 2)
+        self.assertNotIn("耳机 A", [d["device"] for d in wanted])
+
+    def test_split_multi_devices_keeps_per_device_app_source(self) -> None:
+        """按 App 采音：每路选的 App 要跟着设备进 MultiOut；直出不带 App。"""
+        from audiomixing.engine import split_multi_devices
+
+        devices = [{"device": "耳机 A", "gain": 1.0, "delay_ms": 0,
+                    "app_pid": 111, "app_name": "哔哩哔哩"},
+                   {"device": "耳机 B", "gain": 1.0, "delay_ms": 0},
+                   {"device": "扬声器 C", "gain": 1.0, "delay_ms": 0,
+                    "app_pid": 333, "app_name": "Chrome"}]
+        wanted, passthrough = split_multi_devices(devices, "扬声器 C")
+        self.assertEqual(wanted[0]["app_pid"], 111)
+        self.assertEqual(wanted[0]["app_name"], "哔哩哔哩")
+        self.assertEqual(wanted[1]["app_pid"], 0)
+        self.assertTrue(passthrough["passthrough"])
+        self.assertNotIn("app_pid", passthrough, "直出设备不参与按 App 采集")
+
+    def test_multiout_opens_one_capture_per_selected_app(self) -> None:
+        """两个耳机各选一个 App：必须开两路采集，不能共用同一路。"""
+        from audiomixing.audio.multiout import MultiOut
+
+        class _Cap:
+            error = ""
+            blocks_read = 1
+
+        class _Reader:
+            def __init__(self) -> None:
+                self.capture = _Cap()
+
+            def read(self):
+                from array import array
+                return array("f")
+
+            def stop(self) -> None:
+                pass
+
+        class _Hub:
+            def __init__(self) -> None:
+                self.specs: list[dict] = []
+
+            def reader(self, spec, name=""):
+                self.specs.append(dict(spec))
+                return _Reader()
+
+        class _Sink:
+            def start(self) -> None:
+                pass
+
+            def write(self, block) -> None:
+                pass
+
+            def stop(self) -> None:
+                pass
+
+        class _Loop:
+            def __init__(self, *a, **kw) -> None:
+                self.pre_roll_ms = 0.0
+
+            def start(self) -> None:
+                pass
+
+            def is_alive(self) -> bool:
+                return True
+
+        hub = _Hub()
+        with mock.patch("audiomixing.audio.multiout.audio_base.open_sink",
+                        return_value=_Sink()), \
+                mock.patch("audiomixing.audio.multiout.LocalLoop", _Loop), \
+                mock.patch("audiomixing.audio.apps.supported", return_value=(True, "")), \
+                mock.patch("audiomixing.audio.apps.list_audio_apps",
+                           return_value={"apps": [{"pid": 111, "name": "哔哩哔哩"},
+                                                  {"pid": 222, "name": "Chrome"}]}):
+            out = MultiOut(hub)
+            out.configure({"backend": "wasapi", "device": "扬声器", "loopback": True},
+                          [{"device": "耳机 A", "gain": 1.0, "delay_ms": 0,
+                            "app_pid": 111, "app_name": "哔哩哔哩"},
+                           {"device": "耳机 B", "gain": 1.0, "delay_ms": 0,
+                            "app_pid": 222, "app_name": "Chrome"}])
+            stats = out.stats()
+        pids = [s.get("pid") for s in hub.specs]
+        self.assertEqual(pids, [111, 222], "两路必须是两个不同的采集源")
+        got = {d["name"]: d for d in stats["devices"]}
+        self.assertEqual(got["耳机 A"]["app_pid"], 111)
+        self.assertEqual(got["耳机 B"]["app_name"], "Chrome")
+        self.assertTrue(all(d["fallback"] == "" for d in stats["devices"]))
+
+    def _multiout_env(self):
+        """2.42.1 多音源测试的最小环境：真 MixReader + 假读取器/播放端。"""
+        from array import array
+
+        class _Cap:
+            error = ""
+            blocks_read = 1
+
+        class _Reader:
+            def __init__(self, spec) -> None:
+                self.spec = dict(spec)
+                self.capture = _Cap()
+                self.started = False
+
+            @property
+            def endpoint_name(self) -> str:
+                return str(self.spec.get("name") or self.spec.get("device") or "src")
+
+            def start(self) -> None:
+                self.started = True
+
+            def read(self):
+                return array("f")
+
+            def drain_nowait(self):
+                return array("f")
+
+            def stop(self) -> None:
+                self.started = False
+
+        class _Hub:
+            def __init__(self) -> None:
+                self.specs: list[dict] = []
+
+            def reader(self, spec, name=""):
+                self.specs.append(dict(spec))
+                return _Reader(spec)
+
+        class _Sink:
+            def start(self) -> None:
+                pass
+
+            def write(self, block) -> None:
+                pass
+
+            def stop(self) -> None:
+                pass
+
+        class _Loop:
+            def __init__(self, *a, **kw) -> None:
+                self.pre_roll_ms = 0.0
+
+            def start(self) -> None:
+                pass
+
+            def set_gain(self, value) -> None:
+                pass
+
+            def is_alive(self) -> bool:
+                return True
+
+        return _Hub(), _Sink, _Loop
+
+    def test_multiout_one_device_mixes_two_app_sources(self) -> None:
+        """★ 2.42.1：一台输出可以同时接 QQ音乐 + 哔哩哔哩，连几个混几个。"""
+        from audiomixing.audio.multiout import MultiOut
+
+        hub, _Sink, _Loop = self._multiout_env()
+        with mock.patch("audiomixing.audio.multiout.audio_base.open_sink",
+                        return_value=_Sink()), \
+                mock.patch("audiomixing.audio.multiout.LocalLoop", _Loop), \
+                mock.patch("audiomixing.audio.apps.supported", return_value=(True, "")):
+            out = MultiOut(hub)
+            out.configure({"backend": "wasapi", "device": "扬声器", "loopback": True},
+                          [{"device": "耳机 B", "gain": 1.0, "delay_ms": 0,
+                            "sources": [{"kind": "app", "pid": 111, "name": "QQ音乐"},
+                                        {"kind": "app", "pid": 222, "name": "哔哩哔哩"}]}])
+            stats = out.stats()
+        self.assertEqual([s.get("pid") for s in hub.specs], [111, 222],
+                         "两条音源必须各自开一路采集")
+        dev = stats["devices"][0]
+        self.assertEqual(dev["source_count"], 2)
+        self.assertEqual(dev["source_kind"], "mix")
+        self.assertEqual([s["name"] for s in dev["sources"]], ["QQ音乐", "哔哩哔哩"])
+        self.assertTrue(dev["running"])
+
+    def test_multiout_removing_one_source_leaves_other_and_never_desktop(self) -> None:
+        """★ 2.42.1：断开一条线只摘这一条；另一条继续放，绝不改采桌面混音。"""
+        from audiomixing.audio.multiout import MultiOut
+
+        hub, _Sink, _Loop = self._multiout_env()
+        with mock.patch("audiomixing.audio.multiout.audio_base.open_sink",
+                        return_value=_Sink()), \
+                mock.patch("audiomixing.audio.multiout.LocalLoop", _Loop), \
+                mock.patch("audiomixing.audio.apps.supported", return_value=(True, "")):
+            out = MultiOut(hub)
+            base = {"backend": "wasapi", "device": "扬声器", "loopback": True}
+            out.configure(base, [{"device": "耳机 B", "gain": 1.0, "delay_ms": 0,
+                                  "sources": [{"kind": "app", "pid": 111, "name": "QQ音乐"},
+                                              {"kind": "app", "pid": 222, "name": "哔哩哔哩"}]}])
+            out.configure(base, [{"device": "耳机 B", "gain": 1.0, "delay_ms": 0,
+                                  "sources": [{"kind": "app", "pid": 111, "name": "QQ音乐"}]}])
+            stats = out.stats()
+        dev = stats["devices"][0]
+        self.assertEqual(dev["source_count"], 1)
+        self.assertEqual(int(dev["sources"][0]["pid"]), 111)
+        self.assertEqual(dev["source_kind"], "app")
+        self.assertTrue(dev["running"])
+        self.assertFalse([s for s in hub.specs if s.get("kind") != "app"],
+                         "任何时候都不许出现桌面混音采集")
+        self.assertEqual(dev["fallback"], "")
+
+    def test_multiout_no_sources_is_silent_not_desktop(self) -> None:
+        """★ 2.42.1：一条线都没有时该设备静音，绝不能回落桌面混音。"""
+        from audiomixing.audio.multiout import MultiOut
+
+        hub, _Sink, _Loop = self._multiout_env()
+        with mock.patch("audiomixing.audio.multiout.audio_base.open_sink",
+                        return_value=_Sink()), \
+                mock.patch("audiomixing.audio.multiout.LocalLoop", _Loop):
+            out = MultiOut(hub)
+            out.configure({"backend": "wasapi", "device": "扬声器", "loopback": True},
+                          [{"device": "耳机 B", "gain": 1.0, "delay_ms": 0,
+                            "sources": []}])
+            stats = out.stats()
+        dev = stats["devices"][0]
+        self.assertEqual(dev["source_count"], 0)
+        self.assertEqual(dev["source_kind"], "silent")
+        self.assertEqual(dev["fallback"], "")
+        self.assertTrue(dev["running"], "设备仍然打开，只是写静音")
+        self.assertEqual(hub.specs, [], "没有音源就不该开任何采集（尤其是桌面混音）")
+
+    def test_split_multi_devices_keeps_explicit_sources_and_empty_is_silent(self) -> None:
+        """★ 2.42.1：显式 sources 原样保留；空数组 = 静音，不能补成桌面混音。"""
+        from audiomixing.engine import split_multi_devices
+
+        devices = [
+            {"device": "耳机 A", "sources": [{"kind": "app", "pid": 1, "name": "A"},
+                                             {"kind": "app", "pid": 2, "name": "B"}]},
+            {"device": "耳机 B", "sources": []},
+            {"device": "耳机 C"},
+        ]
+        wanted, _ = split_multi_devices(devices, "扬声器")
+        self.assertEqual(len(wanted[0]["sources"]), 2)
+        self.assertEqual(wanted[1]["sources"], [], "显式空音源必须保持为空（静音）")
+        self.assertEqual(wanted[2]["sources"], [{"kind": "desktop"}],
+                         "只有老配置（完全没有 sources 键）才补桌面混音")
+
+    def test_multiout_app_capture_failure_drops_only_that_source(self) -> None:
+        """★ 2.42.1：按 App 打不开时只摘掉这一条音源，**绝不回落桌面混音**。
+
+        只有这一条音源时，设备保留但输出静音；原因写进状态（不静默）。
+        """
+        from audiomixing.audio.multiout import MultiOut
+
+        class _Cap:
+            error = ""
+
+            def __init__(self, error: str = "") -> None:
+                self.error = error
+                self.blocks_read = 1
+
+        class _Reader:
+            def __init__(self, error: str = "") -> None:
+                self.capture = _Cap(error)
+
+            def read(self):
+                from array import array
+                return array("f")
+
+            def stop(self) -> None:
+                pass
+
+        class _Hub:
+            def __init__(self) -> None:
+                self.specs: list[dict] = []
+
+            def reader(self, spec, name=""):
+                self.specs.append(dict(spec))
+                # 第一次（按 App）失败，第二次（桌面混音）正常。
+                return _Reader("这个 App 受保护" if spec.get("kind") == "app" else "")
+
+        class _Sink:
+            def start(self) -> None:
+                pass
+
+            def write(self, block) -> None:
+                pass
+
+            def stop(self) -> None:
+                pass
+
+        class _Loop:
+            def __init__(self, *a, **kw) -> None:
+                self.pre_roll_ms = 0.0
+
+            def start(self) -> None:
+                pass
+
+            def is_alive(self) -> bool:
+                return True
+
+        hub = _Hub()
+        with mock.patch("audiomixing.audio.multiout.audio_base.open_sink",
+                        return_value=_Sink()), \
+                mock.patch("audiomixing.audio.multiout.LocalLoop", _Loop), \
+                mock.patch("audiomixing.audio.apps.supported", return_value=(True, "")), \
+                mock.patch("audiomixing.audio.apps.list_audio_apps",
+                           return_value={"apps": [{"pid": 111, "name": "哔哩哔哩"}]}):
+            out = MultiOut(hub)
+            out.configure({"backend": "wasapi", "device": "扬声器", "loopback": True},
+                          [{"device": "耳机 A", "gain": 1.0, "delay_ms": 0,
+                            "app_pid": 111, "app_name": "哔哩哔哩"}])
+            stats = out.stats()
+        dev = stats["devices"][0]
+        self.assertIn("这个 App 受保护", dev["fallback"])
+        self.assertEqual(dev["source_kind"], "silent", "打不开就静音，绝不回落桌面混音")
+        self.assertEqual(dev["source_count"], 0)
+        self.assertEqual(len(hub.specs), 1, "只试了这一条 App，没有再去采桌面混音")
+        self.assertEqual(hub.specs[-1].get("kind"), "app")
+
+    def test_multiout_paused_app_stays_on_process_loopback(self) -> None:
+        """★ 2026-11-17：App 暂时没在出声，也不能改回桌面混音。
+
+        用户完全可能先连好设备再点播放。进程回环对暂停的进程也能打开，只是先读到静音；
+        这样不会出现"只连了 QQ音乐，却听到整个系统声音"。
+        """
+        from audiomixing.audio.multiout import MultiOut
+
+        class _Reader:
+            def __init__(self) -> None:
+                from types import SimpleNamespace
+                self.capture = SimpleNamespace(error="", blocks_read=1)
+
+            def read(self):
+                from array import array
+                return array("f")
+
+            def stop(self) -> None:
+                pass
+
+        class _Hub:
+            def __init__(self) -> None:
+                self.specs: list[dict] = []
+
+            def reader(self, spec, name=""):
+                self.specs.append(dict(spec))
+                return _Reader()
+
+        class _Sink:
+            def start(self) -> None:
+                pass
+
+            def write(self, block) -> None:
+                pass
+
+            def stop(self) -> None:
+                pass
+
+        class _Loop:
+            def __init__(self, *a, **kw) -> None:
+                self.pre_roll_ms = 0.0
+
+            def start(self) -> None:
+                pass
+
+            def is_alive(self) -> bool:
+                return True
+
+        hub = _Hub()
+        with mock.patch("audiomixing.audio.multiout.audio_base.open_sink",
+                        return_value=_Sink()), \
+                mock.patch("audiomixing.audio.multiout.LocalLoop", _Loop), \
+                mock.patch("audiomixing.audio.apps.supported", return_value=(True, "")), \
+                mock.patch("audiomixing.audio.apps.list_audio_apps",
+                           return_value={"apps": []}):
+            out = MultiOut(hub)
+            out.configure({"backend": "wasapi", "device": "扬声器", "loopback": True},
+                          [{"device": "耳机 A", "gain": 1.0, "delay_ms": 0,
+                            "app_pid": 999999, "app_name": "不存在的App"}])
+            dev = out.stats()["devices"][0]
+        self.assertEqual(dev["fallback"], "", "暂停不等于失败，不许回落")
+        self.assertEqual(hub.specs[0].get("kind"), "app")
+        self.assertEqual(int(hub.specs[0].get("pid") or 0), 999999)
+        self.assertTrue(dev["source"].startswith("App："))
+        self.assertEqual(dev["source_kind"], "app")
+
+    def test_multiout_unsupported_app_capture_says_why(self) -> None:
+        """系统不支持按 App 采音时：回落 + 中文原因，不静默。"""
+        from audiomixing.audio.multiout import MultiOut
+
+        class _Reader:
+            def __init__(self) -> None:
+                from types import SimpleNamespace
+                self.capture = SimpleNamespace(error="", blocks_read=1)
+
+            def read(self):
+                from array import array
+                return array("f")
+
+            def stop(self) -> None:
+                pass
+
+        class _Hub:
+            def __init__(self) -> None:
+                self.specs: list[dict] = []
+
+            def reader(self, spec, name=""):
+                self.specs.append(dict(spec))
+                return _Reader()
+
+        class _Sink:
+            def start(self) -> None:
+                pass
+
+            def write(self, block) -> None:
+                pass
+
+            def stop(self) -> None:
+                pass
+
+        class _Loop:
+            def __init__(self, *a, **kw) -> None:
+                self.pre_roll_ms = 0.0
+
+            def start(self) -> None:
+                pass
+
+            def is_alive(self) -> bool:
+                return True
+
+        hub = _Hub()
+        with mock.patch("audiomixing.audio.multiout.audio_base.open_sink",
+                        return_value=_Sink()), \
+                mock.patch("audiomixing.audio.multiout.LocalLoop", _Loop), \
+                mock.patch("audiomixing.audio.apps.supported",
+                           return_value=(False, "系统版本太旧（需要 Windows 10 2004 及以上）")):
+            out = MultiOut(hub)
+            out.configure({"backend": "wasapi", "device": "扬声器", "loopback": True},
+                          [{"device": "耳机 A", "gain": 1.0, "delay_ms": 0,
+                            "app_pid": 111, "app_name": "哔哩哔哩"}])
+            dev = out.stats()["devices"][0]
+        self.assertIn("系统版本太旧", dev["fallback"])
+        self.assertEqual(len(hub.specs), 0, "不支持时不该尝试进程回环，也不该回落桌面")
+        self.assertEqual(dev["source_kind"], "silent")
+
+    def test_list_audio_apps_dedupes_and_skips_own_process(self) -> None:
+        from audiomixing.audio import apps as app_mod
+
+        seen = {111: r"C:\Apps\bilibili.exe", 222: r"C:\Apps\chrome.exe"}
+        with mock.patch("audiomixing.audio.backends.wasapi_com.process_loopback_available",
+                        return_value=(True, "")), \
+                mock.patch("audiomixing.audio.backends.wasapi_com.active_audio_pids",
+                           return_value=[111, 111, 222, 4, 0,
+                                         __import__("os").getpid()]), \
+                mock.patch("audiomixing.audio.backends.wasapi_com.process_image_name",
+                           side_effect=lambda pid: seen.get(pid, "")):
+            got = app_mod.list_audio_apps()
+        names = [a["name"] for a in got["apps"]]
+        self.assertTrue(got["supported"])
+        self.assertEqual(names, ["Chrome", "哔哩哔哩"], "去重、排除系统音与自身进程")
+        self.assertEqual([a["pid"] for a in got["apps"]], [222, 111])
+
+    def test_simple_audio_volume_vtable_is_idl_order_not_alphabetical(self) -> None:
+        """★ 2026-11-16 致命 bug：vtable 顺序按字母序写反，GetMute 实际调了 SetMute。
+
+        面板一打开（/api/multiout 每秒轮询）就把每个正在出声的 App 会话静音。
+        这里既断言声明顺序，也用假 vtable 证明 call("GetMute") 真的落到第 4 个槽位。
+        """
+        import ctypes
+
+        from audiomixing.audio.backends import wasapi_com as wc
+
+        self.assertEqual(wc.ISimpleAudioVolume._method_names,
+                         ("SetMasterVolume", "GetMasterVolume", "SetMute", "GetMute"),
+                         "ISimpleAudioVolume 必须按 IDL 声明顺序，不能按文档字母序")
+
+        calls: list[str] = []
+        proto = ctypes.WINFUNCTYPE(wc.HRESULT, ctypes.c_void_p,
+                                   ctypes.POINTER(ctypes.c_int))
+
+        def make(name: str):
+            def fn(_this, out):
+                calls.append(name)
+                if out:
+                    out[0] = 0
+                return 0
+            return proto(fn)
+
+        slots = [make("slot3_SetMasterVolume"), make("slot4_GetMasterVolume"),
+                 make("slot5_SetMute"), make("slot6_GetMute")]
+        dummy = ctypes.WINFUNCTYPE(wc.HRESULT, ctypes.c_void_p)(lambda _this: 0)
+        vtable = (ctypes.c_void_p * 7)()
+        for i in range(3):   # IUnknown
+            vtable[i] = ctypes.cast(dummy, ctypes.c_void_p)
+        for i, cb in enumerate(slots):
+            vtable[3 + i] = ctypes.cast(cb, ctypes.c_void_p)
+        holder = (ctypes.c_void_p * 1)()
+        holder[0] = ctypes.cast(vtable, ctypes.c_void_p)
+
+        volume = wc.ISimpleAudioVolume.from_ptr(ctypes.cast(holder, ctypes.c_void_p).value)
+        mute = ctypes.c_int()
+        hr = volume.call("GetMute", ctypes.byref(mute))
+        self.assertEqual(hr, 0)
+        self.assertEqual(calls, ["slot6_GetMute"],
+                         "GetMute 必须调第 6 槽（SetMasterVolume, GetMasterVolume, SetMute, GetMute）")
+        self.assertNotIn("slot5_SetMute", calls, "读静音状态绝不能写到 SetMute")
+
+    @unittest.skipUnless(sys.platform.startswith("win"), "音频会话静音回归只在 Windows 上跑")
+    def test_startup_polling_never_mutes_audio_sessions(self) -> None:
+        """回归：只启动 / 只轮询面板（不进多耳机），会话静音状态前后必须完全一致。"""
+        from audiomixing.audio import apps as app_mod
+        from audiomixing.audio.backends import wasapi as wasapi_backend
+        from audiomixing.audio.backends import wasapi_com as wc
+
+        ok, reason = app_mod.supported()
+        if not ok:
+            self.skipTest("当前环境枚举不到音频会话：%s" % reason)
+        try:
+            wasapi_backend._ensure_com()
+            before = wc.session_mute_states()
+        except Exception as exc:
+            self.skipTest("读不到音频会话：%s" % exc)
+        if not before:
+            self.skipTest("当前没有活动音频会话，无法验证（放点声音再跑）")
+
+        # 模拟 2.40 面板打开后的轮询路径：两次 /api/multiout 等价调用。
+        app_mod.list_audio_apps()
+        app_mod.list_audio_apps()
+        wc.active_audio_pids()
+
+        after = wc.session_mute_states()
+        before_map = {row["pid"]: row["muted"] for row in before}
+        after_map = {row["pid"]: row["muted"] for row in after}
+        newly_muted = sorted(pid for pid, muted in before_map.items()
+                             if not muted and after_map.get(pid) is True)
+        self.assertEqual(newly_muted, [], "轮询把原本没静音的会话静音了：PID %s" % newly_muted)
+        changed = {pid: (before_map[pid], after_map[pid]) for pid in before_map
+                   if pid in after_map and before_map[pid] != after_map[pid]}
+        self.assertEqual(changed, {}, "轮询改变了会话静音状态：%s" % changed)
+
+    def test_unmute_all_sessions_clears_mute_flags(self) -> None:
+        """一键恢复：unmute_all_sessions 要显式 SetMute(FALSE)，结果里带改动数。"""
+        from audiomixing.audio import apps as app_mod
+
+        with mock.patch("audiomixing.audio.backends.wasapi._ensure_com"), \
+                mock.patch("audiomixing.audio.backends.wasapi_com.set_all_sessions_mute",
+                           return_value={"changed": 3, "total": 5}) as fake:
+            got = app_mod.unmute_all_sessions()
+        fake.assert_called_once_with(False)
+        self.assertTrue(got["ok"])
+        self.assertEqual(got["changed"], 3)
+        self.assertEqual(got["total"], 5)
+
+    def test_multi_view_puts_default_device_first_as_passthrough(self) -> None:
+        from audiomixing import webui
+
+        class _Node:
+            def _default_render_name(self) -> str:
+                return "耳机 A"
+
+        out = {"devices": [{"name": "耳机 B", "device": "耳机 B", "running": True},
+                           {"name": "耳机 A", "device": "耳机 A", "running": True}],
+               "available": ["耳机 A", "耳机 B", "扬声器 C"]}
+        got = webui._multi_view(_Node(), out)
+        names = [d["name"] for d in got["devices"]]
+        self.assertEqual(names[0], "耳机 A")
+        self.assertTrue(got["devices"][0]["passthrough"])
+        self.assertEqual(names.count("耳机 A"), 1, "默认设备不能留重复记录")
+        self.assertNotIn("耳机 A", got["available"])
+        self.assertEqual(got["passthrough"], "耳机 A")
+        self.assertIn("耳机 A", got["playing_now"])
+
+    def test_multi_default_switch_migrates_old_passthrough(self) -> None:
+        """系统默认 A→B：A 自动变成普通复制设备，B 变直出，清单不重复。"""
+        from audiomixing.config import Config
+
+        cfg = Config()
+        cfg.multi_out_devices = [{"device": "耳机 B", "gain": 1.0, "delay_ms": 0.0}]
+
+        class _Out:
+            def __init__(self) -> None:
+                self.configured: list[dict] = []
+
+            def running(self) -> bool:
+                return True
+
+            def available_devices(self, exclude=None) -> list[str]:
+                return ["耳机 A", "耳机 B", "扬声器 C"]
+
+            def configure(self, spec, devices) -> None:
+                self.configured = devices
+
+            def stop(self) -> None:
+                pass
+
+        node = self._bare_node(cfg)
+        node.multi_out = _Out()
+        node.multi_passthrough = {"device": "耳机 A", "name": "耳机 A", "passthrough": True}
+        node._multi_passthrough_noted = True
+        node.default_source_spec = lambda: {"device": "耳机 A", "loopback": True}
+        node._default_render_name = lambda: "耳机 B"
+        node._apply_multi_out()
+        names = [d["device"] for d in cfg.multi_out_devices]
+        self.assertEqual(names.count("耳机 A"), 1, "旧直出设备要转成普通设备，且不能重复")
+        self.assertNotIn("耳机 B", names, "新默认设备是直出，不能再留一条复制记录")
+        self.assertEqual(node.multi_passthrough["name"], "耳机 B")
+
+    def test_find_render_endpoint_by_name_and_candidates(self) -> None:
+        from audiomixing.audio import defaultdev
+
+        endpoints = [
+            {"id": "{0.0.0.1}", "name": "耳机 (1MORE HQ51)", "is_default": True},
+            {"id": "{0.0.0.2}", "name": "AUDIO音频", "is_default": False},
+        ]
+        with mock.patch.object(defaultdev, "list_render_endpoints", return_value=endpoints):
+            hit, names = defaultdev.find_render_endpoint("AUDIO音频")
+            self.assertEqual(hit["id"], "{0.0.0.2}")
+            self.assertIn("耳机 (1MORE HQ51)", names)
+            # 大小写 / 包含都能命中；完全不相关则必须回 None 并带回候选。
+            self.assertEqual(defaultdev.find_render_endpoint("audio音频")[0]["name"], "AUDIO音频")
+            miss, names2 = defaultdev.find_render_endpoint("不存在的声卡")
+            self.assertIsNone(miss)
+            self.assertEqual(len(names2), 2)
+
+    def test_lock_multi_default_reports_missing_device_without_touching_system(self) -> None:
+        from audiomixing.audio import defaultdev
+        from audiomixing.config import Config
+
+        node = self._bare_node(Config())
+        with mock.patch.object(defaultdev, "find_render_endpoint", return_value=(None, ["耳机 A", "扬声器 B"])), \
+                mock.patch.object(defaultdev, "set_default_render",
+                                  side_effect=AssertionError("找不到设备时绝不能去改系统默认")):
+            result = node.lock_multi_default("AUDIO音频")
+        self.assertFalse(result["ok"])
+        self.assertIn("没有找到", result["error"])
+        self.assertIn("耳机 A", result["error"])
+        self.assertFalse(node.config.multi_lock_active)
+
+    def test_lock_and_restore_record_original_device(self) -> None:
+        from audiomixing.audio import defaultdev
+        from audiomixing.config import Config
+
+        node = self._bare_node(Config())
+        target = {"id": "{0.0.0.AUDIO}", "name": "AUDIO音频"}
+        original = {"id": "{0.0.0.PHONE}", "name": "耳机 (1MORE HQ51)"}
+        calls: list[str] = []
+        with mock.patch.object(defaultdev, "find_render_endpoint", return_value=(target, [])), \
+                mock.patch.object(defaultdev, "current_default_render", return_value=original), \
+                mock.patch.object(defaultdev, "set_default_render", side_effect=lambda i: calls.append(i) or ""):
+            locked = node.lock_multi_default("AUDIO音频")
+        self.assertTrue(locked["ok"])
+        self.assertEqual(calls, [target["id"]])
+        self.assertTrue(node.config.multi_lock_active)
+        self.assertEqual(node.config.multi_lock_original, original)
+        # 还原：必须切回原设备并清状态
+        with mock.patch.object(defaultdev, "set_default_render", side_effect=lambda i: calls.append(i) or ""):
+            restored = node.restore_multi_default()
+        self.assertTrue(restored["ok"])
+        self.assertEqual(calls, [target["id"], original["id"]])
+        self.assertFalse(node.config.multi_lock_active)
+        self.assertEqual(node.config.multi_lock_original, {})
+
+    def test_multi_lock_status_flags_needs_restore_after_abnormal_exit(self) -> None:
+        from audiomixing.audio import defaultdev
+        from audiomixing.config import Config
+
+        cfg = Config()
+        cfg.multi_lock_device = "AUDIO音频"
+        cfg.multi_lock_active = True
+        cfg.multi_lock_original = {"id": "{0.0.0.PHONE}", "name": "耳机 (1MORE HQ51)"}
+        node = self._bare_node(cfg)
+        target = {"id": "{0.0.0.AUDIO}", "name": "AUDIO音频"}
+        with mock.patch.object(defaultdev, "find_render_endpoint", return_value=(target, [])), \
+                mock.patch.object(defaultdev, "current_default_render", return_value=target):
+            status = node.multi_lock_status()
+        self.assertTrue(status["locked_now"])
+        self.assertTrue(status["needs_restore"],
+                        "上次异常退出、默认还钉在目标上时必须给出还原入口")
+
+    def test_lock_reports_body_error_in_chinese(self) -> None:
+        from audiomixing.audio import defaultdev
+        from audiomixing.config import Config
+
+        node = self._bare_node(Config())
+        target = {"id": "{0.0.0.AUDIO}", "name": "AUDIO音频"}
+        with mock.patch.object(defaultdev, "find_render_endpoint", return_value=(target, [])), \
+                mock.patch.object(defaultdev, "current_default_render",
+                                  return_value={"id": "{0.0.0.PHONE}", "name": "耳机"}), \
+                mock.patch.object(defaultdev, "set_default_render", return_value="设备被独占"):
+            result = node.lock_multi_default("AUDIO音频")
+        self.assertFalse(result["ok"])
+        self.assertIn("设备被独占", result["error"])
+        self.assertFalse(node.config.multi_lock_active)
+
+    def test_multi_canvas_lives_inside_main_panel(self) -> None:
+        """★ 2026-11-16 用户：不要独立页，画布单独一块放进主面板。"""
+        import inspect
+
+        from audiomixing import webui
+
+        html = webui.index_html()
+        self.assertIn("多耳机画布", html)
+        self.assertIn("本机桌面音频", html)
+        self.assertIn("未使用", html)
+        # 两档视图 + 三列（APP / 输出设备 / 远端 AUDIO 音源）
+        self.assertIn('data-mode="simple"', html)
+        self.assertIn('data-mode="detail"', html)
+        self.assertIn("输出音频设备", html)
+        self.assertIn("远端 AUDIO 音源", html)
+        self.assertIn("APP", html)
+        # 画布独立成卡，不和任何配置表单挤在一起（★ v2.42 起也不再有那张配置卡）。
+        self.assertIn('data-card="multiview" data-pane="multi"', html)
+        self.assertNotIn('data-card="multiout"', html, "配置卡整块删除，不许留折叠版")
+        self.assertIn('class="motools"', html, "四样有用控件挪到画布上方工具条")
+        self.assertIn('id="moModeSeg"', html)
+        # 左列与右列不许互相连线：代码里只允许 APP→输出、远端→输出 两种边。
+        self.assertNotIn("['app:desktop', 'remote", html)
+        # 点击放大 = 自己 + 直接相邻
+        self.assertIn("neighborKeys", html)
+        self.assertIn("classList.toggle('moFocus'", html)
+        # 默认设备 = 直出（锁勾选 + 青色虚线 + 不可取消）
+        self.assertIn("直出", html)
+        self.assertIn("直出 · 系统在放", html, "直出设备在画布/卡片上仍要写明")
+        self.assertIn("系统默认设备 · 系统原生播放，不再重复放一份", html)
+        self.assertIn("isPassthrough", html)
+        self.assertIn("stroke-dasharray", html)
+        self.assertIn("（不锁，默认推荐）", html)
+        # 独立页彻底下线：路由、页面文件、入口链接都不许留。
+        self.assertNotIn('href="/multi"', html)
+        self.assertNotIn("打开画布页", html)
+        self.assertFalse((pathlib.Path(__file__).resolve().parent.parent
+                          / "audiomixing" / "ui" / "multi.html").exists())
+        self.assertFalse(hasattr(webui, "_multi_html"))
+        src = inspect.getsource(webui)
+        self.assertNotIn('"/multi"', src, "GET /multi 路由必须删干净")
+
+    def test_multi_simple_mode_is_card_wall_not_rings(self) -> None:
+        """★ 2026-11-17 用户：简洁档不要大圆小圆，改成设备卡片墙（蓝＝启用）。"""
+        from audiomixing import webui
+
+        html = webui.index_html()
+        self.assertIn('id="moCards"', html)
+        self.assertIn("function renderCards", html)
+        self.assertIn("card.className = 'mocard'", html)
+        self.assertIn("系统原生播放，不再重复放一份", html)
+        self.assertIn("点一下开始放", html)
+        # 圆 / 环 / 拖拽切环整条路径必须删干净
+        for gone in ("putRing", "dropOnRing", "moRingInner", "moRingOuter", "moRingHot"):
+            self.assertNotIn(gone, html, "简洁档的圆环残留必须删掉：%s" % gone)
+        # 简洁档在 draw() 里先落卡片、不进入任何连线绘制
+        self.assertIn("renderCards();", html)
+        self.assertIn("if (cvs.mode === 'simple') return { nodes, edges, labels };", html)
+
+    def test_multi_complex_edges_only_real_relations(self) -> None:
+        """★ 2026-11-17：复杂档只画真实关系，直出扇面线和"每台都画一条"都不许留。"""
+        from audiomixing import webui
+
+        html = webui.index_html()
+        self.assertNotIn("if (pt) appList.forEach(a => edges.push", html)
+        self.assertNotIn("remList.forEach(r => edges.push", html)
+        self.assertNotIn("kind === 'pass'", html)
+        self.assertIn("remoteSinkRoutes()", html)
+        self.assertIn("route_id", html)
+
+    def test_multi_slider_limits_are_clamped(self) -> None:
+        """★ 2026-11-17：延迟 0–500ms、增益 0–2，越界要夹住而不是溢出。"""
+        from audiomixing import webui
+
+        html = webui.index_html()
+        self.assertIn("d.max = '500'", html)
+        self.assertIn("function clampDelay", html)
+        self.assertIn("function clampNum", html)
+        self.assertIn("clampDelay(ui.delay_ms)", html)
+        self.assertIn("clampNum(ui.gain, 0, 2, 1.0)", html)
+        # ★ v2.42：设备清单表单整卡删除，唯一入口是卡片墙内联那份。
+        self.assertNotIn('id="moList"', html)
+        self.assertNotIn('id="moApply"', html)
+        # 即时生效：锁定目标一改就落盘，没有「应用」按钮
+        self.assertIn("lockSel.onchange = () => apply(false);", html)
+        self.assertIn("queueGainApply", html)
+        # 轮询不重建正在拖的表单
+        self.assertIn("const busy = cvs.holding", html)
+        # 不在多耳机页时不轮询（避免每秒枚举蓝牙端点）
+        self.assertIn("document.body.dataset.pane !== 'multi'", html)
+        # 音源不可用必须写明；2.42.1 起绝不回落桌面混音
+        self.assertIn("音源不可用：", html)
+        self.assertNotIn("已回落桌面混音", html)
+        self.assertIn("没有音源时这一路静音", html)
+        # 纯增益请求不枚举端点（避免拖动时反复碰蓝牙端点）
+        self.assertIn("'/api/multiout?gain=1'", html)
+        self.assertIn("if \"gain=1\" in self.path:", (ROOT / "audiomixing" / "webui.py").read_text(encoding="utf-8"))
+
+    def test_channel_uses_source_and_output_cards(self) -> None:
+        """★ 2026-11-17 用户：广播页的音源/输出改成小卡片，蓝＝开着。"""
+        from audiomixing import webui
+
+        html = webui.index_html()
+        self.assertIn('id="chSourceCards"', html)
+        self.assertIn('id="chOutputCards"', html)
+        self.assertIn('id="chLocalCard"', html)
+        self.assertIn("function toggleChannelSource", html)
+        self.assertNotIn('id="chSources"', html, "旧的多选下拉必须删掉")
+        self.assertIn("本机广播监听", html)
+        self.assertNotIn("本机直通", html)
+        self.assertIn("勾谁＝把谁的声音送出去", html)
+        self.assertIn("自己这边再放一遍", html)
+
+    def test_multi_out_devices_and_lock_survive_config_roundtrip(self) -> None:
+        from audiomixing.config import Config
+
+        cfg = Config()
+        cfg.multi_out_devices = [{"device": "耳机 A", "gain": 0.8, "delay_ms": 20}]
+        cfg.multi_lock_device = "AUDIO音频"
+        cfg.multi_lock_original = {"id": "{0.0.0.PHONE}", "name": "耳机 A"}
+        cfg.multi_lock_active = True
+        path = _mkdtemp(prefix="am-cfg-multi-") / "config.json"
+        cfg.save(path)
+        back = Config.load(path)
+        self.assertEqual(back.multi_out_devices, cfg.multi_out_devices,
+                         "多耳机设备清单必须持久化（之前 set 完重启就丢）")
+        self.assertEqual(back.multi_lock_device, "AUDIO音频")
+        self.assertEqual(back.multi_lock_original, cfg.multi_lock_original)
+        self.assertTrue(back.multi_lock_active)
+
+    # ---- ★ v2.38（用户）：多版本自启动残留归一 ----
+    def test_autostart_cleanup_keeps_single_entry(self) -> None:
+        from audiomixing import webui
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cur = pathlib.Path(tmp) / "AudioMixing-v2.38.exe"
+            cur.write_bytes(b"x")
+            old = pathlib.Path(tmp) / "Audio Mixing v2.35.exe"
+            old.write_bytes(b"x")
+            gone = pathlib.Path(tmp) / "Audio Mixing v2.20.exe"   # 故意不创建
+
+            run = {
+                "AudioMixing": '"%s" serve' % cur,
+                "AudioMixing-old": '"%s" serve' % old,
+                "AudioMixing-gone": '"%s" serve' % gone,
+                "Weixin": '"D:\\Weixin\\Weixin.exe" -autorun',
+            }
+            plan = webui.plan_autostart_cleanup(run, {}, {}, {}, str(cur), "registry")
+            self.assertEqual(plan["keep_run"], ("AudioMixing", '"%s" serve' % cur))
+            self.assertEqual(sorted(plan["delete_run"]),
+                             ["AudioMixing-gone", "AudioMixing-old"])
+            self.assertNotIn("Weixin", plan["delete_run"])
+            reasons = {r["name"]: r["reason"] for r in plan["rows"]}
+            self.assertIn("不存在", reasons["AudioMixing-gone"])
+            self.assertIn("旧版本", reasons["AudioMixing-old"])
+
+    def test_autostart_cleanup_lnk_targets_resolved(self) -> None:
+        from audiomixing import webui
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cur = pathlib.Path(tmp) / "AudioMixing-v2.38.exe"
+            cur.write_bytes(b"x")
+            old = pathlib.Path(tmp) / "Audio Mixing v2.35.exe"
+            old.write_bytes(b"x")
+            lnk = {
+                str(pathlib.Path(tmp) / "Audio Mixing v2.35.exe - 快捷方式.lnk"): str(old),
+                str(pathlib.Path(tmp) / "AudioMixing.lnk"): str(cur),
+                str(pathlib.Path(tmp) / "QQ.lnk"): "D:\\QQNT\\QQ.exe",
+            }
+            plan = webui.plan_autostart_cleanup({}, {}, {}, lnk, str(cur), "startup")
+            self.assertEqual(plan["keep_lnk"],
+                             (str(pathlib.Path(tmp) / "AudioMixing.lnk"), str(cur)))
+            self.assertEqual(plan["delete_lnk"],
+                             [str(pathlib.Path(tmp) / "Audio Mixing v2.35.exe - 快捷方式.lnk")])
+
+            # 用注册表方式时，启动文件夹里本程序的 .lnk 一条都不留
+            plan = webui.plan_autostart_cleanup({}, {}, {}, lnk, str(cur), "registry")
+            self.assertIsNone(plan["keep_lnk"])
+            self.assertEqual(len(plan["delete_lnk"]), 2)
+            self.assertNotIn(str(pathlib.Path(tmp) / "QQ.lnk"), plan["delete_lnk"])
+
+    def test_autostart_cleanup_runonce_hklm_and_foreign(self) -> None:
+        from audiomixing import webui
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cur = pathlib.Path(tmp) / "AudioMixing-v2.38.exe"
+            cur.write_bytes(b"x")
+            old = pathlib.Path(tmp) / "Audio Mixing v2.30.exe"
+            old.write_bytes(b"x")
+            plan = webui.plan_autostart_cleanup(
+                {}, {"AudioMixing": '"%s" serve' % cur},
+                {"AudioMixing": '"%s" serve' % old, "SecurityHealth": "C:\\WINDOWS\\system32\\SecurityHealthSystray.exe"},
+                {}, str(cur), "registry")
+            self.assertEqual(plan["delete_runonce"], ["AudioMixing"])
+            self.assertEqual(plan["delete_hklm"], ["AudioMixing"])
+
+    def test_normalize_exe_path_quotes_env_and_prefix(self) -> None:
+        from audiomixing import webui
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = pathlib.Path(tmp) / "Audio Mixing v2.38.exe"
+            exe.write_bytes(b"x")
+            got = webui._normalize_exe_path('"%s" serve' % exe)
+            self.assertEqual(got, os.path.normcase(os.path.abspath(str(exe))))
+            self.assertTrue(webui._normalize_exe_path("%TEMP%\\AudioMixing.exe").endswith("audiomixing.exe"))
+            self.assertTrue(webui._looks_like_our_exe("C:\\x\\Audio Mixing v2.35.exe"))
+            self.assertTrue(webui._looks_like_our_exe("C:\\x\\AudioMixing.exe"))
+            self.assertFalse(webui._looks_like_our_exe("D:\\QQNT\\QQ.exe"))
+            self.assertFalse(webui._looks_like_our_exe("C:\\x\\AudioMixing.txt"))
+
     # ---- ★ 2026-11-06（第 3 条）：采集"有数据但一直静音"要如实报出来 ----
     def test_a_device_that_streams_only_silence_is_reported_as_silent(self) -> None:
         """蓝牙端点"连上了、包在走、全是 0"以前显示健康，用户听到的是没声。"""
@@ -10013,3 +11756,251 @@ class TestUiResidueGate(unittest.TestCase):
         self.assertIn("dev-x", keys)
         self.assertIn("inst-x", keys)
         self.assertIn("alias-old", keys)
+
+
+class TestQualityPresets(unittest.TestCase):
+    """★ 2.42.3（第 3 条）：三档「性能预算」的映射、协商与老配置兼容。"""
+
+    def test_three_presets_map_to_real_knobs(self):
+        from audiomixing import quality
+
+        smooth = quality.params("smooth")
+        balanced = quality.params("balanced")
+        high = quality.params("high")
+
+        # 流畅 = 低预算：包更大（包数更少）、缓冲更浅、编码/重采样更便宜。
+        self.assertGreater(smooth["frames_per_packet"], balanced["frames_per_packet"])
+        self.assertLess(smooth["jitter_start_ms"], balanced["jitter_start_ms"])
+        self.assertLess(smooth["opus_bitrate"], balanced["opus_bitrate"])
+        self.assertLess(smooth["opus_complexity"], balanced["opus_complexity"])
+        self.assertLess(smooth["resample_zero_crossings"], balanced["resample_zero_crossings"])
+        # 高音质 = 高预算：码率、复杂度、重采样质量、缓冲全都更高。
+        self.assertGreater(high["opus_bitrate"], balanced["opus_bitrate"])
+        self.assertGreater(high["opus_complexity"], balanced["opus_complexity"])
+        self.assertGreater(high["resample_zero_crossings"], balanced["resample_zero_crossings"])
+        self.assertGreater(high["jitter_start_ms"], balanced["jitter_start_ms"])
+
+        # 均衡必须等于 2.42.2 的既有行为（否则老用户听感会变）。
+        self.assertEqual(balanced["frames_per_packet"], 480)
+        self.assertEqual(balanced["jitter_start_ms"], 55.0)
+        self.assertEqual(balanced["jitter_min_ms"], 25.0)
+        self.assertEqual(balanced["jitter_max_ms"], 150.0)
+        self.assertEqual(balanced["resample_zero_crossings"], 16)
+
+    def test_negotiation_takes_the_lower_budget(self):
+        from audiomixing import quality
+
+        self.assertEqual(quality.negotiate("high", "smooth"), "smooth")
+        self.assertEqual(quality.negotiate("smooth", "high"), "smooth")
+        self.assertEqual(quality.negotiate("high", "balanced"), "balanced")
+        self.assertEqual(quality.negotiate("balanced", "balanced"), "balanced")
+        # 老版本信标没有 quality：按均衡处理，不把新端无谓降档，也不假装它支持高音质。
+        self.assertEqual(quality.negotiate("high", ""), "balanced")
+        self.assertEqual(quality.negotiate("smooth", ""), "smooth")
+        self.assertEqual(quality.negotiate("high", None), "balanced")
+
+    def test_old_or_broken_config_defaults_to_balanced(self):
+        from audiomixing import quality
+        from audiomixing.config import Config
+
+        self.assertEqual(quality.normalize(None), "balanced")
+        self.assertEqual(quality.normalize(""), "balanced")
+        self.assertEqual(quality.normalize("turbo"), "balanced")
+
+        tmp = _mkdtemp("am-quality-") / "config.json"
+        tmp.write_text(json.dumps({"version": 1, "node_id": "old-node"}), encoding="utf-8")
+        cfg = Config.load(tmp, create=False)
+        self.assertEqual(cfg.quality_preset, "balanced", "老配置没有 quality_preset 必须默认均衡")
+
+        tmp.write_text(json.dumps({"version": 1, "node_id": "old-node",
+                                   "quality_preset": "nonsense"}), encoding="utf-8")
+        cfg = Config.load(tmp, create=False)
+        self.assertEqual(cfg.quality_preset, "balanced", "坏值也必须收敛到均衡")
+
+    def test_switching_preset_changes_effective_receiver_values(self):
+        node = AudioMixingNode(_config_stub(name="q", node_id="node-q"),
+                               audio_port=free_udp_port(),
+                               discovery_port=free_udp_port(), simulate=True)
+        node.start(announce=False)
+        try:
+            node.set_quality_preset("smooth", persist=False)
+            st = node.audio_quality_state()
+            self.assertEqual(st["local"], "smooth")
+            self.assertEqual(st["receiver_jitter_start_ms"], 40.0)
+            self.assertEqual(st["receiver_jitter_min_ms"], 20.0)
+            self.assertEqual(st["receiver_jitter_max_ms"], 90.0)
+            self.assertEqual(st["frames_per_packet"], 960)
+
+            node.set_quality_preset("high", persist=False)
+            st = node.audio_quality_state()
+            self.assertEqual(st["local"], "high")
+            self.assertEqual(st["receiver_jitter_start_ms"], 80.0)
+            self.assertEqual(st["receiver_jitter_max_ms"], 200.0)
+            self.assertEqual(st["opus_bitrate"], 192000)
+        finally:
+            node.stop()
+
+
+class TestBroadcastChain(unittest.TestCase):
+    """★ 2.42.3（第 1 条）：PC 发 → 对端广播口 → 收到并打 channel 标记。"""
+
+    def test_pc_broadcast_reaches_peer_broadcast_port_with_channel_flag(self):
+        audio_port_a = free_udp_port()
+        audio_port_b = free_udp_port()
+        bcast_a = free_udp_port()
+        while bcast_a in (audio_port_a, audio_port_b):
+            bcast_a = free_udp_port()
+        bcast_b = free_udp_port()
+        while bcast_b in (audio_port_a, audio_port_b, bcast_a):
+            bcast_b = free_udp_port()
+
+        node_a = AudioMixingNode(_config_stub("A", "node-a"), audio_port=audio_port_a,
+                                 broadcast_port=bcast_a,
+                                 discovery_port=free_udp_port(), simulate=True)
+        node_b = AudioMixingNode(_config_stub("B", "node-b"), audio_port=audio_port_b,
+                                 broadcast_port=bcast_b,
+                                 discovery_port=free_udp_port(), simulate=True)
+        node_a.config.broadcast = True
+        node_a.config.channel_sources = ["tone:880"]
+        node_b.config.listen = True
+        node_a.start(announce=False)
+        node_b.start(announce=False)
+        try:
+            node_a.registry.update({"wl": 1, "id": "node-b", "name": "B",
+                                    "audio_port": audio_port_b,
+                                    "broadcast_port": bcast_b, "web_port": 1},
+                                   "127.0.0.1", local=True)
+            node_b.registry.update({"wl": 1, "id": "node-a", "name": "A",
+                                    "audio_port": audio_port_a,
+                                    "broadcast_port": bcast_a, "web_port": 1},
+                                   "127.0.0.1", local=True)
+
+            # 链式证据 1：PC 发出的广播包，目标端口 = 对端 broadcast_port。
+            peers = {p.node_id: p for p in node_a.registry.all()}
+            targets = {k.split("|", 1)[1]: node_a._send_target_port(r, peers[k.split("|", 1)[1]])
+                       for k, _t, r in node_a.desired_senders()}
+            self.assertEqual(targets.get("node-b"), bcast_b,
+                             "广播必须发到对端 broadcast_port，不是 audio_port")
+
+            deadline = time.monotonic() + 6.0
+            while time.monotonic() < deadline:
+                node_a.tick()
+                node_b.tick()
+                if (node_a.channel_state()["broadcast_sent"]["packets"] > 0
+                        and node_b.receiver.broadcast_packets_received > 0):
+                    break
+                time.sleep(0.2)
+
+            sent = node_a.channel_state()["broadcast_sent"]["packets"]
+            got = node_b.receiver.broadcast_packets_received
+            self.assertGreater(sent, 0, "PC 这一端必须真的发出广播包")
+            self.assertGreater(got, 0, "对端广播口必须真的收到包")
+
+            # 链式证据 2：收到的流带 channel 标记（用于区分广播/点对点）。
+            stats = node_b.receiver.stats()
+            self.assertEqual(stats["broadcast_port"], bcast_b)
+            self.assertTrue(any(s.get("channel") for s in stats["streams"]),
+                            "广播口收到的流必须带 channel=True：%s" % stats["streams"])
+        finally:
+            node_a.stop()
+            node_b.stop()
+
+    def test_legacy_peer_is_named_not_silently_muted(self):
+        """★ 2.42.3：老版本对端没有广播端口时，面板要能拿到逐台提示。"""
+        node = AudioMixingNode(_config_stub("C", "node-c"), audio_port=free_udp_port(),
+                               discovery_port=free_udp_port(), simulate=True)
+        node.start(announce=False)
+        try:
+            node.registry.update({"wl": 1, "id": "old-phone", "name": "旧手机",
+                                  "audio_port": free_udp_port(), "web_port": 1},
+                                 "127.0.0.1", local=True)
+            node.config.broadcast = True
+            node.config.channel_sources = ["tone:440"]
+            legacy = node._legacy_broadcast_peers()
+            self.assertTrue(legacy, "旧版本对端必须被列出来")
+            self.assertIn("旧手机", legacy[0]["text"])
+            self.assertIn("47832", legacy[0]["text"])
+            self.assertIn("legacy_peers", node.channel_state())
+        finally:
+            node.stop()
+
+
+class TestPeerCardPresentation(unittest.TestCase):
+    """★ 2.42.3（第 2 条）：对端设备卡只显示设备本身；简洁档不加解释块。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html = (ROOT / "audiomixing" / "ui" / "index.html").read_text(encoding="utf-8")
+        start = cls.html.find("function renderPeerCards")
+        cls.body = cls.html[start:cls.html.find("\n        function ", start + 10)]
+
+    def test_card_has_no_speaker_picker_or_listen_entry(self):
+        self.assertNotIn("peer.sinks", self.body, "对端卡不再让本机挑对端的扬声器")
+        self.assertNotIn("本机扬声器", self.body)
+        self.assertNotIn("收听它的", self.body)
+        self.assertNotIn("停止收听", self.body)
+        self.assertNotIn("to: ['self']", self.body)
+
+    def test_card_is_click_to_send(self):
+        self.assertIn("card.onclick", self.body)
+        self.assertIn("to: [peer.node_id]", self.body)
+
+    def test_explanation_only_in_detailed_mode(self):
+        self.assertIn("if (!simpleMode)", self.body,
+                      "解释块必须只在详细档出现，简洁档一个字都不加")
+
+class TestRouteEpochAndSelfLoop(unittest.TestCase):
+    """★ 2.44.1（#6 防环最小闭环）：自环丢弃 + 路由 epoch 递增。"""
+
+    def setUp(self):
+        self.node = AudioMixingNode(_config_stub("epoch", "node-epoch"),
+                                    audio_port=free_udp_port(),
+                                    discovery_port=free_udp_port(),
+                                    simulate=True)
+        self.node.start(announce=False)
+        self.addCleanup(self.node.stop)
+
+    def test_self_loop_is_dropped_and_epoch_advances(self):
+        before = self.node.route_epoch()
+        self.node.set_routes([{"id": "loop", "from": ["self"], "to": ["self"]}],
+                             persist=False)
+        self.assertEqual([r["id"] for r in self.node.routes], [],
+                         "本机↔本机自环必须被丢弃")
+        self.assertGreater(self.node.route_epoch(), before,
+                           "每次改表都要推进 epoch")
+        self.node.set_routes([{"id": "ok", "from": ["self"], "to": ["peer-x"]}],
+                             persist=False)
+        self.assertEqual([r["id"] for r in self.node.routes], ["ok"],
+                         "正常单向路由必须保留")
+
+
+class TestOpusCapability(unittest.TestCase):
+    """★ 2.44.1（#3）：Android Opus 能力协商（老手机强制 PCM，新手机才发 Opus）。"""
+
+    def test_android_without_opus_is_forced_pcm(self):
+        from audiomixing import proto
+        from audiomixing.engine import codec_for_target
+        self.assertEqual(codec_for_target(proto.CODEC_OPUS, "Android-17", False),
+                         proto.CODEC_PCM_S16)
+
+    def test_android_with_opus_keeps_opus(self):
+        from audiomixing import proto
+        from audiomixing.engine import codec_for_target
+        self.assertEqual(codec_for_target(proto.CODEC_OPUS, "Android-17", True),
+                         proto.CODEC_OPUS)
+
+    def test_pc_keeps_opus(self):
+        from audiomixing import proto
+        from audiomixing.engine import codec_for_target
+        self.assertEqual(codec_for_target(proto.CODEC_OPUS, "Windows-11", False),
+                         proto.CODEC_OPUS)
+
+    def test_peer_beacon_reports_opus_capability(self):
+        from audiomixing.net.discovery import DiscoveryRegistry
+        reg = DiscoveryRegistry("self")
+        reg.update({"wl": 1, "id": "peer", "name": "p", "audio_port": 1,
+                    "web_port": 0, "opus": 1}, "192.168.1.2")
+        peer = reg.get("peer")
+        self.assertIsNotNone(peer)
+        self.assertTrue(peer.opus)
+        self.assertTrue(peer.to_json()["opus"])

@@ -4,8 +4,8 @@
 #
 #     bash android/tools/run_send_volume_test.sh
 #
-# 被测：SendVolume.java（纯逻辑，零桩）——外放档乘系统音量、静音档默认只保留
-# App 内部音量；两档的 post/raw 与 vol_in_capture 必须和文档口径一致。
+# 被测：SendVolume.java（纯逻辑，零桩）——外放档乘系统音量、静音档乘手机当前音量
+# （2.42.3：静音档跟随手机音量）；两档的 post/raw 与 vol_in_capture 必须和文档口径一致。
 
 set -u
 
