@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import array
 import json
+import select
 import socket
 import threading
 import time
@@ -133,9 +134,16 @@ class JitterBuffer:
         name: str = "",
         route_id: str = "",
         route_ids: Iterable[str] | None = None,
+        start_ms: float | None = None,
+        min_ms: float | None = None,
+        max_ms: float | None = None,
     ) -> None:
         self.channels = channels
         self.name = name
+        # ★ 2.42.3：三档性能预算里的抖动缓冲区间（None = 用当前默认，等同于「均衡」）。
+        self.jitter_start_ms = float(JITTER_START_MS if start_ms is None else start_ms)
+        self.jitter_min_ms = float(JITTER_MIN_MS if min_ms is None else min_ms)
+        self.jitter_max_ms = float(JITTER_MAX_MS if max_ms is None else max_ms)
         # One stream can be wanted by several local sinks - the same sound played
         # on two devices at once - so membership is a set of route ids, not one id.
         self.route_ids: set[str] = {r for r in (route_ids or ()) if r}
@@ -152,7 +160,7 @@ class JitterBuffer:
         self._have_timeline = False
         self._primed = False
         self._warmup_hint_ns = 0
-        self.target_frames = _ms_to_frames(JITTER_START_MS)
+        self.target_frames = _ms_to_frames(self.jitter_start_ms)
         self.samples_written = 0
         self.samples_played = 0
         self.dropped_late = 0
@@ -464,10 +472,10 @@ class JitterBuffer:
             # 涨：真的缺缓冲才涨。欠载 > 2% 或晚到 > 10% 才算"缺"；
             # 更严重的（欠载 > 5% / 晚到 > 25%）一次涨 10ms，否则 5ms。
             grow_needed = underrun_ratio > 0.02 or late_ratio > 0.10
-        if grow_needed and target_ms < JITTER_MAX_MS:
+        if grow_needed and target_ms < self.jitter_max_ms:
             step_ms = 10.0 if (underrun_ratio > 0.05 or late_ratio > 0.25) else 5.0
             grow = min(_ms_to_frames(step_ms),
-                       _ms_to_frames(JITTER_MAX_MS) - self.target_frames)
+                       _ms_to_frames(self.jitter_max_ms) - self.target_frames)
             if grow > 0:
                 self.target_frames += grow
                 # A deeper target means the playhead starts later, so hand the extra
@@ -481,8 +489,8 @@ class JitterBuffer:
             self._clean_s += 1
         else:
             self._clean_s = 0
-        if self._clean_s >= 5 and target_ms > JITTER_MIN_MS:
-            self.target_frames = max(_ms_to_frames(JITTER_MIN_MS), int(self.target_frames * 0.98))
+        if self._clean_s >= 5 and target_ms > self.jitter_min_ms:
+            self.target_frames = max(_ms_to_frames(self.jitter_min_ms), int(self.target_frames * 0.98))
 
     def stats(self) -> dict[str, Any]:
         age_s = max(0.0, (now_ns() - float(self.last_packet_ns or 0.0)) / 1e9)
@@ -537,7 +545,8 @@ def make_decoder(codec: int, channels: int = CHANNELS):
     return None
 
 
-def make_encoder(codec: int, channels: int = CHANNELS):
+def make_encoder(codec: int, channels: int = CHANNELS,
+                 bitrate: int | None = None, complexity: int | None = None):
     if codec == CODEC_PCM_S16:
         return proto.encode_pcm_s16
     if codec == CODEC_PCM_F32:
@@ -547,7 +556,13 @@ def make_encoder(codec: int, channels: int = CHANNELS):
             from ..audio.opus import OpusEncoder
         except ImportError:
             return None
-        enc = OpusEncoder(channels=channels)
+        kwargs: dict[str, Any] = {"channels": channels}
+        # ★ 2.42.3：三档性能预算把码率与复杂度接进 Opus 编码器；PCM 无损，不看这两个。
+        if bitrate:
+            kwargs["bitrate"] = int(bitrate)
+        if complexity is not None:
+            kwargs["complexity"] = int(complexity)
+        enc = OpusEncoder(**kwargs)
         return enc.encode
     return None
 
@@ -574,6 +589,9 @@ class StreamInfo:
     # ★ 2026-11-04（审计 A3）：重复包（同一 seq 又来一遍）单独计数，且不再写进缓冲。
     duplicates: int = 0
     route_id: str = ""
+    # ★ 2.42.2（第 2 条）：这条流是从广播端口（True）还是点对点端口（False）进来的。
+    #   两口的准入互相独立，路由挂载也据此只走对应那一条。
+    channel: bool = False
 
 
 class Receiver:
@@ -587,6 +605,9 @@ class Receiver:
         on_first_packet: Callable[[StreamInfo, tuple[str, int]], None] | None = None,
         accept_source: Callable[[str], bool] | None = None,
         resolve_source: Callable[[str], str] | None = None,
+        # ★ 2.42.2（第 2 条）：广播专用端口与**独立准入**。
+        broadcast_port: int | None = None,
+        accept_channel: Callable[[str], bool] | None = None,
         bind_host: str = "0.0.0.0",
         self_origin_id: int = 0,
         max_hop: int = proto.MAX_HOP,
@@ -601,6 +622,18 @@ class Receiver:
         self.packets_echo_dropped = 0
         self.packets_hop_dropped = 0
         self.port = port
+        # ★ 2.42.3：三档性能预算（流畅/均衡/高音质）落到抖动缓冲的起点与上下限。
+        #   默认值 = 「均衡」= 2.42.2 及以前的行为，老配置不用迁移。
+        self.jitter_start_ms = float(JITTER_START_MS)
+        self.jitter_min_ms = float(JITTER_MIN_MS)
+        self.jitter_max_ms = float(JITTER_MAX_MS)
+        # ★ 2.42.2（第 2 条）：广播与点对点各占一个 socket、各自准入。
+        self.broadcast_port = int(broadcast_port or 0)
+        self._broadcast_sock: socket.socket | None = None
+        self.accept_channel = accept_channel
+        self.broadcast_packets_received = 0
+        self.broadcast_packets_denied = 0
+        self.broadcast_bytes_received = 0
         self.bind_host = bind_host
         self.streams: dict[int, StreamInfo] = {}
         self.buffers: dict[int, JitterBuffer] = {}
@@ -635,26 +668,50 @@ class Receiver:
     # HWHHYN 用 DEEPSEEK 制作
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
+        self._sock = self._open_socket(self.port)
+        # ★ 2.42.2（第 2 条）：广播端口独立绑定。绑不上只影响广播，点对点照旧。
+        if self.broadcast_port and self.broadcast_port != self.port:
+            try:
+                self._broadcast_sock = self._open_socket(self.broadcast_port)
+            except OSError:
+                self._broadcast_sock = None
+        self._thread = threading.Thread(target=self._recv_loop, name="audiomixing-audio-rx", daemon=True)
+        self._thread.start()
+
+    def set_quality_profile(self, start_ms: float | None, min_ms: float | None,
+                            max_ms: float | None) -> None:
+        """★ 2.42.3：换三档性能预算（只影响**新**建的流；已在收的流保持当前目标）。
+
+        面板显示"当前档位实际生效值"读的就是这里的三个数。
+        """
+        try:
+            self.jitter_start_ms = float(JITTER_START_MS if start_ms is None else start_ms)
+            self.jitter_min_ms = float(JITTER_MIN_MS if min_ms is None else min_ms)
+            self.jitter_max_ms = float(JITTER_MAX_MS if max_ms is None else max_ms)
+        except (TypeError, ValueError):
+            pass
+
+    def _open_socket(self, port: int) -> socket.socket:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
         except OSError:
             pass
-        sock.bind((self.bind_host, self.port))
+        sock.bind((self.bind_host, port))
         sock.settimeout(0.5)
-        self._sock = sock
-        self._thread = threading.Thread(target=self._recv_loop, name="audiomixing-audio-rx", daemon=True)
-        self._thread.start()
+        return sock
 
     def stop(self) -> None:
         self._stop.set()
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
-            self._sock = None
+        for attr in ("_sock", "_broadcast_sock"):
+            sock = getattr(self, attr, None)
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                setattr(self, attr, None)
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
@@ -662,53 +719,74 @@ class Receiver:
     # -- receive -----------------------------------------------------------
     def _recv_loop(self) -> None:
         while not self._stop.is_set():
-            sock = self._sock
-            if sock is None:
+            socks = [s for s in (self._sock, self._broadcast_sock) if s is not None]
+            if not socks:
                 return
             try:
-                data, addr = sock.recvfrom(65535)
-            except socket.timeout:
-                self._housekeeping()
-                continue
-            except OSError:
+                ready, _, _ = select.select(socks, [], [], 0.5)
+            except (OSError, ValueError):
                 if self._stop.is_set():
                     return
                 continue
-            pkt = proto.decode(data)
-            if pkt is None:
-                self.packets_rejected += 1
+            if not ready:
+                self._housekeeping()
                 continue
-            # ★ 2026-11-04（Q2）：接收准入。通配"只听"以前会接住所有进来的流，
-            #   包括**本机没有接受的**点对点单播。这里在进入任何流表/计数器之前先判：
-            #   认得出来源、且本机不接受它 → 直接丢包（packets_denied 单独计）。
-            if not self._admitted(pkt, addr[0]):
+            for sock in ready:
+                channel = sock is self._broadcast_sock
+                try:
+                    data, addr = sock.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self._stop.is_set():
+                        return
+                    continue
+                self._process(data, addr, channel)
+            self._housekeeping()
+
+    def _process(self, data: bytes, addr: tuple[str, int], channel: bool) -> None:
+        pkt = proto.decode(data)
+        if pkt is None:
+            self.packets_rejected += 1
+            return
+        # ★ 2026-11-04（Q2）接收准入。★ 2.42.2：按端口分开判 ——
+        #   广播口只问「听广播」开关，点对点口只问具名路由，互不影响。
+        if not self._admitted(pkt, addr[0], channel):
+            if channel:
+                self.broadcast_packets_denied += 1
+            else:
                 self.packets_denied += 1
-                continue
+            return
+        if channel:
+            self.broadcast_packets_received += 1
+            self.broadcast_bytes_received += len(data)
+        else:
             self.packets_received += 1
             self.bytes_received += len(data)
-            try:
-                self._handle(pkt, addr)
-                self._housekeeping()
-            except Exception as exc:  # a bad packet must never kill the receiver
-                self.last_error = "%s: %s" % (type(exc).__name__, exc)
-                self.handle_errors += 1
-                if DEBUG_JITTER:
-                    import traceback
+        try:
+            self._handle(pkt, addr, channel)
+        except Exception as exc:  # a bad packet must never kill the receiver
+            self.last_error = "%s: %s" % (type(exc).__name__, exc)
+            self.handle_errors += 1
+            if DEBUG_JITTER:
+                import traceback
 
-                    traceback.print_exc()
+                traceback.print_exc()
 
-    def _admitted(self, pkt: Packet, host: str) -> bool:
+    def _admitted(self, pkt: Packet, host: str, channel: bool = False) -> bool:
         """这条包能不能进流表（Q2 的接收准入）。
 
-        只拦**音频包**，而且只在认得出来源时才拦 —— 认不出来的（手动 IP、信标丢了）
-        仍然按频道处理，保持老行为；没有注入回调时也一律放行。
+        ★ 2.42.2（第 2 条）：广播与点对点各用各的准入门。
+        * `channel=True`（来自广播口）→ 只问 `accept_channel`；
+        * `channel=False`（来自点对点口）→ 只问 `accept_source`。
+        一条的放行/拒收绝不影响另一条。
+
+        只拦**音频包**，而且只在认得出来源时才拦 —— 认不出来的仍然按频道处理，
+        保持老行为；没有注入回调时也一律放行。
         """
         if pkt.type != proto.T_AUDIO:
             return True
         # ★ 防自环（B 第一阶段）：先于任何路由/频道判据执行。
-        #   ① 原始声音是我自己 → 这是绕回来的自回声，绝不能播放（否则声音会一直绕圈）。
-        #   ② hop 超过上限 → 这条帧已经在网里转了太多跳，继续传只会放大环。
-        #   两个计数都要能在诊断里看到；老端 origin_id=0 不会命中。
         if (getattr(pkt, "origin_id", 0) and self.self_origin_id
                 and pkt.origin_id == self.self_origin_id):
             self.packets_echo_dropped += 1
@@ -716,16 +794,19 @@ class Receiver:
         if getattr(pkt, "hop", 0) > self.max_hop:
             self.packets_hop_dropped += 1
             return False
-        if self.accept_source is None or self.resolve_source is None:
+        accept = self.accept_channel if channel else self.accept_source
+        if accept is None or self.resolve_source is None:
             return True
         node_id = self.resolve_source(host)
         if not node_id:
-            return True
-        return bool(self.accept_source(node_id))
+            # ★ 2.42.2：广播口不依赖"认得出是谁" —— 认不出也必须按「听广播」开关判，
+            #   否则关着听广播时，未知来源照样能进来（端口隔离就白做了）。
+            return True if not channel else bool(accept(''))
+        return bool(accept(node_id))
 
-    def _handle(self, pkt: Packet, addr: tuple[str, int]) -> None:
+    def _handle(self, pkt: Packet, addr: tuple[str, int], channel: bool = False) -> None:
         if pkt.type == proto.T_AUDIO:
-            self._handle_audio(pkt, addr)
+            self._handle_audio(pkt, addr, channel)
             return
         if pkt.type == proto.T_PING:
             # Answer immediately so the peer can lock its clock.
@@ -775,14 +856,19 @@ class Receiver:
                 if len(self.control_messages) > 200:
                     del self.control_messages[:100]
 
-    def _handle_audio(self, pkt: Packet, addr: tuple[str, int]) -> None:
+    def _handle_audio(self, pkt: Packet, addr: tuple[str, int], channel: bool = False) -> None:
         ssrc = pkt.ssrc
         with self._lock:
             info = self.streams.get(ssrc)
             if info is None:
-                info = StreamInfo(ssrc=ssrc, codec=pkt.codec)
+                info = StreamInfo(ssrc=ssrc, codec=pkt.codec, channel=bool(channel))
                 self.streams[ssrc] = info
-                self.buffers[ssrc] = JitterBuffer(name="ssrc-%08x" % ssrc)
+                self.buffers[ssrc] = JitterBuffer(
+                    name="ssrc-%08x" % ssrc,
+                    start_ms=self.jitter_start_ms,
+                    min_ms=self.jitter_min_ms,
+                    max_ms=self.jitter_max_ms,
+                )
                 self._decoders[ssrc] = make_decoder(pkt.codec)
                 if self.on_first_packet is not None:
                     # The callback resolves the sender, and the engine then attaches
@@ -1071,6 +1157,8 @@ class Receiver:
                         "bytes": info.bytes,
                         "kbps": round(rate, 1),
                         "route_id": (",".join(sorted(buf.route_ids)) if buf is not None and buf.route_ids else info.route_id),
+                        # ★ 2.42.2：这条流来自哪个端口（广播口 / 点对点口）。
+                        "channel": bool(getattr(info, "channel", False)),
                         **snap,
                         # ★ 2026-11-04（Q1）：这一路的包时间戳到底有没有被换算到本机时间。
                         #   `clock_ready=False` 时"晚到"一律不计（见 `_handle_audio`），
@@ -1094,9 +1182,18 @@ class Receiver:
                     self._rate_prev.pop(ssrc, None)
         return {
             "port": self.port,
+            "broadcast_port": self.broadcast_port,
             "packets_received": self.packets_received,
             "packets_rejected": self.packets_rejected,
             "packets_denied": self.packets_denied,
+            # ★ 2.42.2（第 2 条）：广播口的独立计数，证明两条通道互不影响。
+            "broadcast_packets_received": self.broadcast_packets_received,
+            "broadcast_packets_denied": self.broadcast_packets_denied,
+            "broadcast_bytes_received": self.broadcast_bytes_received,
+            "broadcast_active_streams": sum(
+                1 for s, b in self.buffers.items()
+                if getattr(self.streams.get(s), "channel", False)
+                and b.samples_written and (now_ns() - b.last_packet_ns) / 1e9 < STREAM_TIMEOUT_S),
             # ★ 2026-11-04（B 第一阶段）防自环的两个独立计数（诊断页/报告要用）。
             "echo_dropped": self.packets_echo_dropped,
             "hop_dropped": self.packets_hop_dropped,
@@ -1147,6 +1244,8 @@ class SenderSession:
         loopback_echo: bool = False,
         origin_id: int = 0,
         hop: int = 0,
+        opus_bitrate: int | None = None,
+        opus_complexity: int | None = None,
     ) -> None:
         self.source = source
         self.host = host
@@ -1168,7 +1267,7 @@ class SenderSession:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._sock: socket.socket | None = None
-        self._encoder = make_encoder(codec)
+        self._encoder = make_encoder(codec, bitrate=opus_bitrate, complexity=opus_complexity)
         self.packets_sent = 0
         self.bytes_sent = 0
         self.frames_sent = 0

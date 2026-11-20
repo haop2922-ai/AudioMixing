@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from .net.discovery import default_node_id
-from .proto import LEGACY_PORT_DISCOVERY, PORT_DISCOVERY
+from .proto import LEGACY_PORT_DISCOVERY, PORT_BROADCAST, PORT_DISCOVERY
+from . import quality
 
 CONFIG_VERSION = 1
 
@@ -126,9 +127,15 @@ class Config:
     #   在 load() 里自动迁移；用户自己填的其它值不动。
     discovery_port: int = PORT_DISCOVERY
     audio_port: int = 47831
+    # ★ 2.42.2（第 2 条）：广播专用接收端口，和点对点 audio_port 完全分开。
+    #   0 / 缺失（老配置）= 自动取 audio_port + 1；与 audio_port 相同也会被纠正。
+    broadcast_port: int = PORT_BROADCAST
     web_port: int = 17800
     # Routing / privacy
     routes: list[dict[str, Any]] = field(default_factory=list)
+    # ★ 2.44.1（#6 防环最小闭环）：路由表版本号。每次 set_routes 递增，
+    #   随路由推送带给对端；对端按 (作者, epoch) 拒绝旧包，避免重放/乱序把旧路由复活。
+    route_epoch: int = 0
     accept_unknown: bool = False
     manual_peers: list[dict[str, Any]] = field(default_factory=list)
     # Local device choices
@@ -141,6 +148,10 @@ class Config:
     # ★ v2.27（用户新 UI 需求）：Windows 开机自启动（写 HKCU\...\Run）。
     #   与上面的 autostart 不是一回事：那个是"启动后自动连蓝牙"。
     launch_at_login: bool = False
+    # ★ v2.36（用户方案）：自启动方式二选一，同一时刻只留一种，避免开机被拉起两次。
+    #   registry —— 写 HKCU\...\Run（默认）；
+    #   startup  —— 在 shell:startup 里放一个指向本 exe 的 .lnk（参数 serve）。
+    autostart_method: str = "registry"
     # LAN "radio channel". `broadcast` sends this machine's sound to every node on the
     # network; `listen` plays whatever arrives on the channel. A listener sends
     # nothing, which is what makes the channel loop-free by construction - the same
@@ -154,16 +165,21 @@ class Config:
     #   "on"    —— 强制开：沿用旧行为（路由增益 × 手机 vol）。
     #   默认 auto；判定样本不足时按"叠加"处理（与 2.10 之前的行为一致）。
     phone_volume_mode: str = "auto"
-    # ★ 2026-11-08（用户方案）：静音档乘数策略。
-    #   internal_only —— 默认：静音档里 STREAM_MUSIC 被钉在 0，这个 0 没有信息量，乘 1.0，
-    #                    只保留 PCM 里的 App 内部增益（"调了没反应"的反面证据见 docs）；
-    #   last_nonzero  —— 沿用进入静音前最后一次非零系统音量（外放档压到 25% 的信息不丢）。
+    # ★ 2.42.3 修复（真机第 3 条）：静音档乘数策略。
+    #   last_nonzero —— 默认：跟随用户/App 最近一次设定的媒体音量（进静音前的最后一次非零值；
+    #                    静音档里每次音量键/App 滑杆的调整都会被记成新值，再被钉回 0）。
+    #   internal_only  —— 旧默认（固定 1.0）。真机上表现为"调手机音量、电脑那头不变"，
+    #                    已不再使用；老配置读到它会在 load() 里迁移成 last_nonzero。
     #   外放档永远乘当前系统媒体音量，与本项无关。
-    phone_silent_vol_policy: str = "internal_only"
+    phone_silent_vol_policy: str = "last_nonzero"
     # What the channel broadcasts. Empty means "this machine's own source_device".
     # Several entries are mixed into one stream, which is how several phones - each on
     # its own Bluetooth adapter - or a phone plus this machine's sound travel as one.
     channel_sources: list[str] = field(default_factory=list)
+    # ★ 2.42.3：三档性能预算（smooth / balanced / high）。
+    #   老配置没有这个键 → 均衡（= 2.42.2 行为，音质与延迟都不变）。
+    #   档位只影响本机的编码/缓冲/重采样开销；对端不一致时两端按较低那档协商。
+    quality_preset: str = quality.DEFAULT
     # ① 自动收听（与手机端同名同义）：
     #   smart_link —— ★ 2026-10-18 用户第 6 条：全局总开关换成**每台设备一个「智连」**。
     #     名单里有的那台设备，"它送声音过来"时才自动开始收听它（= 接受它的「送」）；
@@ -174,16 +190,26 @@ class Config:
     smart_link: list[str] = field(default_factory=list)
     # 本机多设备输出：勾选的输出设备（每项含 device/gain/delay_ms）
     multi_out_devices: list[dict[str, Any]] = field(default_factory=list)
+    # ★ Q2 改（2026-11-16 用户）：默认设备改为「直出」，锁默认设备降级为可选，
+    #   所以这里默认空字符串 = 不锁；用户主动选了目标才去改系统默认。
+    multi_lock_device: str = ""
+    # 锁之前用户原本的默认播放设备（{id, name}），用于关闭/退出时还原。
+    multi_lock_original: dict[str, Any] = field(default_factory=dict)
+    # 是否处于「已被我们锁住」的状态；异常退出后靠它提示还原入口。
+    multi_lock_active: bool = False
     # Play the channel's sources on *this* machine's output as well. This is what makes
     # "phone over Bluetooth -> this PC -> my headphones" work without any second node.
     local: bool = False
-    # Phones to connect by themselves on startup, matched by name. Empty means "connect
-    # nothing": opening an A2DP sink resets that phone's link, so this stays opt-in.
-    autoconnect: list[str] = field(default_factory=list)
+    # ★ v2.42：「打开」的长期放行名单（**设备 id**）。语义：电脑侧只让系统长期放行，
+    #   不主动配对、不主动连接，接收端一直挂着；手机自己连上来就开始音频传输，
+    #   断开后继续等下一次。启动时按这份名单挂常驻接收端，所以重启后仍然生效。
+    #   （v2.41.3 的「常开」与旧「智连」autoconnect 已合并成这一个状态。）
+    bt_always: list[str] = field(default_factory=list)
     # ★ 2026-10-18 用户（图2）：「「正在发送的手机自动播放」就是蓝牙的「智连」」——
     #   原来这里有一个全局开关 `auto_play`（面板上那个勾：手机一开始送声音就自动收编成音源播放）。
     #   它和"每台设备的「智连」"说的是同一件事，所以整块删掉：要不要自动收下这台设备的声音，
-    #   只看那台设备的卡片开没开「智连」（局域网看 smart_link，蓝牙看 autoconnect）。
+    #   只看那台设备的卡片开没开「智连」（局域网看 smart_link；蓝牙的 autoconnect 已于
+    #   v2.42 整条下线，蓝牙声音由 Windows 直接播放）。
     #   默认 = 一台都不自动（用户第 6 条的原话「默认关闭」）。
     #   老配置里那个 "auto_play" 键不再读（from_dict 会当未知键忽略），不会报错。
     # Which window to open when the app starts: "none", "simple" or "full".
@@ -321,6 +347,34 @@ class Config:
             cfg.discovery_port = PORT_DISCOVERY
             if create:
                 cfg.save(p)
+        # ★ 2.42.2（第 2 条）：老配置没有 broadcast_port → 取 audio_port + 1。
+        #   与 audio_port 撞在一起也必须纠正，否则广播和点对点又回到同一个端口。
+        try:
+            bport = int(getattr(cfg, "broadcast_port", 0) or 0)
+        except (TypeError, ValueError):
+            bport = 0
+        if bport <= 0:
+            bport = int(getattr(cfg, "audio_port", 47831) or 47831) + 1
+        if bport == int(getattr(cfg, "audio_port", 0) or 0):
+            bport += 1
+        if bport != int(getattr(cfg, "broadcast_port", 0) or 0):
+            cfg.broadcast_port = bport
+            if create:
+                cfg.save(p)
+        # ★ 2.42.3：老配置没有 quality_preset（或写坏了）→ 均衡，不改变现有听感。
+        want_preset = quality.normalize(getattr(cfg, "quality_preset", ""))
+        if want_preset != getattr(cfg, "quality_preset", None):
+            cfg.quality_preset = want_preset
+            if create:
+                cfg.save(p)
+        # ★ 2.42.3 修复（真机第 3 条）：静音档必须跟随手机音量。
+        #   旧默认 internal_only（固定乘 1.0）在真机上的症状就是
+        #   「静音档传音，手机调音量电脑那头不变」。老配置里的 internal_only 一并迁移；
+        #   写坏的/缺失的值也落到 last_nonzero（乘数为 0 时手机端会退回 1.0，不会哑）。
+        if str(getattr(cfg, "phone_silent_vol_policy", "") or "").strip().lower() != "last_nonzero":
+            cfg.phone_silent_vol_policy = "last_nonzero"
+            if create:
+                cfg.save(p)
         return cfg
 
     def save(self, path: Path | None = None, strict: bool = False) -> Path:
@@ -350,8 +404,10 @@ class Config:
             "name": self.name,
             "discovery_port": self.discovery_port,
             "audio_port": self.audio_port,
+            "broadcast_port": self.broadcast_port,
             "web_port": self.web_port,
             "routes": self.routes,
+            "route_epoch": int(self.route_epoch or 0),
             "accept_unknown": self.accept_unknown,
             "manual_peers": self.manual_peers,
             "forward_to": self.forward_to,
@@ -359,8 +415,11 @@ class Config:
             "sink_device": self.sink_device,
             "codec": self.codec,
             "jitter_ms": self.jitter_ms,
+            # ★ 2.42.3：三档性能预算（流畅/均衡/高音质）。
+            "quality_preset": quality.normalize(self.quality_preset),
             "autostart": self.autostart,
             "launch_at_login": self.launch_at_login,
+            "autostart_method": self.autostart_method,
             "broadcast": self.broadcast,
             "listen": self.listen,
             "channel_gain": self.channel_gain,
@@ -369,11 +428,16 @@ class Config:
             "channel_sources": self.channel_sources,
             "smart_link": self.smart_link,
             "local": self.local,
-            "autoconnect": self.autoconnect,
+            "bt_always": self.bt_always,
             # 启动时顺手打开面板窗口。在详细版面板里可以勾选。
             "open_panel_on_start": self.open_panel_on_start,
             "broadcast_excluded": self.broadcast_excluded,
             "netmic_jitter_ms": self.netmic_jitter_ms,
+            # ★ Q2：多耳机的设备清单之前漏存了（set_multi_out 改完重启就丢），一起补上。
+            "multi_out_devices": self.multi_out_devices,
+            "multi_lock_device": self.multi_lock_device,
+            "multi_lock_original": self.multi_lock_original,
+            "multi_lock_active": self.multi_lock_active,
         }
         tmp = p.with_suffix(".tmp")
         try:
@@ -399,8 +463,10 @@ class Config:
             "name": self.name,
             "discovery_port": self.discovery_port,
             "audio_port": self.audio_port,
+            "broadcast_port": self.broadcast_port,
             "web_port": self.web_port,
             "routes": self.routes,
+            "route_epoch": int(self.route_epoch or 0),
             "accept_unknown": self.accept_unknown,
             "manual_peers": self.manual_peers,
             "forward_to": self.forward_to,
@@ -408,8 +474,11 @@ class Config:
             "sink_device": self.sink_device,
             "codec": self.codec,
             "jitter_ms": self.jitter_ms,
+            # ★ 2.42.3：三档性能预算（流畅/均衡/高音质）。
+            "quality_preset": quality.normalize(self.quality_preset),
             "autostart": self.autostart,
             "launch_at_login": self.launch_at_login,
+            "autostart_method": self.autostart_method,
             "broadcast": self.broadcast,
             "listen": self.listen,
             "channel_gain": self.channel_gain,
@@ -417,8 +486,12 @@ class Config:
             "phone_silent_vol_policy": self.phone_silent_vol_policy,
             "channel_sources": self.channel_sources,
             "local": self.local,
-            "autoconnect": self.autoconnect,
+            "bt_always": self.bt_always,
             "open_panel_on_start": self.open_panel_on_start,
             "netmic_jitter_ms": self.netmic_jitter_ms,
+            "multi_out_devices": self.multi_out_devices,
+            "multi_lock_device": self.multi_lock_device,
+            "multi_lock_original": self.multi_lock_original,
+            "multi_lock_active": self.multi_lock_active,
             "path": str(config_path()),
         }

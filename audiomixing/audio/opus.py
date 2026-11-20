@@ -180,7 +180,8 @@ class OpusEncoder:
     两种都支持；其它长度按 20 毫秒补零，保证不会因为长度不对而报错。
     """
 
-    def __init__(self, channels: int = CHANNELS, bitrate: int = _BITRATE) -> None:
+    def __init__(self, channels: int = CHANNELS, bitrate: int = _BITRATE,
+                 complexity: int | None = None) -> None:
         opus = _load()
         if opus is None:
             raise RuntimeError("Opus 不可用：%s" % _load_error)
@@ -190,6 +191,13 @@ class OpusEncoder:
             self._enc.bitrate = int(bitrate)
         except Exception:
             pass
+        # ★ 2.42.3：三档性能预算里的编码复杂度（0~10）。老 opuslib 没有这个属性就跳过，
+        #   不因为一个可选旋钮把整条编码链路打死。
+        if complexity is not None:
+            try:
+                self._enc.complexity = max(0, min(10, int(complexity)))
+            except Exception:
+                pass
         self.frames_sent = 0
 
     def encode(self, samples: Any) -> bytes:

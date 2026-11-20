@@ -119,6 +119,14 @@ class PeerEndpoints:
     smart: bool = False
     # 对端发现端口的实际端口（信标里的 disc_port）。0 / 缺失 = 按默认 17830 处理。
     disc_port: int = 0
+    # ★ 2.42.2：广播专用接收端口（信标里的 broadcast_port）。0 / 缺失 = 老版本，
+    #   它把广播和点对点混在 audio_port 上；本版不再向这种对端发广播。
+    broadcast_port: int = 0
+    # ★ 2.42.3：对端声明的性能预算档位（空/缺失 = 老版本，按「均衡」处理）。
+    quality: str = ""
+    # ★ 2.31.1（#3）：对端能解 Opus（手机 2.31.1+ 信标里的 opus:1）。
+    #   只有它为真才允许向 Android 目标发 Opus；老手机仍强制 PCM16。
+    opus: bool = False
     first_seen: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
     manual: bool = False
@@ -202,6 +210,11 @@ class PeerEndpoints:
             "name": self.name,
             "host": self.host,
             "audio_port": self.audio_port,
+            "broadcast_port": self.broadcast_port,
+            # ★ 2.42.3：对端档位（面板据此显示协商结果）。
+            "quality": self.quality,
+            # ★ 2.31.1（#3）：对端能否解 Opus（面板/诊断可显示）。
+            "opus": self.opus,
             "web_port": self.web_port,
             "platform": self.platform,
             "version": self.version,
@@ -294,6 +307,9 @@ class DiscoveryRegistry:
                     host=host,
                     audio_port=int(payload.get("audio_port") or 0),
                     web_port=int(payload.get("web_port") or 0),
+                    broadcast_port=int(payload.get("broadcast_port") or 0),
+                    quality=str(payload.get("quality") or ""),
+                    opus=bool(payload.get("opus")),
                     platform=str(payload.get("platform") or ""),
                     version=str(payload.get("version") or ""),
                     manual=manual,
@@ -323,6 +339,11 @@ class DiscoveryRegistry:
             peer.name = str(payload.get("name") or peer.name)
             peer.audio_port = int(payload.get("audio_port") or peer.audio_port)
             peer.web_port = int(payload.get("web_port") or peer.web_port)
+            if payload.get("broadcast_port"):
+                peer.broadcast_port = int(payload.get("broadcast_port") or 0)
+            # ★ 2.42.3：对端档位。老版本没有这个键 → 保持空串（引擎按「均衡」协商）。
+            if "quality" in payload:
+                peer.quality = str(payload.get("quality") or "")
             peer.platform = str(payload.get("platform") or peer.platform)
             peer.version = str(payload.get("version") or peer.version)
             peer.sources = list(payload.get("sources") or [])
@@ -808,6 +829,8 @@ def build_beacon(
     discovery_port: int = 0,
     device_id: str = "",
     instance_id: str = "",
+    broadcast_port: int = 0,
+    quality: str = "",
 ) -> bytes:
     payload = {
         "wl": 1,
@@ -822,6 +845,8 @@ def build_beacon(
         "platform": "%s-%s" % (platform.system() or "?", platform.release() or "?"),
         "version": version,
         "audio_port": audio_port,
+        # ★ 2.42.2：广播走独立端口。老版本没有这个键 → 0，新版本不会向它发广播。
+        "broadcast_port": int(broadcast_port or 0),
         "web_port": web_port,
         "sources": sources,
         "sinks": sinks,
@@ -838,6 +863,9 @@ def build_beacon(
         # ★ 扩展段能力位（2026-11-04）：1 = 我能安全解析音频包里多出来的 8 字节
         #   originId/hop。只有这里为 1 的对端才会收到带扩展段的包；老端永远收老包。
         "ext": 1,
+        # ★ 2.42.3：三档性能预算（smooth / balanced / high）。两端不一致时按较低那档
+        #   协商生效。老版本没有这个键 → 引擎按「均衡」处理（它确实就是均衡的听感）。
+        "quality": str(quality or ""),
         # 我实际绑定的发现端口（端口被占时可能不是 17830），对端按它发包。
         "disc_port": int(discovery_port or 0),
         "scope": "lan",  # this protocol never leaves the local network
@@ -864,6 +892,8 @@ class BeaconService:
         bt_provider: Callable[[], list[str]] | None = None,
         device_id: str = "",
         instance_id: str = "",
+        broadcast_port: int = 0,
+        quality: str = "",
     ) -> None:
         self.registry = registry
         self.node_id = node_id
@@ -872,6 +902,10 @@ class BeaconService:
         self.instance_id = instance_id
         self.name = name
         self.audio_port = audio_port
+        # ★ 2.42.2：广播专用接收端口，随信标公布给对端。
+        self.broadcast_port = int(broadcast_port or 0)
+        # ★ 2.42.3：本机当前档位，随信标公布；对端按较低那档协商。
+        self.quality = str(quality or "")
         self.web_port = web_port
         self.source_provider = source_provider
         self.sink_provider = sink_provider
@@ -983,6 +1017,8 @@ class BeaconService:
             self.port,
             self.device_id,
             self.instance_id,
+            self.broadcast_port,
+            self.quality,
         )
 
     def send_control(self, body: dict[str, Any], host: str, port: int) -> bool:

@@ -142,6 +142,9 @@ public final class AudioSend {
     private volatile int diagGainQ14 = Proto.GAIN_ONE;
     private volatile int diagMediaQ14 = Proto.GAIN_ONE;
     private volatile int diagTotalQ14 = Proto.GAIN_ONE;
+    /** ★ 2.29.3：系统媒体音量索引的实时读数 + mute 标志，用来验证"mute 时索引还在"。 */
+    private volatile int diagSysQ14 = Proto.GAIN_ONE;
+    private volatile int diagSysMute = 0;
     private volatile float diagRawPeak;
     private volatile float diagPostPeak;
     // ★ 2026-11-04（B 第一阶段）：originId/hop 扩展段。
@@ -268,8 +271,10 @@ public final class AudioSend {
     public String diagJson() {
         if (!running) return "";
         return String.format(Locale.US,
-                ",\"vol_q14\":%d,\"gain_q14\":%d,\"total_q14\":%d,\"raw_peak\":%.4f,\"post_peak\":%.4f",
-                diagMediaQ14, diagGainQ14, diagTotalQ14, diagRawPeak, diagPostPeak);
+                ",\"vol_q14\":%d,\"gain_q14\":%d,\"total_q14\":%d"
+                        + ",\"sys_q14\":%d,\"sys_mute\":%d,\"raw_peak\":%.4f,\"post_peak\":%.4f",
+                diagMediaQ14, diagGainQ14, diagTotalQ14, diagSysQ14, diagSysMute,
+                diagRawPeak, diagPostPeak);
     }
 
     // ------------------------------------------------------------ ★ 送声档位音量
@@ -328,6 +333,18 @@ public final class AudioSend {
         // 正好就是 last_nonzero 语义；没有可用值时 mediaQ14 内部会退回 1.0。
         mediaVolQ14 = SendVolume.mediaQ14(sendMode, silentVolPolicy, systemVolQ14, systemVolQ14);
         volSource = SendVolume.modeName(sendMode);
+        // ★ 2.29.3 取证：实时索引 + mute 标志。静音档用 mute 标志后，
+        //   这里应能看到 App 滑块改出来的真实索引（而不是被清零的 0）。
+        try {
+            AudioManager am = (AudioManager) appCtx.getSystemService(Context.AUDIO_SERVICE);
+            if (am != null) {
+                int idx = am.getStreamVolume(AudioManager.STREAM_MUSIC);
+                int max = Math.max(1, am.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
+                diagSysQ14 = SendVolume.q14(idx / (float) max);
+                diagSysMute = am.isStreamMute(AudioManager.STREAM_MUSIC) ? 1 : 0;
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     // ------------------------------------------------------------ ★ 音源切换

@@ -38,13 +38,15 @@ from dataclasses import dataclass, field
 from typing import (Any, Callable, Iterable)
 from . import proto
 from . import __version__
+from . import quality
 from .audio import base as audio_base
 from .audio.format import (CHANNELS, SAMPLE_RATE, apply_gain, as_float_array, peak as sample_peak)
+from .audio import format as audio_format
 from .config import Config
 from .net.discovery import (BeaconService, DiscoveryRegistry, PeerEndpoints, short_id)
 from .net.rtpaudio import (JitterBuffer, Receiver, Sender, SenderSession)
 from .audio.capture import CaptureHub, SILENT_AFTER_S
-from .audio.multiout import MultiOut
+from .audio.multiout import MultiOut, normalize_sources
 from .audio.local import LocalLoop
 from .audio.tap import AudioTap
 PRUNE_AFTER_S = 60.0
@@ -57,6 +59,20 @@ STATS_STOP_GRACE_S = 30.0
 GAIN_ECHO_WINDOW_S = 10.0
 AUTO_LISTEN_LABEL = '对方请求收听（自动）'
 PEER_PRUNE_TTL_S = 90.0
+
+
+def codec_for_target(codec: int, platform: str, opus_capable: bool) -> int:
+    """★ 2.44.1（#3）：给一台目标挑实际编码。
+
+    Android 只有 PCM16 解码器；2.31.1 起信标带 ``opus:1``，才允许发 Opus。
+    老手机/没声明 opus 的一律强制 PCM16，避免"端口通、包在发、手机全丢"。
+    PC↔PC 不受影响，仍按配置的 codec。
+    """
+    if str(platform or '').strip().lower().startswith('android') \
+            and codec != proto.CODEC_PCM_S16:
+        if codec != proto.CODEC_OPUS or not opus_capable:
+            return proto.CODEC_PCM_S16
+    return codec
 ROUTE_STALE_AFTER_S = 60.0
 PEER_VOLUME_TTL_S = 30.0
 PEER_VOLUME_DETECT_MIN_S = 10.0
@@ -306,18 +322,58 @@ class _OutputLevelMeter(threading.Thread):
                 pass
 
 
+def split_multi_devices(devices: list[dict[str, Any]], default_name: str) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """把「多耳机」清单拆成（真正要复制的设备, 直出的默认设备）。
+
+    ★ Q2 改（2026-11-16 用户）：系统默认播放设备永远算在「在听」里，但它走系统
+      原生直出 —— 我们绝不为它开输出、不做回环复制。以前是把它从列表里排除，
+      结果用户还是会手动勾上，于是同一路声音播两遍（金属音）。现在显式分支。
+    """
+    wanted: list[dict[str, Any]] = []
+    passthrough: dict[str, Any] | None = None
+    for item in devices or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("device") or "").strip()
+        if not name:
+            continue
+        if default_name and name == default_name:
+            passthrough = {"device": name, "name": name, "gain": 1.0,
+                           "delay_ms": 0.0, "running": True, "passthrough": True}
+            continue
+        # ★ 2.42.1：一个输出设备可以同时接多个音源；显式空列表 = 静音。
+        sources = normalize_sources(item, legacy_desktop=True)
+        first_app = next((s for s in sources if str(s.get("kind") or "") == "app"), {})
+        wanted.append({"device": name,
+                       "gain": float(item.get("gain", 1.0) or 1.0),
+                       "delay_ms": float(item.get("delay_ms", 0.0) or 0.0),
+                       # ★ 2.42.1：每路自己的音源集合（0 条 = 静音，不回落桌面）。
+                       "sources": sources,
+                       # 兼容旧 UI/旧测试：同时带上第一条 App 音源。
+                       "app_pid": int(first_app.get("pid") or 0),
+                       "app_name": str(first_app.get("name") or "")})
+    return wanted, passthrough
+
+
 class AudioMixingNode:
     '''One AudioMixing instance on one machine.'''
 
     ''
-    def __init__(self, config: Config | None=None, *, audio_port: int | None=None, discovery_port: int | None=None, bind_host: str='0.0.0.0', simulate: bool=False) -> None:
+    def __init__(self, config: Config | None=None, *, audio_port: int | None=None, broadcast_port: int | None=None, discovery_port: int | None=None, bind_host: str='0.0.0.0', simulate: bool=False) -> None:
         self.config = config or Config.load()
         self.bind_host = bind_host
         self.simulate = simulate
         if audio_port:
             self.config.audio_port = audio_port
+            # ★ 2.42.2：广播口必须和点对点口分开；调用方没显式给就跟着 audio_port 走。
+            if not broadcast_port:
+                self.config.broadcast_port = int(audio_port) + 1
+        if broadcast_port:
+            self.config.broadcast_port = int(broadcast_port)
         if discovery_port:
             self.config.discovery_port = discovery_port
+        if int(getattr(self.config, 'broadcast_port', 0) or 0) == int(self.config.audio_port):
+            self.config.broadcast_port = int(self.config.audio_port) + 1
         self.node_id = self.config.node_id
         self.device_id = str(getattr(self.config, 'device_id', '') or self.config.node_id)
         self.instance_id = str(getattr(self.config, 'instance_id', '') or '')
@@ -325,7 +381,7 @@ class AudioMixingNode:
         self.name = self.config.name
         self.registry = DiscoveryRegistry(self.node_id)
         self.sender = Sender(self.node_id, self.name)
-        self.receiver = Receiver(self.node_id, self.config.audio_port, on_first_packet=self._on_stream_start, accept_source=self._stream_is_accepted, resolve_source=self._node_id_for_host, bind_host=bind_host, self_origin_id=self.origin_id)
+        self.receiver = Receiver(self.node_id, self.config.audio_port, on_first_packet=self._on_stream_start, accept_source=self._stream_is_accepted, resolve_source=self._node_id_for_host, bind_host=bind_host, self_origin_id=self.origin_id, broadcast_port=self.config.broadcast_port, accept_channel=self._channel_stream_is_accepted)
         self.sinks = {}
         self.hub = CaptureHub()
         self.tap = AudioTap(name='out')
@@ -357,6 +413,9 @@ class AudioMixingNode:
         self._last_peer_stats = 0.0
         self._stats_last_keys = set()
         self._stats_seen = {}
+        # ★ 2.42.1：对端**上报**的接收统计（它收到了我发的多少包、开了几条流）。
+        #   广播页要回答"谁在听、谁没在听"，只能拿对端自己的话当证据。
+        self._peer_rx_report: dict[str, dict[str, Any]] = {}
         self._stats_grace = {}
         self._bt_requests = {}
         self._bt_request_at = {}
@@ -364,10 +423,16 @@ class AudioMixingNode:
         self._gain_published = {}
         self.routes = []
         self._routes_lock = threading.RLock()
+        # ★ 2.44.1（#6）：路由 epoch —— 本地每次改表递增；对端按作者记最高 epoch。
+        self._route_epoch = int(getattr(self.config, 'route_epoch', 0) or 0)
+        self._push_epochs: dict[str, int] = {}
         self._stop = threading.Event()
         self._threads = []
         self._wake = threading.Event()
         self.multi_out = MultiOut(self.hub)
+        # ★ Q2 改：系统默认输出永远算「在听」，但它直出、我们不复制。
+        self.multi_passthrough: dict[str, Any] | None = None
+        self._multi_passthrough_noted = False
         self._dropped_ids = {}
         self._route_first_seen = {}
         self._last_orphan_sweep = 0.0
@@ -592,13 +657,6 @@ class AudioMixingNode:
             return {"backend": backend, "device": picked}
         return {"backend": backend, "device": "@default"}
 
-    def autoconnect_phones(self) -> list[str]:
-        """按配置连上蓝牙设备。面板和窗口的"连接"按钮走的也是它。"""
-        wanted = [str(x) for x in (self.config.autoconnect or []) if str(x).strip()]
-        if not wanted:
-            return []
-        return self._autoconnect(wanted)
-
     def _capture_selectors(self) -> list[str]:
         """现在正在采集的设备选择器。
 
@@ -716,32 +774,33 @@ class AudioMixingNode:
         except Exception:
             return []
 
-    def _autoconnect(self, wanted: list[str]) -> list[str]:
-        """连上配置里写明的蓝牙设备。start 时调一次。"""
+    def _bt_always(self, wanted: list[str]) -> list[str]:
+        """「打开」：把长期放行名单逐个挂成常驻接收端（v2.41.3 起叫「常开」，v2.42 改名「打开」）。
+
+        与手机点「走蓝牙」触发的 `connect_by_name()` 刻意分开：
+          · 后者是**手机请求**电脑主动连一次（会调 Open()），只在对方点的时候发生；
+          · 这里只调 StartAsync（让系统长期放行），不主动连手机，也不做设备枚举
+            —— `list_devices_cached()` 是约 3 秒的枚举，还会扰动正在保持的连接。
+        手机自己连上来就出声，断开后助手继续等。
+        """
         from . import bluetooth as bt
 
         if not bt.available():
-            self.note("自启连接：这台机器不支持（不是 Windows 或缺少 powershell.exe）")
+            self.note("常开：这台机器不支持（不是 Windows 或缺少 powershell.exe）")
             return []
-        try:
-            devices = bt.list_devices_cached()
-        except Exception as exc:
-            self.note("自启连接：读取蓝牙设备失败 %s" % exc)
-            return []
-        present = {d["name"]: d for d in devices}
         done: list[str] = []
-        for name in wanted:
-            device = present.get(name)
-            if device is None:
-                self.note("自启连接：没找到「%s」（没配对、不在范围内，或名字改了）" % name)
+        for device_id in wanted:
+            device_id = str(device_id or "").strip()
+            if not device_id:
                 continue
-            if device.get("link") in ("connected", "waiting"):
-                done.append(name)  # already up; reconnecting would cut the audio
+            try:
+                result = bt.always_on(device_id)
+            except Exception as exc:
+                self.note("常开：%s 挂接收端失败 %s" % (device_id, exc))
                 continue
-            result = bt.connect(device["id"])
-            self.note("自启连接「%s」-> %s" % (name, result.get("state") or result.get("error")))
+            self.note("常开「%s」-> %s" % (device_id, result.get("state") or result.get("error")))
             if result.get("ok"):
-                done.append(name)
+                done.append(device_id)
         return done
 
     def start(self, *, announce: bool=True) -> None:
@@ -751,6 +810,8 @@ class AudioMixingNode:
         '''
 
         self.receiver.start()
+        # ★ 2.42.3：接收侧的抖动缓冲按本机档位初始化（默认均衡 = 2.42.2 行为）。
+        self.apply_quality_preset()
         self.refresh_devices()
         if self.config.routes:
             try:
@@ -762,7 +823,7 @@ class AudioMixingNode:
             except Exception as exc:
                 self.note('恢复上次的路由失败（已跳过）：%s' % exc)
         if announce:
-            self.beacon = BeaconService(self.registry, self.node_id, self.name, self.config.audio_port, self.config.web_port, self.source_list, self.sink_list, port=self.config.discovery_port, version=__version__, bt_provider=self._bt_names, device_id=self.device_id, instance_id=self.instance_id)
+            self.beacon = BeaconService(self.registry, self.node_id, self.name, self.config.audio_port, self.config.web_port, self.source_list, self.sink_list, port=self.config.discovery_port, version=__version__, bt_provider=self._bt_names, device_id=self.device_id, instance_id=self.instance_id, broadcast_port=self.config.broadcast_port, quality=self.local_quality())
             for peer in self.config.manual_peers:
                 host = str(peer.get('host') or '')
                 if not host:
@@ -775,15 +836,28 @@ class AudioMixingNode:
             worker = threading.Thread(target=target, name=thread_name, daemon=True)
             self._threads.append(worker)
             worker.start()
-        if self.config.autoconnect:
-            try:
-                self._autoconnect(list(self.config.autoconnect))
-            except Exception as exc:
-                self.note('自启连接失败：%s' % exc)
+        always = [str(x) for x in (getattr(self.config, 'bt_always', None) or []) if str(x).strip()]
+        if always:
+            # 「打开」要等 StartAsync（最长十几秒），不能拖住 start()；后台逐个挂，
+            # 失败只记 note。★ v2.42：蓝牙「智连」(autoconnect) 已整条下线，
+            # 启动时不再对手机做任何主动连接。
+            threading.Thread(target=self._bt_always, args=(always,),
+                             name='audiomixing-bt-always', daemon=True).start()
         self.apply_routes()
 
     def stop(self) -> None:
         self._stop.set()
+        # ★ Q2：正常退出时把用户原来的默认播放设备还回去；异常退出靠下次启动的
+        #   multi_lock_status()['needs_restore'] 给出还原入口。
+        try:
+            if getattr(self.config, "multi_lock_active", False):
+                self.restore_multi_default()
+        except Exception:
+            pass
+        try:
+            self.multi_out.stop()
+        except Exception:
+            pass
         if self._out_meter is not None:
             self._out_meter.stop()
             self._out_meter = None
@@ -943,11 +1017,19 @@ class AudioMixingNode:
         origin = str(newest.get("from") or "")
         if origin == self.node_id:
             return
-        # Only newer pushes win: ignore anything older than what we already applied.
-        stamp = float(newest.get("ts") or 0)
-        if stamp and stamp <= getattr(self, "_last_push_ts", 0.0):
-            return
-        self._last_push_ts = stamp or time.time()
+        # ★ 2.44.1（#6）：优先用作者自己的 epoch 判新旧；老对端没有 epoch 再用 ts。
+        epoch = int(newest.get("epoch") or 0)
+        if epoch > 0:
+            last_epoch = self._push_epochs.get(origin, 0)
+            if epoch <= last_epoch:
+                return
+            self._push_epochs[origin] = epoch
+        else:
+            # Only newer pushes win: ignore anything older than what we already applied.
+            stamp = float(newest.get("ts") or 0)
+            if stamp and stamp <= getattr(self, "_last_push_ts", 0.0):
+                return
+            self._last_push_ts = stamp or time.time()
         # Routes the pusher explicitly deleted. Honouring these is what makes
         # "delete" work from either panel: without it the owner's own copy would
         # simply be re-pushed on the next change and the route would come back.
@@ -1415,6 +1497,11 @@ class AudioMixingNode:
             peer = self.registry.get(author)
             author_name = peer.name if peer is not None else ""
         incoming = [self._normalize_route(r, author, author_name) for r in routes if isinstance(r, dict)]
+        # ★ 2.44.1（#6）：本机↔本机自环没有意义，直接丢弃（互送 A→B / B→A 不受影响）。
+        loops = [r for r in incoming if r.get('from') == [author] and r.get('to') == [author]]
+        if loops:
+            incoming = [r for r in incoming if r not in loops]
+            self.note("已忽略 %d 条本机↔本机自环路由" % len(loops))
         # ★ 保留已存在路由的"归属"。
         # 集合里的归属决定"谁的推送有资格替换它"：下面 kept 会把 origin == 推送者
         # 的记录全部丢掉、用推送内容替代。而面板（update_route / set_routes）
@@ -1466,6 +1553,9 @@ class AudioMixingNode:
             ]
             merged = self._dedupe_routes(kept + incoming)
             self.routes = merged
+            # 每次真正改表都推进 epoch（远端 push 合并也算），下一次推送带上新值。
+            self._route_epoch = int(self._route_epoch or 0) + 1
+            self.config.route_epoch = self._route_epoch
             # Only our own routes are persisted: a peer's route belongs to that peer
             # and comes back over the wire, so storing it would resurrect it forever
             # after the other machine is gone.
@@ -1548,6 +1638,10 @@ class AudioMixingNode:
                 self._note_once("合并对端路由失败：%s" % exc)
         if pulled:
             self._note_once("已从 %d 台电脑拉取路由表" % pulled)
+
+    def route_epoch(self) -> int:
+        """★ 2.44.1（#6）：本地路由表版本号，随 routes push 发给对端。"""
+        return int(self._route_epoch or 0)
 
     def local_routes(self) -> list[dict[str, Any]]:
         """The routes this node's own user created (what the panel edits)."""
@@ -1691,6 +1785,125 @@ class AudioMixingNode:
             continue
         return nodes
 
+    def _send_target_port(self, rule: dict[str, Any], target: PeerEndpoints) -> int:
+        """这条规则应该发到对端的哪个端口。
+
+        ★ 2.42.2（第 2 条）：广播 → `broadcast_port`；点对点 → `audio_port`。
+        广播对端没公布广播口（老版本）时返回 0 —— 绝不回落到 audio_port，
+        否则两条通道又混在同一个端口上，端口隔离就失效了。
+        """
+        if rule.get('kind') == 'broadcast':
+            return int(getattr(target, 'broadcast_port', 0) or 0)
+        return int(getattr(target, 'audio_port', 0) or 0)
+
+    def _legacy_broadcast_peers(self) -> list[dict[str, Any]]:
+        """在线、但信标里没有广播端口（2.42.1 及更早）的对端。
+
+        ★ 2.42.3（第 1 条）：新旧混装时本机不向它们发广播（端口隔离优先），
+        但**绝不能默默静音** —— 面板要把名字和原因逐台写出来，用户才知道该升级谁。
+        """
+        out: list[dict[str, Any]] = []
+        try:
+            nodes = self._matching_nodes(['*'])
+        except Exception:
+            return out
+        for peer in nodes:
+            if peer.node_id == self.node_id:
+                continue
+            if not bool(getattr(peer, 'online', True)):
+                continue
+            if int(getattr(peer, 'broadcast_port', 0) or 0) > 0:
+                continue
+            out.append({
+                'node_id': peer.node_id,
+                'name': peer.name,
+                'host': peer.host,
+                'text': ('「%s」是旧版本（信标里没有广播端口），这次收不到广播；'
+                         '把对端升级到 2.42.2 及以上后自动改走 47832。' % peer.name),
+            })
+        return out
+
+    # ─────────────────────── 2.42.3 三档性能预算 ───────────────────────
+
+    def local_quality(self) -> str:
+        """本机选的档位（认不出/老配置 = 均衡）。"""
+        return quality.normalize(getattr(self.config, 'quality_preset', quality.DEFAULT))
+
+    def effective_quality(self) -> str:
+        """两端协商后的档位：按**较低**那档生效（谁的性能预算低就听谁的）。
+
+        对端信标里没有 `quality` 键（老版本）= 均衡 —— 老版本的实际听感就是均衡，
+        这样既不会把新端无谓降档，也不会假装对方支持高音质。
+        """
+        eff = self.local_quality()
+        try:
+            for peer in self._matching_nodes(['*']):
+                if peer.node_id == self.node_id:
+                    continue
+                if not bool(getattr(peer, 'online', True)):
+                    continue
+                eff = quality.negotiate(eff, getattr(peer, 'quality', ''))
+        except Exception:
+            pass
+        return eff
+
+    def audio_quality_state(self) -> dict[str, Any]:
+        """面板/诊断读的档位实况：本机选的、协商生效的、以及实际接到代码里的参数。"""
+        local = self.local_quality()
+        eff = self.effective_quality()
+        prof = quality.params(eff)
+        prof.update({
+            'local': local,
+            'local_label': quality.label(local),
+            'effective': eff,
+            'effective_label': quality.label(eff),
+            'negotiated': eff != local,
+            # 接收端**当前真正在用**的抖动缓冲区间（新流按它建；已在收的流保持当前目标）。
+            'receiver_jitter_start_ms': round(float(getattr(self.receiver, 'jitter_start_ms', 0.0)), 1),
+            'receiver_jitter_min_ms': round(float(getattr(self.receiver, 'jitter_min_ms', 0.0)), 1),
+            'receiver_jitter_max_ms': round(float(getattr(self.receiver, 'jitter_max_ms', 0.0)), 1),
+        })
+        return prof
+
+    def _sync_quality(self) -> str:
+        eff = self.effective_quality()
+        prof = quality.profile(eff)
+        try:
+            self.receiver.set_quality_profile(
+                prof['jitter_start_ms'], prof['jitter_min_ms'], prof['jitter_max_ms'])
+        except Exception:
+            pass
+        # 重采样质量只影响**之后新建**的重采样器（切档后重开音源完整生效）。
+        try:
+            audio_format.set_default_zero_crossings(int(prof['resample_zero_crossings']))
+        except Exception:
+            pass
+        return eff
+
+    def apply_quality_preset(self) -> None:
+        """把档位对齐到接收端与信标（发送端在每条会话创建时按对端协商值取参数）。"""
+        eff = self._sync_quality()
+        beacon = getattr(self, 'beacon', None)
+        if beacon is not None:
+            try:
+                beacon.quality = eff
+            except Exception:
+                pass
+
+    def set_quality_preset(self, value: Any, *, persist: bool = True) -> str:
+        """面板切换档位。返回真正生效的档位（可能被对端协商拉低）。"""
+        name = quality.normalize(value)
+        self.config.quality_preset = name
+        if persist:
+            try:
+                self.config.save()
+            except OSError as exc:
+                self.note('保存音质档位失败（本次仍生效）：%s' % exc)
+        self.apply_quality_preset()
+        eff = self.effective_quality()
+        self.note('音质档位设为「%s」，协商生效「%s」' % (quality.label(name), quality.label(eff)))
+        return eff
+
     def desired_senders(self) -> list[tuple[str, PeerEndpoints, dict[str, Any]]]:
         '''[(session_key, target_node, rule)] this node should be sending right now.
 
@@ -1701,6 +1914,8 @@ class AudioMixingNode:
         '''
 
         listen_only = bool(self.config.listen) and not bool(self.config.broadcast)
+        # ★ 2.42.3：对端上下线会改变协商结果（取较低档），每轮对齐一次接收端。
+        self._sync_quality()
         out = []
         self._senders_blocked = {}
         for rule in self.effective_routes():
@@ -1719,9 +1934,21 @@ class AudioMixingNode:
                                  key=lambda p: (1 if p.manual else 0, str(p.node_id))):
                 if target.node_id == self.node_id:
                     continue
-                if not target.audio_port:
+                port = self._send_target_port(rule, target)
+                if not port:
+                    if rule.get('kind') == 'broadcast' and not any(
+                            p.node_id == target.node_id and int(getattr(p, 'broadcast_port', 0) or 0)
+                            for p in self._matching_nodes(rule['to'])):
+                        key = f'{rule['id']!s}|{target.node_id!s}'
+                        self._senders_blocked[key] = {
+                            'session_key': key, 'route_id': rule['id'],
+                            'node_id': target.node_id, 'name': target.name,
+                            'host': target.host, 'old_peer': True,
+                            'text': ('「%s」的版本过旧，没有广播端口（47832）→ 这次不给它发广播；'
+                                     '请把它的手机端/电脑端升级到支持独立广播端口的版本。'
+                                     % target.name)}
                     continue
-                endpoint = (str(target.host), int(target.audio_port))
+                endpoint = (str(target.host), int(port))
                 if endpoint in seen_endpoints:
                     continue
                 seen_endpoints.add(endpoint)
@@ -1847,7 +2074,10 @@ class AudioMixingNode:
                 "codec": self.config.codec, "source_device": "", "sink_device": "",
                 "label": "频道收听", "origin": self.node_id, "kind": "listen",
             })
-        if self.config.broadcast:
+        if self.config.broadcast and self._broadcast_sources():
+            # ★ 2.42.2（第 1 条）：没选音源就不生成广播规则 —— 一条流都不建。
+            #   以前只看 `config.broadcast`，空清单照样生成规则，`_source_spec_for`
+            #   再回落到桌面混音，于是"一个音源都没选却把桌面广播出去了"。
             out.append({
                 "id": CHANNEL_ROUTE_ID, "from": [self.node_id], "to": ["*"],
                 "gain": 1.0, "mute": False,
@@ -1856,11 +2086,144 @@ class AudioMixingNode:
             })
         return out
 
+    def _broadcast_sources(self) -> list[str]:
+        """广播真正允许使用的音源：配置清单里、扣除「已排除」的那些。
+
+        空列表 = 用户还没选音源，广播必须彻底不发（不建规则、不建会话、0 包），
+        绝不回落到本机默认桌面混音。
+        """
+        excluded = {str(s).strip() for s in getattr(self.config, "broadcast_excluded", [])}
+        return [str(s).strip() for s in self.config.channel_sources
+                if str(s).strip() and str(s).strip() not in excluded]
+
     def effective_routes(self) -> list[dict[str, Any]]:
         """The table plus the synthesised channel rules (never persisted)."""
         with self._routes_lock:
             table = list(self.routes)
         return self.channel_routes() + self._dedupe_routes(table)
+
+    def broadcast_receiver_state(self) -> dict[str, Any]:
+        """广播页的「谁在听 / 谁在播 / 本机有没有送出去」。
+
+        ★ 2.42.1：只报能证明的东西，不按"我发了"推断"对方在听"。
+          · 本机侧：广播发送会话数、已发包数、已发字节（`channel` 前缀会话）；
+          · 对端侧：对端 T_STATS 里自报的 `recv/streams`（最近 15 秒有效）；
+          · 状态：已收听 / 未收听 / 被拒 / 离线。
+        老版本对端不上报时写"对端未上报"，不编造。
+        """
+        now = time.monotonic()
+        sessions: list[Any] = []
+        try:
+            for session in list(self.sender.sessions.values()):
+                route_id = str(getattr(session, "route_id", "") or "")
+                if route_id.split("|", 1)[0] == CHANNEL_ROUTE_ID:
+                    sessions.append(session)
+        except Exception:
+            sessions = []
+        packets = sum(int(getattr(s, "packets_sent", 0) or 0) for s in sessions)
+        bytes_sent = sum(int(getattr(s, "bytes_sent", 0) or 0) for s in sessions)
+        per_target: dict[str, dict[str, int]] = {}
+        for session in sessions:
+            key = str(getattr(session, "node_id", "") or "")
+            if not key:
+                continue
+            acc = per_target.setdefault(key, {"packets": 0, "bytes": 0})
+            acc["packets"] += int(getattr(session, "packets_sent", 0) or 0)
+            acc["bytes"] += int(getattr(session, "bytes_sent", 0) or 0)
+        rows: list[dict[str, Any]] = []
+        try:
+            peers = list(self.registry.snapshot() or [])
+        except Exception:
+            peers = []
+        for peer in peers:
+            node_id = str(peer.get("node_id") or "")
+            if not node_id:
+                continue
+            name = str(peer.get("name") or node_id)
+            host = str(peer.get("host") or "")
+            age_s = float(peer.get("age_s") or 0.0)
+            online = bool(peer.get("online", age_s <= 90.0))
+            report: dict[str, Any] | None = None
+            try:
+                keys = [node_id]
+                for extra in ("device_id", "instance_id"):
+                    value = str(peer.get(extra) or "")
+                    if value:
+                        keys.append(value)
+                keys.extend(str(a) for a in (peer.get("alias_ids") or []) if a)
+                for key in keys:
+                    item = self._peer_rx_report.get(key)
+                    if item and (report is None
+                                 or float(item.get("at") or 0) > float(report.get("at") or 0)):
+                        report = item
+            except Exception:
+                report = self._peer_rx_report.get(node_id)
+            fresh = bool(report and now - float(report.get("at") or 0) <= 15.0)
+            ack = None
+            try:
+                ack = self._peer_listen_ack.get(node_id)
+            except Exception:
+                ack = None
+            rejected = bool(ack and str(ack.get("action") or "") == "reject"
+                            and time.time() - float(ack.get("at") or 0) <= 30.0)
+            if fresh and str(report.get("listen_action") or "") == "reject":
+                rejected = True
+            recv = int(report.get("recv") or 0) if fresh else 0
+            streams = int(report.get("streams") or 0) if fresh else 0
+            if rejected:
+                state = "被拒"
+                detail = "对端明确拒绝了这条广播/收听请求"
+            elif fresh and streams > 0 and recv > 0:
+                state = "已收听"
+                detail = "对端上报：已收到 %d 包、%d 条流" % (recv, streams)
+            elif fresh and streams > 0:
+                state = "未收听"
+                detail = "对端上报 streams=%d 但 recv=0：流建立了，包没到（网络/防火墙）" % streams
+            elif fresh:
+                state = "未收听"
+                detail = "对端上报 streams=0：流未建立（手机没在收这条广播）"
+            else:
+                state = "未收听"
+                detail = "对端未上报接收统计（不能确认它在听）"
+            sent = per_target.get(node_id) or {}
+            rows.append({
+                "node_id": node_id, "name": name, "host": host,
+                "online": online, "age_s": round(age_s, 1),
+                "state": state, "detail": detail,
+                "recv": recv, "streams": streams,
+                "reported_age_s": (round(now - float(report.get("at") or 0), 1)
+                                   if fresh else None),
+                "sent_packets": int(sent.get("packets") or 0),
+                "sent_bytes": int(sent.get("bytes") or 0),
+            })
+        order = {"已收听": 0, "被拒": 1, "未收听": 2}
+        # ★ 2.42.1：手动添加的地址和信标发现的同一台设备会各占一行；按
+        #   （名字, 主机）合并，保留状态更好的那条，避免"一台手机两张卡"。
+        merged: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in rows:
+            key = (str(row.get("name") or ""), str(row.get("host") or ""))
+            prev = merged.get(key)
+            if prev is None:
+                merged[key] = row
+                continue
+            prev["sent_packets"] = int(prev.get("sent_packets") or 0) + int(row.get("sent_packets") or 0)
+            prev["sent_bytes"] = int(prev.get("sent_bytes") or 0) + int(row.get("sent_bytes") or 0)
+            if order.get(str(row.get("state")), 3) < order.get(str(prev.get("state")), 3):
+                prev.update({k: row.get(k) for k in
+                             ("node_id", "state", "detail", "recv", "streams",
+                              "reported_age_s", "online", "age_s")})
+        rows = list(merged.values())
+        rows.sort(key=lambda r: (0 if r.get("online") else 1,
+                                 order.get(str(r.get("state")), 3),
+                                 str(r.get("name") or "")))
+        return {
+            "broadcast": bool(self.config.broadcast),
+            "sessions": len(sessions),
+            "packets": packets,
+            "bytes": bytes_sent,
+            "targets": len(per_target),
+            "receiver_list": rows,
+        }
 
     def channel_state(self) -> dict[str, Any]:
         """频道的实时状态，含"每个音源现在到底能不能用、广播会不会真的发出声音"。
@@ -1870,6 +2233,8 @@ class AudioMixingNode:
         `channel_sources_report()` 统一给出，面板和引擎日志用的是同一套口径。
         """
         report = self.channel_sources_report()
+        # ★ 2.42.1：广播接收端清单 + 本机发送证据（同一次采样，避免两个数字对不上）。
+        broadcast = self.broadcast_receiver_state()
         return {
             "broadcast": bool(self.config.broadcast),
             "listen": bool(self.config.listen),
@@ -1886,6 +2251,24 @@ class AudioMixingNode:
             # 广播现在会不会真的发出音频（含"一个字节都不会发"的人话警告）
             "will_send": report["will_send"],
             "receivers": report["receivers"],
+            # ★ 2.42.2：为什么没在广播（空音源 = 0 包，绝不回落桌面）。
+            "broadcast_blocked": (
+                "未选音源：不广播任何东西（发送 0 包）"
+                if self.config.broadcast and not report["configured"]
+                else ("音源当前不可用：不广播（发送 0 包）"
+                      if self.config.broadcast and not report["will_send"] else "")),
+            # 本机广播到底送出去没有：会话 / 包 / 字节 / 目标数。
+            "broadcast_sent": {
+                "sessions": int(broadcast["sessions"]),
+                "packets": int(broadcast["packets"]),
+                "bytes": int(broadcast["bytes"]),
+                "targets": int(broadcast["targets"]),
+            },
+            # 每个已知对端的广播接收状态（已收听 / 未收听 / 被拒 / 离线）。
+            "receiver_list": list(broadcast["receiver_list"]),
+            # ★ 2.42.3（第 1 条）：在线但没有广播端口的老版本对端。
+            #   广播开着时它们收不到（本版不回落 47831），界面必须把名字列出来 —— 不默默静音。
+            "legacy_peers": self._legacy_broadcast_peers() if self.config.broadcast else [],
             "warnings": report["warnings"],
             # 最近一次"自动换了一台设备"的记录。不能静默：用户手动选过设备时更要写清楚。
             "switch": (dict(self._last_capture_switch,
@@ -1932,7 +2315,7 @@ class AudioMixingNode:
         ★ 2026-10-26 用户：其他终端（蓝牙/WiFi）连上后没声音，去 Windows 声音里
           切换几下输出就恢复，至少 7 个版本如此。自动看门狗会处理“打开着但不再
           消费”的端点；这个按钮/接口是兜底：用户不用再进 Windows 设置，点一下
-          就把每一路播放端、本机直通全部按当前默认输出重新打开。
+          就把每一路播放端、本机广播监听全部按当前默认输出重新打开。
         """
         stopped: list[str] = []
         for rid in list(self.sinks.keys()):
@@ -1959,7 +2342,7 @@ class AudioMixingNode:
         active = sum(1 for e in self.sinks.values()
                      if getattr(e, "feeds_into", None) is None)
         self.note("手动恢复声音：重开 %d 路播放端（已停 %d 路）%s"
-                  % (active, len(stopped), "，并重建本机直通" if loop_stopped else ""))
+                  % (active, len(stopped), "，并重建本机广播监听" if loop_stopped else ""))
         return {
             "ok": True,
             "stopped": stopped,
@@ -1987,10 +2370,20 @@ class AudioMixingNode:
                 self.note('stopped sender %s' % rid)
         for rid, target, rule in wanted:
             spec = self._source_spec_for(rule)
+            target_port = self._send_target_port(rule, target)
             source_key = str(spec.get('backend')), str(spec.get('device'))
             resolved_key = self._resolved_source_key(spec)
             session = self.sender.get(rid)
-            same_target = session is not None and session.host == target.host and session.port == target.audio_port
+            # ★ 2.42.3：协商档位变了（切档/对端上下线）也要重建会话，否则 frames_per_packet
+            #   这些参数只在创建时生效，面板显示"已切档"而实际没变。
+            want_q = quality.negotiate(self.local_quality(), getattr(target, 'quality', ''))
+            want_codec = proto.CODEC_BY_NAME.get(rule['codec'], proto.CODEC_PCM_S16)
+            if str(getattr(target, 'platform', '') or '').strip().lower().startswith('android'):
+                want_codec = proto.CODEC_PCM_S16
+            same_target = (session is not None and session.host == target.host
+                           and session.port == target_port
+                           and int(getattr(session, 'codec', -1)) == int(want_codec)
+                           and getattr(session, 'quality_preset', None) == want_q)
             if same_target and getattr(session, 'source_resolved', None) == resolved_key:
                 if session.gain != rule['gain']:
                     session.gain = rule['gain']
@@ -2032,8 +2425,17 @@ class AudioMixingNode:
                         'text': text,
                     }
                     continue
-            codec = proto.CODEC_BY_NAME.get(rule['codec'], proto.CODEC_PCM_S16)
-            session = SenderSession(source, target.host, target.audio_port, codec=codec, gain=rule['gain'], node_id=self.node_id, node_name=self.name, source_name=source.name if hasattr(source, 'name') else spec.get('device', ''), route_id=rid, origin_id=self.origin_id if bool(getattr(target, 'ext', False)) else 0, hop=0)
+            codec = codec_for_target(
+                proto.CODEC_BY_NAME.get(rule['codec'], proto.CODEC_PCM_S16),
+                getattr(target, 'platform', ''),
+                bool(getattr(target, 'opus', False)),
+            )
+            # ★ 2.42.3：每条会话按「本机 vs 这台对端」协商出来的较低档取参数。
+            #   frames_per_packet / Opus 码率与复杂度都真的接进编码链路，不只是面板数字。
+            qname = quality.negotiate(self.local_quality(), getattr(target, 'quality', ''))
+            qprof = quality.profile(qname)
+            session = SenderSession(source, target.host, target_port, codec=codec, gain=rule['gain'], node_id=self.node_id, node_name=self.name, source_name=source.name if hasattr(source, 'name') else spec.get('device', ''), route_id=rid, origin_id=self.origin_id if bool(getattr(target, 'ext', False)) else 0, hop=0, frames_per_packet=int(qprof['frames_per_packet']), opus_bitrate=int(qprof['opus_bitrate']), opus_complexity=int(qprof['opus_complexity']))
+            session.quality_preset = qname
             session.source_key = source_key
             session.source_resolved = resolved_key
             if not session.supported:
@@ -2047,7 +2449,7 @@ class AudioMixingNode:
                 entry = self._senders_blocked.get(rid)
                 if isinstance(entry, dict) and entry.get('source_error'):
                     self._senders_blocked.pop(rid, None)
-                self.note('sending %s -> %s:%d (%s)' % (rid, target.host, target.audio_port, target.name))
+                self.note('sending %s -> %s:%d (%s)' % (rid, target.host, target_port, target.name))
                 # ★ 2026-11-04（第 11 条）：一开始送就**立刻**把 listen_req 推给对端，
                 #   不再等 `_send_peer_stats` 那 2 秒一次的节流 —— 手机开智连后应当
                 #   在第一个音频包前后就开始收，而不是二十秒后。
@@ -2127,7 +2529,7 @@ class AudioMixingNode:
                         # ★ v2.26 第 4 条：这句原来是英文，用户看不懂也不知道该做什么。
                         #   改成中文 + 两个明确处置：换输出设备；或者"当前没开采集"就忽略。
                         self.note("提示：输出设备「%s」同时也是本机默认的采集设备。"
-                                  "如果你正开着「广播我的声音」或本机直通（采集在跑），"
+                                  "如果你正开着「广播我的声音」或本机广播监听（采集在跑），"
                                   "对方会听到自己的回音 —— 请换一个输出设备；"
                                   "当前没有开采集的话，这条提示可以忽略。" % wanted_selector)
                 engine = self._start_sink(rid, rule)
@@ -2424,6 +2826,61 @@ class AudioMixingNode:
             targets.setdefault(key, info)
         for key, info in self._route_peer_targets().items():
             targets.setdefault(key, info)
+        # ★ 2.42.1（B）：频道收听（from:"*"）没有一台具体的对端，上面两张表都会跳过，
+        #   于是广播接收端**永远不回统计** —— 发送方只能看到"对端未上报"，
+        #   哪怕音频已经收到了也说不清是"没建立流"还是"建立了但没出声"。
+        #   这里把"正在广播、我又在听"的发送方补进收件人：协议不变，还是那条 stats，
+        #   只是让接收端也把自己的 recv/streams 报回去。
+        if bool(getattr(self.config, 'listen', False)):
+            try:
+                # 信标里声明 broadcast=1 的设备就是"正在广播"的发送方。
+                # 对端不一定给我们发过 stats，所以不能只靠 _peer_send_mode。
+                candidates = list(self.registry.snapshot() or [])
+            except Exception:
+                candidates = []
+            if candidates:
+                for peer in candidates:
+                    # ★ 2.42.1：收听着就把自己的 recv/streams 报给所有在线节点。
+                    #   信标里没有 broadcast 字段（老设备/手机可能不上报），
+                    #   只按 broadcast 过滤会导致接收端永远沉默；这条统计每 2 秒
+                    #   一条，发给局域网里的几台设备开销可以忽略。
+                    node_id = str(peer.get('node_id') or '')
+                    host = str(peer.get('host') or '')
+                    port = int(peer.get('audio_port') or 0)
+                    if not node_id or node_id == self.node_id or not host or port <= 0:
+                        continue
+                    # ★ 2.42.1：同一台电脑上跑两个节点时，信标会被判成 local=true；
+                    #   只要 node_id 不是本机（上面已挡），它就是另一条实例，照常回统计。
+                    targets.setdefault(node_id, {
+                        'node_id': node_id, 'host': host, 'port': port,
+                        'sending': False, 'sent': 0, 'bytes': 0,
+                        'want_listen': False, 'listening': True,
+                    })
+            try:
+                for key, value in list(self._peer_send_mode.items()):
+                    if not value:
+                        continue
+                    is_broadcast = bool(value[1]) if len(value) > 1 else True
+                    if not is_broadcast:
+                        continue
+                    try:
+                        peer = self.registry.get(key) or self.registry.resolve(key)
+                    except Exception:
+                        peer = None
+                    if peer is None:
+                        continue
+                    node_id = str(getattr(peer, 'node_id', '') or '')
+                    host = str(getattr(peer, 'host', '') or '')
+                    port = int(getattr(peer, 'audio_port', 0) or 0)
+                    if not node_id or node_id == self.node_id or not host or port <= 0:
+                        continue
+                    targets.setdefault(node_id, {
+                        'node_id': node_id, 'host': host, 'port': port,
+                        'sending': False, 'sent': 0, 'bytes': 0,
+                        'want_listen': False, 'listening': True,
+                    })
+            except Exception:
+                pass
         for key in list(getattr(self, '_stats_last_keys', ())):
             if key in targets or key in self._stats_grace:
                 continue
@@ -2456,27 +2913,24 @@ class AudioMixingNode:
                 body['listen_req'] = str(req)
                 body['listen_req_id'] = self._listen_req_seq
             body.update(gains)
-            # ★ 2026-11-08（用户方案）：把"静音档乘数策略"随统计包幂等下发。
-            #   手机端只认更大的请求号，所以同一句话重复发不会把本地选择反复覆盖。
-            policy = str(getattr(self.config, 'phone_silent_vol_policy', 'internal_only')
-                         or 'internal_only').strip().lower()
-            if policy in ('internal_only', 'last_nonzero'):
-                body['silent_vol_policy'] = policy
-                body['silent_vol_policy_req'] = int(getattr(self, '_silent_policy_seq', 0) or 0)
+            # ★ 2.42.3 修复（真机第 3 条）：静音档必须跟随手机音量。
+            #   旧版本这里允许 internal_only（固定 1.0），真机症状就是
+            #   「静音档传音，手机调音量电脑那头不变」。现在只下发 last_nonzero。
+            body['silent_vol_policy'] = 'last_nonzero'
+            body['silent_vol_policy_req'] = int(getattr(self, '_silent_policy_seq', 0) or 0)
             self._send_ctl(body, peer_id, host, int(info.get('port') or 0))
             continue
 
     def set_phone_silent_vol_policy(self, policy: str) -> str:
-        '''切换手机静音档乘数策略（internal_only / last_nonzero），并立即下发一次。
+        '''切换手机静音档乘数策略，并立即下发一次。
 
-★ 2026-11-08（用户方案）：默认 `internal_only`（乘 1.0）—— 静音档里 STREAM_MUSIC
-  恒为 0，用旧值会造成"调了没反应"；`last_nonzero` 只是给"外放档压到 25% 的信息
-  不想在切静音档时丢掉"的用户留的选择。
+★ 2.42.3 修复（真机第 3 条）：只剩一种语义 `last_nonzero` —— 静音档跟随手机音量。
+  旧值 `internal_only`（固定乘 1.0）会把"手机音量"整段丢掉，已废弃；
+  这里仍接受旧 API 入参，但一律归一到 `last_nonzero`。
   设置页/API 都走这里：改本地配置 + 递增请求号 + 立刻单播给所有已发现节点。
         '''
 
-        p = str(policy or '').strip().lower()
-        p = 'last_nonzero' if p == 'last_nonzero' else 'internal_only'
+        p = 'last_nonzero'
         self.config.phone_silent_vol_policy = p
         self._silent_policy_seq = int(getattr(self, '_silent_policy_seq', 0) or 0) + 1
         try:
@@ -2675,6 +3129,34 @@ class AudioMixingNode:
             ack_id = msg.get('listen_ack_id')
             if node_id and ack_id not in (None, '', 0):
                 self._peer_listen_ack[node_id] = {'node_id': node_id, 'req_id': ack_id, 'action': str(msg.get('listen_ack_action') or ''), 'reason': str(msg.get('listen_ack_reason') or ''), 'at': time.time()}
+            # ★ 2.42.1：记下对端**自己上报**的接收统计。
+            #   广播页要回答"谁在听、谁没在听"，唯一可信的证据是对端收到的包数/流数；
+            #   只按"我发了多少"判断会把"发了但对端没收到"说成已收听。
+            if node_id:
+                report = {'node_id': node_id, 'name': name, 'host': host, 'at': now}
+                for key in ('recv', 'lost', 'buf_ms', 'streams', 'sending', 'sent', 'bytes'):
+                    if msg.get(key) is not None:
+                        try:
+                            report[key] = int(msg.get(key) or 0)
+                        except (TypeError, ValueError):
+                            pass
+                action = str(msg.get('listen_ack_action') or '')
+                if action:
+                    report['listen_action'] = action
+                    report['listen_reason'] = str(msg.get('listen_ack_reason') or '')
+                if len(report) > 4:
+                    # ★ 2.42.1：只按**唯一身份**存，不能把同机多节点共用的 IP 当键 ——
+                    #   否则一台节点上报 recv=202，同机所有卡片都会显示"已收听"。
+                    keys = {node_id}
+                    for extra in ('device_id', 'instance_id'):
+                        value = str(msg.get(extra) or '')
+                        if value:
+                            keys.add(value)
+                    for alias in (msg.get('alias_ids') or []):
+                        if alias:
+                            keys.add(str(alias))
+                    for key in keys:
+                        self._peer_rx_report[key] = report
             if bool(msg.get('want_listen')):
                 self._grant_listen_request(node_id, name, host)
             elif node_id:
@@ -2725,7 +3207,8 @@ class AudioMixingNode:
             for key in keys:
                 self._peer_volume[key] = value, now
             phone: dict[str, Any] = {}
-            for key in ('vol_q14', 'gain_q14', 'total_q14', 'raw_peak', 'post_peak'):
+            for key in ('vol_q14', 'gain_q14', 'total_q14', 'raw_peak', 'post_peak',
+                        'sys_q14', 'sys_mute'):
                 if msg.get(key) is not None:
                     try:
                         phone[key] = round(float(msg[key]), 4)
@@ -3116,16 +3599,24 @@ class AudioMixingNode:
         mode, broadcast = item
         return mode >= 1 and not broadcast
 
-    def _stream_is_accepted(self, node_id: str) -> bool:
+    def _channel_stream_is_accepted(self, node_id: str) -> bool:
+        '''★ 2.42.2（第 2 条）广播口准入：只看「听广播」开关。
+
+        与具名路由、点对点声明完全无关 —— 一条的放行/拒收不会影响另一条。
+        '''
+        return bool(self.config.listen)
+
+    def _stream_is_accepted(self, node_id: str, kind: str = 'p2p') -> bool:
         '''接收准入：这条流能不能进本机混音（Q2 的闸门）。
 
-        规则（与文档里的铁律一致：点对点路由 与 广播→只听 互斥）：
-        * 认不出来源的流 → 放行（老行为：手动 IP / 信标丢了，只能走频道那条）；
-        * 有这台设备的**具名已接受路由** → 放行；
-        * 没有具名路由、但它声明了在对我点对点送 → 拒绝（不进流表、不计接收统计）；
-        * 其余（没声明点对点，也就是频道广播）→ 放行，由通配"只听"接住。
+        ★ 2.42.2：按**端口**分成两套独立准入。
+        * `kind='channel'`（广播口）→ `_channel_stream_is_accepted`，只看 `config.listen`；
+        * 默认 `kind='p2p'`（点对点口）→ 旧判据（具名路由放行、显式点对点拒收、
+          广播/老版本放行），与广播开关无关。
         '''
 
+        if str(kind) == 'channel':
+            return self._channel_stream_is_accepted(node_id)
         nid = str(node_id or '')
         if not nid:
             return True
@@ -3934,19 +4425,15 @@ class AudioMixingNode:
 
         ★ 2026-10-18 用户（图2）：「「正在发送的手机自动播放」就是蓝牙的「智连」」——
           原来那个面板上的全局勾（`config.auto_play`）就是这个判断，现在整块删掉：
-          局域网设备看 `smart_link`（卡片上的「智连」），蓝牙设备看 `autoconnect`
-          （同一张蓝牙卡片上的「智连」）。默认两张名单都是空的 = 一台都不自动。
+          局域网设备看 `smart_link`（卡片上的「智连」）。
+        ★ v2.42：蓝牙侧的「智连」（`config.autoconnect`）已整条下线（和「打开」重复），
+          所以这里只看局域网那张名单；蓝牙声音由 Windows 直接播放，不再走自动收编。
         """
         want = str(name or "").strip().lower()
         if not want:
             return False
         try:
-            if self.smart_link_allows("", want):
-                return True
-        except Exception:
-            pass
-        try:
-            return want in {str(x).strip().lower() for x in (self.config.autoconnect or []) if str(x).strip()}
+            return bool(self.smart_link_allows("", want))
         except Exception:
             return False
 
@@ -4335,6 +4822,15 @@ class AudioMixingNode:
                            "网络上的另一台手机/电脑必须自己打开「广播我的声音」或「送声音」。"),
             })
 
+        if self.config.broadcast and not configured:
+            # ★ 2.42.2（第 1 条）：空音源必须说成"不广播"，而不是静默地回落到桌面声音。
+            warnings.append({
+                "scope": "channel",
+                "level": "bad",
+                "text": "还没选音源：广播不会建立任何流，发送 0 包。",
+                "advice": ("请在下面的「音源」里选一块本机采集设备（一般是「扬声器 (...) [loopback]」，"
+                           "也就是这台电脑正在播放的声音）。网络上的另一台手机/电脑不是本机的音源。"),
+            })
         if self.config.broadcast and not live and definite:
             warnings.append({
                 "scope": "channel",
@@ -4772,33 +5268,202 @@ class AudioMixingNode:
         return False
 
     def set_multi_out(self, devices: list[dict[str, Any]]) -> None:
-        """设置"本机多设备输出"的设备清单，并立刻生效。"""
-        clean: list[dict[str, Any]] = []
-        for item in devices or []:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("device") or "").strip()
-            if not name:
-                continue
-            clean.append({"device": name,
-                          "gain": float(item.get("gain", 1.0) or 1.0),
-                          "delay_ms": float(item.get("delay_ms", 0.0) or 0.0)})
+        """设置"本机多设备输出"的设备清单，并立刻生效。
+
+        ★ Q2 改（2026-11-16 用户）：默认设备永远按「直出」算，不存进复制清单，
+          避免它同时出现在清单里、又被系统直接播放 —— 那就是双声。
+          锁默认设备是可选动作：`multi_lock_device` 为空就完全不碰系统设置。
+        """
+        try:
+            default_name = self._default_render_name() or ""
+        except Exception:
+            default_name = ""
+        clean, _passthrough = split_multi_devices(devices, default_name)
         self.config.multi_out_devices = clean
         self._apply_multi_out()
+        lock_name = str(getattr(self.config, "multi_lock_device", "") or "").strip()
+        try:
+            if clean and lock_name:
+                result = self.lock_multi_default()
+                if not result.get("ok") and result.get("error"):
+                    self.note(result["error"])
+            elif getattr(self.config, "multi_lock_active", False):
+                # 清单清空、或用户把「锁定目标」改回「不锁」——把系统默认还回去。
+                result = self.restore_multi_default()
+                if not result.get("ok") and result.get("error"):
+                    self.note(result["error"])
+        except Exception as exc:
+            self.note("处理系统默认播放设备时出错：%s" % exc)
         try:
             self.save_config()
         except Exception:
             pass
 
-    def _apply_multi_out(self) -> None:
-        """按配置起停"多设备输出"。配置没变时 MultiOut 内部直接返回，不会反复开关设备。"""
+    # ---- ★ Q2：多耳机 = 锁系统默认播放设备 ----
+    def multi_lock_status(self, devices: list | None = None) -> dict[str, Any]:
+        """当前锁定状态（读真实系统默认设备，不显示"勾选意愿"）。
+
+        ``devices`` 是调用方已经枚举好的一份设备快照，用于面板每秒轮询时
+        避免重复枚举（每次枚举都会打开所有端点读格式，包括蓝牙）。
+        """
+        from .audio import defaultdev
+
+        original = dict(getattr(self.config, "multi_lock_original", None) or {})
+        active = bool(getattr(self.config, "multi_lock_active", False))
+        name = str(getattr(self.config, "multi_lock_device", "") or "")
+        current = defaultdev.current_default_render(devices) or {}
+        target, candidates = (defaultdev.find_render_endpoint(name, devices)
+                              if name else (None, []))
+        pinned = bool(target and current.get("id") and current.get("id") == target.get("id"))
+        # 异常退出后：状态还是 active、系统默认仍钉在目标上、但原设备还没还原。
+        needs_restore = bool(active and pinned and original.get("id")
+                             and original.get("id") != current.get("id"))
+        return {
+            "platform_ok": sys.platform == "win32",
+            "device": name,
+            "optional": True,
+            "target": target or {},
+            "original": original,
+            "current": current,
+            "active": active,
+            "locked_now": bool(active and pinned),
+            "needs_restore": needs_restore,
+            "candidates": candidates,
+        }
+
+    def lock_multi_default(self, device: str | None = None) -> dict[str, Any]:
+        """把系统默认播放锁到 device（默认取配置里的 multi_lock_device）。"""
+        from .audio import defaultdev
+
+        if sys.platform != "win32":
+            return {"ok": False, "error": "只有 Windows 需要锁系统默认播放设备"}
+        name = str(device or getattr(self.config, "multi_lock_device", "") or "").strip()
+        if not name:
+            # ★ Q2 改：默认不锁。没选目标时不该报错，也不该去猜「AUDIO音频」。
+            return {"ok": True, "note": "没有选择锁定目标（默认不锁）", "optional": True}
+        target, candidates = defaultdev.find_render_endpoint(name)
+        if not target:
+            msg = ("系统里没有找到名为「%s」的播放设备，未锁定。当前可用：%s"
+                   % (name, "、".join(candidates) or "（一个都没枚举到）"))
+            self._lock_audit("锁定失败：%s" % msg)
+            return {"ok": False, "error": msg, "candidates": candidates}
+        current = defaultdev.current_default_render() or {}
+        original = dict(getattr(self.config, "multi_lock_original", None) or {})
+        if not original.get("id") or original.get("id") == target.get("id"):
+            original = {"id": str(current.get("id") or ""), "name": str(current.get("name") or "")}
+        if current.get("id") == target.get("id"):
+            self.config.multi_lock_device = name
+            self.config.multi_lock_original = original
+            self.config.multi_lock_active = True
+            self._lock_audit("默认播放已经在「%s」，记为锁定（原设备=%s）"
+                             % (target["name"], original.get("name") or "未知"))
+            return {"ok": True, "note": "默认播放已经在「%s」" % target["name"],
+                    "target": target, "original": original}
+        err = defaultdev.set_default_render(str(target["id"]))
+        if err:
+            msg = "锁定「%s」失败：%s" % (target["name"], err)
+            self._lock_audit(msg)
+            return {"ok": False, "error": msg, "target": target}
+        self.config.multi_lock_device = name
+        self.config.multi_lock_original = original
+        self.config.multi_lock_active = True
+        self._lock_audit("默认播放已锁到「%s」（id=%s），原设备=「%s」（id=%s）"
+                         % (target["name"], target["id"],
+                            original.get("name") or "未知", original.get("id") or "未知"))
+        self.note("系统默认播放已锁到「%s」" % target["name"])
+        return {"ok": True, "note": "已锁到「%s」" % target["name"],
+                "target": target, "original": original}
+
+    def restore_multi_default(self) -> dict[str, Any]:
+        """把系统默认播放还原成锁之前的设备。"""
+        from .audio import defaultdev
+
+        original = dict(getattr(self.config, "multi_lock_original", None) or {})
+        if not str(original.get("id") or "").strip():
+            self.config.multi_lock_active = False
+            self.config.multi_lock_original = {}
+            return {"ok": True, "note": "没有记录到原来的默认设备，无需还原"}
+        err = defaultdev.set_default_render(str(original["id"]))
+        if err:
+            msg = ("还原默认播放到「%s」失败：%s"
+                   % (original.get("name") or original.get("id"), err))
+            self._lock_audit(msg)
+            return {"ok": False, "error": msg, "original": original}
+        name = original.get("name") or original.get("id")
+        self.config.multi_lock_active = False
+        self.config.multi_lock_original = {}
+        self._lock_audit("默认播放已还原为「%s」（id=%s）" % (name, original.get("id")))
+        self.note("系统默认播放已还原为「%s」" % name)
+        return {"ok": True, "note": "已还原为「%s」" % name, "original": original}
+
+    def _lock_audit(self, text: str) -> None:
+        """写进 launcher.log 留底（锁定/还原/失败都要有据可查）。"""
         try:
-            wanted = list(getattr(self.config, "multi_out_devices", None) or [])
+            from .webui import _autostart_log
+
+            _autostart_log(text)
+        except Exception:
+            pass
+
+    def _apply_multi_out(self) -> None:
+        """按配置起停"多设备输出"。配置没变时 MultiOut 内部直接返回，不会反复开关设备。
+
+        ★ Q2 改（2026-11-16 用户）：系统默认播放设备永远算在「在听」里，但它是
+          **直出**（系统自己放），我们不为它开一路、不做回环复制；其余设备才走
+          回环采集 + 单独渲染。这样默认设备永远不会出现"播两遍"的金属音。
+        """
+        try:
+            configured = list(getattr(self.config, "multi_out_devices", None) or [])
+            if not configured:
+                self.multi_passthrough = None
+                if self.multi_out.running():
+                    self.multi_out.stop()
+                if getattr(self.config, "multi_lock_active", False):
+                    self.restore_multi_default()
+                return
+            spec = self.default_source_spec()
+            # 锁默认设备是**可选**的：配置为空就不锁（默认不锁）。
+            if str(getattr(self.config, "multi_lock_device", "") or "").strip() \
+                    and not getattr(self.config, "multi_lock_active", False):
+                self.lock_multi_default()
+            try:
+                default_name = self._default_render_name() or ""
+            except Exception:
+                default_name = ""
+            wanted, passthrough = split_multi_devices(configured, default_name)
+            # ★ Q2 边界：系统默认设备被用户从 A 换成 B。
+            #   A 不能继续挂着"直出"标记（它已经不直出了），自动转成普通复制设备，
+            #   页面上就变成一行可勾选的普通设备；用户不想要再取消。清单里不会重复。
+            prev = self.multi_passthrough
+            old = str((prev or {}).get("name") or "")
+            # 只有"明确读到了新的默认设备、且和上次不同"才算切换。
+            # 读不到默认设备（枚举失败返回空）时保持原状，否则会误判成 A 换走、
+            # 把 A 加进复制清单 —— 那正好又变成双声。
+            if old and passthrough and passthrough.get("name") != old:
+                still_there = False
+                try:
+                    still_there = old in self.multi_out.available_devices()
+                except Exception:
+                    still_there = False
+                if still_there and all(str(d.get("device") or "") != old for d in wanted):
+                    wanted.append({"device": old, "gain": 1.0, "delay_ms": 0.0})
+                    self.config.multi_out_devices = [dict(d) for d in wanted]
+                    try:
+                        self.save_config()
+                    except Exception:
+                        pass
+                    self.note("系统默认播放已从「%s」换走，「%s」自动转为普通输出"
+                              "（多耳机页可取消勾选）" % (old, old))
+            if passthrough:
+                self.multi_passthrough = passthrough
+            if passthrough and not self._multi_passthrough_noted:
+                self._multi_passthrough_noted = True
+                self.note("「%s」是系统默认输出，按直出算（系统自己放，不再复制一路）"
+                          % passthrough["name"])
             if not wanted:
                 if self.multi_out.running():
                     self.multi_out.stop()
                 return
-            spec = self.default_source_spec()
             self.multi_out.configure(spec, wanted)
         except Exception as exc:
             self.note("多设备输出出错: %s" % exc)
@@ -4810,15 +5475,19 @@ class AudioMixingNode:
             # 不再只说"打不开"：说清是网络上的另一台设备、是没在送的手机，还是真被拔了。
             # 用户看到的就是这句话，含糊等于没说。
             self._note_once("音源里这些现在用不了，已跳过：%s" % self._explain_selectors(missing))
-        spec = dict(self.default_source_spec())
+        channel_spec: dict[str, Any] = dict(self.default_source_spec())
         if len(channels) > 1:
-            spec["sources"] = channels
-            spec["device"] = channels[0]
+            channel_spec["sources"] = channels
+            channel_spec["device"] = channels[0]
         elif len(channels) == 1:
-            spec = self._single_source_spec(channels[0])
+            channel_spec = self._single_source_spec(channels[0])
+        else:
+            # ★ 2.42.2（第 1 条）：一个可用音源都没有 → 本机监听也不许回落桌面混音。
+            #   用静音采集源，让"没选音源/选了但用不了"和"真的在采一块设备"区分开。
+            channel_spec = {"backend": "null", "device": "silence", "loopback": False}
         sink_spec = self.default_sink_spec()
         key = (tuple(channels), str(sink_spec.get("device")), str(sink_spec.get("backend")))
-        return spec, sink_spec, key
+        return channel_spec, sink_spec, key
 
     @staticmethod
     def _looks_like_same_device(a: str, b: str) -> bool:
@@ -5140,6 +5809,19 @@ class AudioMixingNode:
                 self._loop = None
                 self._loop_key = None
             return
+        # ★ 2.42.2（第 1 条）：没选音源就不建本机监听，更不许回落桌面混音。
+        try:
+            channels_now, _missing_now = self._live_channel_sources()
+        except Exception:
+            channels_now = []
+        if not channels_now:
+            self._local_note = "未选音源：不建本机监听（不回落桌面混音）"
+            self._note_once(self._local_note)
+            if self._loop is not None:
+                self._loop.stop()
+                self._loop = None
+                self._loop_key = None
+            return
         spec, sink_spec, key = self._local_loop_spec()
         self._local_debug = {"spec": dict(spec), "sink": dict(sink_spec),
                              "captures": self._capture_names_for(spec)}
@@ -5209,13 +5891,13 @@ class AudioMixingNode:
             sink = audio_base.open_sink(sink_spec)
         except Exception as exc:
             self._local_note = "打不开设备: %s" % exc
-            self._note_once("本机直通打不开设备: %s" % exc)
+            self._note_once("本机广播监听打不开设备: %s" % exc)
             return
         loop = LocalLoop(source, sink, gain=float(self.config.channel_gain), tap=self.tap)
         loop.start()
         self._loop = loop
         self._loop_key = key
-        self.note("本机直通: %s -> %s" % (loop.describe()["source"], sink_spec.get("device")))
+        self.note("本机广播监听: %s -> %s" % (loop.describe()["source"], sink_spec.get("device")))
 
     def local_state(self) -> dict[str, Any]:
         state = self._loop.describe() if self._loop is not None else {}
@@ -5254,7 +5936,7 @@ class AudioMixingNode:
         三个来源取最大，因为它们各自只看得到声音的一部分：
           * ``meter`` —— 当前输出设备的峰值表：**Windows 直接播放**的那种声音（手机走蓝牙
             进来就是这一类）只有这里看得到，本工具那条路根本没有数据；
-          * ``local`` —— 本机直通那一路实际写进设备的数据；
+          * ``local`` —— 本机广播监听那一路实际写进设备的数据；
           * ``sink``  —— 我们自己开的播放端实际渲染的数据。
         三者都沉默时才是真的 0（本机确实没在出声），不会再像以前那样"明明在响却恒为 0"。
         """
@@ -5360,17 +6042,17 @@ class AudioMixingNode:
         return signals
 
     def _source_spec_for(self, rule: dict[str, Any]) -> dict[str, Any]:
-        if rule.get("kind") == "broadcast" and self.config.channel_sources:
-            # The channel may mix several inputs - several phones, each on its own
-            # Bluetooth adapter, or a phone plus this machine's own sound.
-            excluded = {str(s).strip() for s in getattr(self.config, "broadcast_excluded", [])}
-            sources = [str(s).strip() for s in self.config.channel_sources
-                       if str(s).strip() and str(s).strip() not in excluded]
-            if sources:
-                spec = dict(self.default_source_spec())
-                spec["sources"] = sources
-                spec["device"] = sources[0]
-                return spec
+        if rule.get("kind") == "broadcast":
+            # ★ 2.42.2（第 1 条）：广播只允许用「频道音源」。
+            #   空清单 = 用户没选音源，返回静音源；**绝不**回落到
+            #   `default_source_spec()`（那就是本机桌面混音，正是本 bug）。
+            sources = self._broadcast_sources()
+            if not sources:
+                return {"backend": "null", "device": "silence", "loopback": False}
+            spec = dict(self.default_source_spec())
+            spec["sources"] = sources
+            spec["device"] = sources[0]
+            return spec
         spec = dict(self.default_source_spec())
         selector = (rule.get("source_device") or "").strip()
         if selector:
@@ -5623,25 +6305,24 @@ class AudioMixingNode:
             elif sleep_for < -0.05:
                 next_deadline = time.monotonic()
 
-    def routes_for_sender(self, node_id: str) -> set[str]:
+    def routes_for_sender(self, node_id: str, channel: bool = False) -> set[str]:
         '''The local route ids that want audio from `node_id`.
 
         This is the only correct answer to "which of my sinks does this incoming
         stream belong to"; the receiver cannot know it on its own, because the
         audio packet carries no route id.
 
-        ★ 2026-10-16（用户第 6 条「电脑开只听没有声音」，以及他后来钉死的广播语义）：
-        频道收听那条规则的 from 是**通配** `["*"]` —— 它要的是"谁在发就听谁"。
-        所以这里不能只按"认得出身份的发送方"去匹配：解析不出身份的流（手动填的 IP、
-        信标丢了、路由器做了 AP 隔离）也必须落进那条通配规则里，否则包到了也只能在日志里
-        写一句 "has no local sink yet"，用户听到的是静音。
-
-        ★ 但**具名路由优先**：我既开着「听广播」又点名收这一台时，两条规则都能命中同一个
-        发送方 —— 同一声声音会被两个播放端各放一遍（音量直接翻倍）。所以先给具名命中的那条，
-        一条都没有（不认识这个发送方）才落通配的那条。手机端也写着同一句话
-        （「同一台设备的声音如果从两条路都进来，只会播一路、不叠加」）。
+        ★ 2.42.2（第 2 条）：`channel=True` 表示这条流来自广播端口，只允许挂
+        `CHANNEL_ROUTE_ID`（且必须开着「听广播」）；点对点口不再落通配频道。
         '''
 
+        if channel:
+            if not self.config.listen:
+                return set()
+            for route_id, entry in self.desired_sinks().items():
+                if route_id == CHANNEL_ROUTE_ID and '*' in (entry['rule'].get('from') or []):
+                    return {CHANNEL_ROUTE_ID}
+            return set()
         if not node_id:
             node_id = ''
         specific = set()
@@ -5680,9 +6361,10 @@ class AudioMixingNode:
     def _attach_stream_routes(self, info, addr) -> set[str]:
         """Work out a stream's routes, with a last-resort single-sink fallback."""
 
-        routes = self.routes_for_sender(info.node_id)
+        channel = bool(getattr(info, "channel", False))
+        routes = self.routes_for_sender(info.node_id, channel=channel)
         host = addr[0] if addr else ''
-        if not routes:
+        if not routes and not channel:
             if len(self.sinks) == 1 and not self._sender_is_known(info.node_id) and self._is_manual_peer(host):
                 routes = set(self.sinks)
         return routes
@@ -5726,10 +6408,11 @@ class AudioMixingNode:
             with self.receiver._lock:
                 streams = list(self.receiver.streams.items())
             for ssrc, info in streams:
-                routes = self.routes_for_sender(info.node_id)
-                if not routes and len(self.sinks) == 1 and not self._sender_is_known(info.node_id) and self._is_manual_peer(getattr(info, 'host', '')):
+                channel = bool(getattr(info, 'channel', False))
+                routes = self.routes_for_sender(info.node_id, channel=channel)
+                if not routes and not channel and len(self.sinks) == 1 and not self._sender_is_known(info.node_id) and self._is_manual_peer(getattr(info, 'host', '')):
                     routes = set(self.sinks)
-                if not routes and info.node_id:
+                if not routes and info.node_id and not channel:
                     if self.smart_link_allows(info.node_id, getattr(info, 'node_name', '') or ''):
                         try:
                             self._grant_listen_request(info.node_id, getattr(info, 'node_name', '') or '', '')
@@ -5760,6 +6443,10 @@ class AudioMixingNode:
         if routes:
             self.receiver.assign_routes(info.ssrc, routes)
             self.note('stream %08x from %s -> route(s) %s' % (info.ssrc, addr[0] if addr else '?', ','.join(sorted(routes))))
+            return
+        if getattr(info, "channel", False):
+            # ★ 2.42.2：广播口来的流没有频道收听就只记账，不触发点对点自动收听。
+            self.note('channel stream %08x from %s ignored (not listening)' % (info.ssrc, addr[0] if addr else '?'))
             return
         self._queue_auto_listen(str(getattr(info, 'node_id', '') or ''), str(getattr(info, 'node_name', '') or ''), addr[0] if addr else '')
         self.note('stream %08x from %s has no local sink yet' % (info.ssrc, addr[0] if addr else '?'))
@@ -5955,7 +6642,7 @@ class AudioMixingNode:
 
     def status(self) -> dict[str, Any]:
         recv = self.receiver.stats()
-        return {'debug': getattr(self, '_local_debug', {}), 'quality': self.quality_state(), 'inputs': self._inputs_with_history(), 'node': {'id': self.node_id, 'short_id': short_id(self.node_id), 'name': self.name, 'audio_port': self.config.audio_port, 'web_port': self.config.web_port, 'discovery_port': self.config.discovery_port, 'uptime_s': round(time.time() - self.started_at, 1), 'simulate': self.simulate}, 'backends': audio_base.available_backends(), 'opus': _opus_state(), 'devices': {'sources': self.source_list(), 'sinks': self.sink_list()}, 'peers': self._peers_with_media_volume(), 'routes': self.routes_json(), 'channel': self.channel_state(), 'local': self.local_state(), 'output': self.output_level(), 'signals': self.signals_state(), 'senders': self.sender.stats(), 'senders_blocked': self.blocked_senders(), 'auto_listen': self.auto_listen_state(), 'identity': {'device_id': self.device_id, 'instance_id': self.instance_id, 'node_id': self.node_id, 'alias_ids': list(getattr(self.config, 'alias_ids', []) or []), 'merges': list(getattr(self.config, 'identity_merges', []) or []), 'relation_merges': list(getattr(self.config, 'relation_merges', []) or []), 'conflicts': [dict(p.to_json()) for p in self.registry.all() if getattr(p, 'identity_conflict', False)], 'hints': [{'node_id': p.node_id, 'name': p.name, 'reason': p.merge_hint, 'with': p.merge_hint_with, 'device_id': p.device_id} for p in self.registry.all() if getattr(p, 'merge_hint', '')], 'route_rewrites': list(getattr(self, '_identity_rewrites', []) or [])[-32:]}, 'peer_volume_debug': {'ttl_s': PEER_VOLUME_TTL_S, 'keys': sorted(self._peer_volume.keys()), 'last': dict(getattr(self, '_peer_vol_last', {}) or {}), 'series': self._peer_vol_series()}, 'loop_guard': {'origin_id': self.origin_id, 'echo_dropped': int(recv.get('echo_dropped') or 0), 'hop_dropped': int(recv.get('hop_dropped') or 0), 'max_hop': int(recv.get('max_hop') or 0)}, 'listen_ack': dict(self._peer_listen_ack), 'peer_silence_grace_s': PEER_SILENCE_GRACE_S, 'sinks': [engine.describe() for engine in self.sinks.values()], 'multi_out': self.multi_out.stats(), 'sources': self.hub.stats(), 'receiver': recv, 'totals': {'sent_kbps': self.sender.total_kbps(), 'active_senders': len(self.sender.sessions), 'active_sinks': len(self.sinks), 'active_streams': recv.get('active_streams', 0)}, 'discovery': self.beacon.stats() if self.beacon is not None else {}, 'tap': self.tap.stats(), 'log': self.log[-40:], 'last_error': self.last_error, 'captures': self.hub.stats()}
+        return {'debug': getattr(self, '_local_debug', {}), 'quality': self.quality_state(), 'quality_preset': self.audio_quality_state(), 'inputs': self._inputs_with_history(), 'node': {'id': self.node_id, 'short_id': short_id(self.node_id), 'name': self.name, 'audio_port': self.config.audio_port, 'broadcast_port': self.config.broadcast_port, 'web_port': self.config.web_port, 'discovery_port': self.config.discovery_port, 'uptime_s': round(time.time() - self.started_at, 1), 'simulate': self.simulate}, 'backends': audio_base.available_backends(), 'opus': _opus_state(), 'devices': {'sources': self.source_list(), 'sinks': self.sink_list()}, 'peers': self._peers_with_media_volume(), 'routes': self.routes_json(), 'channel': self.channel_state(), 'local': self.local_state(), 'output': self.output_level(), 'signals': self.signals_state(), 'senders': self.sender.stats(), 'senders_blocked': self.blocked_senders(), 'auto_listen': self.auto_listen_state(), 'identity': {'device_id': self.device_id, 'instance_id': self.instance_id, 'node_id': self.node_id, 'alias_ids': list(getattr(self.config, 'alias_ids', []) or []), 'merges': list(getattr(self.config, 'identity_merges', []) or []), 'relation_merges': list(getattr(self.config, 'relation_merges', []) or []), 'conflicts': [dict(p.to_json()) for p in self.registry.all() if getattr(p, 'identity_conflict', False)], 'hints': [{'node_id': p.node_id, 'name': p.name, 'reason': p.merge_hint, 'with': p.merge_hint_with, 'device_id': p.device_id} for p in self.registry.all() if getattr(p, 'merge_hint', '')], 'route_rewrites': list(getattr(self, '_identity_rewrites', []) or [])[-32:]}, 'peer_volume_debug': {'ttl_s': PEER_VOLUME_TTL_S, 'keys': sorted(self._peer_volume.keys()), 'last': dict(getattr(self, '_peer_vol_last', {}) or {}), 'series': self._peer_vol_series()}, 'loop_guard': {'origin_id': self.origin_id, 'echo_dropped': int(recv.get('echo_dropped') or 0), 'hop_dropped': int(recv.get('hop_dropped') or 0), 'max_hop': int(recv.get('max_hop') or 0)}, 'listen_ack': dict(self._peer_listen_ack), 'peer_silence_grace_s': PEER_SILENCE_GRACE_S, 'sinks': [engine.describe() for engine in self.sinks.values()], 'multi_out': self.multi_out.stats(), 'sources': self.hub.stats(), 'receiver': recv, 'totals': {'sent_kbps': self.sender.total_kbps(), 'active_senders': len(self.sender.sessions), 'active_sinks': len(self.sinks), 'active_streams': recv.get('active_streams', 0)}, 'discovery': self.beacon.stats() if self.beacon is not None else {}, 'tap': self.tap.stats(), 'log': self.log[-40:], 'last_error': self.last_error, 'captures': self.hub.stats()}
 
 
 def _opus_state() -> dict[str, Any]:

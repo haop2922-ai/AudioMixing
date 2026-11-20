@@ -94,6 +94,16 @@ _AUTOSTART_VALUE = "AudioMixing"
 # ★ 2026-11-06（第 5 条）：老版本/w 其它名字写过的值也一起清 —— 取消勾选要"清干净"，
 #   不能让一个旧的、指向临时目录的值继续把程序拉起来。
 _AUTOSTART_LEGACY_VALUES = ("AudioMixing", "audiomixing", "AudioMixingNode", "AudioMixingLauncher")
+# ★ v2.36（用户方案）：第二种方式 —— 在 shell:startup 放一个 .lnk。
+#   两种方式**互斥**：同一时刻只允许一种生效，换方式时先把旧方式清干净，
+#   否则开机会被同样的 exe 拉起两次（第二次撞单实例锁，看起来像"没起来"）。
+_AUTOSTART_REGISTRY = "registry"
+_AUTOSTART_STARTUP = "startup"
+_AUTOSTART_METHODS = (_AUTOSTART_REGISTRY, _AUTOSTART_STARTUP)
+_AUTOSTART_METHOD_LABELS = {_AUTOSTART_REGISTRY: "注册表 Run 键",
+                            _AUTOSTART_STARTUP: "启动文件夹快捷方式"}
+_STARTUP_LNK_NAME = "AudioMixing.lnk"
+_STARTUP_LEGACY_LNK = ("AudioMixing.lnk", "Audio Mixing.lnk", "AudioMixingNode.lnk")
 
 
 def _in_onefile_temp(path: str) -> bool:
@@ -212,80 +222,582 @@ def _run_key():
                           winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE)
 
 
-def autostart_state() -> dict[str, Any]:
-    """注册表里现在到底是什么（面板/诊断据此显示"勾了但没写进去"）。"""
-    state: dict[str, Any] = {"supported": sys.platform == "win32", "enabled": False,
-                             "command": "", "expected": "", "ok": False, "problem": ""}
+def _startup_dir() -> Path:
+    """shell:startup 对应的真实目录。
+
+    测试用 AUDIOMIXING_STARTUP_DIR 指到临时目录，绝不碰用户真实的启动项。
+    """
+    override = os.environ.get("AUDIOMIXING_STARTUP_DIR")
+    if override:
+        return Path(override)
+    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+
+
+def _startup_lnk_path() -> Path:
+    return _startup_dir() / _STARTUP_LNK_NAME
+
+
+def _startup_spec() -> dict[str, str]:
+    """快捷方式该写什么：target 必须是用户双击的那颗 exe，绝不允许 onefile 临时目录。"""
+    exe = _program_exe_path()
+    if not exe or _in_onefile_temp(exe):
+        return {}
+    return {"target": exe, "arguments": "serve",
+            "workdir": str(Path(exe).parent), "icon": exe}
+
+
+def _powershell(script: str, timeout: float = 25.0) -> tuple[int, str]:
+    """跑一段 PowerShell（隐藏窗口），返回 (退出码, 输出)。"""
+    import subprocess
+
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    creation = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
+    try:
+        proc = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+            capture_output=True, timeout=timeout, creationflags=creation)
+    except Exception as exc:
+        return 1, "调用 PowerShell 失败：%s" % exc
+    out = (proc.stdout or b"").decode("utf-8", "replace").strip()
+    err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+    return proc.returncode, out or err
+
+
+def _same_path(a: str, b: str) -> bool:
+    try:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    except (OSError, ValueError):
+        return False
+
+
+def startup_state() -> dict[str, Any]:
+    """启动文件夹里到底有没有快捷方式、它指向哪 —— 读真实文件，不读"用户的意愿"。"""
+    path = _startup_lnk_path()
+    state: dict[str, Any] = {"method": _AUTOSTART_STARTUP,
+                             "label": _AUTOSTART_METHOD_LABELS[_AUTOSTART_STARTUP],
+                             "path": str(path), "exists": path.is_file(),
+                             "target": "", "arguments": "", "ok": False, "problem": ""}
+    if not state["exists"]:
+        return state
+    if sys.platform != "win32":
+        state["problem"] = "启动文件夹方式只支持 Windows"
+        return state
+    quoted = str(path).replace("'", "''")
+    script = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8\n"
+              "$w = New-Object -ComObject WScript.Shell\n"
+              "$s = $w.CreateShortcut('%s')\n"
+              "@{target=$s.TargetPath; arguments=$s.Arguments; workdir=$s.WorkingDirectory}"
+              " | ConvertTo-Json -Compress\n" % quoted)
+    rc, out = _powershell(script)
+    if rc != 0 or not out:
+        state["problem"] = "读取启动文件夹快捷方式失败：%s" % (out or "PowerShell 没有输出")
+        return state
+    try:
+        data = json.loads(out.splitlines()[-1])
+    except ValueError:
+        state["problem"] = "读取启动文件夹快捷方式失败：输出看不懂（%s）" % out[:120]
+        return state
+    state["target"] = str(data.get("target") or "")
+    state["arguments"] = str(data.get("arguments") or "")
+    exe = _program_exe_path()
+    if not state["target"]:
+        state["problem"] = "快捷方式没有目标（可能已损坏），重新保存一次即可"
+    elif exe and not _same_path(state["target"], exe):
+        state["problem"] = ("快捷方式指向 %s，不是当前程序 %s（重新保存一次即可修正）"
+                            % (state["target"], exe))
+    elif "serve" not in state["arguments"].lower():
+        state["problem"] = "快捷方式没有带 serve 参数，开机会弹面板而不是后台就绪"
+    else:
+        state["ok"] = True
+    return state
+
+
+def _write_startup_lnk(spec: dict[str, str]) -> tuple[bool, str]:
+    path = _startup_lnk_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, "建不了启动文件夹 %s：%s" % (path.parent, exc)
+    payload = dict(spec)
+    payload["lnk"] = str(path)
+    tmp = Path(os.environ.get("TEMP") or str(Path.home())) / ("audiomixing-lnk-%d.json" % os.getpid())
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except OSError as exc:
+        return False, "写临时文件失败：%s" % exc
+    script = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8\n"
+              "$ErrorActionPreference='Stop'\n"
+              "try {\n"
+              "  $spec = Get-Content -LiteralPath '%s' -Raw -Encoding UTF8 | ConvertFrom-Json\n"
+              "  $w = New-Object -ComObject WScript.Shell\n"
+              "  $s = $w.CreateShortcut($spec.lnk)\n"
+              "  $s.TargetPath = $spec.target\n"
+              "  $s.Arguments = $spec.arguments\n"
+              "  $s.WorkingDirectory = $spec.workdir\n"
+              "  $s.IconLocation = $spec.icon + ',0'\n"
+              "  $s.Save()\n"
+              "  'OK'\n"
+              "} catch { 'ERR ' + $_.Exception.Message; exit 1 }\n"
+              % str(tmp).replace("'", "''"))
+    rc, out = _powershell(script)
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    if rc != 0 or not out.startswith("OK"):
+        return False, ("创建启动文件夹快捷方式失败：%s"
+                       % (out.replace("ERR ", "") or "PowerShell 没有成功返回"))
+    return True, ""
+
+
+def _delete_startup_lnk() -> tuple[bool, str]:
+    errors = []
+    for name in _STARTUP_LEGACY_LNK:
+        p = _startup_dir() / name
+        if not p.is_file():
+            continue
+        try:
+            p.unlink()
+        except OSError as exc:
+            errors.append("%s（%s）" % (p.name, exc))
+    if errors:
+        return False, "删不掉启动文件夹里的快捷方式：%s" % "；".join(errors)
+    return True, ""
+
+
+def _registry_state() -> dict[str, Any]:
+    state: dict[str, Any] = {"method": _AUTOSTART_REGISTRY,
+                             "label": _AUTOSTART_METHOD_LABELS[_AUTOSTART_REGISTRY],
+                             "exists": False, "command": "", "expected": "",
+                             "ok": False, "problem": ""}
     if sys.platform != "win32":
         state["problem"] = "开机自启动只支持 Windows"
         return state
     try:
         import winreg
-        expected = _autostart_command()
-        state["expected"] = expected
+        state["expected"] = _autostart_command()
         with _run_key() as key:
             for name in _AUTOSTART_LEGACY_VALUES:
                 try:
                     value, _kind = winreg.QueryValueEx(key, name)
                 except FileNotFoundError:
                     continue
-                state["enabled"] = True
+                state["exists"] = True
                 state["command"] = str(value)
                 break
-            else:
-                return state              # 一个都没写
-        state["ok"] = state["command"] == expected
-        if not state["ok"]:
-            state["problem"] = ("注册表里的启动命令和当前程序对不上："
-                                "已写 %r，应为 %r（重新勾选一次即可修正）"
-                                % (state["command"], expected))
     except Exception as exc:
         state["problem"] = "读取开机自启动失败：%s" % exc
+        return state
+    if not state["exists"]:
+        return state
+    state["ok"] = state["command"] == state["expected"]
+    if not state["ok"]:
+        state["problem"] = ("注册表里的启动命令和当前程序对不上：已写 %r，应为 %r"
+                            "（重新保存一次即可修正）"
+                            % (state["command"], state["expected"]))
     return state
 
 
-def set_windows_autostart(enabled: bool) -> tuple[bool, str]:
-    """写/删开机自启动项。返回 (ok, 错误文本)。非 Windows 明确返回不可用。"""
+def _delete_registry_values() -> tuple[bool, str]:
     if sys.platform != "win32":
         return False, "开机自启动只支持 Windows"
     try:
         import winreg
         with _run_key() as key:
-            if enabled:
-                command = _autostart_command()
-                if not command:
-                    return False, "无法确定程序路径，开机自启动没有写入"
-                winreg.SetValueEx(key, _AUTOSTART_VALUE, 0, winreg.REG_SZ, command)
-                # 历史上别的名字写过的值一并删掉，避免同一台机器登录时被拉起两次
-                # （老版本的名字指向旧 exe，更容易看起来"自启动坏了"）。
-                # ★ 2026-11-06（Q4）：注册表值名**不区分大小写**。旧写法
-                #   `if name != "AudioMixing"` 会把 `audiomixing` 当成"另一个名字"
-                #   去删，实际删掉的就是刚写进去的 `AudioMixing`，回读于是
-                #   [WinError 2]；本次改成大小写无关比较。
-                for name in _AUTOSTART_LEGACY_VALUES:
-                    if name.lower() != _AUTOSTART_VALUE.lower():
+            for name in _AUTOSTART_LEGACY_VALUES:
+                try:
+                    winreg.DeleteValue(key, name)
+                except FileNotFoundError:
+                    pass
+        return True, ""
+    except Exception as exc:
+        return False, "删注册表启动项失败：%s" % exc
+
+
+# ---------- ★ v2.38（用户）：多版本残留归一 ----------
+#   用户真机反馈"还会存在上几个版本的开机自启动残留"。这里把识别与清理做成一条规矩：
+#   只认「值是本程序 exe」或「lnk target 是本程序 exe」的项（路径去引号、展开环境变量、
+#   绝对化、大小写无关后比较），其它软件一律不碰；同一时刻只保留一条、且必须指向
+#   当前正在运行的这颗 exe；指向旧版本或已不存在文件的，删掉并写进 launcher.log。
+_OUR_EXE_PREFIXES = ("audiomixing", "audio mixing")
+_HKCU = "HKEY_CURRENT_USER"
+_HKLM = "HKEY_LOCAL_MACHINE"
+_RUN_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_RUNONCE_PATH = r"Software\Microsoft\Windows\CurrentVersion\RunOnce"
+_STARTUP_APPROVED_RUN = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+_STARTUP_APPROVED_FOLDER = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder"
+
+
+def _normalize_exe_path(value: str) -> str:
+    """从一条启动命令里取出 exe 路径：去引号、取第一段、展开 %VAR%、绝对化、大小写无关。"""
+    text = str(value or "").strip()
+    if text.startswith('"'):
+        end = text.find('"', 1)
+        text = text[1:end] if end > 0 else text[1:]
+    text = os.path.expandvars(text)
+    # 没加引号的路径也可能带空格（「Audio Mixing v2.35.exe - 快捷方式」）：
+    # 先按第一个 ".exe" 截断，剩下的才是参数；没有 .exe 才退回"第一段"的老办法。
+    cut = text.lower().find(".exe")
+    if cut >= 0:
+        text = text[:cut + 4]
+    else:
+        parts = text.split()
+        text = parts[0] if parts else ""
+    try:
+        text = os.path.abspath(text)
+    except (OSError, ValueError):
+        pass
+    return os.path.normcase(text)
+
+
+def _looks_like_our_exe(path: str) -> bool:
+    """只认文件名以 AudioMixing / Audio Mixing 开头的 .exe —— 剩下的软件不碰。"""
+    name = os.path.basename(str(path or "")).strip().lower()
+    return name.endswith(".exe") and name.startswith(_OUR_EXE_PREFIXES)
+
+
+def plan_autostart_cleanup(run_values: dict[str, str], runonce_values: dict[str, str],
+                           hklm_values: dict[str, str], lnk_targets: dict[str, str],
+                           current_exe: str, method: str = _AUTOSTART_REGISTRY) -> dict[str, Any]:
+    """算出该删哪些残留、该保留哪一条。纯函数，不碰注册表和磁盘，方便单测。"""
+    cur = _normalize_exe_path(current_exe)
+    keep_run = None
+    keep_lnk = None
+    rows: list[dict[str, Any]] = []
+    delete_run: list[str] = []
+    delete_runonce: list[str] = []
+    delete_hklm: list[str] = []
+    delete_lnk: list[str] = []
+
+    ours_run = []
+    for name, value in sorted(run_values.items()):
+        exe = _normalize_exe_path(value)
+        if _looks_like_our_exe(exe):
+            ours_run.append((name, value, exe))
+
+    if method == _AUTOSTART_REGISTRY:
+        for name, value, exe in ours_run:
+            if exe == cur and name.lower() == _AUTOSTART_VALUE.lower():
+                keep_run = (name, value)
+                break
+        if keep_run is None:
+            for name, value, exe in ours_run:
+                if exe == cur:
+                    keep_run = (name, value)
+                    break
+
+    for name, value, exe in ours_run:
+        if keep_run and name == keep_run[0]:
+            rows.append({"kind": "HKCU Run", "name": name, "value": value, "exe": exe,
+                         "action": "keep", "reason": "指向当前程序，保留这一条"})
+            continue
+        if exe != cur:
+            reason = ("指向旧版本或别的位置（%s）" % exe) if os.path.isfile(exe) \
+                else ("指向不存在的文件（%s）" % exe)
+        else:
+            reason = "同一程序的重复登记，只保留一条"
+        delete_run.append(name)
+        rows.append({"kind": "HKCU Run", "name": name, "value": value, "exe": exe,
+                     "action": "delete", "reason": reason})
+
+    for name, value in sorted(runonce_values.items()):
+        exe = _normalize_exe_path(value)
+        if _looks_like_our_exe(exe):
+            delete_runonce.append(name)
+            rows.append({"kind": "HKCU RunOnce", "name": name, "value": value, "exe": exe,
+                         "action": "delete", "reason": "RunOnce 不应持有本程序的自启动"})
+
+    for name, value in sorted(hklm_values.items()):
+        exe = _normalize_exe_path(value)
+        if _looks_like_our_exe(exe):
+            delete_hklm.append(name)
+            rows.append({"kind": "HKLM Run", "name": name, "value": value, "exe": exe,
+                         "action": "delete", "reason": "本程序只登记 HKCU 一条"})
+
+    ours_lnk = []
+    for path, target in sorted(lnk_targets.items()):
+        exe = _normalize_exe_path(target)
+        if _looks_like_our_exe(exe):
+            ours_lnk.append((path, target, exe))
+    if method == _AUTOSTART_STARTUP:
+        for path, target, exe in ours_lnk:
+            if exe == cur and Path(path).name.lower() == _STARTUP_LNK_NAME.lower():
+                keep_lnk = (path, target)
+                break
+        if keep_lnk is None:
+            for path, target, exe in ours_lnk:
+                if exe == cur:
+                    keep_lnk = (path, target)
+                    break
+
+    for path, target, exe in ours_lnk:
+        if keep_lnk and path == keep_lnk[0]:
+            rows.append({"kind": "Startup .lnk", "name": Path(path).name, "value": target,
+                         "exe": exe, "action": "keep", "reason": "指向当前程序，保留这一条"})
+            continue
+        if exe != cur:
+            reason = ("指向旧版本或别的位置（%s）" % exe) if os.path.isfile(exe) \
+                else ("指向不存在的文件（%s）" % exe)
+        else:
+            reason = "同一程序的重复快捷方式，只保留一条"
+        delete_lnk.append(path)
+        rows.append({"kind": "Startup .lnk", "name": Path(path).name, "value": target,
+                     "exe": exe, "action": "delete", "reason": reason})
+
+    return {"keep_run": keep_run, "keep_lnk": keep_lnk, "delete_run": delete_run,
+            "delete_runonce": delete_runonce, "delete_hklm": delete_hklm,
+            "delete_lnk": delete_lnk, "rows": rows}
+
+
+def _autostart_log(message: str) -> None:
+    """自启动相关的动作写进 launcher.log —— 删了哪条、为什么删，事后都能查。"""
+    try:
+        home = os.environ.get("AUDIOMIXING_HOME")
+        base = Path(home) if home else (Path(os.environ.get("APPDATA") or str(Path.home())) / "AudioMixing")
+        with open(base / "launcher.log", "a", encoding="utf-8") as fh:
+            fh.write("%s  [autostart] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), message))
+    except OSError:
+        pass
+
+
+def _read_registry_values(hive: str, path: str) -> dict[str, str]:
+    if sys.platform != "win32":
+        return {}
+    try:
+        import winreg
+
+        root = winreg.HKEY_CURRENT_USER if hive == _HKCU else winreg.HKEY_LOCAL_MACHINE
+        out: dict[str, str] = {}
+        with winreg.OpenKey(root, path, 0, winreg.KEY_READ) as key:
+            index = 0
+            while True:
+                try:
+                    name, value, _kind = winreg.EnumValue(key, index)
+                except OSError:
+                    break
+                out[str(name)] = str(value)
+                index += 1
+        return out
+    except Exception:
+        return {}
+
+
+def _read_lnk_targets() -> dict[str, str]:
+    """启动文件夹里每个 .lnk 实际指向哪（看 target，不看文件名）。"""
+    directory = _startup_dir()
+    if not directory.is_dir():
+        return {}
+    quoted = str(directory).replace("'", "''")
+    script = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8\n"
+              "$w = New-Object -ComObject WScript.Shell\n"
+              "$r = @(Get-ChildItem -LiteralPath '%s' -Filter *.lnk -File | ForEach-Object {"
+              " $s = $w.CreateShortcut($_.FullName);"
+              " [pscustomobject]@{path=$_.FullName; target=$s.TargetPath} })\n"
+              "@($r) | ConvertTo-Json -Compress\n" % quoted)
+    rc, out = _powershell(script, timeout=6.0)
+    if rc != 0 or not out:
+        return {}
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return {}
+    if isinstance(data, dict):
+        data = [data]
+    return {str(item.get("path")): str(item.get("target") or "")
+            for item in data if isinstance(item, dict) and item.get("path")}
+
+
+def _delete_startup_approved(names: set[str]) -> None:
+    """同名项在任务管理器里被禁用过的记录一并清掉，否则残留状态会跟着名字走。"""
+    if not names or sys.platform != "win32":
+        return
+    try:
+        import winreg
+
+        for path in (_STARTUP_APPROVED_RUN, _STARTUP_APPROVED_FOLDER):
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
+                                    winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as key:
+                    for name in names:
                         try:
                             winreg.DeleteValue(key, name)
-                        except FileNotFoundError:
+                        except OSError:
                             pass
-                # 写完立刻读回来校验：被安全软件拦、路径写错，都能在这一步暴露，
-                # 不再"看着成功、开机不起"。
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def normalize_autostart(method: str = _AUTOSTART_REGISTRY) -> dict[str, Any]:
+    """把本程序在各启动位置的登记收拢成「一条、指向当前 exe」。
+
+    程序启动（含 serve）时调用一次；切换方式前也调用一次。返回值里带清单，便于测试。
+    """
+    method = str(method or _AUTOSTART_REGISTRY).strip().lower()
+    if method not in _AUTOSTART_METHODS:
+        method = _AUTOSTART_REGISTRY
+    if sys.platform != "win32":
+        return {"ok": False, "problem": "只支持 Windows", "removed": [], "plan": None}
+    current = _program_exe_path()
+    if not current:
+        return {"ok": False, "problem": "无法确定当前程序路径，跳过归一", "removed": [], "plan": None}
+
+    run_values = _read_registry_values(_HKCU, _RUN_PATH)
+    runonce_values = _read_registry_values(_HKCU, _RUNONCE_PATH)
+    hklm_values = _read_registry_values(_HKLM, _RUN_PATH)
+    lnk_targets = _read_lnk_targets()
+    plan = plan_autostart_cleanup(run_values, runonce_values, hklm_values,
+                                  lnk_targets, current, method)
+    _autostart_log("归一扫描（方式=%s）：注册表保留=%s，快捷方式保留=%s，待删 %d 条"
+                   % (method, plan["keep_run"], plan["keep_lnk"],
+                      len(plan["delete_run"]) + len(plan["delete_runonce"])
+                      + len(plan["delete_hklm"]) + len(plan["delete_lnk"])))
+    for row in plan["rows"]:
+        if row["action"] == "delete":
+            _autostart_log("删除残留 [%s] %s = %s（%s）"
+                           % (row["kind"], row["name"], row["value"], row["reason"]))
+
+    removed: list[str] = []
+    if plan["delete_run"] or plan["delete_runonce"] or plan["delete_hklm"]:
+        try:
+            import winreg
+
+            pairs = [(_HKCU, _RUN_PATH, plan["delete_run"]),
+                     (_HKCU, _RUNONCE_PATH, plan["delete_runonce"]),
+                     (_HKLM, _RUN_PATH, plan["delete_hklm"])]
+            for hive, path, names in pairs:
+                if not names:
+                    continue
+                root = winreg.HKEY_CURRENT_USER if hive == _HKCU else winreg.HKEY_LOCAL_MACHINE
                 try:
-                    written, _kind = winreg.QueryValueEx(key, _AUTOSTART_VALUE)
+                    with winreg.OpenKey(root, path, 0,
+                                        winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as key:
+                        for name in names:
+                            try:
+                                winreg.DeleteValue(key, name)
+                                removed.append("%s\\%s" % (path, name))
+                            except OSError as exc:
+                                _autostart_log("删除 %s\\%s 失败：%s" % (path, name, exc))
                 except OSError as exc:
-                    return False, "写入后读不回来：%s" % exc
-                if str(written) != command:
-                    return False, ("写入后校验不一致：注册表是 %r，应为 %r"
-                                   % (written, command))
-                if _in_onefile_temp(command):
-                    return False, ("启动命令指向临时解包目录（%s），重启后就不存在；"
-                                   "请用发布包里的 exe 重新勾选" % command)
-            else:
-                for name in _AUTOSTART_LEGACY_VALUES:
+                    _autostart_log("打开 %s 失败（HKLM 需要管理员）：%s" % (path, exc))
+        except Exception as exc:
+            _autostart_log("清理注册表启动项失败：%s" % exc)
+
+    _delete_startup_approved(set(plan["delete_run"]))
+
+    for path in plan["delete_lnk"]:
+        try:
+            Path(path).unlink()
+            removed.append(path)
+        except OSError as exc:
+            _autostart_log("删除快捷方式 %s 失败：%s" % (path, exc))
+
+    return {"ok": True, "problem": "", "removed": removed, "plan": plan}
+
+
+def autostart_state(method: str = _AUTOSTART_REGISTRY) -> dict[str, Any]:
+    """面板显示用的"真实状态"：注册表与启动文件夹各读一遍，谁也不靠勾选意愿。"""
+    method = str(method or _AUTOSTART_REGISTRY).strip().lower()
+    if method not in _AUTOSTART_METHODS:
+        method = _AUTOSTART_REGISTRY
+    registry = _registry_state()
+    startup = startup_state()
+    active = registry if method == _AUTOSTART_REGISTRY else startup
+    state: dict[str, Any] = {
+        "supported": sys.platform == "win32",
+        "method": method,
+        "method_label": _AUTOSTART_METHOD_LABELS[method],
+        "enabled": bool(registry["exists"] or startup["exists"]),
+        "command": registry["command"] or (
+            ('"%s" %s' % (startup["target"], startup["arguments"])).strip()
+            if startup["exists"] else ""),
+        "expected": registry["expected"],
+        "ok": bool(active["ok"]),
+        "problem": "",
+        "registry": registry,
+        "startup": startup,
+        "methods": [{"value": k, "label": _AUTOSTART_METHOD_LABELS[k]}
+                    for k in _AUTOSTART_METHODS],
+    }
+    if not state["supported"]:
+        state["problem"] = "开机自启动只支持 Windows"
+    elif not state["enabled"]:
+        state["problem"] = ""
+    elif registry["exists"] and startup["exists"]:
+        state["problem"] = ("两种方式同时存在（注册表 + 启动文件夹），开机会被拉起两次；"
+                            "在设置里保存一次自启动即可只保留当前方式")
+    elif not active["ok"]:
+        state["problem"] = active["problem"] or "启动项指向的不是当前程序"
+    return state
+
+
+def set_windows_autostart(enabled: bool, method: str = _AUTOSTART_REGISTRY) -> tuple[bool, str]:
+    """写/删开机自启动项。返回 (ok, 错误文本)。非 Windows 明确返回不可用。
+
+    ★ v2.36：method 决定用哪种方式；两种方式互斥 —— 开启前先把另一种清干净，
+    再写当前这种（用户要求"换方式先清旧的，别开机起两次"）。
+    """
+    if sys.platform != "win32":
+        return False, "开机自启动只支持 Windows"
+    method = str(method or _AUTOSTART_REGISTRY).strip().lower()
+    if method not in _AUTOSTART_METHODS:
+        return False, "未知的开机自启动方式：%s" % method
+    try:
+        if not enabled:
+            ok, err = _delete_registry_values()
+            if not ok:
+                return False, err
+            return _delete_startup_lnk()
+        if method == _AUTOSTART_STARTUP:
+            spec = _startup_spec()
+            if not spec:
+                return False, ("无法确定程序路径（或它指向 onefile 临时目录），"
+                               "启动文件夹快捷方式没有写入")
+            ok, err = _delete_registry_values()
+            if not ok:
+                return False, "清理旧的注册表启动项失败：%s" % err
+            ok, err = _write_startup_lnk(spec)
+            if not ok:
+                return False, err
+            check = startup_state()
+            if not check["ok"]:
+                _delete_startup_lnk()
+                return False, "写入后校验不一致：%s" % (check["problem"] or "快捷方式指向不对")
+            return True, ""
+
+        import winreg
+        command = _autostart_command()
+        if not command:
+            return False, "无法确定程序路径，开机自启动没有写入"
+        if _in_onefile_temp(command):
+            return False, ("启动命令指向临时解包目录（%s），重启后就不存在；"
+                           "请用发布包里的 exe 重新勾选" % command)
+        ok, err = _delete_startup_lnk()
+        if not ok:
+            return False, "清理旧的启动文件夹快捷方式失败：%s" % err
+        with _run_key() as key:
+            winreg.SetValueEx(key, _AUTOSTART_VALUE, 0, winreg.REG_SZ, command)
+            # 历史上别的名字写过的值一并删掉，避免同一台机器登录时被拉起两次
+            # （老版本的名字指向旧 exe，更容易看起来"自启动坏了"）。
+            # ★ 2026-11-06（Q4）：注册表值名**不区分大小写**，这里按小写比较。
+            for name in _AUTOSTART_LEGACY_VALUES:
+                if name.lower() != _AUTOSTART_VALUE.lower():
                     try:
                         winreg.DeleteValue(key, name)
                     except FileNotFoundError:
                         pass
+            # 写完立刻读回来校验：被安全软件拦、路径写错，都能在这一步暴露，
+            # 不再"看着成功、开机不起"。
+            try:
+                written, _kind = winreg.QueryValueEx(key, _AUTOSTART_VALUE)
+            except OSError as exc:
+                return False, "写入后读不回来：%s" % exc
+            if str(written) != command:
+                return False, ("写入后校验不一致：注册表是 %r，应为 %r"
+                               % (written, command))
         return True, ""
     except Exception as exc:
         return False, "写入开机自启动失败：%s" % exc
@@ -772,7 +1284,7 @@ class AudioMixingApi:
             if channel.get("broadcast"):
                 wanted.append("广播")
             if local.get("enabled"):
-                wanted.append("本机直通")
+                wanted.append("本机广播监听")
             if wanted:
                 sw = cap.get("switch") or {}
                 if sw and float(sw.get("age_s") or 9999) < 20:
@@ -786,7 +1298,7 @@ class AudioMixingApi:
                             "如果一直是这样，看第 2 步的音源是不是配错了。" % "、".join(wanted))
                     detail = ""
             else:
-                text = "现在没有在采集任何设备（「广播我的声音」和「本机直通」都没开）。"
+                text = "现在没有在采集任何设备（「广播我的声音」和「本机广播监听」都没开）。"
                 detail = "开了之后这一台电脑的声音才有东西可发。"
             steps.append({"id": "capture", "n": 1, "title": "采集源到底有没有声音？",
                           "state": "warn", "text": text, "detail": detail,
@@ -970,6 +1482,7 @@ class AudioMixingApi:
                 #   _best_local_address() 会先找"和已知对端同网段"的地址，再退回物理网卡排序。
                 "host": _best_local_address(node, report),
                 "audio_port": node.config.audio_port,
+                "broadcast_port": node.config.broadcast_port,
                 "web_port": node.config.web_port,
                 "sources": node.source_list(),
                 "sinks": node.sink_list(),
@@ -1315,13 +1828,52 @@ class AudioMixingApi:
         fn = getattr(self.node, "bluetooth_requests", None)
         return list(fn()) if callable(fn) else []
 
+    def bluetooth_always(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """蓝牙卡片的「打开 / 关闭」：长期放行名单存 `config.bt_always`（设备 id）。
+
+        语义（v2.42，2.42.1 补充）：
+          · 打开 —— 电脑侧长期放行，接收端常驻；**按下时主动尝试连接这台手机一次**
+            （复用 connect() 的 StartAsync+Open 链路），失败也继续等手机自己连；
+            手机自己连上来就开始音频传输，断开后助手不退出，重启后按名单自动再挂上。
+          · 关闭 —— 真正断开并停掉常驻接收端，同时从持久名单里移除。
+        「智连」（旧 config.autoconnect：启动时 StartAsync+Open 主动连一次）v2.42
+        整条下线 —— 它和「打开」语义重复。
+        """
+        node = self.node
+        device_id = str(payload.get("id") or "").strip()
+        if not device_id:
+            raise ApiError("缺少设备 id")
+        on = bool(payload.get("on"))
+        ids = [str(x).strip() for x in (getattr(node.config, "bt_always", None) or [])
+               if str(x).strip()]
+        if on:
+            if device_id not in ids:
+                ids.append(device_id)
+        else:
+            ids = [x for x in ids if x != device_id]
+        node.config.bt_always = ids[:8]
+        try:
+            node.config.save(strict=True)
+        except OSError as exc:
+            raise ApiError("保存「常开」名单失败：%s" % exc, 500)
+        if not on:
+            return dict(bluetooth.always_off(device_id), ok=True)
+        result = bluetooth.always_on(device_id)
+        if result.get("ok"):
+            return result
+        # 名单保留（手机可能只是没开机；下次启动会再挂），但把真实原因说清楚，
+        # 尤其「没有配对记录」必须引导去 Windows 蓝牙设置，不做应用内静默配对。
+        result["note"] = result.get("error") or (
+            "没能打开常驻接收端：%s" % (result.get("state") or "未知原因"))
+        return result
+
     # ★ 2026-11-04（第 11 条）：蓝牙卡片「本机播放」按钮与整条后端链路已删除
     #   （前端 btLocal() / POST /api/bluetooth/local / set_bluetooth_local_play）。
     #   驱动不出声时的手动兜底仍可用：「频道 → 音源」选中 `麦克风 (手机名 A2DP SNK)`，
-    #   勾选「本机直通」即可，不需要这个按钮。
+    #   勾选「本机广播监听」即可，不需要这个按钮。
 
     def recover_audio(self) -> dict[str, Any]:
-        """「恢复声音」：重开所有本机播放端 + 本机直通。
+        """「恢复声音」：重开所有本机播放端 + 本机广播监听。
 
         ★ 2026-10-26 用户：其他终端（蓝牙/WiFi）连上后没声音，去 Windows 声音里
           切换几下输出才恢复，至少 7 个版本如此。程序现在会自动看门狗重开僵死
@@ -1422,12 +1974,12 @@ class AudioMixingApi:
             lines.append("  处置：设备管理器 → 蓝牙 → 卸载 Intel 蓝牙驱动 → 重启让 Windows 装通用驱动；")
             lines.append("        或更新/回退 Intel 蓝牙驱动后再试。")
             lines.append("  本工具兜底：手机媒体音频已到后，到「频道 → 音源」选中 "
-                         "`麦克风 (手机名 A2DP SNK)` 并勾「本机直通」，由本工具采集并播放。")
+                         "`麦克风 (手机名 A2DP SNK)` 并勾「本机广播监听」，由本工具采集并播放。")
         elif amd_cpu:
             lines.append("这是 AMD 平台。AMD 主板的蓝牙通常由板厂集成的模块提供（MediaTek / Realtek /")
             lines.append("Qualcomm 等），同样可能出现「手机连接正常、A2DP SNK 端点 active，但系统不出声」。")
             lines.append("  处置：先更新/重装主板或蓝牙模块驱动；仍无声就到「频道 → 音源」")
-            lines.append("        选中 `麦克风 (手机名 A2DP SNK)` 并勾「本机直通」——")
+            lines.append("        选中 `麦克风 (手机名 A2DP SNK)` 并勾「本机广播监听」——")
             lines.append("        驱动不把端点列进 WASAPI 时，本工具会按注册表里的端点 id 直接打开它。")
         else:
             lines.append("不是 Intel 蓝牙；如果没声音，先看下面「蓝牙」段的媒体链路是否 active。")
@@ -1519,6 +2071,12 @@ class AudioMixingApi:
                              phone.get("vol_q14"), float(phone.get("vol_q14") or 0.0) / 16384.0,
                              phone.get("gain_q14"), q, q / 16384.0, raw, post, verdict,
                              ("　" + mode_txt) if mode_txt else ""))
+            # ★ 2.43.2（#9）：静音档用 mute 标志后，实时索引才是"读到的条"。
+            #   手机 2.30.1 起上报 sys_q14 / sys_mute；老手机没有这两个键就不显示。
+            if phone.get("sys_q14") is not None:
+                lines.append("手机系统流：实时索引 Q14=%s（=%.2f）· 静音标志=%s" % (
+                    phone.get("sys_q14"), float(phone.get("sys_q14") or 0.0) / 16384.0,
+                    "开" if int(float(phone.get("sys_mute") or 0)) else "关"))
 
         head("控制面（各走哪条路）")
         # ★ 2026-10-15 起控制消息分两条路（见 docs 与 net/discovery.py 开头）：
@@ -1778,10 +2336,11 @@ class AudioMixingApi:
                 if not devices:
                     lines.append("列表是空的：Windows 里还没配对过任何能送声音过来的手机")
                 link_cn = {"connected": "正在接收手机声音",
+                           "always": "已打开·常驻接收（等手机自己连）",
                            "waiting": "手机已连接，但媒体音频未到",
                            "hfp": "只有通话通路（没有媒体声音）", "error": "出错", "off": "未连接"}
-                auto_names = {str(x).strip().lower()
-                              for x in (getattr(node.config, "autoconnect", None) or [])
+                always_ids = {str(x).strip()
+                              for x in (getattr(node.config, "bt_always", None) or [])
                               if str(x).strip()}
                 for dev in devices:
                     note = str(dev.get("state_note") or "").strip()
@@ -1813,10 +2372,10 @@ class AudioMixingApi:
                             lines.append("      本机所有 A2DP/SNK 端点：%s" % "；".join(
                                 "%s「%s」state=%s" % (e.get("flow"), e.get("name"), e.get("state"))
                                 for e in all_bt[:8]))
-                    lines.append("      蓝牙智连：%s" % (
-                        "开（启动时自动尝试连接一次，播放交给 Windows）"
-                        if str(dev.get("name") or "").strip().lower() in auto_names else "关"))
-                    lines.append("      听不到声音时：到「频道 → 音源」选中这块 A2DP SNK 并勾「本机直通」")
+                    lines.append("      蓝牙「打开」：%s" % (
+                        "是（长期放行、接收端常驻，不主动连手机）"
+                        if str(dev.get("id") or "").strip() in always_ids else "否"))
+                    lines.append("      听不到声音时：到「频道 → 音源」选中这块 A2DP SNK 并勾「本机广播监听」")
         except Exception as exc:
             lines.append("读取失败：%s" % exc)
         for req in (node.bluetooth_requests() if hasattr(node, "bluetooth_requests") else []):
@@ -2059,7 +2618,7 @@ class AudioMixingApi:
                     state = "手机媒体音频已到（系统播放）"
                     detail = ("本机由 Windows 直接播放，不需要再加音源。要把手机声音转发到别的设备/频道，"
                               "才到控制台「频道 → 音源」选中「麦克风 (%s A2DP SNK)」并勾「广播我的声音」；"
-                              "「本机直通」会和系统播放重复，慎用。" % phone)
+                              "「本机广播监听」会和系统播放重复，慎用。" % phone)
                 elif link == "waiting":
                     state = "手机已连接，但媒体音频未到"
                     detail = ("现在没有声音：请在手机蓝牙设置里确认「媒体音频」已打开，"
@@ -2396,8 +2955,8 @@ class AudioMixingApi:
             "mic_count": len(mics),
             "updated": round(time.time(), 1),
             "uptime_s": round(time.time() - getattr(node, "started_at", time.time()), 1),
-            # ★ 2026-10-16：这里原来只取 local.*（本机直通那一路）。而手机走蓝牙进来时
-            #   声音是 Windows 直接播放的，本机直通根本没有数据 → 监控页脚那行
+            # ★ 2026-10-16：这里原来只取 local.*（本机广播监听那一路）。而手机走蓝牙进来时
+            #   声音是 Windows 直接播放的，本机广播监听根本没有数据 → 监控页脚那行
             #   「本机输出电平」永远是 0。改用和面板同一个口径（output_level()）。
             "local_peak": self.node.output_level().get("peak"),
             "node": str(getattr(node, "name", "")),
@@ -2836,13 +3395,29 @@ class AudioMixingApi:
                 elif value and key == "listen" and node.config.broadcast:
                     node.config.broadcast = False
                     changed.append("broadcast")
-        if "launch_at_login" in payload:
-            want = bool(payload["launch_at_login"])
-            ok, err = set_windows_autostart(want)
-            if not ok:
-                raise ApiError(err, 500)
+        if "launch_at_login" in payload or "autostart_method" in payload:
+            # ★ v2.36：开关与方式一起处理。换方式时 set_windows_autostart 会先把旧方式
+            #   清干净再写新的 —— 两种方式永远只留一种，不会开机起两次。
+            want = bool(payload.get("launch_at_login", node.config.launch_at_login))
+            method = str(payload.get("autostart_method",
+                                     getattr(node.config, "autostart_method", "registry"))
+                         or "registry").strip().lower()
+            if method not in _AUTOSTART_METHODS:
+                raise ApiError("开机自启动方式只能是 registry 或 startup", 400)
+            if want != bool(node.config.launch_at_login) \
+                    or method != getattr(node.config, "autostart_method", "registry"):
+                if want:
+                    # ★ v2.38：换方式前先把各处的本程序登记归一，避免新旧并存。
+                    normalize_autostart(method)
+                ok, err = set_windows_autostart(want, method)
+                if not ok:
+                    raise ApiError(err, 500)
+            old_method = getattr(node.config, "autostart_method", "registry")
             node.config.launch_at_login = want
+            node.config.autostart_method = method
             changed.append("launch_at_login")
+            if method != old_method:
+                changed.append("autostart_method")
         if "open_panel_on_start" in payload:
             want = str(payload["open_panel_on_start"] or "none").strip().lower()
             if want not in ("none", "simple", "full"):
@@ -2905,6 +3480,18 @@ class AudioMixingApi:
                 node.apply_routes()
             except Exception as exc:
                 node.note("「静音档乘数策略」立即生效失败：%s" % exc)
+        if "quality_preset" in payload:
+            # ★ 2.42.3：三档性能预算（smooth / balanced / high）。
+            #   立即生效：接收端抖动缓冲换档；发送端会话按新档重建（帧长/Opus 参数）。
+            want = str(payload["quality_preset"] or "").strip().lower()
+            if want not in ("smooth", "balanced", "high"):
+                raise ApiError("quality_preset 只能是 smooth、balanced 或 high", 400)
+            node.set_quality_preset(want)
+            changed.append("quality_preset")
+            try:
+                node.apply_routes()
+            except Exception as exc:
+                node.note("「音质档位」立即生效失败：%s" % exc)
         if "channel_sources" in payload:
             raw = payload["channel_sources"]
             if isinstance(raw, str):
@@ -2932,13 +3519,9 @@ class AudioMixingApi:
             node.config.channel_sources = wanted
             changed.append("channel_sources")
         if "autoconnect" in payload:
-            raw = payload["autoconnect"]
-            if isinstance(raw, str):
-                raw = [raw]
-            if not isinstance(raw, list):
-                raise ApiError("autoconnect must be a list of phone names")
-            node.config.autoconnect = [str(x).strip() for x in raw if str(x).strip()][:8]
-            changed.append("autoconnect")
+            # ★ v2.42：蓝牙「智连」已整条下线（和「打开」重复），旧面板/旧脚本再发
+            #   这个字段时不再落盘 —— 明确告诉调用方它没了，而不是静默写入一份没人读的配置。
+            raise ApiError("蓝牙「智连」已下线：请用蓝牙卡片上的「打开 / 关闭」")
             if "jitter_ms" in payload:
                 node.config.jitter_ms = float(payload["jitter_ms"])
                 for buf in node.receiver.buffers.values():
@@ -2953,6 +3536,7 @@ class AudioMixingApi:
         wanted_ports: dict[str, int] = {}
         for key, label in (("web_port", "面板端口"),
                            ("audio_port", "音频端口（UDP）"),
+                           ("broadcast_port", "广播端口（UDP，独立于点对点）"),
                            ("discovery_port", "发现端口（UDP）")):
             if key not in payload:
                 continue
@@ -2965,22 +3549,28 @@ class AudioMixingApi:
             wanted_ports[key] = value
         # 记下运行中那份的真实端口：下面只是临时改成新值写盘，写完必须还原。
         previous_ports = {k: getattr(node.config, k)
-                          for k in ("web_port", "audio_port", "discovery_port")}
+                          for k in ("web_port", "audio_port", "broadcast_port", "discovery_port")}
         real_port_changes: dict[str, int] = {}
         if wanted_ports:
             current = {
                 "web_port": int(node.config.web_port),
                 "audio_port": int(node.config.audio_port),
+                "broadcast_port": int(node.config.broadcast_port),
                 "discovery_port": int(node.config.discovery_port),
             }
             current.update(wanted_ports)
-            if len(set(current.values())) != 3:
-                raise ApiError("三个端口不能重复：面板 %d / 音频 %d / 发现 %d"
+            # ★ 2.42.2：广播端口必须与点对点端口分开；改了点对点口就自动跟着 +1。
+            if "audio_port" in wanted_ports and "broadcast_port" not in wanted_ports:
+                current["broadcast_port"] = current["audio_port"] + 1
+                wanted_ports["broadcast_port"] = current["broadcast_port"]
+            if len(set(current.values())) != len(current):
+                raise ApiError("四个端口不能重复：面板 %d / 点对点 %d / 广播 %d / 发现 %d"
                                % (current["web_port"], current["audio_port"],
-                                  current["discovery_port"]), 400)
+                                  current["broadcast_port"], current["discovery_port"]), 400)
             # 面板端口 +1 是手机长连接端口（引擎自己也要绑它），一起查重。
-            if current["web_port"] + 1 in (current["audio_port"], current["discovery_port"]):
-                raise ApiError("面板端口 +1（%d）被音频/发现端口占用了，换一个面板端口"
+            if current["web_port"] + 1 in (current["audio_port"], current["broadcast_port"],
+                                           current["discovery_port"]):
+                raise ApiError("面板端口 +1（%d）被点对点/广播/发现端口占用了，换一个面板端口"
                                % (current["web_port"] + 1), 400)
             # ★ 2026-11-01：保存后会**自动重启**，所以必须先把"新端口能不能真的绑上"
             #   查清楚。旧实现只校验范围和重复，端口被别的程序占着也会返回"保存成功"；
@@ -3166,19 +3756,6 @@ def _ws_read_frame(conn: Any, max_len: int = 1 << 20) -> tuple[int, bytes] | Non
             break
         return first, b"".join(chunks)
     return opcode, payload
-
-
-_P2P_ROOMS: Any = None
-
-
-def _p2p_rooms() -> Any:
-    """整个进程共用一张手机直连房间表（所有连接共用同一实例）。"""
-    global _P2P_ROOMS
-    if _P2P_ROOMS is None:
-        from .net.p2p import P2PRooms
-
-        _P2P_ROOMS = P2PRooms()
-    return _P2P_ROOMS
 
 
 def ws_frame(payload: bytes, opcode: int = 0x2) -> bytes:
@@ -3474,100 +4051,6 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             tap.unsubscribe(sid)
 
-    def _websocket_p2p(self, parsed) -> None:
-        """手机↔手机直连（WebRTC）的**信令**通道。
-
-        这个接口只转发几十字节的协商信息（offer/answer/ICE）。音频是两台手机
-        WebRTC 直连的，**完全不经过这台电脑** —— 这是功能的设计前提，
-        所以这里绝不接收、缓存或转发任何二进制音频（p2p 层会拒收二进制并计数）。
-
-        线程模型：`ThreadingHTTPServer` 下，每条连接一个线程，而对端线程会替我写
-        我的 socket（转发、bye、error）。所以每个连接都要一把写锁，否则两个线程
-        同时 sendall 会写出交错的帧，浏览器直接报协议错。
-        """
-        key = self.headers.get("Sec-WebSocket-Key", "")
-        if not key or "websocket" not in (self.headers.get("Upgrade") or "").lower():
-            self._json(400, {"error": "this endpoint speaks websocket"})
-            return
-
-        qs = parse_qs(parsed.query)
-        room = str((qs.get("room") or [""])[0]).strip()
-        role = str((qs.get("role") or ["host"])[0]).strip().lower() or "host"
-        name = str((qs.get("name") or ["手机"])[0]).strip() or "手机"
-        if not (len(room) == 4 and room.isdigit()):
-            # 4 位数字房间号：够局域网内用，也便于另一台手机手输。
-            self._json(400, {"error": "房间号要 4 位数字"})
-            return
-
-        conn = self.connection
-        try:
-            conn.sendall(
-                (
-                    "HTTP/1.1 101 Switching Protocols\r\n"
-                    "Upgrade: websocket\r\n"
-                    "Connection: Upgrade\r\n"
-                    "Sec-WebSocket-Accept: %s\r\n\r\n" % ws_accept(key)
-                ).encode("ascii")
-            )
-        except OSError:
-            return
-        self.close_connection = True
-
-        from .net.p2p import P2PRooms
-
-        send_lock = threading.Lock()
-        closed = threading.Event()
-
-        def send_text(text: str) -> None:
-            """线程安全地把一条消息发回去（对端线程也会调它）。"""
-            with send_lock:
-                if closed.is_set():
-                    return
-                try:
-                    conn.sendall(ws_frame(str(text).encode("utf-8"), opcode=0x1))
-                except OSError:
-                    closed.set()
-
-        def close_conn() -> None:
-            closed.set()
-            try:
-                conn.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-
-        rooms = _p2p_rooms()
-        member = rooms.join(room, role, name, send_text, close_conn)
-        if member is None:
-            # 房间已满：error 已经回给对方，连接也已经关了，这里直接收工。
-            return
-        try:
-            while not closed.is_set():
-                frame = _ws_read_frame(conn)
-                if frame is None:
-                    break
-                opcode, payload = frame
-                if opcode == 0x8:            # close
-                    break
-                if opcode == 0x9:            # ping -> pong
-                    with send_lock:
-                        if not closed.is_set():
-                            try:
-                                conn.sendall(ws_frame(payload[:125], opcode=0xA))
-                            except OSError:
-                                closed.set()
-                    continue
-                if opcode == 0xA:            # pong：忽略
-                    continue
-                if opcode in (0x1, 0x2):
-                    # 文本原样转发；二进制交给 p2p 层拒收（那是"绝不转发音频"的红线，
-                    # 所以这里【不要】先 decode 成 str，否则等于放行了二进制）。
-                    text: Any = payload.decode("utf-8", "replace") if opcode == 0x1 else payload
-                    rooms.relay(room, member, text)
-        except (OSError, ValueError):
-            pass
-        finally:
-            rooms.leave(room, member)
-
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
@@ -3618,7 +4101,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             # ★ v2.27（用户第 9 条）：手机 2.15 已能独立完成广播（SendFanout 直接发给
             #   所有在线对端，不借电脑转发信令），所以 /p2p、/p2p.html、/direct 三个入口
-            #   一并下线。底层 net/p2p.py 暂留（没有入口，后续再清），不影响广播。
+            #   一并下线。★ v2.33（Q2）：net/p2p.py、房间表与信令处理已整块删除，
+            #   这里保留 410 只为让旧客户端立刻拿到"入口已移除"而不是 404。
             if path in ("/p2p", "/p2p.html", "/direct") or path == "/ws/p2p":
                 self._send(410, b"p2p entry removed in v2.27", "text/plain; charset=utf-8")
                 return
@@ -3655,6 +4139,10 @@ class _Handler(BaseHTTPRequestHandler):
                     "devices": devices,
                     "radio": radio,
                     "empty_reason": empty_reason,
+                    # ★ v2.41.3「常开」：长期放行名单（设备 id），面板据此显示第三态按钮。
+                    "always": [str(x) for x in
+                               (getattr(self.api.node.config, "bt_always", None) or [])
+                               if str(x).strip()],
                     # ★ ④ 手机点过「走蓝牙」的记录：电脑这边去连它连成没连成，
                     #   面板 ⑦ 那张卡直接把结果写出来，用户不用猜。
                     "requests": self.api.bluetooth_requests(),
@@ -3871,8 +4359,60 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/multiout":
                 node = self.api.node
                 out = node.multi_out.stats()
-                out["available"] = node.multi_out.available_devices()
+                # ★ 2026-11-17 蓝牙卡顿：面板每秒轮询原来会把同一份设备清单枚举三次
+                #   （available / endpoints / lock 各一次），每次枚举都会打开所有端点
+                #   （包括蓝牙）读混音格式。这里只枚举一次，三处共用。
+                devices_now: list = []
+                try:
+                    from .audio import base as audio_base
+
+                    devices_now = audio_base.list_all_devices()
+                except Exception:
+                    devices_now = []
+                # ★ Q2：GET 也必须排除「系统默认输出 / 正在采集的那块」。
+                #   以前只有 POST 排除，页面刷新后默认设备又出现在列表里，
+                #   用户勾上就是"同一路声音被播两遍"——老 BUG「一选默认耳机就炸」。
+                out["available"] = node.multi_out.available_devices(devices=devices_now)
+                out = _multi_view(node, out)
+                # ★ Q2：画布页要的"真实状态" —— 系统默认设备、锁没锁、还剩哪些端点。
+                try:
+                    from .audio import defaultdev
+
+                    out["lock"] = node.multi_lock_status(devices=devices_now)
+                    out["endpoints"] = defaultdev.list_render_endpoints(devices_now)
+                except Exception as exc:
+                    out["lock"] = {"error": "读不到系统默认播放设备：%s" % exc}
+                    out["endpoints"] = []
+                out["definition"] = ("「正在使用」= 已勾选且成功打开的多路输出设备；"
+                                     "其余真实播放端点算「未使用」。")
+                # ★ 2026-11-16 按 App 采音：这一段就是详细档左列「APP」的真实数据源。
+                try:
+                    from .audio import apps as app_mod
+
+                    out["apps"] = app_mod.list_audio_apps()
+                except Exception as exc:
+                    out["apps"] = {"supported": False,
+                                   "reason": "读不到 App 列表：%s" % exc, "apps": []}
+                try:
+                    spec = node.default_source_spec() or {}
+                    out["capture"] = {
+                        "device": str(spec.get("device") or ""),
+                        "loopback": bool(spec.get("loopback")),
+                        "label": ("本机桌面音频" if spec.get("loopback") else "麦克风 / 输入"),
+                    }
+                except Exception:
+                    out["capture"] = {}
                 self._json(200, out)
+                return
+            if path == "/api/apps":
+                # 正在出声的 App 列表：音频会话 → PID → 进程名（活跃且非静音）。
+                try:
+                    from .audio import apps as app_mod
+
+                    self._json(200, app_mod.list_audio_apps())
+                except Exception as exc:
+                    self._json(200, {"supported": False,
+                                     "reason": "读不到 App 列表：%s" % exc, "apps": []})
                 return
             if path == "/api/monitor":
                 self._json(200, self.api.monitor())
@@ -3882,7 +4422,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/config":
                 self._json(200, {"config": self.api.node.config.to_json(),
-                                 "autostart": autostart_state()})
+                                 "autostart": autostart_state(getattr(self.api.node.config, "autostart_method", "registry"))})
                 return
             if path == "/api/net":
                 self._json(200, self.api.network())
@@ -3921,6 +4461,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._mic_stream(parsed)
                 return
             body = self._read_json()
+            if path == "/api/multiout/restore_default":
+                # ★ Q2：异常退出后系统默认还钉在目标设备上时，点一下还原。
+                self._json(200, self.api.node.restore_multi_default())
+                return
             if path == "/api/multiout":
                 # 本机多设备输出：勾选几个输出设备就同时响几个。
                 # 这里用 body（POST 分支里请求体叫 body，只有 GET 分支叫 payload，
@@ -3942,37 +4486,62 @@ class _Handler(BaseHTTPRequestHandler):
                             delay = float(entry.get("delay_ms", 0.0))
                         except (TypeError, ValueError):
                             delay = 0.0
-                        items.append({"device": name,
-                                      "gain": max(0.0, min(4.0, gain)),
-                                      "delay_ms": max(0.0, min(2000.0, delay))})
+                        try:
+                            app_pid = int(entry.get("app_pid") or 0)
+                        except (TypeError, ValueError):
+                            app_pid = 0
+                        item = {"device": name,
+                                "gain": max(0.0, min(4.0, gain)),
+                                "delay_ms": max(0.0, min(2000.0, delay))}
+                        # ★ 2.42.1：每路可以接多个音源。显式 sources 列表（哪怕是空）
+                        #   必须原样保留 —— 空列表代表"这一路没有音源、静音"，
+                        #   绝不能当成"没选 App 就采桌面混音"。
+                        if isinstance(entry.get("sources"), list):
+                            parsed: list[dict] = []
+                            for src in entry["sources"][:8]:
+                                if not isinstance(src, dict):
+                                    continue
+                                kind = str(src.get("kind") or "").strip().lower()
+                                if kind == "desktop":
+                                    parsed.append({"kind": "desktop"})
+                                    continue
+                                if kind != "app":
+                                    continue
+                                try:
+                                    pid = int(src.get("pid") or 0)
+                                except (TypeError, ValueError):
+                                    pid = 0
+                                if pid > 0:
+                                    parsed.append({"kind": "app", "pid": pid,
+                                                   "name": str(src.get("name") or "")[:80]})
+                            item["sources"] = parsed
+                        else:
+                            # 旧版请求只有 app_pid：归成一条 App 音源。
+                            if app_pid > 0:
+                                item["app_pid"] = app_pid
+                                item["app_name"] = str(entry.get("app_name") or "")[:80]
+                        items.append(item)
+                # ★ Q2：页面可以改「锁到哪块设备」；空字符串 = 不锁（默认推荐），
+                #   所以必须允许把它改回空，否则用户永远取消不了锁定。
+                if "lock_device" in body:
+                    self.api.node.config.multi_lock_device = str(body.get("lock_device") or "").strip()
                 self.api.node.set_multi_out(items)
                 out = self.api.node.multi_out.stats()
-                _excl: list[str] = []
-                try:
-                    # 两个来源都问一遍：多设备输出是从 default_source_spec() 那块
-                    # 设备的回环采的，它一定已经在响；_default_render_name() 是
-                    # Windows 当前的默认输出，通常与前者相同。
-                    spec_now = self.api.node.default_source_spec() or {}
-                    name_now = str(spec_now.get("device") or "")
-                    if name_now:
-                        _excl.append(name_now)
-                except Exception:
-                    pass
-                try:
-                    default_now = self.api.node._default_render_name()
-                    if default_now:
-                        _excl.append(default_now)
-                except Exception:
-                    pass
-                try:
-                    for item in self.api.node.devices or []:
-                        if getattr(item, "is_default", False):
-                            _excl.append(str(getattr(item, "name", "") or ""))
-                except Exception:
-                    pass
-                _excl = [x for x in dict.fromkeys(_excl) if x]
-                out["available"] = self.api.node.multi_out.available_devices(_excl)
-                out["playing_now"] = _excl
+                out = _multi_view(self.api.node, out)
+                if "gain=1" in self.path:
+                    # 拖动滑杆的纯增益请求：不读锁、不再枚举端点。
+                    # 否则每 160ms 一次会反复打开所有端点（含蓝牙）。
+                    out["lock"] = {}
+                    out["endpoints"] = []
+                else:
+                    try:
+                        from .audio import defaultdev
+
+                        out["lock"] = self.api.node.multi_lock_status()
+                        out["endpoints"] = defaultdev.list_render_endpoints()
+                    except Exception as exc:
+                        out["lock"] = {"error": str(exc)}
+                        out["endpoints"] = []
                 self._json(200, out)
                 return
             if path == "/api/firewall":
@@ -4024,6 +4593,18 @@ class _Handler(BaseHTTPRequestHandler):
                 bluetooth.invalidate_cache()
                 # ★ v2.26 第 3 条：合并卡要一次断掉全部历史配对 id。
                 ids = body.get("ids")
+                # ★ v2.41.3：点「断开」也要把它从「常开」放行名单里摘掉，
+                #   否则这次断开了、下次启动又自己挂回去，用户会觉得按钮没生效。
+                targets = [str(x) for x in (ids if isinstance(ids, list) and ids
+                                            else [body.get("id")]) if x]
+                cfg = self.api.node.config
+                kept = [x for x in (getattr(cfg, "bt_always", None) or []) if str(x) not in targets]
+                if kept != (getattr(cfg, "bt_always", None) or []):
+                    cfg.bt_always = kept
+                    try:
+                        cfg.save()
+                    except OSError:
+                        pass
                 if isinstance(ids, list) and ids:
                     results = [bluetooth.disconnect(str(x)) for x in ids if x]
                     ok = any(bool(item.get("ok")) for item in results)
@@ -4034,8 +4615,11 @@ class _Handler(BaseHTTPRequestHandler):
             elif path == "/api/bluetooth/cleanup":
                 # ★ v2.26 第 3 条：只清本程序的旧记录；Windows 配对删不掉，响应里写明。
                 self._json(200, bluetooth.cleanup_stale_records())
+            elif path == "/api/bluetooth/always":
+                # ★ v2.41.3「常开」：长期放行（只 StartAsync，不 Open），名单单独持久化。
+                self._json(200, self.api.bluetooth_always(body))
             elif path == "/api/audio/recover":
-                # 「恢复声音」：重开全部播放端 + 本机直通（等同在 Windows 声音里切一次输出）。
+                # 「恢复声音」：重开全部播放端 + 本机广播监听（等同在 Windows 声音里切一次输出）。
                 self._json(200, self.api.recover_audio())
             elif path == "/api/mic/gain":
                 from .audio.backends import netmic as netmic_backend
@@ -4158,7 +4742,8 @@ class WebUI:
                     continue
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    body = {"routes": routes, "from": self.node.node_id, "ts": time.time()}
+                    body = {"routes": routes, "from": self.node.node_id,
+                            "epoch": self.node.route_epoch(), "ts": time.time()}
                     if gone:
                         body["removed"] = gone
                     pkt = proto.Packet.control(proto.T_ROUTE, body)
@@ -4180,10 +4765,26 @@ class WebUI:
         #   exe 被替换或挪了位置后，注册表里的旧路径会指向一个不存在的文件；
         #   每次启动自愈，比要求用户回设置页重勾一遍可靠。只在打包态做（源码态
         #   写的是 launcher.py 的开发路径，不替用户做这个决定）。
+        # ★ v2.38（用户）：多版本残留归一放到服务起来之后的后台线程 ——
+        #   它要读注册表、跑一次 PowerShell 解析快捷方式，不能挡住面板端口
+        #   （verify_exe 的"serve 启动 30s"就是被它拖挂的）。
+        #   顺序也必须在上面"以当前 exe 自愈重写"之后，否则会把刚写的那条当重复删掉。
+        #   沙箱/自检进程（指定了 AUDIOMIXING_HOME）不碰用户真实的启动项。
+        if sys.platform == "win32" and not os.environ.get("AUDIOMIXING_HOME") \
+                and _program_exe_path():
+            def _normalize_later() -> None:
+                try:
+                    normalize_autostart(getattr(self.node.config, "autostart_method", "registry"))
+                except Exception as exc:
+                    _autostart_log("启动时归一扫描失败：%s" % exc)
+
+            threading.Thread(target=_normalize_later, name="audiomixing-autostart",
+                             daemon=True).start()
         if sys.platform == "win32" and getattr(self.node.config, "launch_at_login", False) \
                 and _program_exe_path():
             try:
-                ok, err = set_windows_autostart(True)
+                ok, err = set_windows_autostart(
+                    True, getattr(self.node.config, "autostart_method", "registry"))
                 if not ok:
                     self.node.note("开机自启动没有生效：%s" % err)
             except Exception:
@@ -4277,6 +4878,37 @@ def index_html() -> str:
 
     _INDEX_CACHE = FALLBACK_HTML
     return _INDEX_CACHE
+
+
+def _multi_view(node: Any, out: dict[str, Any]) -> dict[str, Any]:
+    """把多耳机状态整理成页面要的形状。
+
+    ★ Q2 改（2026-11-16 用户）：系统默认播放设备永远在列表里、永远算「在听」，
+      但它是**直出**（系统自己放，我们不复制），所以：
+        · `devices` 第一行固定是它，带 `passthrough: True`；
+        · `available` 里不再重复出现；
+        · 其它设备才是我们真正开输出、走回环复制的。
+    """
+    default = ""
+    try:
+        default = str(node._default_render_name() or "")
+    except Exception:
+        default = ""
+    real = [d for d in (out.get("devices") or [])
+            if str(d.get("name") or d.get("device") or "") != default]
+    rows: list[dict[str, Any]] = []
+    if default:
+        rows.append({"name": default, "device": default, "gain": 1.0, "delay_ms": 0.0,
+                     "running": True, "passthrough": True,
+                     "source": "直出（系统在放）", "sources": [], "source_count": 0,
+                     "app_pid": 0, "fallback": ""})
+    rows.extend(real)
+    out["devices"] = rows
+    out["available"] = [n for n in (out.get("available") or []) if n != default]
+    out["passthrough"] = default
+    out["lock_optional"] = True
+    out["playing_now"] = [str(d.get("name") or d.get("device") or "") for d in rows]
+    return out
 
 
 def _phone_html(kind: str) -> str:
@@ -4843,7 +5475,7 @@ on('recover', 'click', async () => {
   const r = await (await fetch('/api/audio/recover', {method:'POST'})).json();
   if(r && r.ok){
     alert('已重开 ' + (r.restarted || 0) + ' 路播放端' +
-          (r.loop_stopped ? '，本机直通也重建了。' : '。'));
+          (r.loop_stopped ? '，本机广播监听也重建了。' : '。'));
   }else{
     alert('恢复失败：' + ((r && r.error) || '未知'));
   }

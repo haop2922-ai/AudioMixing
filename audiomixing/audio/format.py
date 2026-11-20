@@ -370,14 +370,14 @@ def _blackman(x: float) -> float:
     return 0.42 - 0.5 * math.cos(2 * math.pi * t) + 0.08 * math.cos(4 * math.pi * t)
 
 
-def _build_tap_table() -> list[float]:
+def _build_tap_table(zero_crossings: int | None = None) -> list[float]:
     """Windowed-sinc table: row ``p`` holds taps for phase ``p / _TABLE_SIZE``.
 
     Layout: ``table[p * 2Z + (k + Z)]`` is the weight for tap ``k`` in ``[-Z, Z)``.
-    Precomputed once at import; this is what makes the streaming resampler fast
+    Precomputed once per ``Z``; this is what makes the streaming resampler fast
     enough (a few percent of one core for 48 kHz stereo).
     """
-    z = _ZERO_CROSSINGS
+    z = int(zero_crossings or _ZERO_CROSSINGS)
     span = 2 * z
     table = [0.0] * ((_TABLE_SIZE + 1) * span)  # +1 row so index _TABLE_SIZE is valid
     for p in range(_TABLE_SIZE + 1):
@@ -390,6 +390,27 @@ def _build_tap_table() -> list[float]:
 
 
 _TAPS = _build_tap_table()
+# ★ 2.42.3：三档性能预算按不同过零数缓存抽头表（流畅=8，均衡=16，高音质=24）。
+_TAP_CACHE: dict[int, list[float]] = {_ZERO_CROSSINGS: _TAPS}
+
+
+def tap_table(zero_crossings: int) -> list[float]:
+    z = max(4, min(48, int(zero_crossings or _ZERO_CROSSINGS)))
+    table = _TAP_CACHE.get(z)
+    if table is None:
+        table = _build_tap_table(z)
+        _TAP_CACHE[z] = table
+    return table
+
+
+# ★ 2.42.3：新建 Resampler 的默认抽头数。引擎切档时改它；**已经建好的**重采样器保持原样，
+# 要完整生效就重开一次音源（面板会这么写）。
+_DEFAULT_ZERO_CROSSINGS = _ZERO_CROSSINGS
+
+
+def set_default_zero_crossings(zero_crossings: int) -> None:
+    global _DEFAULT_ZERO_CROSSINGS
+    _DEFAULT_ZERO_CROSSINGS = max(4, min(48, int(zero_crossings or _ZERO_CROSSINGS)))
 
 
 class Resampler:
@@ -401,13 +422,16 @@ class Resampler:
     tests/test_audiomixing.py.
     """
 
-    def __init__(self, src_rate: int, dst_rate: int, channels: int = CHANNELS) -> None:
+    def __init__(self, src_rate: int, dst_rate: int, channels: int = CHANNELS,
+                 zero_crossings: int | None = None) -> None:
         self.src_rate = int(src_rate)
         self.dst_rate = int(dst_rate)
         self.channels = int(channels)
         self.ratio = self.src_rate / float(self.dst_rate)
-        self._z = _ZERO_CROSSINGS
+        # ★ 2.42.3：三档性能预算只改抽头数（4~48）；None = 2.42.2 的默认值。
+        self._z = max(4, min(48, int(zero_crossings or _DEFAULT_ZERO_CROSSINGS)))
         self._span = 2 * self._z
+        self._taps = tap_table(self._z)
         # Pending input, starting with z silent frames of history. `_pos` is the
         # fractional position of the next output frame within `_in`.
         self._in = [0.0] * (self._z * self.channels)
@@ -436,7 +460,7 @@ class Resampler:
         ch = self.channels
         z = self._z
         span = self._span
-        taps = _TAPS
+        taps = self._taps
         n_in = len(self._in) // ch
         out = array("f")
         pos = self._pos

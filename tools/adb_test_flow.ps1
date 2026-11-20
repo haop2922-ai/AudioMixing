@@ -1,4 +1,4 @@
-﻿# 真机一键流程（Android Debug Bridge）
+﻿﻿# 真机一键流程（Android Debug Bridge）
 #
 # 用途：adb 授权后一条命令装测试源、设音量、抓 dumpsys / logcat / 截屏、
 #       并把 AudioMixing 手机的 SharedPreferences（档位、静音档策略等）拉下来。

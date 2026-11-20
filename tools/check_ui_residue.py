@@ -53,6 +53,111 @@ SOURCE_BANNED_TOKENS = BANNED_TOKENS - WHITELIST_TOKENS - {"test"}
 #: 未采集 / 占位文案：不允许出现在页面源码里（发现就该补采集或改成明确说明）。
 BANNED_UI_TEXT = ("还没测到",)
 
+#: ★ v2.42：多耳机页那张「一台电脑，多个耳机」配置卡已整块删除。
+#: 这些 id 只要还在页面或脚本里，就说明删漏了（不允许折叠/隐藏版本）。
+REMOVED_MULTI_IDS = ("moList", "moApply", "moBody", "moSummary")
+#: 这四样控件挪进了画布卡里的 .motools 工具条，必须各出现且只出现一次。
+MULTI_TOOL_IDS = ("moStop", "moRefresh", "moLockDevice", "moRestore",
+                  "moStatus", "moLockInfo")
+
+
+def check_bt_card_buttons(text: str) -> list[str]:
+    """★ v2.42：蓝牙卡片只允许「打开 / 关闭 / 隐藏」三颗，旧入口必须真删。
+    ★ 2.42.1：卡片下方不再有黄字提示；「打开」默认黑色，成功后才是 primary（蓝色）。"""
+    problems: list[str] = []
+    for gone in ("btToggle(", "btAuto(", "btAlways(", "btAutoList",
+                 ">${map[2] ? '断开' : '连接'}</button>",
+                 "const hint = d.link === 'hfp'", "${hint}"):
+        if gone in text:
+            problems.append("蓝牙卡片还残留已删除的按钮/脚本/黄字提示：%s" % gone)
+    for keep in ("async function btOpen(", "async function btClose(",
+                 'onclick="btOpen(${i})"', 'onclick="btClose(${i})"',
+                 'onclick="btHide(${i})"'):
+        if keep not in text:
+            problems.append("蓝牙卡片缺少 %s" % keep)
+    if text.count('onclick="btOpen(${i})"') != 1:
+        problems.append("「打开」按钮必须恰好 1 颗")
+    if text.count('onclick="btClose(${i})"') != 1:
+        problems.append("「关闭」按钮必须恰好 1 颗")
+    # ★ 2.42.1：初始不能是蓝的（primary），必须由 openOk 决定。
+    if "class=\"tiny ${openOk ? 'primary' : ''}\" onclick=\"btOpen" not in text:
+        problems.append("「打开」按钮默认必须是黑色，只有成功后才变蓝（缺 openOk 条件）")
+    if "btOpenOk" not in text:
+        problems.append("缺少 btOpenOk：无法证明「打开」成功后按钮才变蓝")
+    # ★ 2.42.2（第 3 条）：简洁档不许再有整段说明/黄字块 —— .btrules 必须彻底删除。
+    for gone in ('class="btrules"', ".btrules{", "只剩两颗按钮",
+                 "一个蓝牙适配器同一时刻只能接一台手机", "adapterNote"):
+        if gone in text:
+            problems.append("简洁档还残留整段说明/黄字块：%s" % gone)
+    return problems
+
+
+def check_multi_sources(text: str) -> list[str]:
+    """★ 2.42.1：多耳机必须支持"一路多音源 + 空音源静音"，且复杂档只列工作中的输出。"""
+    problems: list[str] = []
+    for token in ("function sourcesOf(", "function sourceKey(", "sources: []",
+                  "sources: sourcesOf(cfg).map", "renderPeerCards(wrap)"):
+        if token not in text:
+            problems.append("index.html 缺少 2.42.1 多音源/对端卡片实现：%s" % token)
+    if "未连音源 · 这一路静音" not in text:
+        problems.append("index.html 没有写清「没有音源时这一路静音」")
+    if "已回落桌面混音" in text:
+        problems.append("index.html 还残留「已回落桌面混音」文案（2.42.1 禁止回落）")
+    # 复杂档输出列必须过滤到"工作中"的设备。
+    if "isPassthrough(name) || isChosen(name) || remSink.has(name)" not in text:
+        problems.append("复杂档「输出音频设备」列没有过滤未启用设备")
+    # ★ 2.42.2（第 4 条）：对端 audio 卡只送不收。
+    start = text.find("function renderPeerCards")
+    if start < 0:
+        problems.append("index.html 找不到 renderPeerCards()")
+    else:
+        nxt = text.find("\n        function ", start + 10)
+        body = text[start:nxt if nxt > start else len(text)]
+        for gone in ("收听它的", "停止收听", "to: ['self']", "peerRoute(peer, 'in')",
+                     "送声音到它", "本机扬声器"):
+            if gone in body:
+                problems.append("对端 audio 卡还残留「本机扬声器/本机收听它」的入口或文案：%s" % gone)
+        # ★ 2.42.3（第 2 条）：简洁档的对端卡只留设备名 + 在线/送声状态；
+        #   解释块必须包在 `if (!simpleMode)` 里，简洁档一个字都不加。
+        if "if (!simpleMode)" not in body:
+            problems.append("对端 audio 卡的说明块没有只在详细档出现（if (!simpleMode)）")
+        if "card.onclick" not in body:
+            problems.append("对端 audio 卡缺少「点卡片＝送/停」的入口")
+    return problems
+
+
+def check_multi_card_removed(text: str) -> list[str]:
+    """证明「一台电脑，多个耳机」整卡已删、四样有用控件只在画布工具条里。"""
+    problems: list[str] = []
+    for token in REMOVED_MULTI_IDS:
+        if (re.search(r'id\s*=\s*"%s"' % token, text)
+                or re.search(r"getElementById\(\s*['\"]%s['\"]\s*\)" % token, text)):
+            problems.append("index.html 还残留已删除的多耳机配置卡节点/脚本 %s" % token)
+    if re.search(r'data-card\s*=\s*"multiout"', text):
+        problems.append('index.html 还残留 data-card="multiout"（那张配置卡应整块删除）')
+    for token in MULTI_TOOL_IDS:
+        count = len(re.findall(r'id\s*=\s*"%s"' % token, text))
+        if count != 1:
+            problems.append("工具条节点 %s 出现 %d 次（应恰好 1 次）" % (token, count))
+    card = re.search(r'<section[^>]*data-card="multiview"[\s\S]*?</section>', text)
+    if not card:
+        problems.append('index.html 找不到画布卡 data-card="multiview"')
+    else:
+        block = card.group(0)
+        if 'class="motools"' not in block:
+            problems.append("画布卡里没有 .motools 工具条")
+        for token in MULTI_TOOL_IDS:
+            if 'id="%s"' % token not in block:
+                problems.append("工具条节点 %s 不在画布卡里" % token)
+        if block.find('class="motools"') > block.find('id="moCards"'):
+            problems.append("工具条必须在卡片墙/画布之前")
+    for dead in (".mohead .moTitle", ".mohead #moToggle"):
+        if dead in text:
+            problems.append("index.html 还留着死样式 %s" % dead)
+    if re.search(r">\s*应用\s*<", text):
+        problems.append("index.html 还有「应用」按钮（已改成即时生效）")
+    return problems
+
 
 def _default_config() -> pathlib.Path | None:
     home = os.environ.get("AUDIOMIXING_HOME")
@@ -132,6 +237,9 @@ def check_ui_source(allow: set[str]) -> list[str]:
             if re.search(r"(?i)(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(tok), text):
                 problems.append("%s 含测试/占位词「%s」" % (path.name, tok))
         if name == "index.html":
+            problems += check_multi_card_removed(text)
+            problems += check_bt_card_buttons(text)
+            problems += check_multi_sources(text)
             m = re.search(r"function\s+renderDeviceCards\s*\(\)\s*\{([\s\S]*?)\n\}", text)
             if not m:
                 problems.append("index.html 找不到 renderDeviceCards()")

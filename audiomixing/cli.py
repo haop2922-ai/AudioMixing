@@ -28,6 +28,21 @@ from .net import discovery as disc
 from .net.rtpaudio import JitterBuffer, Receiver, SenderSession
 
 
+def _service_log(message: str) -> None:
+    """serve 模式的"已启动 / 为什么退出"也写进 launcher.log。
+
+    ★ v2.37：开机自启动走的就是 serve。可它以前只打 stdout，打包成 exe 后没有控制台，
+    日志里只有启动器那四行「启动环境」—— 用户和我都看不出它到底起没起，
+    于是被判定成"自启动没生效"（实际服务已经在 17800 上应答）。
+    """
+    try:
+        base = config_path().parent
+        with open(base / "launcher.log", "a", encoding="utf-8") as fh:
+            fh.write("%s  [serve] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), message))
+    except OSError:
+        pass
+
+
 def _ordered_lan_ips(node: Any, report: dict[str, Any]) -> list[str]:
     """按「对端最可能连得上」的顺序排私网地址。
 
@@ -259,6 +274,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         print("      http://127.0.0.1:%d  （仅本机）" % requested_web)
         print()
         print("  这个新窗口会退出。要重启服务，请先关闭原来那个黑窗口。")
+        _service_log("已有实例在跑（127.0.0.1:%d），本进程按单实例规则退出" % requested_web)
         if getattr(args, "open_browser", False):
             urls = ["http://%s:%d" % (i["address"], requested_web)
                     for i in disc.lan_report()["interfaces"] if i["kind"] == "private"]
@@ -369,6 +385,74 @@ def cmd_serve(args: argparse.Namespace) -> int:
         )
     except OSError:
         pass
+
+    # ★ v2.37：serve 模式（开机自启动走的就是它）补上**托盘**和一行"已启动"日志。
+    #   以前它没有任何可见迹象：没有窗口、没有托盘、日志也不写"已启动"，
+    #   用户开机后只能得出"没自启动"的结论 —— 实际服务已经在 17800 上应答。
+    #   仍然不弹面板（用户要的是后台托盘），双击托盘才打开面板。
+    _service_log("已启动 %s（后台常驻，不弹面板）" % local_url)
+
+    def stop_everything() -> None:
+        _service_log("从托盘退出")
+        try:
+            ui.stop()
+        except Exception as exc:
+            _service_log("停止面板失败: %s" % exc)
+        try:
+            node.stop()
+        except Exception as exc:
+            _service_log("停止节点失败: %s" % exc)
+        try:
+            from . import bluetooth as _bt
+
+            _bt.disconnect_all()
+        except Exception:
+            pass
+
+    def open_panel() -> None:
+        # ★ Q1（2026-11-16）：这里原来直接用 webbrowser 打开面板地址，完全绕开
+        #   audiomixing_launcher.open_monitor 的去重。serve 模式（开机自启动就是
+        #   这条路径）下，每双击一次托盘就多一个浏览器窗口 —— 正是"窗口无限多开"。
+        #   现在优先用启动器那套：已有窗口就提窗，没有才开，跨进程串行。
+        opener = None
+        try:
+            import __main__ as main_module
+
+            opener = getattr(main_module, "open_monitor", None)
+        except Exception:
+            opener = None
+        if not callable(opener):
+            try:
+                from audiomixing_launcher import open_monitor as opener  # noqa: F811
+            except Exception:
+                opener = None
+        if callable(opener):
+            try:
+                opener(local_url)
+                return
+            except Exception as exc:
+                _service_log("打开面板失败（启动器路径）: %s" % exc)
+        # 最后兜底：也走应用模式 + 去重，绝不直接开一个普通浏览器窗。
+        try:
+            from . import tray as tray_module
+
+            tray_module.open_url_fallback(local_url)
+        except Exception as exc:
+            _service_log("打开面板失败: %s" % exc)
+
+    # 有控制台时（开发者在终端里跑）保持原来的 Ctrl+C 形态，不额外加托盘；
+    # 没有控制台时（开机自启 / 双击 exe）才需要托盘当唯一入口。
+    if not (getattr(sys.stdout, "isatty", lambda: False)()):
+        try:
+            from . import tray as tray_module
+
+            tray_module.set_panel_opener(open_panel)
+            if tray_module.Tray(local_url, on_quit=stop_everything).run():
+                _service_log("托盘图标已退出，进程结束")
+                return 0
+            _service_log("托盘不可用，退化为无界面常驻")
+        except Exception as exc:
+            _service_log("托盘不可用，退化为无界面常驻: %s" % exc)
 
     try:
         while True:

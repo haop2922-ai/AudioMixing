@@ -564,6 +564,7 @@ public final class Diagnosis {
         //   绝不能顺手改系统音量（以前的滑杆就是错的）。
         sb.append("我们这一层：").append(e.volumeText()).append('\n');
         sb.append("系统音量：").append(e.systemVolumeText()).append('\n');
+        sb.append(e.allStreamVolumeText()).append('\n');
         sb.append("音量关系：").append(e.volumeExplainText()).append('\n');
         // ★ 节点 ID：持久化的，重启不变 —— 电脑端才不会把同一台手机记成好几台设备。
         sb.append("节点 ID ：").append(e.nodeIdText()).append('\n');
@@ -1013,7 +1014,8 @@ public final class Diagnosis {
         }
         try {
             PackageInfo pi = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
-            return pi.versionName + "（versionCode " + pi.versionCode + "）";
+            return pi.versionName + "（versionCode " + pi.versionCode + " · "
+                    + BuildConfig.BUILD_TAG + "）";
         } catch (Throwable t) {
             return "读取失败：" + t;
         }

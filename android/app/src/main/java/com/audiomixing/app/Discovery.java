@@ -126,6 +126,10 @@ public final class Discovery {
         /** 对端 IP（明文点分十进制）。 */
         public volatile String host = "";
         public volatile int audioPort = Proto.DEFAULT_AUDIO_PORT;
+        /** ★ 2.42.2（第 2 条）：广播专用端口；0 / 缺失 = 老版本，不向它发广播。 */
+        public volatile int broadcastPort;
+        /** ★ 2.42.3：对端性能预算档位（smooth / balanced / high）；空 = 老版本（按均衡）。 */
+        public volatile String quality = "";
         /** 手机没有网页面板，正常是 0；电脑端会填 17800。 */
         public volatile int webPort;
         public volatile String platform = "";
@@ -218,6 +222,10 @@ public final class Discovery {
     /** 名字是用户自己改的吗（默认名带短后缀区分同型号；用户改过就以用户的为准）。 */
     private volatile boolean customName;
     private volatile int audioPort;
+    /** ★ 2.42.2（第 2 条）：广播专用接收端口，随信标公布。 */
+    private volatile int broadcastPort = Proto.DEFAULT_BROADCAST_PORT;
+    /** ★ 2.42.3：本机性能预算档位（smooth / balanced / high），随信标公布。 */
+    private volatile String quality = "balanced";
     private volatile int webPort;
     private volatile boolean busy;
     private volatile boolean running;
@@ -572,6 +580,29 @@ public final class Discovery {
     public void setAudioPort(int port) {
         if (port > 0) {
             audioPort = port;
+        }
+    }
+
+    /** ★ 2.42.2：广播端口被占时 Engine 换了一个，同理要如实公布。 */
+    public int broadcastPort() {
+        return broadcastPort;
+    }
+
+    public void setBroadcastPort(int port) {
+        if (port > 0 && port != audioPort) {
+            broadcastPort = port;
+        }
+    }
+
+    /** ★ 2.42.3：本机档位（smooth / balanced / high），随信标公布给对端协商。 */
+    public String quality() {
+        return quality;
+    }
+
+    public void setQuality(String value) {
+        String q = value == null ? "" : value.trim().toLowerCase();
+        if ("smooth".equals(q) || "balanced".equals(q) || "high".equals(q)) {
+            quality = q;
         }
     }
 
@@ -1015,6 +1046,11 @@ public final class Discovery {
             o.put("platform", defaultPlatform());
             o.put("version", APP_VERSION);
             o.put("audio_port", audioPort);
+            o.put("broadcast_port", broadcastPort);
+            // ★ 2.42.3：性能预算档位。两端不一致时按较低那档协商生效。
+            o.put("quality", quality);
+            // ★ 2.31.1（#3）：我能解 Opus（Concentus）。老电脑忽略这个键，仍发 PCM。
+            o.put("opus", 1);
             o.put("web_port", webPort);
             JSONArray sources = new JSONArray();
             sources.put(item("mic", "麦克风", "mic"));
@@ -1226,6 +1262,10 @@ public final class Discovery {
             if (ap > 0) {
                 peer.audioPort = ap;
             }
+            // ★ 2.42.2：对端广播端口。老版本没有这个键 → 0（不向它发广播）。
+            peer.broadcastPort = o.optInt("broadcast_port", 0);
+            // ★ 2.42.3：对端档位。老版本没有这个键 → 空（协商时按均衡处理）。
+            peer.quality = o.optString("quality", "");
             int wp = o.optInt("web_port", 0);
             if (wp >= 0) {
                 peer.webPort = wp;

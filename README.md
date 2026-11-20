@@ -96,7 +96,7 @@ python tools/build_nuitka.py --test
 audiomixing/
   engine.py          核心：设备、路由、播放端、本机直通、多设备输出
   net/rtpaudio.py    RTP 收发、抖动缓冲、时钟对齐
-  net/discovery.py   局域网发现（UDP 17830，两端一致；音频端口由信标协商）
+  net/discovery.py   局域网发现（UDP 17830，两端一致；点对点音频 47831 / 广播 47832 由信标公布）
   audio/             WASAPI 采集与播放、Opus、采集共享、多设备输出
   webui.py           控制台、监控页、诊断报告的 HTTP 服务
   ui/                控制台与各页面的前端

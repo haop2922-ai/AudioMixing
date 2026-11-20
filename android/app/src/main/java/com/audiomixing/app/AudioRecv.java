@@ -241,6 +241,56 @@ public final class AudioRecv {
     private final CopyOnWriteArrayList<Stream> streams = new CopyOnWriteArrayList<>();
     /** 空 = 全收（还没勾任何人时"打开就能听"）；一旦用户动过开关，就只播明确打开的那些。 */
     private final Map<String, Boolean> allowed = new HashMap<>();
+    /**
+     * ★ 2.42.2（第 2 条）：本接收器专收广播口（47832）。
+     *
+     * <p>频道模式跳过 {@link #allowed} 名单 —— 广播和点对点各用各的端口、各判各的，
+     * 一条的放行/拒收不会影响另一条。点对点接收器永远不开这个开关。
+     */
+    private volatile boolean channelMode;
+
+    /**
+     * ★ 2.42.3（第 1 条）：旧版本发送方的兼容判据。
+     *
+     * <p>2.42.2 之后广播走独立端口 47832；但 2.42.1 及更早的电脑仍把广播发到本机 47831。
+     * 手机这边如果严格执行「点对点口只认勾过收听的设备」，旧电脑的广播就会被整条拒掉 ——
+     * 用户看到的就是「升级手机后听不到旧电脑的广播，而且没有任何提示」。
+     *
+     * <p>所以由引擎注入一个判据：**只对信标里没有广播端口的旧设备**放行
+     * （见 {@code Engine#legacyChannelAllowed}）。新设备永远走 47832，两档隔离不受影响。
+     */
+    public interface LegacyChannelJudge {
+        boolean allow(String host);
+    }
+
+    private volatile LegacyChannelJudge legacyChannelJudge;
+
+    public void setLegacyChannelJudge(LegacyChannelJudge judge) {
+        legacyChannelJudge = judge;
+    }
+
+    private boolean legacyChannelAllowed(String host) {
+        LegacyChannelJudge j = legacyChannelJudge;
+        if (j == null) {
+            return false;
+        }
+        try {
+            return j.allow(host);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * ★ 2.42.3（第 1 条）：本接收器**绝不能**占用的端口。
+     *
+     * <p>点对点接收器（47831）被别的 App 占了时会往后找空闲口，原来会一路找到 47832 ——
+     * 那正是广播接收器的端口。两个 socket 都带 SO_REUSEADDR 绑同一个 UDP 口时，
+     * 内核只把单播投给其中一个（通常是后绑的那个），于是广播包进到了点对点接收器，
+     * 被它按「没勾收听」拒掉：现场表现就是「听广播没声音，但端口确实收到了包」。
+     * 所以点对点接收器要把广播口列为禁区，广播接收器同理。
+     */
+    private volatile int reservedPort;
 
     private volatile boolean running;
     private Thread rxThread;
@@ -414,6 +464,20 @@ public final class AudioRecv {
         }
     }
 
+    /** ★ 2.42.2：频道模式 = 这个接收器只收广播口，准入只看「听广播」开关。 */
+    public void setChannelMode(boolean on) {
+        channelMode = on;
+    }
+
+    public boolean isChannelMode() {
+        return channelMode;
+    }
+
+    /** ★ 2.42.3：换空闲口时跳过这个端口（点对点 ↔ 广播互不抢占）。 */
+    public void setReservedPort(int port) {
+        reservedPort = port > 0 ? port : 0;
+    }
+
     private boolean isAllowed(String host) {
         synchronized (allowLock) {
             if (allowed.isEmpty()) {
@@ -581,8 +645,20 @@ public final class AudioRecv {
      * 只是探测，探完立刻关掉 —— 正式收包由 {@link #start()} 在后台重新绑。
      */
     public static int pickFreePort(int preferred) {
+        return pickFreePort(preferred, 0);
+    }
+
+    /**
+     * ★ 2.42.3：找空闲口时跳过 {@code avoid}（另一档接收器的端口）。
+     *
+     * @return 找到的端口；一个都没找到返回 -1（调用方必须如实报错）
+     */
+    public static int pickFreePort(int preferred, int avoid) {
         int start = preferred > 0 ? preferred : Proto.DEFAULT_AUDIO_PORT;
         for (int p = start; p < start + 20 && p < 65535; p++) {
+            if (p == avoid) {
+                continue;
+            }
             try (DatagramSocket probe = new DatagramSocket(null)) {
                 probe.setReuseAddress(false);
                 probe.bind(new InetSocketAddress(p));
@@ -638,7 +714,7 @@ public final class AudioRecv {
                     }
                 }
                 int next = want + 1;
-                int free = pickFreePort(next);
+                int free = pickFreePort(next, reservedPort);
                 if (free < 0) {
                     break;
                 }
@@ -763,18 +839,34 @@ public final class AudioRecv {
         int plen0 = pkt.payload == null ? 0 : pkt.payload.length;
         // 记下"对面到底用什么编码发的"：这一条比任何猜测都直接（电脑端广播/路由用的是
         // config.codec，默认 pcm_s16，但用户可能改成 opus 或 pcm_f32）。
-        if (pkt.codec != Proto.CODEC_PCM_S16) {
+        if (pkt.codec != Proto.CODEC_PCM_S16 && pkt.codec != Proto.CODEC_OPUS) {
             bumpBad(11, host, len);
             lastCodecSeen = "codec=" + pkt.codec + "（" + codecName(pkt.codec) + "）";
             sampleBad(4, buf, len, from, "编码 " + lastCodecSeen + "，负载 " + plen0
                     + " 字节，samples=" + pkt.samples);
             return;
         }
-        lastCodecSeen = "codec=2（PCM 16位）";
-        if (!isAllowed(host)) {
-            bump(5);   // 用户没勾「收听」它（也没开「听广播」）
+        if (!channelMode && !isAllowed(host) && !legacyChannelAllowed(host)) {
+            bump(5);   // 用户没勾「收听」它（点对点口）；广播口走 channelMode，不看这份名单
             return;
         }
+        if (pkt.codec == Proto.CODEC_OPUS) {
+            // ★ 2.31.1（#3）：Opus 包先解码，再按 480 帧切块进抖动缓冲。
+            Integer busyOpus = acceptStreamFor(host, pkt.ssrc);
+            if (busyOpus != null) {
+                dupRoutePackets++;
+                dupRouteText = host + "：ssrc " + Integer.toHexString(busyOpus) + " 正在放，"
+                        + "ssrc " + Integer.toHexString(pkt.ssrc) + " 已抑制（同一台设备的第 2 条流，不叠加）";
+                return;
+            }
+            bump(0);
+            Stream opusStream = streamFor(host, pkt.ssrc);
+            opusStream.storeOpus(pkt.payload, plen0, pkt.samples,
+                    (pkt.flags & Proto.FLAG_SILENCE) != 0);
+            lastCodecSeen = "codec=3（Opus，已解码）";
+            return;
+        }
+        lastCodecSeen = "codec=2（PCM 16位）";
         int plen = plen0;
         // ★★ 准入判据 = 【负载长度】，不再看 samples ★★
         //
@@ -1299,6 +1391,11 @@ public final class AudioRecv {
         final String key;
         final String host;
         final int ssrc;
+        /** ★ 2.31.1（#3）：Opus 解码器（每路一个，状态不能混用）；null = 还没收到过 Opus。 */
+        OpusPcmDecoder opus;
+        int opusSeq;
+        String opusError = "";
+        int codec = -1;
         final byte[][] slots = new byte[SLOTS][FRAME_BYTES];
         final boolean[] filled = new boolean[SLOTS];
 
@@ -1321,12 +1418,88 @@ public final class AudioRecv {
             this.ssrc = ssrc;
         }
 
+        /** 编码切换（PCM ↔ Opus）时清空这一路；ssrc 不变但包长语义完全不同。 */
+        synchronized void resetForCodec(int c) {
+            codec = c;
+            nextSeq = -1;
+            highestSeq = 0;
+            playing = false;
+            opusSeq = 0;
+            Arrays.fill(filled, false);
+        }
+
+        /**
+         * ★ 2.31.1（#3）：收一包 Opus，解码后按 480 帧切块，走原来的抖动缓冲。
+         *
+         * <p>为什么切块：手机播放线程固定每 10ms 取 480 帧；PC 的 Opus 包可能是
+         * 480/960/2880 帧（均衡/流畅/高音质），不切开就会一半样本没机会播。
+         */
+        void storeOpus(byte[] payload, int len, int frames, boolean silent) {
+            if (opus == null) {
+                try {
+                    opus = new OpusPcmDecoder();
+                } catch (Throwable t) {
+                    opusError = String.valueOf(t);
+                    return;
+                }
+            }
+            byte[] pcm = opus.decode(payload, len, frames);
+            if (pcm.length <= 0) {
+                opusError = "decode 返回空（codec=3）";
+                return;
+            }
+            int totalFrames = pcm.length / (Proto.CHANNELS * 2);
+            int chunks = (totalFrames + Proto.FRAME_SAMPLES - 1) / Proto.FRAME_SAMPLES;
+            if (chunks <= 0) {
+                return;
+            }
+            if (totalFrames % Proto.FRAME_SAMPLES != 0) {
+                pcm = Arrays.copyOf(pcm, chunks * FRAME_BYTES);
+            }
+            long now = SystemClock.elapsedRealtime();
+            lastPacketMs = now;
+            received++;
+            synchronized (this) {
+                if (codec != Proto.CODEC_OPUS) {
+                    resetForCodec(Proto.CODEC_OPUS);
+                }
+                if (nextSeq < 0) {
+                    nextSeq = opusSeq;
+                    highestSeq = opusSeq;
+                    prebufStartMs = now;
+                }
+                for (int i = 0; i < chunks; i++) {
+                    int seq = (opusSeq + i) & 0xFFFF;
+                    int idx = seq & MASK;
+                    if (filled[idx]) {
+                        dup++;
+                        continue;
+                    }
+                    byte[] slot = slots[idx];
+                    if (silent) {
+                        Arrays.fill(slot, (byte) 0);
+                    } else {
+                        System.arraycopy(pcm, i * FRAME_BYTES, slot, 0, FRAME_BYTES);
+                        if (gain != 1f) {
+                            scalePcm16(slot, slot, FRAME_BYTES, gain);
+                        }
+                    }
+                    filled[idx] = true;
+                }
+                opusSeq = (opusSeq + chunks) & 0xFFFF;
+                highestSeq = (opusSeq - 1) & 0xFFFF;
+            }
+        }
+
         /** 收包线程调用：把这一包放进对应槽位。 */
         void store(int seq, byte[] payload, int len, boolean silent) {
             long now = SystemClock.elapsedRealtime();
             lastPacketMs = now;
             received++;
             synchronized (this) {
+                if (codec != Proto.CODEC_PCM_S16) {
+                    resetForCodec(Proto.CODEC_PCM_S16);
+                }
                 if (nextSeq < 0) {
                     // 这条流的第一包：它就是播放的起点，预缓冲计时也从这一刻开始。
                     nextSeq = seq;

@@ -96,6 +96,7 @@ def ensure_ports(cfg: Any, *, save: bool = True) -> dict[str, int]:
     """
     web = int(getattr(cfg, "web_port", 17800))
     audio = int(getattr(cfg, "audio_port", 47831))
+    bcast = int(getattr(cfg, "broadcast_port", 0) or 0) or (audio + 1)
     disc = int(getattr(cfg, "discovery_port", 17830))
 
     # A valid layout needs four distinct numbers and web/web+1 free.
@@ -114,6 +115,13 @@ def ensure_ports(cfg: Any, *, save: bool = True) -> dict[str, int]:
         new_audio = audio
 
     reserved = {new_web, new_web + 1, new_audio}
+    # ★ 2.42.2：广播口必须与点对点口分开；冲突时单独挪广播口。
+    if bcast == new_audio or bcast in reserved or not _udp_free(bcast):
+        new_bcast = _next_udp(bcast, reserved | {new_audio})
+    else:
+        new_bcast = bcast
+
+    reserved = {new_web, new_web + 1, new_audio, new_bcast}
     if disc in reserved or not _udp_free(disc):
         new_disc = _next_udp(disc, reserved)
     else:
@@ -126,6 +134,11 @@ def ensure_ports(cfg: Any, *, save: bool = True) -> dict[str, int]:
     if new_audio != audio:
         cfg.audio_port = new_audio
         changed["audio_port"] = new_audio
+    if new_bcast != bcast:
+        cfg.broadcast_port = new_bcast
+        changed["broadcast_port"] = new_bcast
+    elif int(getattr(cfg, "broadcast_port", 0) or 0) != new_bcast:
+        cfg.broadcast_port = new_bcast
     if new_disc != disc:
         cfg.discovery_port = new_disc
         changed["discovery_port"] = new_disc
