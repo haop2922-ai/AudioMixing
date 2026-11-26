@@ -149,6 +149,15 @@
     <input type="range" id="gain" min="0" max="1.5" step="0.05" value="1">
     <span class="val" id="gainVal">1.00</span>
   </div>
+  <div class="row" id="qualityRow" style="margin-top:10px">
+    <label>音质</label>
+    <select id="quality" style="flex:1;padding:8px;border-radius:8px;background:#0f141b;
+            color:var(--fg);border:1px solid #2a3140">
+      <option value="saver">省电 · 24kHz 单声道</option>
+      <option value="balanced">均衡 · 48kHz 单声道</option>
+      <option value="quality">音质 · 48kHz 立体声</option>
+    </select>
+  </div>
   <details>
     <summary>详情与排查</summary>
     <div class="kv" id="kv"></div>
@@ -174,6 +183,17 @@ const PHONE_NAME = (qs.get('name') || '手机').slice(0, 32) || '手机';
 
 let ws = null, ctx = null, gainNode = null, playAt = 0, running = false, busy = false;
 let lost = 0, recv = 0, rate = 24000, ch = 1, backlog = 0;
+let listenQuality = localStorage.getItem('am-listen-q') || '';
+let fmtLabel = 'PCM · 等待格式…';
+if($('quality')) $('quality').value = listenQuality || 'balanced';
+$('quality').onchange = () => {
+  listenQuality = $('quality').value;
+  try{ localStorage.setItem('am-listen-q', listenQuality); }catch(e){}
+  // 连接内切档：服务端收到后回一帧新格式，不断流、不重连。
+  if(running && mode === 'listen' && ws && ws.readyState === 1){
+    try{ ws.send(JSON.stringify({type:'quality', quality: listenQuality})); }catch(e){}
+  }
+};
 let micStream = null, micNode = null, micSource = null, micQueue = [], micSending = false, micSent = 0, micPeak = 0;
 let lastMsgAt = 0, level = 0;
 
@@ -237,6 +257,7 @@ function kv(pairs){
 
 function modeUI(){
   const listen = mode === 'listen';
+  if($('qualityRow')) $('qualityRow').style.display = listen ? '' : 'none';
   $('mListen').classList.toggle('sel', listen);
   $('mSend').classList.toggle('sel', !listen);
   $('gainLabel').textContent = listen ? '音量' : '灵敏度';
@@ -270,7 +291,8 @@ function syncUrl(){
 /* ---------- 收听（WebSocket PCM16） ---------- */
 function wsUrl(){
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return proto + '//' + location.host + '/ws/audio';
+  return proto + '//' + location.host + '/ws/audio'
+    + (listenQuality ? ('?q=' + encodeURIComponent(listenQuality)) : '');
 }
 function stopListen(){
   if(ws){ try{ ws.close(); }catch(e){} ws = null; }
@@ -299,23 +321,40 @@ function openSocket(){
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
     setState('已连接，等待声音…', 'on');
-    kv([['地址', location.host], ['格式', 'PCM 24kHz 单声道'], ['状态', '等待数据']]);
+    kv([['地址', location.host], ['格式', fmtLabel], ['状态', '等待数据']]);
   };
   ws.onmessage = (ev) => {
+    // ★ 2.46.12：服务端第一帧是文本，告诉我们真实档位/采样率/声道。
+    if(typeof ev.data === 'string'){
+      try{
+        const f = JSON.parse(ev.data);
+        if(f && f.type === 'format'){
+          if(f.rate) rate = Number(f.rate) || rate;
+          if(f.channels) ch = Number(f.channels) || ch;
+          fmtLabel = 'PCM ' + (rate / 1000) + 'kHz ' + (ch === 2 ? '立体声' : '单声道')
+            + (f.label ? ('（' + f.label + '）') : '');
+        }
+      }catch(e){}
+      return;
+    }
     if(!ctx || !gainNode) return;
     const bytes = new Uint8Array(ev.data);
     const frames = bytes.length / 2 / ch;
     if(!frames) return;
     recv++; lastMsgAt = Date.now();
-    const buf = ctx.createBuffer(ch, frames, 24000);
-    const out = buf.getChannelData(0);
+    const buf = ctx.createBuffer(ch, frames, rate);
     let peak = 0;
-    for(let i = 0, p = 0; i < frames; i++, p += 2){
-      const v = (bytes[p] | (bytes[p+1] << 8)) << 16 >> 16;
-      const f = v / 32768;
-      out[i] = f;
-      const a = f < 0 ? -f : f;
-      if(a > peak) peak = a;
+    for(let c = 0; c < ch; c++){
+      const out = buf.getChannelData(c);
+      for(let i = 0, p = c * 2; i < frames; i++, p += ch * 2){
+        const v = (bytes[p] | (bytes[p + 1] << 8)) << 16 >> 16;
+        const f = v / 32768;
+        out[i] = f;
+        if(c === 0){
+          const a = f < 0 ? -f : f;
+          if(a > peak) peak = a;
+        }
+      }
     }
     const src = ctx.createBufferSource();
     src.buffer = buf; src.connect(gainNode);
@@ -337,7 +376,7 @@ function openSocket(){
         ['缓冲', Math.round(backlog * 1000) + ' ms'],
         ['已收块', String(recv)],
         ['丢弃块', String(lost)],
-        ['格式', 'PCM 24kHz 单声道'],
+        ['格式', fmtLabel],
       ]);
     }
   };
@@ -467,6 +506,10 @@ document.addEventListener('visibilitychange', () => { if(document.hidden && runn
   try{
     const r = await fetch('/api/status', {cache:'no-store'});
     const s = await r.json();
+    // ★ 2.46.12：本机没选过档位时，跟随电脑端设置的默认档。
+    if(!listenQuality && s.listen_quality && s.listen_quality.local && $('quality')){
+      $('quality').value = s.listen_quality.local;
+    }
     const name = (s.node && s.node.name) || '这台电脑';
     $('peer').textContent = '电脑：' + name + '　·　' + (s.node && s.node.lan_ip ? s.node.lan_ip : location.host);
   }catch(e){

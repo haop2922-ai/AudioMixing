@@ -273,5 +273,5 @@ http://127.0.0.1:17800
 
 ---
 
-*上一任交接人：DeepSeek Harness（AI 助手）。项目由用户 HWHHYN 主导。*
+*上一任交接人：DeepSeek Harness（AI 助手）。项目由用户 haop2922（HWHHYN）主导。*
 *如果你发现这份文档有错，请直接改它 —— 文档也是这个项目的一部分。*

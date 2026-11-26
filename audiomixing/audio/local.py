@@ -19,7 +19,7 @@ from array import array
 from .format import CHANNELS, SAMPLE_RATE, as_float_array
 
 
-# HWHHYN 用 DEEPSEEK 制作
+# 作者：haop2922（HWHHYN）
 def _apply_gain_ramp(samples, state: list, gain_from: float, gain_to: float,
                      cutoff_hz: float = 25.0):
     """直流阻断 + 逐样本线性增益过渡 + 柔和限幅，一次循环做完。

@@ -33,7 +33,7 @@ ICON = ROOT / "tools" / "audiomixing.ico"
 NAME = "AudioMixing"
 
 
-# HWHHYN 用 DEEPSEEK 制作
+# 作者：haop2922（HWHHYN）
 def make_icon() -> pathlib.Path | None:
     """Draw a simple speaker/wave icon so the exe is recognisable in Explorer.
 

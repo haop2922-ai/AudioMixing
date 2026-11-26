@@ -953,6 +953,17 @@ html:not(.fullui) .card .body { padding-top: 6px; }
                 title="机器够好：更高码率/编码复杂度/重采样质量与更深缓冲，CPU 会上去">高音质</button>
         <span class="mini" id="qNow" style="opacity:.75"></span>
       </span>
+      <!-- ★ 2.46.12：手机网页版听众的三个带宽档位（App 听众固定 48kHz 立体声）。 -->
+      <span class="tiny" id="qlSeg" style="display:inline-flex;gap:2px;align-items:center">
+        <span class="mini" style="opacity:.7" title="手机网页版听众（扫码/浏览器）的带宽档位；App 听众固定 48kHz 立体声">听众</span>
+        <button class="tiny" data-ql="saver" onclick="setListenQuality('saver')"
+                title="24kHz 单声道，约 47KB/s：游戏听脚步、弱 Wi-Fi、长时间使用">省电</button>
+        <button class="tiny" data-ql="balanced" onclick="setListenQuality('balanced')"
+                title="48kHz 单声道，约 94KB/s（默认）：视频、会议、日常">均衡</button>
+        <button class="tiny" data-ql="quality" onclick="setListenQuality('quality')"
+                title="48kHz 立体声，约 188KB/s：听歌、信号好的 Wi-Fi">音质</button>
+        <span class="mini" id="qlNow" style="opacity:.75"></span>
+      </span>
       <!-- ★ v2.27（用户新 UI 需求）：把散落的维护按钮收进「设置」；标签行只留
            主行动「快速上手」，刷新挪到上面「网址复制」右边。 -->
       <button class="primary" id="guideBtn" onclick="openGuide()"
@@ -5637,6 +5648,32 @@ async function setQualityPreset(name){
   }catch(e){ toast('切换档位失败：' + e.message, 'err'); }
 }
 
+/* ★ 2.46.12：手机网页版听众音质（省电 / 均衡 / 音质）。 */
+const LISTEN_Q_LABEL = {saver: '省电', balanced: '均衡', quality: '音质'};
+function renderListenQuality(q){
+  const seg = $('qlSeg'); if(!seg) return;
+  const local = (q && q.local) || 'balanced';
+  document.querySelectorAll('button[data-ql]').forEach(b => {
+    b.classList.toggle('on', b.getAttribute('data-ql') === local);
+  });
+  const f = (q && q.format) || {};
+  const now = $('qlNow');
+  if(now){
+    now.textContent = f.rate
+      ? ((f.label || LISTEN_Q_LABEL[local] || '') + ' · ' + (f.rate / 1000) + 'kHz/'
+         + (f.channels === 2 ? '立体声' : '单声道') + ' · ' + f.kbps + 'KB/s')
+      : '';
+    now.title = '只影响浏览器听众；Android App 听众走 RTP，固定 48kHz 立体声';
+  }
+}
+async function setListenQuality(name){
+  try{
+    await api('/api/settings', { listen_quality: name });
+    toast('手机听众音质：' + (LISTEN_Q_LABEL[name] || name), 'ok');
+    refreshAll();
+  }catch(e){ toast('切换失败：' + e.message, 'err'); }
+}
+
 /* ★ 2.46.4：点对点链路（自动 / 有线优先 / Wi-Fi 优先） */
 function renderLinkPreference(pref){
   const seg = $('linkPrefSeg'); if(!seg) return;
@@ -5762,6 +5799,7 @@ async function refreshAll(){
     renderPickers();
     renderStatus();
     renderQualityPreset(status && status.quality_preset);
+    renderListenQuality(status && status.listen_quality);
     renderLinkPreference(status && status.link_preference);
     renderStreams();
     // ★ 第 4 条：回环警告是**全局**的（每一页都看得见），所以放在这里、不放在关系图那一页里。

@@ -82,7 +82,7 @@ class WNDCLASSW(ctypes.Structure):
     ]
 
 
-# HWHHYN 用 DEEPSEEK 制作
+# 作者：haop2922（HWHHYN）
 def _find_edge() -> str:
     """找 Edge 的可执行文件；找不到返回空串（那时才退回默认浏览器）。
 
@@ -245,7 +245,7 @@ def _open_panel(address: str, page: str = "monitor") -> None:
     _open_url(address.rstrip("/") + ("/" + page.lstrip("/") if page else "/"))
 
 
-# HWHHYN 用 DEEPSEEK 制作
+# 作者：haop2922（HWHHYN）
 def _real_exe() -> str:
     """这次运行"到底是哪个程序"—— 用户双击的那颗 exe，源码运行时是入口 .py。
 

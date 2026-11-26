@@ -123,7 +123,7 @@ def nuitka_args(onedir: bool) -> list[str]:
         # 结果文件属性里显示的版本和面板上的版本对不上，用户没法靠右键属性确认自己拿的是哪一版）。
         "--file-version=%s" % _padded_version(),
         "--product-version=%s" % _padded_version(),
-        "--copyright=MIT License",
+        "--copyright=Apache License 2.0",
         ENTRY,
     ]
 

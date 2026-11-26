@@ -1,6 +1,9 @@
 # 构建产物：不进仓库，走 GitHub Releases 上传
 dist/
 build/
+# release/ 是交付产物目录（exe/apk/历史包），整体不进版本库；
+# 本机保留文件，只从 git 索引移除（git rm -r --cached release/）。
+release/
 *.spec
 release/*.exe
 release/*.zip
@@ -67,3 +70,12 @@ tools/installer_payload/*.apk
 
 # 真实渲染自检截图：含本机 IP / 主机名 / MAC / Windows 用户名，不进公开仓库
 docs/selfcheck/
+
+# ── 2026-11-26 仓库整改 ───────────────────────────────────────────
+# 本机工具/交接副本/截图缓存：都不属于源码树
+.trae/
+.screenshots/
+Mac版交接/
+临时日志
+*.log
+

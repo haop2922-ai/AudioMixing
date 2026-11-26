@@ -29,7 +29,7 @@ if not getattr(sys, "frozen", False):
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
 
-# HWHHYN 用 DEEPSEEK 制作
+# 作者：haop2922（HWHHYN）
 def _log_path() -> str:
     """日志放哪：优先跟配置目录走，其次 %APPDATA%\\AudioMixing，最后用户主目录。
 
@@ -97,7 +97,7 @@ def _silence_std_streams() -> None:
     if sys.stderr is None:
         sys.stderr = _NullWriter()
 
-# HWHHYN 用 DEEPSEEK 制作
+# 作者：haop2922（HWHHYN）
 
 def _enable_dpi_awareness() -> None:
     if sys.platform != "win32":

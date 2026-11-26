@@ -33,7 +33,7 @@ _opus: Any = None
 _load_error = ""
 
 
-# HWHHYN 用 DEEPSEEK 制作
+# 作者：haop2922（HWHHYN）
 def _candidate_dirs() -> list[str]:
     """所有可能藏着 opus.dll 的目录。
 

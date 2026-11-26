@@ -101,7 +101,7 @@ def _chunk_peak(samples) -> float:
 DEBUG_JITTER = bool(_os.environ.get("AUDIOMIXING_DEBUG_JITTER") or _os.environ.get("WAVELINK_DEBUG_JITTER"))
 
 
-# HWHHYN 用 DEEPSEEK 制作
+# 作者：haop2922（HWHHYN）
 def _jdbg(*args) -> None:
     if DEBUG_JITTER:
         print("[jitter]", *args, file=__import__("sys").stderr)
@@ -665,7 +665,7 @@ class Receiver:
         #   前端 `stream.get("kbps")` 永远是 0。这里按真实字节增量算一个每秒窗口。
         self._rate_prev: dict[int, tuple[float, int, float]] = {}
 
-    # HWHHYN 用 DEEPSEEK 制作
+    # 作者：haop2922（HWHHYN）
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
         self._sock = self._open_socket(self.port)

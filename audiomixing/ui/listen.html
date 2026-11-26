@@ -40,6 +40,15 @@
     <input type="range" id="vol" min="0" max="1.5" step="0.05" value="1">
     <span class="mono" id="volVal">1.00</span>
   </div>
+  <div class="row">
+    <label>音质</label>
+    <select id="qsel" style="flex:1;padding:8px;border-radius:8px;background:#0f141b;
+            color:var(--fg);border:1px solid var(--line)">
+      <option value="saver">省电 · 24kHz 单声道</option>
+      <option value="balanced">均衡 · 48kHz 单声道</option>
+      <option value="quality">音质 · 48kHz 立体声</option>
+    </select>
+  </div>
   <div class="stat">
     <div><span class="dot" id="dot"></span><span id="state">未连接</span></div>
     <div>延迟 <span class="mono" id="lat">—</span>　缓冲 <span class="mono" id="buf">—</span>　丢块 <span class="mono" id="lost">0</span></div>
@@ -60,6 +69,17 @@
 const $ = (id) => document.getElementById(id);
 let ws = null, ctx = null, gain = null, playAt = 0, playing = false;
 let lost = 0, recv = 0, startedAt = 0, rate = 24000, ch = 1;
+let quality = localStorage.getItem('am-listen-q') || '';
+let fmtLabel = 'PCM · 等待格式…';
+if($('qsel')) $('qsel').value = quality || 'balanced';
+$('qsel').onchange = () => {
+  quality = $('qsel').value;
+  try{ localStorage.setItem('am-listen-q', quality); }catch(e){}
+  // 连接内切档：服务端收到后回一帧新格式，不断流、不重连。
+  if(playing && ws && ws.readyState === 1){
+    try{ ws.send(JSON.stringify({type:'quality', quality: quality})); }catch(e){}
+  }
+};
 
 function setState(text, cls){
   $('state').textContent = text;
@@ -72,6 +92,10 @@ async function fetchInfo(){
     const r = await fetch('/api/status', {cache:'no-store'});
     const s = await r.json();
     const ch = s.channel || {};
+    // ★ 2.46.12：用户没在本机选过档位时，跟随电脑端设置的默认档。
+    if(!quality && s.listen_quality && s.listen_quality.local && $('qsel')){
+      $('qsel').value = s.listen_quality.local;
+    }
     const parts = [];
     parts.push(s.node.name + ' 上正在播放的声音');
     if(ch.listen) parts.push('（本机在收听频道）');
@@ -88,7 +112,8 @@ $('volVal').textContent = Number($('vol').value).toFixed(2);
 
 function wsUrl(){
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return proto + '//' + location.host + '/ws/audio';
+  return proto + '//' + location.host + '/ws/audio'
+    + (quality ? ('?q=' + encodeURIComponent(quality)) : '');
 }
 
 function stop(){
@@ -113,7 +138,7 @@ async function start(){
     // click handler, which is exactly what it needs.
     ctx = new (window.AudioContext || window.webkitAudioContext)();
     await ctx.resume().catch(()=>{});
-    rate = 24000;
+    rate = 24000;   // 服务端会在第一帧文本里给出真实档位，收到后覆盖
     gain = ctx.createGain();
     gain.gain.value = Number($('vol').value);
     gain.connect(ctx.destination);
@@ -132,15 +157,29 @@ function openSocket(){
   ws.onopen = () => {
     $('btn').textContent = '停止收听';
     setState('已连接，等待声音…', 'on');
-    $('fmt').textContent = 'PCM16 · ' + (ch) + 'ch · 24000Hz（服务端已降采样）';
+    $('fmt').textContent = fmtLabel;
   };
   ws.onmessage = (ev) => {
+    // ★ 2.46.12：第一帧是文本，服务端告诉我们真实档位/采样率/声道。
+    if(typeof ev.data === 'string'){
+      try{
+        const f = JSON.parse(ev.data);
+        if(f && f.type === 'format'){
+          if(f.rate) rate = Number(f.rate) || rate;
+          if(f.channels) ch = Number(f.channels) || ch;
+          fmtLabel = 'PCM16 · ' + (ch) + 'ch · ' + rate + 'Hz'
+            + (f.label ? ('（' + f.label + '）') : '');
+          $('fmt').textContent = fmtLabel;
+        }
+      }catch(e){}
+      return;
+    }
     if(!ctx || !gain) return;
     const bytes = new Uint8Array(ev.data);
     const frames = bytes.length / 2 / ch;
     if(!frames) return;
     recv++;
-    const buf = ctx.createBuffer(ch, frames, 24000);
+    const buf = ctx.createBuffer(ch, frames, rate);
     for(let c = 0; c < ch; c++){
       const out = buf.getChannelData(c);
       for(let i = 0, p = c * 2; i < frames; i++, p += ch * 2){

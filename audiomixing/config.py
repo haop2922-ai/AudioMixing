@@ -19,7 +19,7 @@ from . import quality
 CONFIG_VERSION = 1
 
 
-# HWHHYN 用 DEEPSEEK 制作
+# 作者：haop2922（HWHHYN）
 def _migrate_old_dir(new_dir: "Path") -> None:
     """把旧的 %APPDATA%\\WaveLink 整棵复制到新目录（只做一次）。
 
@@ -180,6 +180,11 @@ class Config:
     #   老配置没有这个键 → 均衡（= 2.42.2 行为，音质与延迟都不变）。
     #   档位只影响本机的编码/缓冲/重采样开销；对端不一致时两端按较低那档协商。
     quality_preset: str = quality.DEFAULT
+    # ★ 2.46.12：手机网页版听众的音频质量（saver / balanced / quality）。
+    #   只影响浏览器听众（WebSocket / HTTP PCM）的采样率与声道，不影响 App 的 RTP。
+    #   saver=24kHz 单声道(~47KB/s) / balanced=48kHz 单声道(~94KB/s) /
+    #   quality=48kHz 立体声(~188KB/s)。默认 balanced（视频、会议、日常）。
+    listen_quality: str = "balanced"
     # ★ 2.46.4：点对点链路偏好（auto / wired / wireless）。
     #   auto = 有网线 / USB 网络共享时优先走有线；wired/wireless 可强制。
     #   只影响"选哪块网卡的地址/往哪个对端 IP 发"，不改变任何音频参数。
@@ -370,10 +375,18 @@ class Config:
             cfg.broadcast_port = bport
             if create:
                 cfg.save(p)
-        # ★ 2.42.3：老配置没有 quality_preset（或写坏了）→ 均衡，不改变现有听感。
+        # ★ 2.46.3：老配置没有 quality_preset（或写坏了）→ 均衡，不改变现有听感。
         want_preset = quality.normalize(getattr(cfg, "quality_preset", ""))
         if want_preset != getattr(cfg, "quality_preset", None):
             cfg.quality_preset = want_preset
+            if create:
+                cfg.save(p)
+        # ★ 2.46.12：手机网页版听众音质；缺失/写坏 → balanced。
+        want_listen_q = str(getattr(cfg, "listen_quality", "balanced") or "balanced").strip().lower()
+        if want_listen_q not in ("saver", "balanced", "quality"):
+            want_listen_q = "balanced"
+        if want_listen_q != getattr(cfg, "listen_quality", None):
+            cfg.listen_quality = want_listen_q
             if create:
                 cfg.save(p)
         # ★ 2.42.3 修复（真机第 3 条）：静音档必须跟随手机音量。
@@ -440,6 +453,8 @@ class Config:
             "jitter_ms": self.jitter_ms,
             # ★ 2.42.3：三档性能预算（流畅/均衡/高音质）。
             "quality_preset": quality.normalize(self.quality_preset),
+            # ★ 2.46.12：手机网页版听众音质（省电/均衡/音质）。
+            "listen_quality": self.listen_quality if self.listen_quality in ("saver", "balanced", "quality") else "balanced",
             # ★ 2.46.4：点对点链路偏好（自动 / 有线 / Wi-Fi）。
             "link_preference": self.link_preference if self.link_preference in ("auto", "wired", "wireless") else "auto",
             # ★ 2.46.5：插上 USB 自动触发（需要 USB 调试 + adb）。
@@ -503,6 +518,8 @@ class Config:
             "jitter_ms": self.jitter_ms,
             # ★ 2.42.3：三档性能预算（流畅/均衡/高音质）。
             "quality_preset": quality.normalize(self.quality_preset),
+            # ★ 2.46.12：手机网页版听众音质（省电/均衡/音质）。
+            "listen_quality": self.listen_quality if self.listen_quality in ("saver", "balanced", "quality") else "balanced",
             # ★ 2.46.4：点对点链路偏好（自动 / 有线 / Wi-Fi）。
             "link_preference": self.link_preference if self.link_preference in ("auto", "wired", "wireless") else "auto",
             # ★ 2.46.5：插上 USB 自动触发（需要 USB 调试 + adb）。

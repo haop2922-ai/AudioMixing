@@ -179,7 +179,7 @@ python tools/check_android_proto.py <把Java那边的hex粘进来>   # 也可以
 
 ---
 
-HWHHYN 用 DEEPSEEK 制作
+作者：haop2922（HWHHYN）
 
 ### ★ 验收要看内容，不要看哈希（2026-10-12 踩到）
 

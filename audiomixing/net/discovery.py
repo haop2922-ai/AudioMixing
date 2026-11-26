@@ -55,7 +55,7 @@ NODE_TIMEOUT_S = 15.0
 IFACE_REFRESH_S = 20.0
 
 
-# HWHHYN 用 DEEPSEEK 制作
+# 作者：haop2922（HWHHYN）
 def default_node_id() -> str:
     return str(uuid.uuid4())
 

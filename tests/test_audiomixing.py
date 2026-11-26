@@ -91,7 +91,7 @@ class ToneSource:
     sample_rate = SAMPLE_RATE
     channels = CHANNELS
 
-    # HWHHYN 用 DEEPSEEK 制作
+    # 作者：haop2922（HWHHYN）
     def __init__(self, freq: float = 1000.0, blocks: int = 200, pace: float = 0.0, gain: float = 0.35) -> None:
         self.freq = freq
         self.blocks = blocks
@@ -832,7 +832,7 @@ class TestDiscovery(unittest.TestCase):
         peer.last_seen = time.time() - 60
         self.assertFalse(peer.online)
         self.assertEqual(registry.online(), [])
-# HWHHYN 用 DEEPSEEK 制作
+# 作者：haop2922（HWHHYN）
 
     def test_beacon_service_hears_another_node(self):
         """Two BeaconServices on the loopback interface must find each other."""
@@ -3404,6 +3404,54 @@ class TestChannelSourceSafety(unittest.TestCase):
         self.assertIn("x.extra && x.extra.live", html)
 
 
+class TestListenQuality(unittest.TestCase):
+    """★ 2.46.12：手机网页版听众三档（省电 / 均衡 / 音质）。"""
+
+    def test_tiers_and_block_sizes(self):
+        from audiomixing import webui
+
+        self.assertEqual(webui.normalize_listen_quality("saver"), "saver")
+        self.assertEqual(webui.normalize_listen_quality("QUALITY"), "quality")
+        self.assertEqual(webui.normalize_listen_quality("loud"), "balanced")
+        self.assertEqual(
+            (webui.listen_format("saver")["rate"],
+             webui.listen_format("saver")["channels"],
+             webui.listen_format("saver")["block_bytes"]), (24000, 1, 480))
+        self.assertEqual(
+            (webui.listen_format("balanced")["rate"],
+             webui.listen_format("balanced")["channels"],
+             webui.listen_format("balanced")["block_bytes"]), (48000, 1, 960))
+        self.assertEqual(
+            (webui.listen_format("quality")["rate"],
+             webui.listen_format("quality")["channels"],
+             webui.listen_format("quality")["block_bytes"]), (48000, 2, 1920))
+        # 480 帧 48k 立体声 PCM16（1920 字节）→ 各档固定块长
+        pcm = b"\x01\x00\x02\x00" * 480
+        self.assertEqual(len(webui.listen_pcm(pcm, "saver")), 480)
+        self.assertEqual(len(webui.listen_pcm(pcm, "balanced")), 960)
+        self.assertEqual(len(webui.listen_pcm(pcm, "quality")), 1920)
+
+    def test_ws_text_payload_unmasks_client_frame(self):
+        """★ 2.46.12：连接内切档要能解析浏览器发来的带掩码文本帧。"""
+        from audiomixing.webui import ws_text_payload
+
+        msg = b'{"type":"quality","quality":"quality"}'
+        mask = b"\x01\x02\x03\x04"
+        body = bytes(b ^ mask[i % 4] for i, b in enumerate(msg))
+        frame = bytes([0x81, 0x80 | len(msg)]) + mask + body
+        self.assertEqual(ws_text_payload(frame), msg.decode("utf-8"))
+        self.assertEqual(ws_text_payload(b"\x81\x02hi"), "hi")
+        self.assertEqual(ws_text_payload(b"\x82\x02hi"), "", "二进制帧不是控制消息")
+
+    def test_config_normalizes_unknown_value(self):
+        from audiomixing.config import Config
+
+        p = _mkdtemp("am-lq-") / "config.json"
+        p.write_text(json.dumps({"listen_quality": "LOUD"}), encoding="utf-8")
+        cfg = Config.load(p)
+        self.assertEqual(cfg.listen_quality, "balanced")
+
+
 class TestCustomPorts(unittest.TestCase):
     """v2.10：自定义端口只出现在「设置」页；保存只落盘，重启才生效。"""
 
@@ -3558,6 +3606,20 @@ class TestCustomPorts(unittest.TestCase):
 
         with self.assertRaises(ApiError) as ctx:
             self.api.set_settings({"web_port": 80})
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_listen_quality_setting_and_status(self) -> None:
+        """★ 2.46.12：三档音质可通过 /api/settings 切换，状态里带真实格式。"""
+        from audiomixing.webui import ApiError
+
+        self.api.set_settings({"listen_quality": "quality"})
+        self.assertEqual(self.node.config.listen_quality, "quality")
+        st = self.api.status()
+        self.assertEqual(st["listen_quality"]["local"], "quality")
+        self.assertEqual(st["listen_quality"]["format"]["channels"], 2)
+        self.assertEqual(st["listen_quality"]["format"]["rate"], 48000)
+        with self.assertRaises(ApiError) as ctx:
+            self.api.set_settings({"listen_quality": "loud"})
         self.assertEqual(ctx.exception.status, 400)
 
     def test_audio_port_65534_has_no_broadcast_neighbour(self) -> None:

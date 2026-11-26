@@ -908,7 +908,7 @@ def _parent_process_info() -> tuple[int, str]:
 
 
 class ApiError(Exception):
-    # HWHHYN 用 DEEPSEEK 制作
+    # 作者：haop2922（HWHHYN）
     def __init__(self, message: str, status: int = 400, data: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.status = status
@@ -1087,6 +1087,10 @@ class AudioMixingApi:
 
     def status(self) -> dict[str, Any]:
         data = self.node.status()
+        # ★ 2.46.12：手机网页版听众的默认档位与真实格式（采样率/声道/码率）。
+        listen_q = normalize_listen_quality(
+            getattr(self.node.config, "listen_quality", DEFAULT_LISTEN_QUALITY))
+        data["listen_quality"] = {"local": listen_q, "format": listen_format(listen_q)}
         # ★ 2026-11-01：启动器要靠它区分"自己人"和同端口的同类软件。
         data["app"] = "audiomixing"
         data["page_rev"] = self.page_rev()
@@ -2991,9 +2995,11 @@ class AudioMixingApi:
             #   「本机输出电平」永远是 0。改用和面板同一个口径（output_level()）。
             "local_peak": self.node.output_level().get("peak"),
             "node": str(getattr(node, "name", "")),
+            # ★ 2.46.12：监控页显示当前手机听众档位与实际码率。
+            "listen_quality": status.get("listen_quality"),
         }
 
-# HWHHYN 用 DEEPSEEK 制作
+# 作者：haop2922（HWHHYN）
 
     def monitor_disconnect(self, kind: str, target: str = "") -> tuple[int, dict[str, Any]]:
         """监控页每一行的「断开」，按 kind 分派，返回 (HTTP 码, 响应体)。
@@ -3602,6 +3608,13 @@ class AudioMixingApi:
                 node.apply_routes()
             except Exception as exc:
                 node.note("「音质档位」立即生效失败：%s" % exc)
+        if "listen_quality" in payload:
+            # ★ 2.46.12：手机网页版听众音质（省电 / 均衡 / 音质）。
+            want = str(payload["listen_quality"] or "").strip().lower()
+            if want not in ("saver", "balanced", "quality"):
+                raise ApiError("listen_quality 只能是 saver、balanced 或 quality", 400)
+            node.config.listen_quality = want
+            changed.append("listen_quality")
         if "link_preference" in payload:
             # ★ 2.46.4：点对点链路偏好（auto / wired / wireless）。
             want = str(payload["link_preference"] or "").strip().lower()
@@ -3906,6 +3919,37 @@ def ws_frame(payload: bytes, opcode: int = 0x2) -> bytes:
     return bytes(header) + payload
 
 
+def ws_text_payload(data: bytes) -> str:
+    """解析一个客户端 WebSocket 文本帧（浏览器发的帧一定带掩码）。
+
+    ★ 2.46.12：听众页在连接内切换音质档位时会发一帧 JSON 文本；这里只负责
+    把长度/掩码拆掉并解成 UTF-8。不是文本帧、长度不对、解码失败都返回空串，
+    调用方当作“没有控制消息”即可，绝不能因此断开音频。
+    """
+    if not data or (data[0] & 0x0F) != 0x1:
+        return ""
+    try:
+        ln = data[1] & 0x7F
+        off = 2
+        if ln == 126:
+            ln = int.from_bytes(data[2:4], "big")
+            off = 4
+        elif ln == 127:
+            ln = int.from_bytes(data[2:10], "big")
+            off = 10
+        masked = bool(data[1] & 0x80)
+        if masked:
+            mask = data[off:off + 4]
+            off += 4
+        body = bytearray(data[off:off + ln])
+        if masked:
+            for i in range(len(body)):
+                body[i] ^= mask[i % 4]
+        return bytes(body).decode("utf-8")
+    except (IndexError, UnicodeDecodeError):
+        return ""
+
+
 # 并发上限：每条连接一个线程，局域网里有人乱开连接不能把线程数顶爆。
 # 64 足够（一台手机 ≈ 2 条：面板 + 音频/长连接；家庭/小办公室远远用不完）。
 MAX_CONNECTIONS = 64
@@ -4079,14 +4123,19 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "frames": frames, "queued_frames": state["queued_frames"],
                          "dropped_frames": state["dropped_frames"]})
 
-    def _stream_pcm(self) -> None:
-        """把本机正在播放的声音按固定块长分块推给手机（24kHz 单声道 PCM16）。
+    def _stream_pcm(self, query: str = "") -> None:
+        """把本机正在播放的声音按固定块长推给手机（PCM16，档位可配）。
 
-        响应头里带上采样率和声道数，手机端不用猜；块长固定 480 字节。
-        没人听的时候 tap 里没有数据，这里就静静地等，不占 CPU。
+        ★ 2.46.12：`?q=saver|balanced|quality` 可覆盖全局默认；响应头带上
+        真实采样率/声道/块长，手机端不用猜。
         """
         conn = self.connection
         tap = self.api.node.tap
+        qv = str((parse_qs(query or "").get("q") or [""])[0]).strip().lower()
+        quality = normalize_listen_quality(
+            qv or getattr(self.api.node.config, "listen_quality", DEFAULT_LISTEN_QUALITY))
+        fmt = listen_format(quality)
+        block = int(fmt["block_bytes"])
         sid = tap.subscribe()
         try:
             conn.sendall(
@@ -4095,10 +4144,12 @@ class _Handler(BaseHTTPRequestHandler):
                     "Content-Type: application/octet-stream\r\n"
                     "Transfer-Encoding: chunked\r\n"
                     "Cache-Control: no-store\r\n"
-                    "X-Sample-Rate: 24000\r\n"
-                    "X-Channels: 1\r\n"
+                    "X-Quality: %s\r\n"
+                    "X-Sample-Rate: %d\r\n"
+                    "X-Channels: %d\r\n"
                     "X-Block-Bytes: %d\r\n"
-                    "Connection: close\r\n\r\n" % BLOCK_BYTES_MONO
+                    "Connection: close\r\n\r\n" % (
+                        quality, int(fmt["rate"]), int(fmt["channels"]), block)
                 ).encode("ascii")
             )
         except OSError:
@@ -4109,10 +4160,10 @@ class _Handler(BaseHTTPRequestHandler):
             while True:
                 payload = tap.drain(sid)
                 if payload:
-                    mono = _to_24k_mono(payload)
-                    for off in range(0, len(mono), BLOCK_BYTES_MONO):
-                        piece = mono[off : off + BLOCK_BYTES_MONO]
-                        if len(piece) != BLOCK_BYTES_MONO:
+                    pcm = listen_pcm(payload, quality)
+                    for off in range(0, len(pcm), block):
+                        piece = pcm[off : off + block]
+                        if len(piece) != block:
                             continue
                         # 分块传输：十六进制长度 + CRLF + 数据 + CRLF
                         conn.sendall(b"%x\r\n" % len(piece) + piece + b"\r\n")
@@ -4123,7 +4174,7 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             tap.unsubscribe(sid)
 
-    def _websocket_audio(self) -> None:
+    def _websocket_audio(self, query: str = "") -> None:
         """Stream this node's output to a browser as raw PCM16, over WebSocket.
 
         Not plain request/response: audio is continuous, and a browser has no UDP
@@ -4154,18 +4205,32 @@ class _Handler(BaseHTTPRequestHandler):
         tap = self.api.node.tap
         sid = tap.subscribe()
         block_s = 480 / 48000.0
-        # 手机听众这条路走 WebSocket，未压缩 48k 立体声是 1536 KB/s，
-        # 手机上根本吃不下：缓冲涨到一秒就开丢。这里降成 24k 单声道，
-        # 数据量变四分之一，够放音乐和视频，手机也能跟上。
+        # ★ 2.46.12：档位可由 `?q=` 指定（默认读配置）。WebSocket 拿不到响应头，
+        #   所以先发一帧文本把真实格式告诉页面，之后才是固定块长的二进制音频。
+        qv = str((parse_qs(query or "").get("q") or [""])[0]).strip().lower()
+        quality = normalize_listen_quality(
+            qv or getattr(self.api.node.config, "listen_quality", DEFAULT_LISTEN_QUALITY))
+        fmt = listen_format(quality)
+        block = int(fmt["block_bytes"])
+        try:
+            preamble = json.dumps({
+                "type": "format", "quality": quality, "label": fmt["label"],
+                "rate": int(fmt["rate"]), "channels": int(fmt["channels"]),
+                "block_bytes": block, "kbps": fmt["kbps"],
+            }, ensure_ascii=False).encode("utf-8")
+            conn.sendall(ws_frame(preamble, opcode=0x1))
+        except OSError:
+            tap.unsubscribe(sid)
+            return
         try:
             while True:
                 payload = tap.drain(sid)
                 if payload:
                     # 一块一块地重切，保证客户端每次收到的长度完全一样。
-                    mono = _to_24k_mono(payload)
-                    for off in range(0, len(mono), BLOCK_BYTES_MONO):
-                        piece = mono[off : off + BLOCK_BYTES_MONO]
-                        if len(piece) == BLOCK_BYTES_MONO:
+                    pcm = listen_pcm(payload, quality)
+                    for off in range(0, len(pcm), block):
+                        piece = pcm[off : off + block]
+                        if len(piece) == block:
                             conn.sendall(ws_frame(piece))
                 # Read whatever the client sent (close/ping) so it cannot pile up.
                 ready, _, _ = select.select([conn], [], [], 0)
@@ -4178,6 +4243,23 @@ class _Handler(BaseHTTPRequestHandler):
                         break
                     if opcode == 0x9:  # ping -> empty pong
                         conn.sendall(ws_frame(b"", opcode=0xA))
+                    elif opcode == 0x1:
+                        # ★ 2.46.12：听众页在连接内切换档位（不重连、不断流）。
+                        try:
+                            msg = json.loads(ws_text_payload(data) or "{}")
+                            q2 = normalize_listen_quality(msg.get("quality"))
+                            if msg.get("type") == "quality" and q2 != quality:
+                                quality = q2
+                                fmt = listen_format(quality)
+                                block = int(fmt["block_bytes"])
+                                conn.sendall(ws_frame(json.dumps({
+                                    "type": "format", "quality": quality,
+                                    "label": fmt["label"], "rate": int(fmt["rate"]),
+                                    "channels": int(fmt["channels"]),
+                                    "block_bytes": block, "kbps": fmt["kbps"],
+                                }, ensure_ascii=False).encode("utf-8"), opcode=0x1))
+                        except (ValueError, KeyError):
+                            pass
                 time.sleep(block_s)
         except (OSError, ValueError):
             pass
@@ -4240,7 +4322,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(410, b"p2p entry removed in v2.27", "text/plain; charset=utf-8")
                 return
             if path == "/ws/audio":
-                self._websocket_audio()
+                self._websocket_audio(parsed.query)
                 return
             if path == "/api/bluetooth":
                 # parsed.query is the raw string here; the dict comes from parse_qs, as
@@ -4484,7 +4566,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if path == "/audio.pcm":
                 # 手机 APK 用的低门槛入口：普通 HTTP 分块传输，读就行。
-                self._stream_pcm()
+                self._stream_pcm(parsed.query)
                 return
             if path == "/api/multiout":
                 node = self.api.node
@@ -5374,33 +5456,60 @@ def _qr_png(text: str) -> bytes | None:
         return None
 
 
-BLOCK_BYTES_MONO = 480  # 24kHz 单声道 10 毫秒
+LISTEN_QUALITIES: dict[str, dict[str, Any]] = {
+    # ★ 2.46.12：手机网页版听众三档。只影响浏览器听众的带宽，不影响 App 的 RTP。
+    "saver": {"label": "省电", "rate": 24000, "channels": 1, "block_bytes": 480},
+    "balanced": {"label": "均衡", "rate": 48000, "channels": 1, "block_bytes": 960},
+    "quality": {"label": "音质", "rate": 48000, "channels": 2, "block_bytes": 1920},
+}
+DEFAULT_LISTEN_QUALITY = "balanced"
 
 
-def _to_24k_mono(pcm16: bytes) -> bytes:
-    """把 48kHz 立体声 PCM16 变成 24kHz 单声道，并按固定长度重新切块。
+def normalize_listen_quality(value: Any) -> str:
+    """saver / balanced / quality；认不出的一律 balanced（默认档）。"""
+    q = str(value or "").strip().lower()
+    return q if q in LISTEN_QUALITIES else DEFAULT_LISTEN_QUALITY
 
-    规则（照现场量出来的问题定的）：
-      * 只认 48k 立体声 4 字节一帧的输入；长度不是 4 的倍数就裁掉尾巴。
-      * 每两个立体声帧取一帧，只留左声道 -> 24kHz 单声道，每帧 2 字节。
-      * 输出一律重新切成 480 字节一块（24kHz 的 10 毫秒）。
-        客户端最怕同一条流里长短不一：它会按一种长度播，另一种就变调。
 
-    转换不成就返回空，让调用方丢掉这一块 —— 绝不把旧格式混进去。
+def listen_format(value: Any) -> dict[str, Any]:
+    """某档的采样率/声道/每块字节/实际码率（KB/s），给状态接口和页面用。"""
+    q = normalize_listen_quality(value)
+    info = dict(LISTEN_QUALITIES[q])
+    info["quality"] = q
+    info["kbps"] = round(info["rate"] * info["channels"] * 2 / 1000.0, 1)
+    return info
+
+
+def listen_pcm(pcm16: bytes, quality: Any) -> bytes:
+    """把 48kHz 立体声 PCM16 转成目标档位，并按固定块长补齐。
+
+    输入是 tap 的 48kHz/立体声/16bit 块（4 字节一帧）：
+      * saver    每两帧取一帧、只留左声道 -> 24kHz 单声道（480 字节/块）
+      * balanced 每帧只留左声道            -> 48kHz 单声道（960 字节/块）
+      * quality  原样                       -> 48kHz 立体声（1920 字节/块）
+    同一连接内块长必须恒定：客户端按一种长度播，另一种会变调。
     """
+    q = normalize_listen_quality(quality)
+    block = int(LISTEN_QUALITIES[q]["block_bytes"])
     try:
         import array as _array
 
         usable = len(pcm16) - (len(pcm16) % 4)
         if usable <= 0:
             return b""
-        frames = _array.array("h")
-        frames.frombytes(pcm16[:usable])
-        mono = _array.array("h", [frames[i] for i in range(0, len(frames) - 1, 4)])
-        raw = mono.tobytes()
-        if len(raw) % BLOCK_BYTES_MONO:
-            raw += b"\x00" * (BLOCK_BYTES_MONO - (len(raw) % BLOCK_BYTES_MONO))
-        return raw
+        if q == "quality":
+            out = pcm16[:usable]
+        else:
+            frames = _array.array("h")
+            frames.frombytes(pcm16[:usable])
+            if q == "balanced":
+                mono = frames[0::2]
+            else:
+                mono = frames[0::4]
+            out = mono.tobytes()
+        if len(out) % block:
+            out += b"\x00" * (block - (len(out) % block))
+        return out
     except Exception:
         return b""
 
@@ -5457,6 +5566,7 @@ def monitor_html() -> str:
     <a class="tab" href="/">控制台</a>
   </nav>
   <span class="dim" id="who"></span>
+  <span class="dim" id="listenQ" style="font-size:12px"></span>
   <a id="dgLink" href="/diagnose"
      title="诊断报告页：可一键下载诊断包（zip），不用再全选复制"
      style="padding:4px 12px;border-radius:8px;background:#1d2634;color:#e8edf5;
@@ -5530,6 +5640,17 @@ async function tick(){
   try{
     const d = await (await fetch('/api/monitor', {cache:'no-store'})).json();
     document.getElementById('who').textContent = d.node || '';
+    // ★ 2.46.12：手机网页版听众当前档位 + 实际码率（服务端口径，不是猜的）。
+    const lq = d.listen_quality || {};
+    const lf = lq.format || {};
+    const lqEl = document.getElementById('listenQ');
+    if(lqEl){
+      lqEl.textContent = lf.rate
+        ? ('手机听众：' + (lf.label || lq.local || '') + ' · '
+           + (lf.rate / 1000) + 'kHz/' + (lf.channels === 2 ? '立体声' : '单声道')
+           + ' · ' + lf.kbps + 'KB/s')
+        : '';
+    }
     document.getElementById('when').textContent = '更新于 ' + new Date().toLocaleTimeString();
     let rows = d.flows || [];
     if(localOnly){
