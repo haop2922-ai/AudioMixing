@@ -118,17 +118,16 @@ tools/               打包、自检、回收站等工具
 
 ## 许可
 
-**个人与非商业用途免费；商业用途需事先取得书面授权。**
+**Apache License 2.0** —— 可商用、可修改、可分发，保留版权与许可声明即可。
 
-采用 [PolyForm Noncommercial License 1.0.0](LICENSE)，全文见 `LICENSE`。
-商业授权范围、申请方式与“什么算商业用途”的判定见
-[LICENSE-COMMERCIAL.md](LICENSE-COMMERCIAL.md)。
+全文见 [`LICENSE`](LICENSE)，版权行见 [`NOTICE`](NOTICE)。
 
-- ✅ 免费：个人自用、家庭、教学科研、非营利、开源项目、评测与教程视频
-- 💼 需授权：公司内部部署、客户交付、随硬件/软件捆绑、SaaS 与托管服务、OEM 白牌、以本项目变现
-- 📌 许可沿革：早期提交的 `LICENSE` 文件为 MIT；自 2026-11-13（提交 `646aafb`）起统一为上述许可，
-  **此后所有版本与分发（含历史 Release 页）均以新许可为准**。
-  作者声明本项目此前未授权任何第三方商用；若你此前已依 MIT 取得副本，作者不主动主张其既往权利。
+- ✅ 允许：个人使用、公司内部使用、集成进自有产品、SaaS 与托管、二次开发（含闭源分发）
+- 📌 需要保留：版权声明、`LICENSE` 与 `NOTICE`；修改过的文件请注明改动
+- 🚫 不授予：商标使用权（“Audio Mixing” 名称与图标不随许可证授权）
+
+许可沿革：MIT（2025-08 起）→ PolyForm Noncommercial（2026-11-13）→ **Apache-2.0（2026-11-26）**，
+详见[许可变更公告](https://github.com/haop2922-ai/AudioMixing/issues/2)。
 
 HWHHYN 用 DEEPSEEK 制作
 
