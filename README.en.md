@@ -132,6 +132,19 @@ If devices cannot find each other, check in this order:
 - Every fix is documented (location / cause / change / regression test) in
   [docs/BUG修复明细.md](docs/BUG修复明细.md) (Chinese).
 
+## MCP interface (let AI drive Audio Mixing)
+
+A built-in MCP server (standard library only, local stdio, no third-party dependencies)
+lets AI clients read device/routing state and control volume.
+
+```bash
+python tools/audiomixing_mcp.py --print-config   # print mcpServers config for your AI client
+python tools/audiomixing_mcp.py --selftest       # self-test (Audio Mixing must be running)
+```
+
+Code: audiomixing/mcp_server.py, tools/audiomixing_mcp.py.
+Docs: tools/audiomixing_mcp.README.md.
+
 ## Building it yourself
 
 ```bash

@@ -121,6 +121,18 @@
 - 每一轮修复的逐条明细（位置 / 原因 / 修法 / 回归测试）见
   [docs/BUG修复明细.md](docs/BUG修复明细.md)。
 
+## MCP 接口（让 AI 直接操作 Audio Mixing）
+
+内置一个 MCP 服务（仅标准库、本地 stdio、无第三方依赖），AI 客户端可以直接读取设备与路由状态、调节音量。
+
+```bash
+python tools/audiomixing_mcp.py --print-config   # 输出 mcpServers 配置，粘到 AI 客户端
+python tools/audiomixing_mcp.py --selftest       # 自检（需 Audio Mixing 正在运行）
+```
+
+相关代码：audiomixing/mcp_server.py、tools/audiomixing_mcp.py，
+使用说明见 tools/audiomixing_mcp.README.md。
+
 ## 怎么自己编译
 
 ```bash
