@@ -14,6 +14,7 @@ import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.InterfaceAddress;
 import java.net.MulticastSocket;
 import java.net.NetworkInterface;
 import java.net.SocketException;
@@ -23,6 +24,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Enumeration;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -234,10 +236,37 @@ public final class Discovery {
     /** 用户设置的发现端口（默认 17830）。绑定失败时才退回默认/临时端口。 */
     private volatile int preferredPort = Proto.DEFAULT_DISCOVERY_PORT;
     private volatile List<String> localIps = Collections.emptyList();
+    // ★ 2.31.7：每块网卡的真实广播地址（由 InterfaceAddress 给出，前缀长度是多少都正确）。
+    //   以前发定向广播时一律把最后一段替换成 .255 —— /24 没问题，但 /16、/23 的局域网
+    //   会把信标发到网段里一台无关主机，定向广播这条路等于失效。
+    private volatile Map<String, String> localBroadcasts = Collections.emptyMap();
+    /**
+     * ★ 2.31.3：本机 IP -> wired / wireless / other。
+     * 同一台电脑同时有 Wi-Fi 和有线（网线 / USB 网络共享）时，用它稳定选有线地址。
+     */
+    private volatile Map<String, String> localLinkTypes = Collections.emptyMap();
+    /** ★ 2.31.3：auto / wired / wireless。手机端默认 auto：检测到 USB 网络共享就优先走它。 */
+    private volatile String linkPreference = "auto";
+    /**
+     * ★ 2.31.5：用户手动填的电脑 IP。
+     *
+     * <p>为什么需要它：自动发现靠组播/广播，有些路由器会开「客户端隔离」或丢掉组播，
+     * 表现就是"手机列表里 0 台、电脑也看不到手机"。这时只要知道电脑 IP，
+     * 每轮给这个地址**单播**一份信标，就能把对端拉回来（对端收到后会单播回我们）。
+     */
+    private volatile List<String> manualHosts = Collections.emptyList();
     private volatile Listener listener;
     private volatile String lastError = "";
     private volatile long beaconsSent;
     private volatile long beaconsReceived;
+    /**
+     * ★ 2.31.6：信标**尝试**轮数（每 2 秒 +1，不管这一轮有没有发成功）。
+     *
+     * <p>为什么不能只看 {@link #beaconsSent}：`beaconsSent` 只在一轮里至少有一份
+     * 发成功时才 +1。局域网被系统/路由器拦掉时（EPERM、没有路由），发送全是失败，
+     * `beaconsSent` 永远是 0，界面就永远不显示"发现自检"——最需要它的场景反而看不到。
+     */
+    private volatile long beaconRounds;
 
     // ── ★ 发现层自检（2026-10-12 真机反馈：74 秒只收到 8 个信标、列表里 0 台设备，
     //    而"到底是我们没发出去、还是对方的帧被 Wi-Fi 丢了"完全看不出来）。
@@ -619,6 +648,20 @@ public final class Discovery {
         return localIps;
     }
 
+    /** ★ 2.31.3：auto / wired / wireless。手机端默认 auto（有 USB 网络共享就优先）。 */
+    public void setLinkPreference(String value) {
+        String v = value == null ? "" : value.trim().toLowerCase(java.util.Locale.US);
+        if ("wired".equals(v) || "wireless".equals(v)) {
+            linkPreference = v;
+        } else {
+            linkPreference = "auto";
+        }
+    }
+
+    public String linkPreference() {
+        return linkPreference;
+    }
+
     /** 实际绑定的发现端口（正常就是 17830）。 */
     public int boundPort() {
         return boundPort;
@@ -637,6 +680,11 @@ public final class Discovery {
 
     public long beaconsReceived() {
         return beaconsReceived;
+    }
+
+    /** ★ 2.31.6：信标尝试轮数（含全部失败的轮次）。 */
+    public long beaconRounds() {
+        return beaconRounds;
     }
 
     /** 组播/广播/单播各发出去多少份（哪条通道是通的，一眼可见）。 */
@@ -687,6 +735,39 @@ public final class Discovery {
         } catch (Throwable t) {
             return l != null;
         }
+    }
+
+    /** ★ 2.31.5：手动添加的电脑地址（去掉重复/空项后保存）。 */
+    public void setManualHosts(List<String> hosts) {
+        List<String> copy = new ArrayList<String>();
+        if (hosts != null) {
+            for (String h : hosts) {
+                String v = h == null ? "" : h.trim();
+                if (!v.isEmpty() && !copy.contains(v)) {
+                    copy.add(v);
+                }
+            }
+        }
+        manualHosts = copy;
+    }
+
+    public List<String> manualHosts() {
+        return manualHosts;
+    }
+
+    /** 本机所有非回环 IPv4（发现自检那一行用；空表示没有局域网地址）。 */
+    public String localIpText() {
+        if (localIps.isEmpty()) {
+            return "（没有 IPv4 地址）";
+        }
+        StringBuilder sb = new StringBuilder(64);
+        for (String ip : localIps) {
+            if (sb.length() > 0) {
+                sb.append('、');
+            }
+            sb.append(ip);
+        }
+        return sb.toString();
     }
 
     /** 最近一次收到"自己的"信标距今多久（毫秒）；-1 = 从来没收到过。 */
@@ -863,6 +944,7 @@ public final class Discovery {
         // 第一件事就是收组播锁：放在这里而不是 start()，同样是为了不占主线程。
         acquireMulticastLock();
         while (running) {
+            beaconRounds++;
             try {
                 // 网卡地址变了（切 Wi-Fi / 开关热点 / VPN 起来）就必须重开 socket 重新加组，
                 // 否则会一直对着旧网卡发，表现就是"换了个 Wi-Fi 就看不见设备了"。
@@ -968,31 +1050,72 @@ public final class Discovery {
         return out;
     }
 
-    /** 组播一份 + 受限广播一份 + 每个本机 /24 的定向广播一份。 */
+    /**
+     * 组播一份 + 受限广播一份 + 每个本机 /24 的定向广播一份。
+     *
+     * <p>★ 2.31.5：端口不是默认 17830 时（被别的 App 占了 / 用户改过），
+     * <b>再往默认端口发一份</b> —— 否则对端只监听 17830，永远看不到我们，
+     * 也就永远不会按我们信标里的 {@code disc_port} 回单播。
+     * 手动添加的电脑同样每轮单播一份，这是路由器挡组播时的兜底。
+     */
     private List<InetSocketAddress> beaconTargets() {
         // 必须发到"我们自己实际在听的那个端口"：用户把发现端口改成 47832 后，
         // 还发到默认 17830 的话，对端（同样改成 47832）永远收不到。
         int sendPort = boundPort > 0 ? boundPort : preferredPort;
-        List<InetSocketAddress> out = new ArrayList<>(8);
-        out.add(new InetSocketAddress(groupAddress(), sendPort));
-        // 受限广播：有些 AP 放行这个但不放行组播。
-        try {
-            out.add(new InetSocketAddress(InetAddress.getByName("255.255.255.255"), sendPort));
-        } catch (IOException ignored) {
+        List<Integer> ports = new ArrayList<Integer>(3);
+        ports.add(sendPort);
+        if (sendPort != Proto.DEFAULT_DISCOVERY_PORT) {
+            ports.add(Proto.DEFAULT_DISCOVERY_PORT);
         }
-        // 定向广播（192.168.1.255）：比受限广播更可靠，路由器不会丢。
-        for (String ip : localIps) {
-            int dot = ip.lastIndexOf('.');
-            if (dot <= 0) {
-                continue;
-            }
+        if (preferredPort > 0 && preferredPort != sendPort
+                && preferredPort != Proto.DEFAULT_DISCOVERY_PORT) {
+            ports.add(preferredPort);
+        }
+        List<InetSocketAddress> out = new ArrayList<InetSocketAddress>(16);
+        for (int port : ports) {
+            out.add(new InetSocketAddress(groupAddress(), port));
+            // 受限广播：有些 AP 放行这个但不放行组播。
             try {
-                out.add(new InetSocketAddress(
-                        InetAddress.getByName(ip.substring(0, dot) + ".255"), sendPort));
+                out.add(new InetSocketAddress(InetAddress.getByName("255.255.255.255"), port));
             } catch (IOException ignored) {
             }
+            // 定向广播（192.168.1.255）：比受限广播更可靠，路由器不会丢。
+            // ★ 2.31.7：用网卡自己上报的广播地址（任何前缀长度都正确）；
+            //   老写法一律把最后一段替换成 .255，/16、/23 的局域网会发错主机。
+            for (String ip : localIps) {
+                String bc = localBroadcasts.get(ip);
+                if (bc == null || bc.isEmpty()) {
+                    int dot = ip.lastIndexOf('.');
+                    if (dot <= 0) {
+                        continue;
+                    }
+                    bc = ip.substring(0, dot) + ".255";
+                }
+                try {
+                    out.add(new InetSocketAddress(InetAddress.getByName(bc), port));
+                } catch (IOException ignored) {
+                }
+            }
         }
-        return out;
+        // 手动添加的电脑：每轮单播一份（路由器挡组播时的兜底）。
+        // ★ 2.31.7：以前只发默认 17830 —— 电脑把发现端口改成别的值时，手动 IP 这条
+        //   兜底路完全失效。现在和组播/广播用同一组端口。
+        for (String host : manualHosts) {
+            for (int port : ports) {
+                try {
+                    out.add(new InetSocketAddress(InetAddress.getByName(host), port));
+                } catch (IOException | RuntimeException ignored) {
+                }
+            }
+        }
+        // 去重：同一"地址:端口"只发一份，别因为补端口把流量翻倍。
+        List<InetSocketAddress> uniq = new ArrayList<InetSocketAddress>(out.size());
+        for (InetSocketAddress sa : out) {
+            if (!uniq.contains(sa)) {
+                uniq.add(sa);
+            }
+        }
+        return uniq;
     }
 
     /**
@@ -1583,21 +1706,37 @@ public final class Discovery {
         }
     }
 
-    /** Wi-Fi > 热点 > 有线 > 其它。 */
-    private static int ifaceScore(String name) {
+    /** ★ 2.31.3：Wi-Fi > 热点 > 有线 > 其它；用户可切成"有线优先"或"Wi-Fi 优先"。 */
+    private int ifaceScore(String name) {
         if (name == null) {
             return 0;
         }
-        if (name.startsWith("wlan")) {
-            return 4;
-        }
-        if (name.startsWith("ap") || name.startsWith("swlan")) {
-            return 3;
-        }
-        if (name.startsWith("eth")) {
+        String n = name.toLowerCase(java.util.Locale.US);
+        boolean usb = n.startsWith("usb") || n.startsWith("rndis");
+        boolean eth = n.startsWith("eth");
+        boolean wlan = n.startsWith("wlan") || n.startsWith("swlan") || n.startsWith("ap");
+        if ("wireless".equals(linkPreference)) {
+            if (wlan) return 6;
+            if (usb || eth) return 1;
             return 2;
         }
+        // auto / wired：USB 网络共享 > 有线 > Wi-Fi。
+        if (usb) return 6;
+        if (eth) return 5;
+        if (wlan) return 4;
         return 1;
+    }
+
+    /** 网卡名的链路类型。usb0/rndis0/eth0 = 有线；wlan0 = Wi-Fi。 */
+    private static String ifaceKind(String name) {
+        String n = name == null ? "" : name.toLowerCase(java.util.Locale.US);
+        if (n.startsWith("usb") || n.startsWith("rndis") || n.startsWith("eth")) {
+            return "wired";
+        }
+        if (n.startsWith("wlan") || n.startsWith("swlan") || n.startsWith("ap")) {
+            return "wireless";
+        }
+        return "other";
     }
 
     private static boolean hasIpv4(NetworkInterface nif) {
@@ -1671,9 +1810,12 @@ public final class Discovery {
         }
     }
 
-    /** 本机所有非回环 IPv4 地址。 */
-    private static List<String> scanLocalIps() {
+    /** 本机所有非回环 IPv4 地址；★ 2.31.3：按链路偏好排序（USB/有线优先）。 */
+    private List<String> scanLocalIps() {
         List<String> out = new ArrayList<>(4);
+        Map<String, String> types = new HashMap<>();
+        Map<String, Integer> scores = new HashMap<>();
+        Map<String, String> broadcasts = new HashMap<>();
         try {
             Enumeration<NetworkInterface> all = NetworkInterface.getNetworkInterfaces();
             while (all != null && all.hasMoreElements()) {
@@ -1682,11 +1824,20 @@ public final class Discovery {
                     if (!nif.isUp() || nif.isLoopback()) {
                         continue;
                     }
-                    Enumeration<InetAddress> addrs = nif.getInetAddresses();
-                    while (addrs != null && addrs.hasMoreElements()) {
-                        InetAddress a = addrs.nextElement();
-                        if (a instanceof java.net.Inet4Address && !a.isLoopbackAddress()) {
-                            out.add(a.getHostAddress());
+                    String kind = ifaceKind(nif.getName());
+                    int score = ifaceScore(nif.getName());
+                    for (InterfaceAddress ia : nif.getInterfaceAddresses()) {
+                        InetAddress a = ia.getAddress();
+                        if (!(a instanceof java.net.Inet4Address) || a.isLoopbackAddress()) {
+                            continue;
+                        }
+                        String ip = a.getHostAddress();
+                        out.add(ip);
+                        types.put(ip, kind);
+                        scores.put(ip, score);
+                        InetAddress bc = ia.getBroadcast();
+                        if (bc != null) {
+                            broadcasts.put(ip, bc.getHostAddress());
                         }
                     }
                 } catch (SocketException ignored) {
@@ -1695,7 +1846,12 @@ public final class Discovery {
         } catch (SocketException e) {
             return Collections.emptyList();
         }
-        Collections.sort(out);
+        Collections.sort(out, (a, b) -> {
+            int d = Integer.compare(scores.getOrDefault(b, 0), scores.getOrDefault(a, 0));
+            return d != 0 ? d : a.compareTo(b);
+        });
+        localLinkTypes = types;
+        localBroadcasts = broadcasts;
         return out;
     }
 
@@ -1735,14 +1891,26 @@ public final class Discovery {
     private int rank(String host) {
         boolean lan = isPrivate(host);
         boolean sameSubnet = false;
+        String kind = "";
         for (String ip : localIps) {
             int dot = ip.lastIndexOf('.');
             if (dot > 0 && host.startsWith(ip.substring(0, dot + 1))) {
                 sameSubnet = true;
+                kind = localLinkTypes.getOrDefault(ip, "");
                 break;
             }
         }
-        return (lan ? 2 : 0) + (sameSubnet ? 1 : 0);
+        // ★ 2.31.3：有线地址 +2、Wi-Fi +1（无线优先时反过来）。
+        //   同一台电脑同时发 Wi-Fi 和 USB 两条信标时，hostBetter 稳定选有线那条。
+        int link = 0;
+        if ("wireless".equals(linkPreference)) {
+            if ("wireless".equals(kind)) link = 2;
+            else if ("wired".equals(kind)) link = 1;
+        } else {
+            if ("wired".equals(kind)) link = 2;
+            else if ("wireless".equals(kind)) link = 1;
+        }
+        return (lan ? 2 : 0) + (sameSubnet ? 1 : 0) + link;
     }
 
     private static boolean isPrivate(String host) {

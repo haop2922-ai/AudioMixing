@@ -180,6 +180,15 @@ class Config:
     #   老配置没有这个键 → 均衡（= 2.42.2 行为，音质与延迟都不变）。
     #   档位只影响本机的编码/缓冲/重采样开销；对端不一致时两端按较低那档协商。
     quality_preset: str = quality.DEFAULT
+    # ★ 2.46.4：点对点链路偏好（auto / wired / wireless）。
+    #   auto = 有网线 / USB 网络共享时优先走有线；wired/wireless 可强制。
+    #   只影响"选哪块网卡的地址/往哪个对端 IP 发"，不改变任何音频参数。
+    link_preference: str = "auto"
+    # ★ 2.46.5：「插上 USB 自动触发」——像 spacedesk 的 USB 模式一样，插线就自动启动
+    #   手机端并尝试打开 USB 网络共享。需要手机开启 USB 调试 + 电脑有 adb.exe；
+    #   没有 adb、或那台设备没装我们的手机端时，它什么都不做（只记一条状态）。
+    #   默认开：用户要的是"连上直接触发"，不该再让他在设置里找一次开关。
+    usb_auto: bool = True
     # ① 自动收听（与手机端同名同义）：
     #   smart_link —— ★ 2026-10-18 用户第 6 条：全局总开关换成**每台设备一个「智连」**。
     #     名单里有的那台设备，"它送声音过来"时才自动开始收听它（= 接受它的「送」）；
@@ -375,6 +384,20 @@ class Config:
             cfg.phone_silent_vol_policy = "last_nonzero"
             if create:
                 cfg.save(p)
+        # ★ 2.46.4：点对点链路偏好。老配置没有这个键 / 写坏了 → auto。
+        want_link = str(getattr(cfg, "link_preference", "auto") or "auto").strip().lower()
+        if want_link not in ("auto", "wired", "wireless"):
+            want_link = "auto"
+        if want_link != getattr(cfg, "link_preference", None):
+            cfg.link_preference = want_link
+            if create:
+                cfg.save(p)
+        # ★ 2.46.5：usb_auto 只接受布尔；字符串形式的旧值归一。
+        if not isinstance(getattr(cfg, "usb_auto", None), bool):
+            raw_usb = getattr(cfg, "usb_auto", False)
+            cfg.usb_auto = str(raw_usb).strip().lower() in ("1", "true", "yes", "on")
+            if create:
+                cfg.save(p)
         return cfg
 
     def save(self, path: Path | None = None, strict: bool = False) -> Path:
@@ -417,6 +440,10 @@ class Config:
             "jitter_ms": self.jitter_ms,
             # ★ 2.42.3：三档性能预算（流畅/均衡/高音质）。
             "quality_preset": quality.normalize(self.quality_preset),
+            # ★ 2.46.4：点对点链路偏好（自动 / 有线 / Wi-Fi）。
+            "link_preference": self.link_preference if self.link_preference in ("auto", "wired", "wireless") else "auto",
+            # ★ 2.46.5：插上 USB 自动触发（需要 USB 调试 + adb）。
+            "usb_auto": bool(self.usb_auto),
             "autostart": self.autostart,
             "launch_at_login": self.launch_at_login,
             "autostart_method": self.autostart_method,
@@ -476,6 +503,10 @@ class Config:
             "jitter_ms": self.jitter_ms,
             # ★ 2.42.3：三档性能预算（流畅/均衡/高音质）。
             "quality_preset": quality.normalize(self.quality_preset),
+            # ★ 2.46.4：点对点链路偏好（自动 / 有线 / Wi-Fi）。
+            "link_preference": self.link_preference if self.link_preference in ("auto", "wired", "wireless") else "auto",
+            # ★ 2.46.5：插上 USB 自动触发（需要 USB 调试 + adb）。
+            "usb_auto": bool(self.usb_auto),
             "autostart": self.autostart,
             "launch_at_login": self.launch_at_login,
             "autostart_method": self.autostart_method,

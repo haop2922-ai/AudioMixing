@@ -93,19 +93,22 @@ def check_bt_card_buttons(text: str) -> list[str]:
 
 
 def check_multi_sources(text: str) -> list[str]:
-    """★ 2.42.1：多耳机必须支持"一路多音源 + 空音源静音"，且复杂档只列工作中的输出。"""
+    """★ 2.42.1 / 2.46.7：多耳机必须支持一路多音源 + 空音源静音；
+    ★ 2026-11-26：详细档改成「音源 × 输出设备」矩阵（简洁档仍是卡片墙）。"""
     problems: list[str] = []
     for token in ("function sourcesOf(", "function sourceKey(", "sources: []",
-                  "sources: sourcesOf(cfg).map", "renderPeerCards(wrap)"):
+                  "sources: sourcesOf(cfg).map", "renderPeerCards()"):
         if token not in text:
-            problems.append("index.html 缺少 2.42.1 多音源/对端卡片实现：%s" % token)
-    if "未连音源 · 这一路静音" not in text:
+            problems.append("index.html 缺少多音源/对端卡片实现：%s" % token)
+    if "没有音源（静音）" not in text:
         problems.append("index.html 没有写清「没有音源时这一路静音」")
     if "已回落桌面混音" in text:
         problems.append("index.html 还残留「已回落桌面混音」文案（2.42.1 禁止回落）")
-    # 复杂档输出列必须过滤到"工作中"的设备。
-    if "isPassthrough(name) || isChosen(name) || remSink.has(name)" not in text:
-        problems.append("复杂档「输出音频设备」列没有过滤未启用设备")
+    # ★ 2026-11-26：详细档＝矩阵。左上全开、右下全关、行列折叠必须都在。
+    for token in ("function renderMatrix(", "音频全开", "音频全关",
+                  "折叠", "foldedDevices", "foldedSources"):
+        if token not in text:
+            problems.append("index.html 缺少矩阵实现：%s" % token)
     # ★ 2.42.2（第 4 条）：对端 audio 卡只送不收。
     start = text.find("function renderPeerCards")
     if start < 0:
@@ -117,10 +120,9 @@ def check_multi_sources(text: str) -> list[str]:
                      "送声音到它", "本机扬声器"):
             if gone in body:
                 problems.append("对端 audio 卡还残留「本机扬声器/本机收听它」的入口或文案：%s" % gone)
-        # ★ 2.42.3（第 2 条）：简洁档的对端卡只留设备名 + 在线/送声状态；
-        #   解释块必须包在 `if (!simpleMode)` 里，简洁档一个字都不加。
-        if "if (!simpleMode)" not in body:
-            problems.append("对端 audio 卡的说明块没有只在详细档出现（if (!simpleMode)）")
+        # 对端卡只留设备名 + 在线/送声状态；两档都不再堆解释文字。
+        if "card.append(nm, st)" not in body:
+            problems.append("对端 audio 卡应只有设备名 + 状态（不堆解释）")
         if "card.onclick" not in body:
             problems.append("对端 audio 卡缺少「点卡片＝送/停」的入口")
     return problems

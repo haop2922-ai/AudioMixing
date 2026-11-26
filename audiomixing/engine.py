@@ -39,6 +39,7 @@ from typing import (Any, Callable, Iterable)
 from . import proto
 from . import __version__
 from . import quality
+from . import usb_auto
 from .audio import base as audio_base
 from .audio.format import (CHANNELS, SAMPLE_RATE, apply_gain, as_float_array, peak as sample_peak)
 from .audio import format as audio_format
@@ -73,6 +74,19 @@ def codec_for_target(codec: int, platform: str, opus_capable: bool) -> int:
         if codec != proto.CODEC_OPUS or not opus_capable:
             return proto.CODEC_PCM_S16
     return codec
+
+
+def frames_for_target(frames: int, codec: int, platform: str) -> int:
+    """★ 2.46.3：Android 的 PCM16 接收端只认 480 帧/包（负载 1920 字节）。
+
+    AudioRecv 对 ``plen > 1920`` 的 PCM16 包直接判 badFrames 丢弃；2.42.3 的
+    「流畅」档一包 960 帧（3840 字节），于是整条链路"包在发、手机全丢"。
+    Opus 包在手机端会解码后重新切成 480 帧，所以仍可用 960 帧。
+    """
+    if str(platform or '').strip().lower().startswith('android') \
+            and int(codec) == proto.CODEC_PCM_S16:
+        return 480
+    return int(frames)
 ROUTE_STALE_AFTER_S = 60.0
 PEER_VOLUME_TTL_S = 30.0
 PEER_VOLUME_DETECT_MIN_S = 10.0
@@ -428,6 +442,8 @@ class AudioMixingNode:
         self._push_epochs: dict[str, int] = {}
         self._stop = threading.Event()
         self._threads = []
+        # ★ 2.46.5：可选的 USB 自动触发（adb）。默认关，没 adb 时线程自己退出。
+        self._usb_bridge: usb_auto.UsbAutoBridge | None = None
         self._wake = threading.Event()
         self.multi_out = MultiOut(self.hub)
         # ★ Q2 改：系统默认输出永远算「在听」，但它直出、我们不复制。
@@ -812,6 +828,11 @@ class AudioMixingNode:
         self.receiver.start()
         # ★ 2.42.3：接收侧的抖动缓冲按本机档位初始化（默认均衡 = 2.42.2 行为）。
         self.apply_quality_preset()
+        # ★ 2.46.4：把链路偏好交给发现层；对端同时有 Wi-Fi/有线地址时按它选。
+        try:
+            self.registry.set_link_preference(self.link_preference())
+        except Exception:
+            pass
         self.refresh_devices()
         if self.config.routes:
             try:
@@ -844,9 +865,34 @@ class AudioMixingNode:
             threading.Thread(target=self._bt_always, args=(always,),
                              name='audiomixing-bt-always', daemon=True).start()
         self.apply_routes()
+        # ★ 2.46.5：插上 USB 自动触发（只有用户显式打开、且本机有 adb 才跑）。
+        self._start_usb_bridge()
+
+    def _start_usb_bridge(self) -> None:
+        if not self.usb_auto_enabled():
+            return
+        # ★ 2.46.9：线程只建一次。关→开复用同一个线程（见 _stop_usb_bridge），
+        #   不会出现旧线程还在跑命令、新线程已经起来的情况。
+        bridge = self._usb_bridge
+        if bridge is not None and bridge.is_alive():
+            bridge.set_enabled(True)
+            return
+        self._usb_bridge = usb_auto.UsbAutoBridge(on_note=self.note)
+        self._usb_bridge.set_enabled(True)
+        self._usb_bridge.start()
+
+    def _stop_usb_bridge(self, *, shutdown: bool = False) -> None:
+        bridge = self._usb_bridge
+        if bridge is None:
+            return
+        bridge.set_enabled(False)
+        if shutdown:
+            bridge.stop()
+            self._usb_bridge = None
 
     def stop(self) -> None:
         self._stop.set()
+        self._stop_usb_bridge(shutdown=True)
         # ★ Q2：正常退出时把用户原来的默认播放设备还回去；异常退出靠下次启动的
         #   multi_lock_status()['needs_restore'] 给出还原入口。
         try:
@@ -1823,6 +1869,74 @@ class AudioMixingNode:
             })
         return out
 
+    # ─────────────────────── 2.46.4 点对点链路偏好 ───────────────────────
+
+    def link_preference(self) -> str:
+        """auto / wired / wireless。认不出 = auto。"""
+        value = str(getattr(self.config, 'link_preference', 'auto') or 'auto').strip().lower()
+        return value if value in ('auto', 'wired', 'wireless') else 'auto'
+
+    def set_link_preference(self, value: Any, *, persist: bool = True) -> str:
+        """切换点对点链路偏好：自动 / 有线优先 / Wi-Fi 优先。
+
+        只影响"选哪条网卡的地址"，不改音频参数。auto = 有网线或 USB 网络共享时
+        优先走有线；找不到有线才退回 Wi-Fi。
+        """
+        pref = str(value or 'auto').strip().lower()
+        if pref not in ('auto', 'wired', 'wireless'):
+            pref = 'auto'
+        self.config.link_preference = pref
+        if persist:
+            try:
+                self.config.save()
+            except OSError as exc:
+                self.note('保存链路偏好失败（本次仍生效）：%s' % exc)
+        try:
+            self.registry.set_link_preference(pref)
+        except Exception:
+            pass
+        label = {'auto': '自动', 'wired': '有线优先', 'wireless': 'Wi-Fi 优先'}[pref]
+        self.note('点对点链路设为：%s' % label)
+        return pref
+
+    # ─────────────────────── 2.46.5 USB 自动触发（可选） ───────────────────────
+
+    def usb_auto_enabled(self) -> bool:
+        return bool(getattr(self.config, 'usb_auto', False))
+
+    def usb_auto_state(self) -> dict[str, Any]:
+        bridge = self._usb_bridge
+        return {
+            'enabled': self.usb_auto_enabled(),
+            'adb': str(getattr(bridge, 'adb', '') or usb_auto.find_adb()),
+            'running': bool(bridge is not None and bridge.is_alive()
+                            and bridge.enabled()),
+            'error': str(getattr(bridge, 'last_error', '') or ''),
+        }
+
+    def set_usb_auto(self, value: Any, *, persist: bool = True) -> bool:
+        """打开/关闭「插上 USB 自动触发」。
+
+        这不是普通应用能自己开 USB 共享：必须手机已开 USB 调试、电脑端有 adb。
+        命令是固定的（启动 App + 尝试 rndis），不执行任何用户输入。
+        """
+        on = usb_auto.as_bool(value)
+        self.config.usb_auto = on
+        if persist:
+            try:
+                self.config.save()
+            except OSError as exc:
+                self.note('保存 USB 自动模式失败（本次仍生效）：%s' % exc)
+        if on:
+            if not usb_auto.find_adb():
+                self.note('USB 自动模式已开启，但本机没找到 adb.exe；'
+                          '装 Android SDK Platform-Tools，或把 adb.exe 放到程序目录。')
+            self._start_usb_bridge()
+        else:
+            self._stop_usb_bridge()
+            self.note('USB 自动模式已关闭')
+        return on
+
     # ─────────────────────── 2.42.3 三档性能预算 ───────────────────────
 
     def local_quality(self) -> str:
@@ -2376,13 +2490,29 @@ class AudioMixingNode:
             session = self.sender.get(rid)
             # ★ 2.42.3：协商档位变了（切档/对端上下线）也要重建会话，否则 frames_per_packet
             #   这些参数只在创建时生效，面板显示"已切档"而实际没变。
+            # ★ 2.46.3：codec 必须和创建会话时用同一个 codec_for_target；帧长也要按
+            #   目标**实际**编码算（Android PCM16 只认 480 帧），否则会每轮重建会话。
             want_q = quality.negotiate(self.local_quality(), getattr(target, 'quality', ''))
-            want_codec = proto.CODEC_BY_NAME.get(rule['codec'], proto.CODEC_PCM_S16)
-            if str(getattr(target, 'platform', '') or '').strip().lower().startswith('android'):
-                want_codec = proto.CODEC_PCM_S16
+            qprof = quality.profile(want_q)
+            want_codec = codec_for_target(
+                proto.CODEC_BY_NAME.get(rule['codec'], proto.CODEC_PCM_S16),
+                getattr(target, 'platform', ''),
+                bool(getattr(target, 'opus', False)),
+            )
+            want_frames = frames_for_target(
+                int(qprof['frames_per_packet']), want_codec,
+                getattr(target, 'platform', ''))
+            have_codec = (int(getattr(session, 'request_codec',
+                                      getattr(session, 'codec', -1)))
+                          if session is not None else -1)
+            expect_frames = frames_for_target(
+                int(qprof['frames_per_packet']),
+                int(getattr(session, 'codec', want_codec)) if session is not None else want_codec,
+                getattr(target, 'platform', ''))
             same_target = (session is not None and session.host == target.host
                            and session.port == target_port
-                           and int(getattr(session, 'codec', -1)) == int(want_codec)
+                           and have_codec == int(want_codec)
+                           and int(getattr(session, 'frames_per_packet', -1)) == int(expect_frames)
                            and getattr(session, 'quality_preset', None) == want_q)
             if same_target and getattr(session, 'source_resolved', None) == resolved_key:
                 if session.gain != rule['gain']:
@@ -2425,23 +2555,23 @@ class AudioMixingNode:
                         'text': text,
                     }
                     continue
-            codec = codec_for_target(
-                proto.CODEC_BY_NAME.get(rule['codec'], proto.CODEC_PCM_S16),
-                getattr(target, 'platform', ''),
-                bool(getattr(target, 'opus', False)),
-            )
+            codec = want_codec
             # ★ 2.42.3：每条会话按「本机 vs 这台对端」协商出来的较低档取参数。
             #   frames_per_packet / Opus 码率与复杂度都真的接进编码链路，不只是面板数字。
-            qname = quality.negotiate(self.local_quality(), getattr(target, 'quality', ''))
-            qprof = quality.profile(qname)
-            session = SenderSession(source, target.host, target_port, codec=codec, gain=rule['gain'], node_id=self.node_id, node_name=self.name, source_name=source.name if hasattr(source, 'name') else spec.get('device', ''), route_id=rid, origin_id=self.origin_id if bool(getattr(target, 'ext', False)) else 0, hop=0, frames_per_packet=int(qprof['frames_per_packet']), opus_bitrate=int(qprof['opus_bitrate']), opus_complexity=int(qprof['opus_complexity']))
-            session.quality_preset = qname
+            # ★ 2.46.3：Android 的 PCM16 只能 480 帧/包，帧长按 frames_for_target 收敛。
+            session = SenderSession(source, target.host, target_port, codec=codec, gain=rule['gain'], node_id=self.node_id, node_name=self.name, source_name=source.name if hasattr(source, 'name') else spec.get('device', ''), route_id=rid, origin_id=self.origin_id if bool(getattr(target, 'ext', False)) else 0, hop=0, frames_per_packet=int(want_frames), opus_bitrate=int(qprof['opus_bitrate']), opus_complexity=int(qprof['opus_complexity']))
+            session.quality_preset = want_q
+            session.request_codec = want_codec
             session.source_key = source_key
             session.source_resolved = resolved_key
             if not session.supported:
                 self.note('codec %s unavailable, falling back to pcm_s16' % rule['codec'])
                 session.codec = proto.CODEC_PCM_S16
                 session._encoder = __import__('audiomixing.proto', fromlist=['x']).encode_pcm_s16
+                # ★ 2.46.3：Opus 不可用时实际走 PCM16，帧长必须跟着回到 Android 能收的档。
+                session.frames_per_packet = frames_for_target(
+                    int(qprof['frames_per_packet']), proto.CODEC_PCM_S16,
+                    getattr(target, 'platform', ''))
             try:
                 self.sender.add(rid, session)
                 # 送声恢复后只清掉"音源打不开"这一类提示；
@@ -4041,29 +4171,6 @@ class AudioMixingNode:
                 return str(selector)
         return ""
 
-    def _revoke_auto_listen(self, node_id: str) -> None:
-        '''对端停了送声音 → 收回本机替它自动打开的那条收听路由。
-
-        用户真机反馈（2026-10-15）：「手机 WiFi 送声音关闭后，电脑听的选项不会自动关」。
-        只认"我们建的"（记录里 created=True）：如果那条路由本来就是用户自己建的，
-        当初只是记了一笔，这时绝不能替他删掉 —— 那就变成"程序动了用户的设置"。
-        '''
-
-        record = self._auto_listen_granted.pop(node_id, None)
-        if not record or not record.get('created'):
-            return
-        route_id = str(record.get('route_id') or '')
-        if not route_id:
-            return
-        left = [r for r in self.routes if str(r.get('id') or '') != route_id]
-        if len(left) == len(self.routes):
-            return
-        try:
-            self.set_routes(left)
-            self.note('对方（%s）停了送声音，已收回自动打开的收听' % (record.get('name') or node_id))
-        except Exception as exc:
-            self.note('收回自动收听失败：%s' % exc)
-
     def _peer_name_of(self, node_id: str) -> str:
         """node_id → 显示名（注册表里的记录就带着名字）；查不到就回空串。
 
@@ -5267,18 +5374,26 @@ class AudioMixingNode:
             pass
         return False
 
-    def set_multi_out(self, devices: list[dict[str, Any]]) -> None:
+    def set_multi_out(self, devices: list[dict[str, Any]], *,
+                      gain_only: bool = False) -> None:
         """设置"本机多设备输出"的设备清单，并立刻生效。
 
         ★ Q2 改（2026-11-16 用户）：默认设备永远按「直出」算，不存进复制清单，
           避免它同时出现在清单里、又被系统直接播放 —— 那就是双声。
           锁默认设备是可选动作：`multi_lock_device` 为空就完全不碰系统设置。
+
+        ★ 2.46.9：`gain_only=True` 是面板拖动音量滑杆的快速路径。它只把音量合并进
+          现有配置并让运行中的输出就地改增益，**不碰系统默认设备、不写配置文件**
+          —— 否则每 180ms 一次会反复枚举播放端点并写盘（正是蓝牙卡顿的老坑）。
         """
         try:
             default_name = self._default_render_name() or ""
         except Exception:
             default_name = ""
         clean, _passthrough = split_multi_devices(devices, default_name)
+        if gain_only:
+            self._apply_multi_gains(clean)
+            return
         self.config.multi_out_devices = clean
         self._apply_multi_out()
         lock_name = str(getattr(self.config, "multi_lock_device", "") or "").strip()
@@ -5298,6 +5413,25 @@ class AudioMixingNode:
             self.save_config()
         except Exception:
             pass
+
+    def _apply_multi_gains(self, devices: list[dict[str, Any]]) -> None:
+        """只合并音量：不动音源 / 延迟 / 设备清单，不锁默认设备，不写盘。"""
+        wanted: dict[str, float] = {}
+        for item in devices or []:
+            name = str(item.get("device") or "").strip()
+            if not name:
+                continue
+            try:
+                wanted[name] = max(0.0, min(4.0, float(item.get("gain", 1.0))))
+            except (TypeError, ValueError):
+                continue
+        if not wanted:
+            return
+        for item in list(getattr(self.config, "multi_out_devices", None) or []):
+            name = str(item.get("device") or "").strip()
+            if name in wanted:
+                item["gain"] = wanted[name]
+        self._apply_multi_out()
 
     # ---- ★ Q2：多耳机 = 锁系统默认播放设备 ----
     def multi_lock_status(self, devices: list | None = None) -> dict[str, Any]:
@@ -6642,7 +6776,7 @@ class AudioMixingNode:
 
     def status(self) -> dict[str, Any]:
         recv = self.receiver.stats()
-        return {'debug': getattr(self, '_local_debug', {}), 'quality': self.quality_state(), 'quality_preset': self.audio_quality_state(), 'inputs': self._inputs_with_history(), 'node': {'id': self.node_id, 'short_id': short_id(self.node_id), 'name': self.name, 'audio_port': self.config.audio_port, 'broadcast_port': self.config.broadcast_port, 'web_port': self.config.web_port, 'discovery_port': self.config.discovery_port, 'uptime_s': round(time.time() - self.started_at, 1), 'simulate': self.simulate}, 'backends': audio_base.available_backends(), 'opus': _opus_state(), 'devices': {'sources': self.source_list(), 'sinks': self.sink_list()}, 'peers': self._peers_with_media_volume(), 'routes': self.routes_json(), 'channel': self.channel_state(), 'local': self.local_state(), 'output': self.output_level(), 'signals': self.signals_state(), 'senders': self.sender.stats(), 'senders_blocked': self.blocked_senders(), 'auto_listen': self.auto_listen_state(), 'identity': {'device_id': self.device_id, 'instance_id': self.instance_id, 'node_id': self.node_id, 'alias_ids': list(getattr(self.config, 'alias_ids', []) or []), 'merges': list(getattr(self.config, 'identity_merges', []) or []), 'relation_merges': list(getattr(self.config, 'relation_merges', []) or []), 'conflicts': [dict(p.to_json()) for p in self.registry.all() if getattr(p, 'identity_conflict', False)], 'hints': [{'node_id': p.node_id, 'name': p.name, 'reason': p.merge_hint, 'with': p.merge_hint_with, 'device_id': p.device_id} for p in self.registry.all() if getattr(p, 'merge_hint', '')], 'route_rewrites': list(getattr(self, '_identity_rewrites', []) or [])[-32:]}, 'peer_volume_debug': {'ttl_s': PEER_VOLUME_TTL_S, 'keys': sorted(self._peer_volume.keys()), 'last': dict(getattr(self, '_peer_vol_last', {}) or {}), 'series': self._peer_vol_series()}, 'loop_guard': {'origin_id': self.origin_id, 'echo_dropped': int(recv.get('echo_dropped') or 0), 'hop_dropped': int(recv.get('hop_dropped') or 0), 'max_hop': int(recv.get('max_hop') or 0)}, 'listen_ack': dict(self._peer_listen_ack), 'peer_silence_grace_s': PEER_SILENCE_GRACE_S, 'sinks': [engine.describe() for engine in self.sinks.values()], 'multi_out': self.multi_out.stats(), 'sources': self.hub.stats(), 'receiver': recv, 'totals': {'sent_kbps': self.sender.total_kbps(), 'active_senders': len(self.sender.sessions), 'active_sinks': len(self.sinks), 'active_streams': recv.get('active_streams', 0)}, 'discovery': self.beacon.stats() if self.beacon is not None else {}, 'tap': self.tap.stats(), 'log': self.log[-40:], 'last_error': self.last_error, 'captures': self.hub.stats()}
+        return {'debug': getattr(self, '_local_debug', {}), 'quality': self.quality_state(), 'quality_preset': self.audio_quality_state(), 'link_preference': self.link_preference(), 'usb_auto': self.usb_auto_state(), 'inputs': self._inputs_with_history(), 'node': {'id': self.node_id, 'short_id': short_id(self.node_id), 'name': self.name, 'audio_port': self.config.audio_port, 'broadcast_port': self.config.broadcast_port, 'web_port': self.config.web_port, 'discovery_port': self.config.discovery_port, 'uptime_s': round(time.time() - self.started_at, 1), 'simulate': self.simulate}, 'backends': audio_base.available_backends(), 'opus': _opus_state(), 'devices': {'sources': self.source_list(), 'sinks': self.sink_list()}, 'peers': self._peers_with_media_volume(), 'routes': self.routes_json(), 'channel': self.channel_state(), 'local': self.local_state(), 'output': self.output_level(), 'signals': self.signals_state(), 'senders': self.sender.stats(), 'senders_blocked': self.blocked_senders(), 'auto_listen': self.auto_listen_state(), 'identity': {'device_id': self.device_id, 'instance_id': self.instance_id, 'node_id': self.node_id, 'alias_ids': list(getattr(self.config, 'alias_ids', []) or []), 'merges': list(getattr(self.config, 'identity_merges', []) or []), 'relation_merges': list(getattr(self.config, 'relation_merges', []) or []), 'conflicts': [dict(p.to_json()) for p in self.registry.all() if getattr(p, 'identity_conflict', False)], 'hints': [{'node_id': p.node_id, 'name': p.name, 'reason': p.merge_hint, 'with': p.merge_hint_with, 'device_id': p.device_id} for p in self.registry.all() if getattr(p, 'merge_hint', '')], 'route_rewrites': list(getattr(self, '_identity_rewrites', []) or [])[-32:]}, 'peer_volume_debug': {'ttl_s': PEER_VOLUME_TTL_S, 'keys': sorted(self._peer_volume.keys()), 'last': dict(getattr(self, '_peer_vol_last', {}) or {}), 'series': self._peer_vol_series()}, 'loop_guard': {'origin_id': self.origin_id, 'echo_dropped': int(recv.get('echo_dropped') or 0), 'hop_dropped': int(recv.get('hop_dropped') or 0), 'max_hop': int(recv.get('max_hop') or 0)}, 'listen_ack': dict(self._peer_listen_ack), 'peer_silence_grace_s': PEER_SILENCE_GRACE_S, 'sinks': [engine.describe() for engine in self.sinks.values()], 'multi_out': self.multi_out.stats(), 'sources': self.hub.stats(), 'receiver': recv, 'totals': {'sent_kbps': self.sender.total_kbps(), 'active_senders': len(self.sender.sessions), 'active_sinks': len(self.sinks), 'active_streams': recv.get('active_streams', 0)}, 'discovery': self.beacon.stats() if self.beacon is not None else {}, 'tap': self.tap.stats(), 'log': self.log[-40:], 'last_error': self.last_error, 'captures': self.hub.stats()}
 
 
 def _opus_state() -> dict[str, Any]:

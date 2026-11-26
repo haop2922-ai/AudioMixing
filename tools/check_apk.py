@@ -33,8 +33,8 @@ except Exception:  # pragma: no cover - Python < 3.7 或非常规 stdout
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DEFAULT = ROOT / "android/app/build/outputs/apk/debug/app-debug.apk"
-RELEASE_DEFAULT = ROOT / "release/GOGO/AudioMixing-手机版-v2.31.1.apk"
-REQUIRED_VERSION = "2.31.1"
+RELEASE_DEFAULT = ROOT / "release/GOGO/AudioMixing-手机版-v2.31.7.apk"
+REQUIRED_VERSION = "2.31.7"
 # 2.10 的手机音量联动符号 + 2.11 的送声音档位字段（电脑端准入判据靠它）
 # + 2.12 的防自环扩展段字段（音频帧 originId/hop）。
 # 2.14 新增：bt_name / bt_mac（手机自报蓝牙身份，电脑端合并 WiFi/蓝牙链路的证据）。
@@ -58,23 +58,34 @@ REQUIRED_VERSION = "2.31.1"
 REQUIRED_SYMBOLS = ["mediaVolumeRatio", "mediaVolumeRatioFor", "send_mode", "originId",
                     "bt_name", "vol_in_capture", "diagJson", "total_q14", "setSendState",
                     "beaconSendMode", "silent_vol_policy", "vol_policy", "channelMode",
-                    "quality", "setReservedPort", "LegacyChannelJudge", "concentus"]
-PAYLOAD = ROOT / "tools/installer_payload/AudioMixing-手机版-v2.31.1.apk"
+                    "quality", "setReservedPort", "LegacyChannelJudge", "concentus",
+                    "HostGate", "storeChunks", "crossReceiverDup",
+                    "localLinkTypes", "setLinkPreference",
+                    # 2.31.5：9 键可缩放控制卡 + 设置对话框 + USB 网络共享自检
+                    "control_collapsed", "showSettingsDialog", "usbTetherIp",
+                    # 2.31.5（issue #1）：手动电脑 IP + 发现自检 + 附近的设备权限
+                    "manual_peer_hosts", "discoverySummary", "setManualHosts",
+                    "NEARBY_WIFI_DEVICES",
+                    # 2.31.6（代码审查）：自检用尝试轮数
+                    "beaconRounds", "discoveryAttempts",
+                    # 2.31.7：按真实前缀发定向广播 + 手动 IP 覆盖全部发现端口
+                    "localBroadcasts", "getInterfaceAddresses"]
+PAYLOAD = ROOT / "tools/installer_payload/AudioMixing-手机版-v2.31.7.apk"
 # 交付副本全部改为**带版本号**的文件名（用户实机装错过版本，第 6 条）。
 # ★ v2.33（Q2 交付）：把桌面、面板 ui 目录、构建输出也纳入逐份哈希比对 ——
 #   用户明确要求 APK 至少覆盖这六处，缺一处就可能在"扫码装 App"时发错包。
-DESKTOP_APK = pathlib.Path.home() / "Desktop" / "AudioMixing-手机版-v2.31.1.apk"
-DELIVERY_COPIES = [ROOT / "release/GOGO/AudioMixing-手机版-v2.31.1.apk",
-                   ROOT / "release/AudioMixing-手机版-v2.31.1.apk",
+DESKTOP_APK = pathlib.Path.home() / "Desktop" / "AudioMixing-手机版-v2.31.7.apk"
+DELIVERY_COPIES = [ROOT / "release/GOGO/AudioMixing-手机版-v2.31.7.apk",
+                   ROOT / "release/AudioMixing-手机版-v2.31.7.apk",
                    PAYLOAD,
-                   ROOT / "audiomixing/ui/AudioMixing-手机版-v2.31.1.apk",
+                   ROOT / "audiomixing/ui/AudioMixing-手机版-v2.31.7.apk",
                    DESKTOP_APK,
                    DEFAULT]
 
 # 每个交付的类都要在这里 —— 漏掉一个，那个类整个丢了脚本也照样报 PASS
 # （Diagnosis.java 是 task-6 的主要交付物，之前就漏在清单外）。
 CLASSES = ["Proto", "Discovery", "AudioSend", "AudioRecv", "Engine", "MixService",
-           "MainActivity", "Diagnosis", "OpusPcmDecoder"]
+           "MainActivity", "Diagnosis", "OpusPcmDecoder", "HostGate"]
 WORDS = ["麦克风", "收听", "送声音", "详情", "设备", "正在", "局域网", "配对", "同一", "音量"]
 
 

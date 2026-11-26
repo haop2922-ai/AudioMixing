@@ -152,7 +152,7 @@ def _restore_config(previous: str | None) -> None:
 
 def cmd_net(args: argparse.Namespace) -> int:
     """Show this machine's LAN interfaces and what Audio Mixing can reach."""
-    report = disc.lan_report()
+    report = disc.lan_report(refresh_types=True)
     cfg = Config.load()
     if args.json:
         _print(report)
@@ -269,7 +269,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                                         running.get("totals", {}).get("active_sinks", 0)))
         print()
         print("  请直接用这个网址（本机或手机/别的电脑都可以）：")
-        for ip in [i["address"] for i in disc.lan_report()["interfaces"] if i["kind"] == "private"]:
+        for ip in [i["address"] for i in disc.lan_report(refresh_types=True)["interfaces"] if i["kind"] == "private"]:
             print("      http://%s:%d" % (ip, requested_web))
         print("      http://127.0.0.1:%d  （仅本机）" % requested_web)
         print()
@@ -277,7 +277,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         _service_log("已有实例在跑（127.0.0.1:%d），本进程按单实例规则退出" % requested_web)
         if getattr(args, "open_browser", False):
             urls = ["http://%s:%d" % (i["address"], requested_web)
-                    for i in disc.lan_report()["interfaces"] if i["kind"] == "private"]
+                    for i in disc.lan_report(refresh_types=True)["interfaces"] if i["kind"] == "private"]
             try:
                 import webbrowser
 
@@ -324,6 +324,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     # Only advertise addresses that are actually on a LAN. A VPN adapter or a public
     # address would look like a valid choice to the user and then fail on the other
     # machine -- exactly the kind of dead end this printout exists to prevent.
+    # ★ 2.46.9：这里用默认（只读缓存）——否则冷启动会在打印横幅前同步跑一次
+    #   PowerShell，把 last-run.txt 也一起拖后；面板的地址列表会由后台探测补齐。
     lan_report = disc.lan_report()
     lan_ips = _ordered_lan_ips(node, lan_report)
     skipped = [i["address"] for i in lan_report["interfaces"] if i["kind"] != "private"]

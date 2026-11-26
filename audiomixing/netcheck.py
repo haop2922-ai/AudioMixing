@@ -167,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- 3. addresses ----------------------------------------------------
     line("--- 3. addresses (use the LAN one on the phone) ---")
-    report = disc.lan_report()
+    report = disc.lan_report(refresh_types=True)
     lan: list[str] = []
     for iface in report["interfaces"]:
         tag = "LAN  <-- use this" if iface["kind"] == "private" else "NOT LAN (VPN/public, phone cannot use)"

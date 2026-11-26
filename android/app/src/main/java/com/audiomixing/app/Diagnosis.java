@@ -641,7 +641,7 @@ public final class Diagnosis {
                     .append(" · 版本不对 ").append(st.badVersion)
                     .append(" · 包太短 ").append(st.badShort)
                     .append(" · 编码不是 PCM16 ").append(st.badCodec)
-                    .append(" · 帧长不是 480 ").append(st.badFrames).append('\n');
+                    .append(" · 帧长超限 ").append(st.badFrames).append('\n');
             if (st.lastCodecSeen != null && st.lastCodecSeen.length() > 0) {
                 sb.append("对面编码：").append(st.lastCodecSeen).append('\n');
             }
@@ -848,8 +848,8 @@ public final class Diagnosis {
             }
             if (st.badFrames > 0) {
                 sb.append("· 本机：有 ").append(st.badFrames)
-                        .append(" 个包不是 480 帧/10ms 一包 → 手机只认这一档（不做重采样），")
-                        .append("要对面把每包帧数改回 480。\n");
+                        .append(" 个包的负载超过 8 块 × 1920 字节（>80ms 一包）→ 已拒收；")
+                        .append("要对面把每包帧数改回 480（PCM16）或 960（Opus）。\n");
             }
             if (st.badMagic > 0) {
                 sb.append("· 本机：有 ").append(st.badMagic)

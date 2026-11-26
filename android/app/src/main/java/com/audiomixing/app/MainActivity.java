@@ -100,6 +100,8 @@ public class MainActivity extends Activity {
     private static final int REQ_NOTIF = 1002;
     /** ★ 「采本机声音」的系统授权窗口（MediaProjection 的一次性许可）。 */
     private static final int REQ_PROJ = 1003;
+    /** ★ 2.31.5：「附近的设备」（Android 13+，Android 16/17 的本地网络保护也归这一组）。 */
+    private static final int REQ_NEARBY = 1004;
     /** 界面刷新间隔：150ms 足够跟手，又不会一直在重画。 */
     private static final long TICK_MS = 150L;
 
@@ -114,8 +116,18 @@ public class MainActivity extends Activity {
     // ★ 主控大块里分成"三档都能看见"和"只有详细档才有"的两部分
     /** 音源的实时状态（"现在实际送的是哪一个" + 静音提醒）：补充信息，只在详细档露出。 */
     private LinearLayout sourceInfoWrap;
-    /** 「🚀 快速上手 / ✏️ 改名」：只在详细档出现（简洁档一个多余的字都不要）。 */
-    private LinearLayout detailOnlyRow;
+    // ★ 2.31.4（用户图1）：9 个按键合成一张大卡片，可收成一条可展开的横线。
+    /** 卡片的按钮主体：收起时整块隐藏。 */
+    private LinearLayout controlBody;
+    /** 收起后仍常驻的那条横线：左侧是状态摘要。 */
+    private TextView controlSummary;
+    /** 折叠/展开按键（卡片头右侧）。 */
+    private TextView controlToggle;
+    /** 第 3 行（听广播 / 广播我的声音）：监控档隐藏。 */
+    private View controlChannelRow;
+    private boolean controlCollapsed;
+    /** ★ 2.31.5：空列表时那条"发现自检"（一直收不到别人的信标才显示）。 */
+    private TextView discoveryNow;
     // ★ 音源
     private TextView playChip;
     private TextView micChip;
@@ -130,11 +142,14 @@ public class MainActivity extends Activity {
     private TextView broadcastChip;
     private TextView broadcastNow;
     private boolean lastBroadcastOn;
-    // ★ 2.42.3：三档性能预算（流畅 / 均衡 / 高音质）
-    private TextView qSmoothChip;
-    private TextView qBalancedChip;
-    private TextView qHighChip;
+    // ★ 2.42.3：三档性能预算（流畅 / 均衡 / 高音质）。
+    //   ★ 2.31.4：三个档位按钮搬进「⚙ 设置」对话框，这里只留当前生效值 ——
+    //     对话框关着时它是 null（刷新时判空跳过），打开时由 refreshChannelRow 实时更新。
     private TextView qualityNow;
+    /** 「⚙ 设置」里链路偏好的当前值（对话框关着时为 null）。 */
+    private TextView linkNowText;
+    /** 「⚙ 设置」里 USB 网络共享状态（对话框关着时为 null）。 */
+    private TextView linkUsbText;
     // ★ ④ 安全停发提示（"已停止向 XXX 发送…"，和自动收听是两件事，保留）。
     //   ★ 2026-10-18 用户第 6 条：全局的「自动收听路由声音」开关及其提示/一键收回已整段删掉 ——
     //     自动听不听改由每台设备卡片上的第 4 颗「智连」按钮各自决定（默认关），
@@ -169,6 +184,8 @@ public class MainActivity extends Activity {
     private static final int MODE_MONITOR = 2;
     private static final String PREFS_NAME = "audiomixing";
     private static final String KEY_VIEW_MODE = "view_mode";
+    /** ★ 2.31.4：9 键控制卡是否已收成一条横线。 */
+    private static final String KEY_CONTROL_COLLAPSED = "control_collapsed";
 
     private int viewMode = MODE_SIMPLE;
     private TextView modeSimple;
@@ -227,6 +244,62 @@ public class MainActivity extends Activity {
         return viewMode == MODE_DETAIL;
     }
 
+    // ══════════════════ ★ 2.31.4：9 键控制卡（缩放 / 收起） ══════════════════
+    //
+    // 用户原话：「绿框内 8 个按键保留合成一个大卡片…并添加一个缩放按键，允许这 9 个按键
+    // 构成的卡片可以变成一条可展开的横线」。收起后只留卡片头那一行 —— 模式 + 音源 +
+    // 收听/广播状态，一眼知道现在是什么状态；点整行或右边的「▸ 展开」恢复。
+
+    private void setControlCollapsed(boolean collapsed) {
+        controlCollapsed = collapsed;
+        try {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit().putBoolean(KEY_CONTROL_COLLAPSED, collapsed).apply();
+        } catch (Throwable ignored) {
+            // 存不了就只是"下次打开回到展开"，不影响使用
+        }
+        applyControlCollapsed();
+    }
+
+    private boolean loadControlCollapsed() {
+        try {
+            return getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .getBoolean(KEY_CONTROL_COLLAPSED, false);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private void applyControlCollapsed() {
+        if (controlBody != null) {
+            controlBody.setVisibility(controlCollapsed ? View.GONE : View.VISIBLE);
+        }
+        if (controlToggle != null) {
+            styleChip(controlToggle, false, controlCollapsed ? "▸ 展开" : "▾ 收起");
+        }
+        refreshControlSummary();
+    }
+
+    /** 收起后那条横线上的摘要：模式 + 音源 + 听广播 / 广播中。 */
+    private void refreshControlSummary() {
+        if (controlSummary == null) {
+            return;
+        }
+        String mode = viewMode == MODE_DETAIL ? "详细"
+                : (viewMode == MODE_MONITOR ? "监控" : "简洁");
+        StringBuilder sb = new StringBuilder("控制 · ").append(mode);
+        int src = engine.sourceState();
+        sb.append(" · 音源").append(src == SourcePolicy.SRC_OFF ? "关"
+                : (src == SourcePolicy.SRC_MIC ? "麦克风" : "本机声音"));
+        if (engine.isChannelListening()) {
+            sb.append(" · 听广播中");
+        }
+        if (engine.isBroadcasting()) {
+            sb.append(" · 广播中");
+        }
+        setTextIfChanged(controlSummary, sb.toString());
+    }
+
     /** 把一块解释性长说明登记进"只有详细档才显示"的集合，并按当前档位立刻定一次可见性。 */
     private void registerLong(List<View> into, View v) {
         into.add(v);
@@ -259,12 +332,13 @@ public class MainActivity extends Activity {
         if (micChip != null) {
             micChip.setVisibility(monitor ? View.GONE : View.VISIBLE);
         }
+        // ★ 2.31.4：「听广播 / 广播我的声音」搬进控制卡后同样按监控档隐藏。
+        if (controlChannelRow != null) {
+            controlChannelRow.setVisibility(monitor ? View.GONE : View.VISIBLE);
+        }
         // 下面这些全是"补充信息/不常用入口"：只有详细档露（用户原话见类里的那段说明）。
         if (sourceInfoWrap != null) {
             sourceInfoWrap.setVisibility(detail ? View.VISIBLE : View.GONE);
-        }
-        if (detailOnlyRow != null) {
-            detailOnlyRow.setVisibility(detail ? View.VISIBLE : View.GONE);
         }
         if (hintCard != null) {
             hintCard.setVisibility(detail ? View.VISIBLE : View.GONE);
@@ -279,6 +353,7 @@ public class MainActivity extends Activity {
             // 「详细」档：本机信息块（IP/端口/统计/对端回话…）常驻展开。
             detailWrap.setVisibility(detail ? View.VISIBLE : View.GONE);
         }
+        refreshControlSummary();
     }
 
     private final Runnable tick = new Runnable() {
@@ -321,12 +396,17 @@ public class MainActivity extends Activity {
         engine.start();               // 打开 App 就开始找设备，不需要用户做任何事
         MixService.safeStart(this);   // 常驻通知；服务起不来也不影响界面可用
         askNotificationPermission();  // 安卓 13+ 通知要运行时授权
+        askNearbyPermission();        // 安卓 13+「附近的设备」；Android 16 本地网络保护也用它
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         ticking = true;
+        // 从系统「热点和网络共享」页回来时，设置对话框可能还开着：立刻重读 USB 状态。
+        if (linkUsbText != null) {
+            setTextIfChanged(linkUsbText, usbTetherStatusText());
+        }
         ui.removeCallbacks(tick);
         ui.post(tick);
     }
@@ -358,6 +438,17 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int req, String[] perms, int[] granted) {
         super.onRequestPermissionsResult(req, perms, granted);
+        if (req == REQ_NEARBY) {
+            boolean ok = granted.length > 0 && granted[0] == PackageManager.PERMISSION_GRANTED;
+            if (ok) {
+                toast("已允许「附近的设备」：局域网发现会更可靠");
+            } else {
+                toast("没有「附近的设备」权限：部分系统（Android 16+）会拦局域网发现；"
+                        + "可在「⚙ 设置 → 发现」里再授权");
+            }
+            refreshNow();
+            return;
+        }
         if (req != REQ_MIC) {
             return;
         }
@@ -430,6 +521,16 @@ public class MainActivity extends Activity {
         }
         refreshSourceRow();
         refreshChannelRow();
+        refreshControlSummary();
+        // ★ 2.31.5：一直收不到别人的信标（自己已经发了一阵子）就把发现自检摊开，
+        //   别让用户对着"搜索中"干等 —— 这一行能直接区分"我没发出去 / 发了没人回"。
+        if (discoveryNow != null) {
+            boolean show = engine.discoveryReceived() == 0 && engine.discoveryAttempts() >= 10;
+            discoveryNow.setVisibility(show ? View.VISIBLE : View.GONE);
+            if (show) {
+                setTextIfChanged(discoveryNow, engine.discoverySummary());
+            }
+        }
         if (subLine != null) {
             // 名字被改过之后，标题下面那行要跟着变（信标 2 秒内带出去，界面立刻变）
             setTextIfChanged(subLine, engine.localName() + " ✏️ · " + engine.platform());
@@ -480,12 +581,11 @@ public class MainActivity extends Activity {
             setTextIfChanged(suspendedLine, susp.length() > 0 ? ("⏸ " + susp) : "");
             suspendedLine.setVisibility(susp.length() > 0 ? View.VISIBLE : View.GONE);
         }
-        // ★ 2.42.3：档位按钮与生效值
-        String q = engine.qualityPreset();
-        if (qSmoothChip != null) styleChip(qSmoothChip, "smooth".equals(q), "流畅");
-        if (qBalancedChip != null) styleChip(qBalancedChip, "balanced".equals(q), "均衡");
-        if (qHighChip != null) styleChip(qHighChip, "high".equals(q), "高音质");
+        // ★ 2.42.3：档位（按钮已搬进「⚙ 设置」，这里只更新当前生效值）
         if (qualityNow != null) setTextIfChanged(qualityNow, engine.qualityStateText());
+        if (linkNowText != null) {
+            setTextIfChanged(linkNowText, "当前：" + engine.linkPreferenceLabel());
+        }
     }
 
     /** ★ 2.42.3：切换性能预算档位并把协商结果如实报给用户。 */
@@ -558,6 +658,7 @@ public class MainActivity extends Activity {
     private void rebuild(List<Discovery.Peer> peers) {
         listBox.removeAllViews();
         rows.clear();
+        discoveryNow = null;           // 旧空状态卡片一起被丢掉，别再更新它
         dynLongTextViews.clear();      // 空状态卡片里的长说明跟着旧 View 一起丢掉
         if (peers.isEmpty()) {
             listBox.addView(buildEmptyCard());
@@ -1135,6 +1236,40 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * ★ 2.31.5：请求「附近的设备」。
+     *
+     * <p>Android 13+ 的 NEARBY_WIFI_DEVICES 本身是 Wi-Fi 相关权限；Android 16 的
+     * 「本地网络保护」试验开关也把授予它当作放行 UDP/组播的条件，Android 17 起更是
+     * 并进了 ACCESS_LOCAL_NETWORK 同一权限组。我们只做局域网发现，问这一句是合理的；
+     * 用户拒绝也不拦着用，只是发现可能被系统拦掉（设置里有状态和再次授权入口）。
+     */
+    private void askNearbyPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return;
+        }
+        try {
+            if (checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES)
+                    != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(new String[]{Manifest.permission.NEARBY_WIFI_DEVICES}, REQ_NEARBY);
+            }
+        } catch (Throwable t) {
+            Log.w("AM-Main", "请求「附近的设备」权限失败", t);
+        }
+    }
+
+    private boolean nearbyGranted() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return true;
+        }
+        try {
+            return checkSelfPermission(Manifest.permission.NEARBY_WIFI_DEVICES)
+                    == PackageManager.PERMISSION_GRANTED;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     private void toast(String s) {
         Toast.makeText(this, s, Toast.LENGTH_SHORT).show();
     }
@@ -1155,14 +1290,11 @@ public class MainActivity extends Activity {
         scroll.addView(root, new ViewGroup.LayoutParams(MATCH, WRAP));
 
         root.addView(buildHeader());
-        // ★ 一个大块、6 个小格（用户 2026-10-15）：
-        //   简洁 / 详细 / 监控 / 诊断 / 本机声音 / 麦克风。
-        //   原来这三样（三档切换、工具栏、音源）散在三张卡片里，第 6 格还拖着一整块
-        //   说明和一根全局音量滑杆 —— 用户原话是无用的"整个大块全删掉"。
+        // ★ 2.31.4（用户图1）：9 个按键（三档 / 诊断 / 音源 ×2 / 听广播 / 广播 / 设置）
+        //   合成一张可缩放的大卡片。收起后只剩卡片头那一条横线。
         root.addView(buildMainCard());
-        // ★ 「听广播 / 广播我的声音」放在设备列表【上面】：用户现在最常见的情况就是列表里 0 台设备
-        //   （电脑在广播、手机看不见它），那时候列表里没有任何东西可点，
-        //   而这个开关恰恰是"电脑在广播，我要能听见"的唯一入口 —— 放进列表里等于藏起来。
+        // ★ 频道【状态】留在设备列表上面：列表里 0 台设备时（电脑在广播、手机看不见它），
+        //   这里仍然写着"在听谁 / 为什么没声音"。开关本身已并入上面的控制卡。
         channelCard = buildChannelCard();
         root.addView(channelCard);
 
@@ -1182,26 +1314,53 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * ★ 主控大块（2026-10-15 用户要求）：<b>一个大块，分 6 个小格</b>。
+     * ★ 2.31.4（用户图1）：把原来散在两个卡片里的 8 个按键合成<b>一张大卡片</b>，
+     * 再加上第 9 个「⚙ 设置」，右上角还有一个「缩放」键。
      *
-     * <p>用户原话：「合成一个大块，分6个小块。简洁/详细/监控/诊断/本机声音/麦克风」——
-     * 这 6 样原来散在三张卡片里（三档切换一张、工具栏一张、"送什么声音"一张），
-     * 最后那张还塞了一整块说明和一根全局音量滑杆。
+     * <p>用户原话：「绿框内 8 个按键保留合成一个大卡片并添加一个设置按键。把你觉得应该
+     * 属于设置的东西都放进去。并添加一个缩放按键，允许这 9 个按键构成的卡片可以变成
+     * 一条可展开的横线。」
      *
-     * <p>他同时把"多出来的东西"点掉了：
-     * <ul>
-     *   <li>「整个大块全删掉，音量功能重复了，诊断保留了，改名在页面左上角名字那也重复了」
-     *       —— 所以"我们这一层的音量"滑杆、只读的系统音量那一行、那一长段音源限制说明、
-     *       {@code ▸ 详情} 开关，以及诊断/改名的副本，全部删掉；</li>
-     *   <li>「全部删掉，这些详细页全部都有还不常用，凭什么出现在简洁页面」
-     *       —— 快速上手、改名、本机信息那串 kv，只在「详细」档出现。</li>
-     * </ul>
+     * <p>结构：卡片头（模式 + 音源 + 收听/广播状态摘要 + ▾收起/▸展开）常驻；
+     * {@link #controlBody} 里是 9 个按键，收起时整块隐藏，只剩卡片头那一条横线。
+     * 音质、链路偏好、端口、静音档说明、快速上手、改名、版本号全部收进「⚙ 设置」。
      *
      * <p>音量滑杆并没有消失：每台设备卡片里本来就有一对自己的「收 / 送」滑杆（见
      * {@link #gainRow}），那才是用户真正在调的东西 —— 全局那一根是重复的，所以拿掉。
      */
     private View buildMainCard() {
         LinearLayout card = card();
+
+        // ── 卡片头：收起后就是那"一条可展开的横线" ──
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        head.setClickable(true);
+        head.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                setControlCollapsed(!controlCollapsed);
+            }
+        });
+
+        controlSummary = text("", 12f, DIM, false);
+        LinearLayout.LayoutParams sumLp = margins(0, WRAP, 0, 0, dpi(8), 0);
+        sumLp.weight = 1f;
+        head.addView(controlSummary, sumLp);
+
+        controlToggle = chip("▾ 收起");
+        controlToggle.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                setControlCollapsed(!controlCollapsed);
+            }
+        });
+        head.addView(controlToggle, new LinearLayout.LayoutParams(WRAP, dpi(34)));
+        card.addView(head);
+
+        controlBody = new LinearLayout(this);
+        controlBody.setOrientation(LinearLayout.VERTICAL);
+        card.addView(controlBody);
 
         // ── 第 1 行：三档切换（简洁 / 详细 / 监控）──
         LinearLayout modes = new LinearLayout(this);
@@ -1239,7 +1398,7 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams p3 = margins(0, dpi(40), 0, 0, 0, 0);
         p3.weight = 1f;
         modes.addView(modeMonitor, p3);
-        card.addView(modes);
+        controlBody.addView(modes);
 
         // ── 第 2 行：诊断 / 本机声音 / 麦克风（三档都看得见 —— 诊断是"看"的入口）──
         LinearLayout tools = new LinearLayout(this);
@@ -1282,7 +1441,58 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams mlp = margins(0, dpi(42), 0, 0, 0, 0);
         mlp.weight = 1f;
         tools.addView(micChip, mlp);
-        card.addView(tools, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+        controlBody.addView(tools, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+
+        // ── 第 3 行：📻 听广播 / 📢 广播我的声音 ──
+        //   监控档是只读面板，这一行整行隐藏（见 applyMode）。
+        controlChannelRow = new LinearLayout(this);
+        ((LinearLayout) controlChannelRow).setOrientation(LinearLayout.HORIZONTAL);
+
+        channelChip = chip("📻 听广播");
+        channelChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                boolean on = !engine.isChannelListening();
+                engine.setChannelListen(on);
+                toast(on ? "已打开听广播：谁在广播就听谁" : "已关闭听广播");
+                refreshNow();
+            }
+        });
+        LinearLayout.LayoutParams clp = margins(0, dpi(44), 0, 0, dpi(6), 0);
+        clp.weight = 1f;
+        ((LinearLayout) controlChannelRow).addView(channelChip, clp);
+
+        // ★ 「📢 广播我的声音」：用户原话「没有发广播」。
+        //   做法：对发现列表里每个在线节点各建一条单播发送（一次采集、一包编码、发 N 份）。
+        broadcastChip = chip("📢 广播我的声音");
+        broadcastChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                boolean on = !engine.isBroadcasting();
+                if (on && !engine.sourceEnabled()) {
+                    // 音源开关关着就没声音可广播；绝不替用户打开采集（更不能开麦）。
+                    toast("音源已关闭：先点「🔊 本机声音」或「🎤 麦克风」打开采集");
+                    return;
+                }
+                engine.setBroadcasting(on);
+                toast(on ? "已开始广播：我的声音送给每一台在线设备" : "已停止广播");
+                refreshNow();
+            }
+        });
+        LinearLayout.LayoutParams blp = margins(0, dpi(44), 0, 0, 0, 0);
+        blp.weight = 1f;
+        ((LinearLayout) controlChannelRow).addView(broadcastChip, blp);
+        controlBody.addView(controlChannelRow, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+
+        // ── 第 4 行：⚙ 设置（第 9 个按键）──
+        TextView settingsChip = chip("⚙ 设置");
+        settingsChip.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showSettingsDialog();
+            }
+        });
+        controlBody.addView(settingsChip, margins(MATCH, dpi(42), 0, dpi(8), 0, 0));
 
         // ── 音源的实时状态（"现在实际送的是哪一个" + 静音提醒 + 限制说明）：只有详细档露 ──
         sourceInfoWrap = new LinearLayout(this);
@@ -1307,42 +1517,12 @@ public class MainActivity extends Activity {
                 + "🎤 麦克风 = 对讲：说给对面听。两种都走同一条音频链路，音质一样。", 11.5f, DIM, false);
         limit.setLineSpacing(dp(3), 1f);
         sourceInfoWrap.addView(limit, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
-        card.addView(sourceInfoWrap);
-
-        // ── 只有详细档才出现的那两个入口：快速上手 / 改名 ──
-        //   （"详情"已经变成这一档本身；"展开说明"连按钮一起去掉了 —— 简洁档一个补充字都没有。）
-        detailOnlyRow = new LinearLayout(this);
-        detailOnlyRow.setOrientation(LinearLayout.HORIZONTAL);
-        detailOnlyRow.setGravity(Gravity.CENTER_VERTICAL);
-
-        TextView qsChip = chip("🚀 快速上手");
-        qsChip.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                showQuickStartDialog();
-            }
-        });
-        LinearLayout.LayoutParams qlp = margins(0, dpi(42), 0, dpi(10), dpi(6), 0);
-        qlp.weight = 1f;
-        detailOnlyRow.addView(qsChip, qlp);
-
-        // ★ 「✏️ 改名」：点标题下那行名字也能改，这里再给一个显式入口
-        TextView renameChip = chip("✏️ 改名");
-        renameChip.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                showRenameDialog();
-            }
-        });
-        LinearLayout.LayoutParams rlp = margins(0, dpi(42), 0, dpi(10), 0, 0);
-        rlp.weight = 1f;
-        detailOnlyRow.addView(renameChip, rlp);
-        card.addView(detailOnlyRow);
+        controlBody.addView(sourceInfoWrap);
 
         // ── 详细档的本机信息（原来「▸ 详情」里那一串）──
         detailWrap = new LinearLayout(this);
         detailWrap.setOrientation(LinearLayout.VERTICAL);
-        card.addView(detailWrap);
+        controlBody.addView(detailWrap);
 
         kv("本机名称", "name");
         kv("本机 IP", "ip");
@@ -1364,12 +1544,10 @@ public class MainActivity extends Activity {
         // ★ 2026-11-08（用户方案）：音量乘数绑在送声档位上；这里只暴露"静音档乘数策略"。
         kv("音量乘数", "volmode");
 
-        // ★ 2026-11-01 用户：手机端没有端口修改，电脑改端口后手机连不上。
-        //   这里放在「详细」档，和电脑的「设置 → 端口设置」对应：
-        //   · 发现端口：要和电脑一致，否则收不到对方的信标/控制消息；
-        //   · 音频端口：本机接收声音的 UDP 端口，电脑按信标里的这个值发过来。
-        detailWrap.addView(buildPortSettings(), margins(MATCH, WRAP, 0, dpi(14), 0, 0));
-        detailWrap.addView(buildVolumePolicySettings(), margins(MATCH, WRAP, 0, dpi(14), 0, 0));
+        // ★ 2.31.4：发现端口设置 / 静音档说明都搬进「⚙ 设置」了 ——
+        //   卡片收起时它们跟着一起隐藏，展开后也不必在详细档里翻这么长的表单。
+        controlCollapsed = loadControlCollapsed();
+        applyControlCollapsed();
         return card;
     }
 
@@ -1465,6 +1643,403 @@ public class MainActivity extends Activity {
         return box;
     }
 
+    // ══════════════════ ★ 2.31.4：「⚙ 设置」对话框（第 9 个按键） ══════════════════
+    //
+    // 用户原话：「把你觉得应该属于设置的东西都放进去」。这里收的是：
+    //   音质档位 / 点对点链路偏好 + USB 网络共享入口 / 发现端口 / 静音档说明 /
+    //   快速上手 / 改名 / 版本与节点 ID。
+    // 这样主控卡只留 9 个按键，详细档也不再拖着一长串表单。
+
+    private void showSettingsDialog() {
+        final Dialog d = new Dialog(this);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setBackground(roundRect(0xF5070B12, dp(18), LINE, Math.max(1, dpi(1))));
+        int pad = dpi(16);
+        box.setPadding(pad, pad, pad, pad);
+
+        box.addView(text("⚙ 设置", 16f, FG, true));
+
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.addView(buildQualitySettings(), margins(MATCH, WRAP, 0, dpi(14), 0, 0));
+        body.addView(buildLinkSettings(), margins(MATCH, WRAP, 0, dpi(18), 0, 0));
+        body.addView(buildDiscoverySettings(), margins(MATCH, WRAP, 0, dpi(18), 0, 0));
+        body.addView(buildPortSettings(), margins(MATCH, WRAP, 0, dpi(18), 0, 0));
+        body.addView(buildVolumePolicySettings(), margins(MATCH, WRAP, 0, dpi(18), 0, 0));
+        body.addView(buildQuickEntries(d), margins(MATCH, WRAP, 0, dpi(18), 0, 0));
+        body.addView(buildAbout(), margins(MATCH, WRAP, 0, dpi(18), 0, 0));
+
+        ScrollView sv = new ScrollView(this);
+        sv.setVerticalScrollBarEnabled(false);
+        sv.addView(body, new ViewGroup.LayoutParams(MATCH, WRAP));
+        int bodyH = Math.max(dpi(240),
+                (int) (getResources().getDisplayMetrics().heightPixels * 0.64f));
+        box.addView(sv, margins(MATCH, bodyH, 0, dpi(10), 0, dpi(12)));
+
+        TextView ok = chip("完成");
+        ok.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                d.dismiss();
+            }
+        });
+        box.addView(ok, margins(MATCH, dpi(46), 0, 0, 0, 0));
+
+        // 对话框里的控件随对话框一起销毁：把引用清掉，别让 150ms 的刷新继续碰它们。
+        d.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+            @Override
+            public void onDismiss(android.content.DialogInterface dialog) {
+                qualityNow = null;
+                linkNowText = null;
+                linkUsbText = null;
+            }
+        });
+
+        d.setContentView(box);
+        Window dw = d.getWindow();
+        if (dw != null) {
+            dw.setBackgroundDrawable(new ColorDrawable(0));
+            dw.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            dw.setDimAmount(0.62f);
+            dw.setLayout(MATCH, WRAP);
+        }
+        d.show();
+    }
+
+    /** 设置里每一块的标题。 */
+    private LinearLayout settingsSection(String title) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.addView(text(title, 12.5f, FG, true));
+        return box;
+    }
+
+    /** 音质三档（从频道卡搬进来的）。 */
+    private View buildQualitySettings() {
+        LinearLayout box = settingsSection("音质");
+        TextView desc = text("两端各自可设；不一致时按较低那档协商（省 CPU 的那档生效）。",
+                10.5f, DIM, false);
+        desc.setLineSpacing(dp(2), 1f);
+        box.addView(desc, margins(MATCH, WRAP, 0, dpi(4), 0, dpi(6)));
+
+        final String[] names = {"smooth", "balanced", "high"};
+        final String[] labels = {"流畅", "均衡", "高音质"};
+        final TextView[] chips = new TextView[3];
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < names.length; i++) {
+            final int idx = i;
+            chips[i] = chip(labels[i]);
+            chips[i].setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    chooseQuality(names[idx]);
+                    for (int k = 0; k < names.length; k++) {
+                        styleChip(chips[k], k == idx, labels[k]);
+                    }
+                }
+            });
+            LinearLayout.LayoutParams lp = margins(0, dpi(40), i < names.length - 1 ? dpi(6) : 0, 0, 0, 0);
+            lp.weight = 1f;
+            row.addView(chips[i], lp);
+            styleChip(chips[i], names[i].equals(engine.qualityPreset()), labels[i]);
+        }
+        box.addView(row);
+        qualityNow = text(engine.qualityStateText(), 11.5f, DIM, false);
+        box.addView(qualityNow, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
+        return box;
+    }
+
+    /**
+     * 点对点链路偏好 + USB 网络共享入口。
+     *
+     * <p>★ 用户实测反馈（2.31.3）：「只有『有线优先』的时候手机才能被电脑检测到，自动挡都不行」。
+     * 2.31.4 起「自动」的排序已改成 USB &gt; 网线 &gt; Wi-Fi（和电脑端一致），
+     * 这里把口径写清楚，并给出 USB 网络共享的开关入口与当前状态。
+     */
+    private View buildLinkSettings() {
+        LinearLayout box = settingsSection("点对点链路");
+        TextView desc = text("自动 = 有 USB 网络共享或网线就优先走有线，没插线才用 Wi-Fi。"
+                + "两边（电脑 / 手机）要能互通，设备列表才会出现。", 10.5f, DIM, false);
+        desc.setLineSpacing(dp(2), 1f);
+        box.addView(desc, margins(MATCH, WRAP, 0, dpi(4), 0, dpi(6)));
+
+        final String[] values = {"auto", "wired", "wireless"};
+        final String[] labels = {"自动", "有线优先", "Wi-Fi 优先"};
+        final TextView[] chips = new TextView[3];
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < values.length; i++) {
+            final int idx = i;
+            chips[i] = chip(labels[i]);
+            chips[i].setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    engine.setLinkPreference(values[idx]);
+                    for (int k = 0; k < values.length; k++) {
+                        styleChip(chips[k], k == idx, labels[k]);
+                    }
+                    toast("链路偏好：已切到「" + labels[idx] + "」");
+                    refreshNow();
+                }
+            });
+            LinearLayout.LayoutParams lp = margins(0, dpi(40), i < values.length - 1 ? dpi(6) : 0, 0, 0, 0);
+            lp.weight = 1f;
+            row.addView(chips[i], lp);
+            styleChip(chips[i], values[i].equals(engine.linkPreference()), labels[i]);
+        }
+        box.addView(row);
+
+        linkNowText = text("当前：" + engine.linkPreferenceLabel(), 11.5f, DIM, false);
+        box.addView(linkNowText, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
+
+        linkUsbText = text(usbTetherStatusText(), 11f, DIM, false);
+        linkUsbText.setLineSpacing(dp(2), 1f);
+        box.addView(linkUsbText, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+
+        TextView open = chip("🔌 打开 USB 网络共享");
+        open.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openTetheringSettings();
+            }
+        });
+        box.addView(open, margins(MATCH, dpi(40), 0, dpi(6), 0, 0));
+
+        TextView note = text("普通 App 没有权限自己开关 USB 网络共享。插上线后可以在这里点一次；"
+                + "也可以打开电脑端「设置 → 点对点链路 → USB 自动」——"
+                + "电脑会用 adb 自动启动手机端并尝试打开共享（手机需先开启一次「USB 调试」，"
+                + "和 spacedesk 的 USB 模式同理）。", 10.5f, DIM, false);
+        note.setLineSpacing(dp(2), 1f);
+        box.addView(note, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
+        return box;
+    }
+
+    /**
+     * ★ 2.31.5：发现兜底 —— 路由器挡组播/广播时，手动填电脑 IP。
+     *
+     * <p>为什么这一块要放在「⚙ 设置」：用户实测"安卓端搜不到 Windows"时，
+     * 常见原因是同一 Wi-Fi 下 AP 开了客户端隔离或丢了组播帧。自动那条路修不了路由器，
+     * 但只要有电脑 IP，单播信标就能把两端拉起来。这里同时把发现自检摆出来，
+     * 让"发了几份 / 收了几份"一眼可见。
+     */
+    private View buildDiscoverySettings() {
+        LinearLayout box = settingsSection("发现（自动找不到设备时）");
+        TextView desc = text("自动发现靠组播/广播；有的路由器开了客户端隔离，手机就会一直 0 台。"
+                + "把电脑面板顶部那个局域网 IP 填在这里，App 每 2 秒直接给它单播一份信标。",
+                10.5f, DIM, false);
+        desc.setLineSpacing(dp(2), 1f);
+        box.addView(desc, margins(MATCH, WRAP, 0, dpi(4), 0, dpi(6)));
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+
+        final EditText host = new EditText(this);
+        // ★ 2.31.6：不能用 TYPE_CLASS_PHONE —— 部分输入法的拨号键盘没有小数点，
+        //   而这是"自动发现失败"时唯一的兜底入口，打不出 IP 等于没有兜底。
+        host.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        host.setHint("电脑 IP，例如 192.168.2.100");
+        host.setTextSize(12f);
+        host.setTextColor(FG);
+        host.setHintTextColor(DIM);
+        host.setSingleLine(true);
+        row.addView(host, new LinearLayout.LayoutParams(0, dpi(42), 1f));
+
+        final TextView list = text("", 11.5f, DIM, false);
+        list.setLineSpacing(dp(2), 1f);
+
+        TextView add = chip("添加");
+        add.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                String added = engine.addManualPeer(host.getText() == null
+                        ? "" : host.getText().toString());
+                if (added.isEmpty()) {
+                    toast("IP 格式不对，例如 192.168.2.100（可在电脑面板顶部看到）");
+                    return;
+                }
+                host.setText("");
+                toast("已添加电脑 " + added + "：每 2 秒给它单播一次信标");
+                renderManualPeers(list);
+            }
+        });
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(WRAP, dpi(42));
+        alp.leftMargin = dpi(8);
+        row.addView(add, alp);
+        box.addView(row, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
+
+        renderManualPeers(list);
+        box.addView(list, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
+
+        TextView clear = chip("清空手动地址");
+        clear.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                engine.clearManualPeers();
+                renderManualPeers(list);
+                toast("已清空手动添加的电脑地址");
+            }
+        });
+        box.addView(clear, margins(MATCH, dpi(40), 0, dpi(6), 0, 0));
+
+        // 发现自检（打开设置这一刻的快照；关掉再开就是最新值）
+        TextView self = text(engine.discoverySummary(), 10.5f, DIM, false);
+        self.setLineSpacing(dp(2), 1f);
+        self.setTextIsSelectable(true);
+        box.addView(self, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
+
+        // Android 13+「附近的设备」：Android 16 的本地网络保护也看这项。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            boolean ok = nearbyGranted();
+            TextView perm = text(ok
+                    ? "「附近的设备」权限：已授予 ✓"
+                    : "「附近的设备」权限：未授予 —— Android 16+ 的本地网络保护可能拦 UDP",
+                    10.5f, ok ? DIM : WARN, false);
+            perm.setLineSpacing(dp(2), 1f);
+            box.addView(perm, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
+            if (!ok) {
+                TextView ask = chip("授权「附近的设备」");
+                ask.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        askNearbyPermission();
+                    }
+                });
+                box.addView(ask, margins(MATCH, dpi(40), 0, dpi(6), 0, 0));
+            }
+        }
+        return box;
+    }
+
+    /** 设置里"已手动添加：…"那一行。 */
+    private void renderManualPeers(TextView into) {
+        if (into == null) {
+            return;
+        }
+        List<String> hosts = engine.manualPeerHosts();
+        if (hosts == null || hosts.isEmpty()) {
+            into.setText("还没手动添加。自动发现正常时不需要它。");
+            return;
+        }
+        StringBuilder sb = new StringBuilder("已手动添加：");
+        for (String h : hosts) {
+            if (sb.charAt(sb.length() - 1) != '：') {
+                sb.append('、');
+            }
+            sb.append(h);
+        }
+        into.setText(sb.toString());
+    }
+
+    /** USB 网络共享是否已经开起来（看 rndis/usb 网卡有没有 IPv4）。 */
+    private String usbTetherStatusText() {
+        String ip = usbTetherIp();
+        if (ip.length() > 0) {
+            return "USB 网络共享：已开启（本机 " + ip + "）";
+        }
+        return "USB 网络共享：未开启（没检测到 USB 网卡地址）";
+    }
+
+    private String usbTetherIp() {
+        try {
+            java.util.Enumeration<java.net.NetworkInterface> nis =
+                    java.net.NetworkInterface.getNetworkInterfaces();
+            while (nis != null && nis.hasMoreElements()) {
+                java.net.NetworkInterface ni = nis.nextElement();
+                String n = ni.getName() == null ? "" : ni.getName().toLowerCase(Locale.ROOT);
+                if (!n.startsWith("rndis") && !n.startsWith("usb")) {
+                    continue;
+                }
+                for (java.net.InterfaceAddress a : ni.getInterfaceAddresses()) {
+                    java.net.InetAddress ip = a.getAddress();
+                    if (ip != null && ip instanceof java.net.Inet4Address && !ip.isLoopbackAddress()) {
+                        return ip.getHostAddress();
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            // 拿不到就当"未开启"，只是少一行状态
+        }
+        return "";
+    }
+
+    /**
+     * 跳到系统的「热点和网络共享」页。
+     *
+     * <p>`android.settings.TETHER_SETTINGS` 不是所有 ROM 都有，所以准备了
+     * {@link android.provider.Settings#ACTION_WIRELESS_SETTINGS} 兜底，再不行就给一句人话。
+     */
+    private void openTetheringSettings() {
+        String[] actions = {"android.settings.TETHER_SETTINGS",
+                android.provider.Settings.ACTION_WIRELESS_SETTINGS};
+        for (String action : actions) {
+            try {
+                Intent i = new Intent(action);
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(i);
+                return;
+            } catch (Throwable ignored) {
+                // 换下一个入口
+            }
+        }
+        toast("没找到可打开的系统设置页，请到「设置 → 网络 → 热点和网络共享」里打开 USB 网络共享");
+    }
+
+    /** 快速上手 / 改名：从详细档搬进设置，三档都能进。 */
+    private View buildQuickEntries(final Dialog parent) {
+        LinearLayout box = settingsSection("更多");
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+
+        TextView qs = chip("🚀 快速上手");
+        qs.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                parent.dismiss();
+                showQuickStartDialog();
+            }
+        });
+        LinearLayout.LayoutParams qlp = margins(0, dpi(42), 0, dpi(8), dpi(6), 0);
+        qlp.weight = 1f;
+        row.addView(qs, qlp);
+
+        TextView rename = chip("✏️ 改名");
+        rename.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                parent.dismiss();
+                showRenameDialog();
+            }
+        });
+        LinearLayout.LayoutParams rlp = margins(0, dpi(42), 0, dpi(8), 0, 0);
+        rlp.weight = 1f;
+        row.addView(rename, rlp);
+        box.addView(row);
+        return box;
+    }
+
+    /** 版本与节点 ID（排障时核对"装的是不是这一轮交付的包"）。 */
+    private View buildAbout() {
+        LinearLayout box = settingsSection("关于");
+        String ver = "";
+        try {
+            ver = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Throwable ignored) {
+            // 取不到就只显示名字
+        }
+        box.addView(text("Audio Mixing 手机端" + (ver.length() > 0 ? " v" + ver : ""),
+                11.5f, FG, false), margins(MATCH, WRAP, 0, dpi(4), 0, 0));
+        TextView id = text(engine.nodeIdText(), 10.5f, DIM, false);
+        id.setLineSpacing(dp(2), 1f);
+        id.setTextIsSelectable(true);
+        box.addView(id, margins(MATCH, WRAP, 0, dpi(4), 0, 0));
+        return box;
+    }
+
     /**
      * 保存发现端口后自动重启引擎（2026-11-01 用户要求）。
      *
@@ -1517,90 +2092,24 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * ★ 「频道」卡片：一对开关 —— 📻 听广播（我收谁的）+ 📢 广播我的声音（我发给谁）。
+     * ★ 「频道」状态卡片。
      *
-     * <p>为什么必须是独立开关：我们设计里广播和点对点是两条通道。
-     * 电脑开「广播我的声音」时声音发给<b>所有在线节点</b>，而手机原来只播"用户点过🎧收听的那几台"，
-     * 于是电脑广播过来的包全被按名单过滤掉 —— 真机现场就是这样，一个包都没播。
-     * 反过来，手机原来也<b>没有</b>"把我的声音广播出去"（用户原话：「没有发广播」），这一对现在补齐。
+     * <p>★ 2.31.4（用户图1）：「📻 听广播 / 📢 广播我的声音」两个开关并入上面的 9 键控制卡，
+     * 这张卡只留**状态**。控制卡收成一条横线时，这里仍然能看到"现在在听谁 / 发给几台 / 为什么停"，
+     * 所以这张卡不能跟着一起收。
+     *
+     * <p>为什么广播和点对点是两条独立通道：电脑开「广播我的声音」时声音发给<b>所有在线节点</b>，
+     * 而手机原来只播"用户点过🎧收听的那几台"，于是电脑广播过来的包全被按名单过滤掉 ——
+     * 真机现场就是这样，一个包都没播。反过来，手机原来也<b>没有</b>"把我的声音广播出去"
+     * （用户原话：「没有发广播」），这一对在控制卡里补齐。
      */
     private View buildChannelCard() {
         LinearLayout card = card();
-
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-
-        channelChip = chip("📻 听广播");
-        channelChip.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                boolean on = !engine.isChannelListening();
-                engine.setChannelListen(on);
-                toast(on ? "已打开听广播：谁在广播就听谁" : "已关闭听广播");
-                refreshNow();
-            }
-        });
-        LinearLayout.LayoutParams clp = margins(0, dpi(44), 0, 0, 0, 0);
-        clp.weight = 1f;
-        row.addView(channelChip, clp);
-
-        // ★ 「📢 广播我的声音」：用户原话「没有发广播」。
-        //   做法：对发现列表里每个在线节点各建一条单播发送（一次采集、一包编码、发 N 份）。
-        broadcastChip = chip("📢 广播我的声音");
-        broadcastChip.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                boolean on = !engine.isBroadcasting();
-                if (on && !engine.sourceEnabled()) {
-                    // 音源开关关着就没声音可广播；绝不替用户打开采集（更不能开麦）。
-                    toast("音源已关闭：先在主控区点「🔊 本机声音」或「🎤 麦克风」打开采集");
-                    return;
-                }
-                engine.setBroadcasting(on);
-                toast(on ? "已开始广播：我的声音送给每一台在线设备" : "已停止广播");
-                refreshNow();
-            }
-        });
-        LinearLayout.LayoutParams blp = margins(0, dpi(44), dpi(8), 0, 0, 0);
-        blp.weight = 1f;
-        row.addView(broadcastChip, blp);
-        card.addView(row);
-
-        // ★ 2.42.3：三档性能预算。老机器选流畅、一般选均衡、机器够好选高音质。
-        //   两端各自可设，不一致时按较低那档协商（下面那行会写出生效值）。
-        LinearLayout qrow = new LinearLayout(this);
-        qrow.setOrientation(LinearLayout.HORIZONTAL);
-        TextView qlb = text("音质", 12f, DIM, false);
-        qrow.addView(qlb, margins(0, WRAP, 0, 0, dpi(6), 0));
-        qSmoothChip = chip("流畅");
-        qSmoothChip.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { chooseQuality("smooth"); }
-        });
-        qBalancedChip = chip("均衡");
-        qBalancedChip.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { chooseQuality("balanced"); }
-        });
-        qHighChip = chip("高音质");
-        qHighChip.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { chooseQuality("high"); }
-        });
-        LinearLayout.LayoutParams qp = margins(0, dpi(40), dpi(6), 0, 0, 0);
-        qp.weight = 1f;
-        qrow.addView(qSmoothChip, qp);
-        LinearLayout.LayoutParams qp2 = margins(0, dpi(40), dpi(6), 0, 0, 0);
-        qp2.weight = 1f;
-        qrow.addView(qBalancedChip, qp2);
-        LinearLayout.LayoutParams qp3 = margins(0, dpi(40), 0, 0, 0, 0);
-        qp3.weight = 1f;
-        qrow.addView(qHighChip, qp3);
-        card.addView(qrow, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
-
-        qualityNow = text(engine.qualityStateText(), 11.5f, DIM, false);
-        card.addView(qualityNow, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
+        card.addView(text("📡 频道状态", 12.5f, DIM, false));
 
         channelNow = text("", 12f, DIM, false);
         channelNow.setLineSpacing(dp(3), 1f);
-        card.addView(channelNow, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
+        card.addView(channelNow, margins(MATCH, WRAP, 0, dpi(8), 0, 0));
 
         // ★ ④ 安全检查的结果：「已停止向 XXX 发送 —— 它已经 18 秒没有消息了…」
         suspendedLine = text("", 11.5f, WARN, false);
@@ -1857,9 +2366,19 @@ public class MainActivity extends Activity {
         card.addView(e, margins(MATCH, WRAP, 0, dpi(6), 0, 0));
         registerLong(dynLongTextViews, e);      // 本机 IP/名字属于细节：简洁档收起来
 
+        // ★ 2.31.5：一直收不到信标才显示（refresh() 控制可见性）。
+        //   把"发了几份 / 收了几份 / 收到自己没有 / 发现端口"摆出来，一眼能分清是哪一段断了。
+        discoveryNow = text("", 11f, WARN, false);
+        discoveryNow.setGravity(Gravity.CENTER);
+        discoveryNow.setLineSpacing(dp(3), 1f);
+        discoveryNow.setTextIsSelectable(true);
+        discoveryNow.setVisibility(View.GONE);
+        card.addView(discoveryNow, margins(MATCH, WRAP, 0, dpi(10), 0, 0));
+
         // 一张小抄：列表空着时按这个顺序查（和诊断报告里的【发现自检】对得上）
-        TextView tip = text("一直搜不到设备？点「详情」看「发现统计」里的自检："
-                + "如果写着\"从没收到过自己的信标\"，那是本机/路由器的组播问题（换 Wi-Fi、关掉 AP 隔离）。",
+        TextView tip = text("一直搜不到设备？先看上面那行自检："
+                + "「收 0 / 自己 0」多半是路由器开了 AP 隔离或丢了组播 —— 换一个 Wi-Fi，"
+                + "或在「⚙ 设置 → 发现」里手动填电脑 IP。点「🩺 诊断」可复制完整自检。",
                 11.5f, DIM, false);
         tip.setGravity(Gravity.CENTER);
         tip.setLineSpacing(dp(3), 1f);

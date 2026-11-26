@@ -51,6 +51,8 @@ from ..proto import (
 
 BEACON_INTERVAL_S = 2.0
 NODE_TIMEOUT_S = 15.0
+#: 网卡类型（PowerShell）多久在后台重探一次；信标线程只读缓存，绝不同步探测。
+IFACE_REFRESH_S = 20.0
 
 
 # HWHHYN 用 DEEPSEEK 制作
@@ -71,7 +73,9 @@ def _norm_name(name: str) -> str:
     return " ".join(str(name or "").split()).casefold()
 
 
-def address_rank(host: str, local_ips: set[str] | None = None) -> tuple[int, int]:
+def address_rank(host: str, local_ips: set[str] | None = None,
+                 link_types: dict[str, str] | None = None,
+                 preference: str = "auto") -> tuple[int, int, int]:
     """How good a peer address is; **lower is better**.
 
     A machine with a VPN overlay (Radmin, Hamachi, ZeroTier, Tailscale) is heard
@@ -79,19 +83,33 @@ def address_rank(host: str, local_ips: set[str] | None = None) -> tuple[int, int
     Picking "whichever arrived last" makes the audio path alternate between a
     direct LAN hop and a tunnel, which shows up as latency that randomly doubles.
 
-    Ranking: an address on one of our own /24s wins, then any other private /
-    link-local address, and last anything else (the overlay).
+    ★ 2.46.4：同一台设备同时有 Wi-Fi 和有线（网线 / USB 网络共享）时，
+    也必须稳定选**有线**那条。`link_types` 是本机 IP -> wired/wireless/virtual，
+    对端地址和哪块本机网卡同 /24，就按那块网卡的链路类型打分。
     """
     if not host:
-        return (9, 9)
+        return (9, 9, 9)
     host = host.strip()
     same_subnet = 1
     ips = local_ips if local_ips else set()
+    prefix = ""
     if host.count(".") == 3:
         prefix = host.rsplit(".", 1)[0] + "."
         if any(ip.startswith(prefix) for ip in ips if ip.count(".") == 3 and not ip.startswith("127.")):
             same_subnet = 0
-    return (0 if is_lan_address(host) else 1, same_subnet)
+    link = 3
+    pref = str(preference or "auto").strip().lower()
+    if pref == "wireless":
+        order = {"wireless": 0, "usb": 1, "wired": 2}
+    else:
+        order = {"usb": 0, "wired": 1, "wireless": 2}
+    if prefix:
+        for ip, kind in (link_types or {}).items():
+            if not ip.startswith(prefix):
+                continue
+            link = order.get(str(kind or "").lower(), 3)
+            break
+    return (0 if is_lan_address(host) else 1, same_subnet, link)
 
 
 @dataclass
@@ -171,7 +189,7 @@ class PeerEndpoints:
     merge_hint_with: str = ""
     # Quality of the address currently in `host`. Kept out of to_json(): it is an
     # internal tie-breaker, not something the control panel needs to render.
-    host_rank: tuple[int, int] | None = None
+    host_rank: tuple[int, ...] | None = None
     # ★ 心跳记录（2026-10-16 用户：「虽然二者没有收发声音，但是设备间信号应当存在」）：
     #   每收到一次它的信标就记一个间隔。为什么需要它 —— 手机端**不回 PING/PONG**
     #   （面板上"测连通"那句提示就是这么写的），所以对手机拿不到往返时延；能反映
@@ -259,19 +277,38 @@ class DiscoveryRegistry:
         self._peers: dict[str, PeerEndpoints] = {}
         self._lock = threading.Lock()
         self._local_ips: set[str] = set(local_ips or ())
+        # ★ 2.46.4：本机 IP -> wired / wireless / virtual / other；以及链路偏好。
+        #   对端同时有 Wi-Fi 和有线地址时，用它稳定选有线（或 Wi-Fi）。
+        self._link_types: dict[str, str] = {}
+        self.link_preference = "auto"
         # ★ 2026-11-03：这台机器**这台进程里见过一次**的身份（id / 名字 / 地址 / 短 id）。
         #   它和 `_peers` 是两件事：`_peers` 会被 `prune()` 清掉（界面上不再出现幽灵设备），
         #   而"见过"必须留下来 —— 否则一条指向"关机了的真设备"的路由会在清理之后
         #   被 `_route_is_orphan()` 当成"从没见过的假设备"删掉（用户要求不能误删真设备）。
         self._ever: set[str] = set()
 
-    def set_local_ips(self, local_ips: set[str]) -> None:
+    def set_local_ips(self, local_ips: set[str],
+                      link_types: dict[str, str] | None = None) -> None:
         """Tell the registry which addresses belong to this machine.
 
         Used to rank peer addresses: an address on one of our own subnets is a
         direct LAN path and always beats one that only arrives over a VPN.
+        ★ 2.46.4：`link_types` 让"有线地址"压过"Wi-Fi 地址"，不在两条路之间跳。
         """
         self._local_ips = set(local_ips or ())
+        if link_types is not None:
+            self._link_types = dict(link_types or {})
+
+    def set_link_preference(self, preference: str) -> str:
+        """auto / wired / wireless。改完清空 rank，让下一轮信标按新偏好重排。"""
+        pref = str(preference or "auto").strip().lower()
+        if pref not in ("auto", "wired", "wireless"):
+            pref = "auto"
+        self.link_preference = pref
+        with self._lock:
+            for peer in self._peers.values():
+                peer.host_rank = None
+        return pref
 
     def update(self, payload: dict[str, Any], host: str, *, local: bool = False, manual: bool = False) -> PeerEndpoints | None:
         pid = str(payload.get("id") or "")
@@ -281,7 +318,7 @@ class DiscoveryRegistry:
         #   老端没有这两个键 → 空串，退回"按 node_id 当主键"的老路径（向后兼容）。
         did = str(payload.get("device_id") or payload.get("deviceId") or "").strip()
         iid = str(payload.get("instance_id") or payload.get("instanceId") or "").strip()
-        rank = address_rank(host, self._local_ips)
+        rank = address_rank(host, self._local_ips, self._link_types, self.link_preference)
         with self._lock:
             # 同一 deviceId 但 instanceId 不同 = 两台真机搬了同一份配置。
             # 绝不合并；分开放，并把 identity_conflict 标出来让人确认。
@@ -749,6 +786,10 @@ def local_ip_addresses() -> list[str]:
             pass
         finally:
             s.close()
+    # ★ 2.46.8：这里**不再**调用 iface_types()。它内部会跑 PowerShell（本机实测约 1 秒，
+    #   慢机器超时 6 秒），而本函数会在信标线程里每 2 秒被调一次 —— 一旦缓存过期就会
+    #   把信标卡住几秒，对端 15 秒收不到就判死。需要全部网卡地址的调用方（BeaconService）
+    #   自己把 iface_types() 的结果并进来，并把探测放到启动/后台线程里。
     addrs.add("127.0.0.1")
     return sorted(a for a in addrs if a)
 
@@ -778,9 +819,15 @@ def is_lan_address(host: str) -> bool:
     return bool(ip.is_private or ip.is_loopback or ip.is_link_local)
 
 
-def lan_report() -> dict[str, Any]:
+def lan_report(refresh_types: bool = False) -> dict[str, Any]:
     """What this machine can see on its local network — used by `audiomixing net`
-    and by the control panel, which shows the user where to point other devices."""
+    and by the control panel, which shows the user where to point other devices.
+
+    ★ 2.46.9：默认**绝不**在调用线程里跑 PowerShell。`iface_types()` 缓存过期时
+    会同步探测（本机约 1 秒，慢机器最长 6 秒），而 `/api/peers` 被面板每 800ms
+    拉一次 —— 原来每 15 秒就卡一下。默认只读缓存，缓存为空时起后台线程补；
+    一次性命令（`audiomixing net` / `doctor`）需要准确类型时传 refresh_types=True。
+    """
     import ipaddress
 
     interfaces: list[dict[str, Any]] = []
@@ -788,7 +835,17 @@ def lan_report() -> dict[str, Any]:
         hostname = socket.gethostname()
     except OSError:
         hostname = ""
-    addrs = local_ip_addresses()
+    # ★ 2.46.8：local_ip_addresses() 现在只做便宜的本机枚举（不跑 PowerShell），
+    #   全量网卡地址在**这里**并进来 —— 否则面板的「本机 IP」/二维码又会只看到
+    #   gethostname 那一块网卡，2.46.6 修过的 issue #1 会回归。
+    addrs = set(local_ip_addresses())
+    types = iface_types(force=True) if refresh_types else cached_iface_types()
+    if not types and _iface_cache_stale():
+        # ★ 只有"从未探测过 / 缓存已过期"才补一次后台探测。缓存是新鲜的但结果为空
+        #   （没有网卡 / PowerShell 不可用）时不能再起 —— 否则面板每 800ms 调一次
+        #   lan_report，就会变成不停启动 PowerShell 的死循环。
+        _kick_iface_probe()
+    addrs.update(types.keys())
     reports: list[dict[str, Any]] = []
     for addr in addrs:
         if addr.startswith("127."):
@@ -807,6 +864,9 @@ def lan_report() -> dict[str, Any]:
                 "subnet": subnet,
                 "broadcast": broadcast,
                 "kind": "private" if is_lan_address(addr) else "public",
+                # ★ 2.46.4：有线 / Wi-Fi / 虚拟 / 其它。点对点链路优先用它判断，
+                #   而不是只看 192.168 / 10 的网段排序（USB 网络共享也常是 192.168.x）。
+                "type": types.get(addr, "other"),
                 "hostname": hostname,
             }
         )
@@ -815,6 +875,150 @@ def lan_report() -> dict[str, Any]:
     # Interface with the primary address first (the `ipaddress` import is used
     # above; keep the ordering stable so the UI does not flicker).
     return {"interfaces": reports, "lan_only": True}
+
+
+# ★ 2.46.4：网卡类型缓存。Get-NetAdapter 要跑 PowerShell（几百毫秒），
+#   而 lan_report() 会被面板频繁调用；缓存 15 秒，地址变了则强制刷新。
+_IFACE_TYPES_CACHE: dict[str, Any] = {"at": 0.0, "types": {}}
+_IFACE_TYPES_LOCK = threading.Lock()
+_IFACE_TYPES_TTL_S = 15.0
+
+
+def _classify_iface(alias: str, desc: str, media: str, phys: str) -> str:
+    """把一块网卡收敛成 usb / wired / wireless / virtual / other。
+
+    顺序很重要：Hyper-V 的虚拟网卡描述里也带 "Ethernet"，必须先判虚拟；
+    USB 网络共享（RNDIS / NDIS / Internet 共享）单独算 usb —— 用户说的"有线模式"
+    就是它，auto 时必须压过 Wi-Fi，否则插上数据线还会选 Wi-Fi 地址。
+    """
+    text = " ".join((alias or "", desc or "", media or "", phys or "")).lower()
+    if any(k in text for k in (
+            "hyper-v", "vmware", "virtualbox", "wsl", "loopback", "vpn",
+            "tap-", "tun", "bluetooth", "vethernet", "zerotier", "tailscale",
+            "radmin", "hamachi", "虚拟")):
+        return "virtual"
+    if any(k in text for k in ("wi-fi", "wifi", "wlan", "wireless", "802.11")):
+        return "wireless"
+    if any(k in text for k in (
+            "rndis", "ndis", "usb", "tether", "android", "internet sharing",
+            "共享")):
+        return "usb"
+    # 以太网适配器的 MediaType 固定是 802.3；有些驱动描述里没有 "Ethernet" 这个词。
+    if "802.3" in media.lower() or "802.3" in phys.lower():
+        return "wired"
+    if any(k in text for k in ("ethernet", "gbe", "以太网", "本地连接")):
+        return "wired"
+    return "other"
+
+
+def iface_types(force: bool = False) -> dict[str, str]:
+    """IP -> wired / wireless / virtual / other（Windows；拿不到就是空表）。
+
+    只用 PowerShell 的 Get-NetIPAddress + Get-NetAdapter，不装第三方库。
+    失败/超时一律返回上一次缓存（没有就空表），绝不让面板因为探测网卡而卡住。
+    """
+    now = time.time()
+    with _IFACE_TYPES_LOCK:
+        cached = dict(_IFACE_TYPES_CACHE.get("types") or {})
+        cached_at = float(_IFACE_TYPES_CACHE.get("at") or 0)
+        # ★ 探测失败也缓存 15 秒：否则面板每次轮询都要再跑一遍 PowerShell，
+        #   一台没有 Get-NetAdapter 的机器会被拖慢到没法用。
+        if not force and cached_at and now - cached_at < _IFACE_TYPES_TTL_S:
+            return cached
+    if platform.system().lower() != "windows":
+        return {}
+    import subprocess
+
+    script = (
+        "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+        "$ips=Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+        "Where-Object {$_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*'};"
+        "$ads=@{};"
+        "Get-NetAdapter -ErrorAction SilentlyContinue | ForEach-Object {$ads[[int]$_.ifIndex]=$_};"
+        "$out=@();"
+        "foreach($ip in $ips){$a=$ads[[int]$ip.InterfaceIndex];"
+        "if($null -ne $a){$out += [pscustomobject]@{ip=$ip.IPAddress;"
+        "alias=[string]$ip.InterfaceAlias;desc=[string]$a.InterfaceDescription;"
+        "media=[string]$a.MediaType;phys=[string]$a.PhysicalMediaType}}};"
+        "if($out.Count -gt 0){$out | ConvertTo-Json -Compress -Depth 3}"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=6, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = (proc.stdout or "").strip()
+    except Exception:
+        with _IFACE_TYPES_LOCK:
+            _IFACE_TYPES_CACHE["at"] = now
+        return cached
+    data: Any = []
+    if out:
+        try:
+            data = json.loads(out)
+        except ValueError:
+            data = []
+    if isinstance(data, dict):
+        data = [data]
+    types: dict[str, str] = {}
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, dict):
+            continue
+        ip = str(item.get("ip") or "").strip()
+        if not ip:
+            continue
+        types[ip] = _classify_iface(
+            str(item.get("alias") or ""), str(item.get("desc") or ""),
+            str(item.get("media") or ""), str(item.get("phys") or ""))
+    with _IFACE_TYPES_LOCK:
+        _IFACE_TYPES_CACHE["at"] = now
+        _IFACE_TYPES_CACHE["types"] = dict(types)
+    return types
+
+
+def cached_iface_types() -> dict[str, str]:
+    """只读上一次探测结果，**不跑 PowerShell**（信标线程专用）。
+
+    ★ 2.46.8：`iface_types()` 在缓存过期时会同步跑 PowerShell；信标线程每 2 秒
+    调一次，绝不能让它卡在那里。需要刷新时由 `BeaconService` 另起后台线程。
+    """
+    with _IFACE_TYPES_LOCK:
+        return dict(_IFACE_TYPES_CACHE.get("types") or {})
+
+
+_IFACE_PROBE_LOCK = threading.Lock()
+_IFACE_PROBE_RUNNING = False
+
+
+def _iface_cache_stale() -> bool:
+    """网卡类型缓存是不是"从没探测过 / 已经过期"（空结果但刚测过不算过期）。"""
+    with _IFACE_TYPES_LOCK:
+        at = float(_IFACE_TYPES_CACHE.get("at") or 0.0)
+    return (not at) or (time.time() - at >= _IFACE_TYPES_TTL_S)
+
+
+def _kick_iface_probe() -> None:
+    """缓存为空时起一次性后台探测，**不阻塞调用方**（★ 2.46.9）。
+
+    `lan_report()` 会被面板高频调用；在没有缓存（刚启动 / CLI）时不能同步跑
+    PowerShell，否则又是“每 15 秒卡一次”。这里只保证同一时刻最多一个探测线程。
+    """
+    global _IFACE_PROBE_RUNNING
+    with _IFACE_PROBE_LOCK:
+        if _IFACE_PROBE_RUNNING:
+            return
+        _IFACE_PROBE_RUNNING = True
+
+    def runner() -> None:
+        global _IFACE_PROBE_RUNNING
+        try:
+            iface_types(force=True)
+        finally:
+            with _IFACE_PROBE_LOCK:
+                _IFACE_PROBE_RUNNING = False
+
+    threading.Thread(target=runner, name="audiomixing-iface-probe-one",
+                     daemon=True).start()
 
 
 def build_beacon(
@@ -919,7 +1123,14 @@ class BeaconService:
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._sock: socket.socket | None = None
-        self._local_ips = set(local_ip_addresses())
+        # ★ 2.46.8：不在这里探测网卡 —— __init__ 里跑 PowerShell 会和 start() 里的
+        #   强制探测重复（本机实测两次各约 1 秒）。地址统一在 start() 里探测一次。
+        self._local_ips: set[str] = set()
+        # ★ 2.46.4：本机 IP -> wired/wireless/...，用于对端地址排序（有线优先）。
+        self._link_types: dict[str, str] = {}
+        # ★ 2.46.8：网卡探测（PowerShell）放到后台线程；信标线程只读缓存。
+        self._last_iface_probe = 0.0
+        self._iface_probe_running = False
         self.beacons_sent = 0
         self.beacons_received = 0
         # ★ 单播信标（发给"已经见过面的对端"）：手机上「丢设备」的根因就是缺这一条，
@@ -956,8 +1167,13 @@ class BeaconService:
                 pass
 
     def start(self) -> None:
-        self._local_ips = set(local_ip_addresses())
-        self.registry.set_local_ips(self._local_ips)
+        # ★ 2.46.9：启动时不再同步跑 PowerShell —— 慢机器上它会让信标晚 6 秒才开始
+        #   发，对端 15 秒判死。先用缓存值开局，第一轮 _refresh_local_links 立刻
+        #   安排后台探测，探测完再更新 registry。
+        self._link_types = cached_iface_types()
+        self._local_ips = set(local_ip_addresses()) | set(self._link_types or {})
+        self._last_iface_probe = 0.0
+        self.registry.set_local_ips(self._local_ips, self._link_types)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -1071,20 +1287,68 @@ class BeaconService:
             return
         self._sock.sendto(self._beacon_bytes(), (host, port))
 
+    def _refresh_local_links(self) -> None:
+        """★ 2.46.4：USB 网络共享是**运行中才出现**的新网卡。
+
+        启动时记下的 _local_ips 不能一直不变；每轮信标顺手比一次，地址变了就
+        重新探测类型并通知 registry —— 否则插上数据线后程序永远不知道有条有线。
+        """
+        # 便宜的本机地址每轮比一次（不跑 PowerShell）；类型用缓存。
+        ips = set(local_ip_addresses()) | set(cached_iface_types().keys())
+        if ips != self._local_ips:
+            self._local_ips = ips
+            self.registry.set_local_ips(self._local_ips, self._link_types)
+        # 网卡类型 / 新网卡交给后台探测，绝不阻塞信标线程。
+        now = time.time()
+        if not self._iface_probe_running and now - self._last_iface_probe >= IFACE_REFRESH_S:
+            self._last_iface_probe = now
+            self._iface_probe_running = True
+            threading.Thread(target=self._probe_local_links,
+                             name="audiomixing-iface-probe", daemon=True).start()
+
+    def _probe_local_links(self) -> None:
+        """后台刷新网卡类型（PowerShell），完成后通知 registry。"""
+        try:
+            types = iface_types(force=True)
+        except Exception:
+            types = {}
+        try:
+            if self._stop.is_set():
+                return
+            ips = set(local_ip_addresses()) | set(types or {})
+            changed = (ips != self._local_ips) or (bool(types) and types != self._link_types)
+            if types:
+                self._link_types = types
+            self._local_ips = ips
+            if changed:
+                self.registry.set_local_ips(self._local_ips, self._link_types)
+        finally:
+            self._iface_probe_running = False
+
     def _announce_loop(self) -> None:
         while not self._stop.is_set():
+            self._refresh_local_links()
             data = self._beacon_bytes()
             sock = self._sock
             if sock is None:
                 return
-            targets = [(self.group, self.port), ("255.255.255.255", self.port)]
-            # Also hit each /24 broadcast range we know about, plus manual peers.
-            # Only for real LAN addresses: a VPN adapter's "broadcast" (Radmin hands
-            # out 26.x.x.x with a /8 mask) is not a /24 and the beacon would be sent
-            # to a made-up address instead of the tunnel's actual broadcast.
-            for ip in self._local_ips:
-                if ip.count(".") == 3 and not ip.startswith("127.") and is_lan_address(ip):
-                    targets.append(("%s.255" % ip.rsplit(".", 1)[0], self.port))
+            # ★ 2.46.6：端口不是默认 17830 时（配置改了 / 端口被占），再往默认端口发一份。
+            #   否则只监听默认端口的手机永远看不到我们，也就不会按我们信标里的 disc_port
+            #   回单播 —— 这正是 issue #1 里"两边谁也发现不了谁"的一种成因。
+            ports = [self.port]
+            if self.port != PORT_DISCOVERY:
+                ports.append(PORT_DISCOVERY)
+            targets = []
+            for port in ports:
+                targets.append((self.group, port))
+                targets.append(("255.255.255.255", port))
+                # Also hit each /24 broadcast range we know about, plus manual peers.
+                # Only for real LAN addresses: a VPN adapter's "broadcast" (Radmin hands
+                # out 26.x.x.x with a /8 mask) is not a /24 and the beacon would be sent
+                # to a made-up address instead of the tunnel's actual broadcast.
+                for ip in self._local_ips:
+                    if ip.count(".") == 3 and not ip.startswith("127.") and is_lan_address(ip):
+                        targets.append(("%s.255" % ip.rsplit(".", 1)[0], port))
             for host_port in self._manual_targets:
                 host, _, port = host_port.partition(":")
                 targets.append((host, int(port or self.port)))

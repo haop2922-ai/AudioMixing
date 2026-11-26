@@ -127,11 +127,3 @@ def unmute_all_sessions() -> dict[str, Any]:
         return {"ok": False, "changed": 0, "total": 0, "reason": "恢复失败：%s" % exc}
     return {"ok": True, "changed": int(stats.get("changed") or 0),
             "total": int(stats.get("total") or 0), "reason": ""}
-
-
-def find_app(pid: int) -> dict[str, Any] | None:
-    """按 PID 取一条 App（用于把配置里的 PID 还原成名字）。"""
-    for item in list_audio_apps().get("apps") or []:
-        if int(item.get("pid") or 0) == int(pid):
-            return item
-    return None

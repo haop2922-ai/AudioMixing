@@ -7,6 +7,15 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
     <!--
+      ★ 2.31.5：NEARBY_WIFI_DEVICES（Android 13+，「附近的设备」）。
+      我们只用它来做局域网发现（UDP 组播/广播 + 组播锁）。
+      Android 16 的「本地网络保护」试验开关把授予这一权限当作放行局域网 UDP 的条件；
+      Android 17 起 ACCESS_LOCAL_NETWORK 也被归进同一个 NEARBY_DEVICES 权限组。
+      neverForLocation：我们不用 Wi-Fi 结果推断位置。
+    -->
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+                     android:usesPermissionFlags="neverForLocation"/>
+    <!--
       WAKE_LOCK 是必须的：AudioRecv/AudioSend 会各拿一个 WifiLock，
       让 Wi-Fi 在息屏后别进省电模式（省电模式会把抖动缓冲冲垮，听感就是一顿一顿）。
       忘了声明它时，真机上会看到 "Neither user ... has android.permission.WAKE_LOCK"

@@ -1038,6 +1038,12 @@ def _main(argv: list[str] | None = None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     """最外层兜底：连 _main 里的导入/环境错误也要让用户看见。"""
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # ★ 2.46.1：单 exe 的 MCP 模式。必须在 _main 之前拦截 —— _main 会
+    #   _silence_std_streams()，把 stdio 关掉，MCP 就没法说话了。
+    if "--mcp" in raw:
+        from audiomixing.mcp_server import run_mcp
+        return run_mcp()
     try:
         return _main(argv)
     except Exception:

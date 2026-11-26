@@ -2929,6 +2929,16 @@ class TestChannelSourceSafety(unittest.TestCase):
         self.assertEqual(self.node.config.channel_sources, [],
                          "不能静默存进配置 —— 存了就是一个字节都不发")
 
+    def test_settings_applies_jitter_buffer(self) -> None:
+        """★ 2.46.9：抖动缓冲设置曾落在 raise 之后（不可达），改了完全没反应。"""
+        from audiomixing.net import rtpaudio
+
+        self.api.set_settings({"jitter_ms": 80})
+        self.assertEqual(self.node.config.jitter_ms, 80)
+        # 越界要夹到 JITTER_MIN/MAX，而不是原样存进去
+        self.api.set_settings({"jitter_ms": 999})
+        self.assertEqual(self.node.config.jitter_ms, rtpaudio.JITTER_MAX_MS)
+
     def test_a_local_capture_device_is_still_accepted(self) -> None:
         """本机真实存在的采集设备必须照常能存（别把正常路径一起堵死）。"""
         speaker = "扬声器 (Senary Audio)"
@@ -3549,6 +3559,36 @@ class TestCustomPorts(unittest.TestCase):
         with self.assertRaises(ApiError) as ctx:
             self.api.set_settings({"web_port": 80})
         self.assertEqual(ctx.exception.status, 400)
+
+    def test_audio_port_65534_has_no_broadcast_neighbour(self) -> None:
+        """★ 2.46.10：广播端口 = 音频端口 + 1，65534 会算出 65535（保存成功、重启绑不上）。"""
+        from audiomixing.webui import ApiError
+
+        with self.assertRaises(ApiError) as ctx:
+            self.api.set_settings({"audio_port": 65534})
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertIn("65534", str(ctx.exception))
+
+    def test_add_peer_rejects_non_numeric_port(self) -> None:
+        """★ 2.46.10：外部输入（页面/CLI/MCP）给非数字端口时不能 500。"""
+        from audiomixing.webui import ApiError
+
+        with self.assertRaises(ApiError) as ctx:
+            self.api.add_peer({"host": "192.168.0.50", "port": "abc"})
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_devices_api_does_not_force_enumerate_every_poll(self) -> None:
+        """★ 2.46.11：主面板每 800ms 调 /api/devices；强制枚举会反复打开蓝牙端点，
+        正在播的蓝牙音频就会一卡一卡。必须走 refresh_devices(force=False) 的缓存。"""
+        calls = []
+        orig = self.node.refresh_devices
+        self.node.refresh_devices = (          # type: ignore[method-assign]
+            lambda force=False: calls.append(force) or self.node.devices)
+        try:
+            self.api.devices()
+        finally:
+            self.node.refresh_devices = orig            # type: ignore[method-assign]
+        self.assertEqual(calls, [False], "面板轮询必须走缓存，不能 force=True")
 
     def test_unwritable_config_is_reported_not_faked(self) -> None:
         """磁盘写不进去时必须报错，不能回一个“已保存”。"""
@@ -4459,14 +4499,16 @@ class TestDeviceCardUi(unittest.TestCase):
                       html, "打开按钮默认必须是黑色（没有 primary）")
 
     def test_multiout_supports_multiple_sources_and_peer_audio_cards(self) -> None:
-        """★ 2.42.1：一路多音源、空音源静音、复杂档只列工作中的输出、对端 audio 卡片。"""
+        """★ 2.42.1 / 2.46.7：一路多音源、空音源静音、对端 audio 卡片；
+        ★ 2026-11-26：详细档从画布改成「音源 × 输出设备」矩阵。"""
         html = self._html()
         for token in ("function sourcesOf(", "function sourceKey(",
-                      "未连音源 · 这一路静音", "renderPeerCards(wrap)",
+                      "没有音源（静音）", "renderPeerCards()",
                       "sources: sourcesOf(cfg).map"):
             self.assertIn(token, html)
-        self.assertIn("isPassthrough(name) || isChosen(name) || remSink.has(name)", html,
-                      "复杂档输出列必须过滤掉未启用设备")
+        self.assertIn("function renderMatrix(", html, "详细档必须渲染矩阵")
+        for token in ("音频全开", "音频全关", "折叠"):
+            self.assertIn(token, html, "矩阵缺少 %s" % token)
         self.assertNotIn("已回落桌面混音", html)
 
     def test_the_drag_based_route_builder_is_gone(self) -> None:
@@ -5997,9 +6039,8 @@ class TestPanelLayoutAndSimpleMode(unittest.TestCase):
     def test_the_multi_output_block_has_its_own_tab(self) -> None:
         """第 5 条（2026-10-16 更版）：多耳机自己占一页（「多耳机」）。
 
-        ★ v2.42：那一页里原来还挂着一张「一台电脑，多个耳机」配置卡（设备清单/
-        勾选行/桌面混音下拉/应用/状态/说明）。用户确认它已经没有存在意义，整卡删除，
-        四样真有用的控件挪进画布卡的工具条。这里钉住"删干净了、工具条还在"。
+        ★ 2026-11-26：那一页的详细档改成「音源 × 输出设备」矩阵（不再有画布/
+        档位小开关）；简洁档仍是卡片墙。工具条那几样必须原地保留。
         """
         html = self._html()
         # 整卡与它的节点、脚本引用都不许留（用户明确不要折叠/隐藏版本）。
@@ -6009,19 +6050,19 @@ class TestPanelLayoutAndSimpleMode(unittest.TestCase):
         self.assertNotIn('id="multiOutCard"', html, "旧的那张独立卡片要真的没了")
         status = html.index('data-card="status" data-pane="status"')
         block = html.index('data-card="multiview" data-pane="multi"')
-        self.assertLess(status, block, "多耳机画布排在本机状态之后")
-        self.assertLess(block, html.index("手机扫码", status), "多耳机画布要排在扫码之前")
-        # 画布仍是那一页；四样有用控件在画布卡里、在卡片墙/画布之前。
+        self.assertLess(status, block, "多耳机排在本机状态之后")
+        self.assertLess(block, html.index("手机扫码", status), "多耳机要排在扫码之前")
         self.assertNotIn('id="moToggle"', html, "独立页之后不再需要收起/展开控件")
         self.assertNotIn('href="/multi"', html, "独立画布页已下线，不许留悬空入口")
         section = html[block:html.index("手机扫码", block)]
-        self.assertIn('class="motools"', section, "工具条要在画布卡里")
+        self.assertIn('class="motools"', section, "工具条要在多耳机卡里")
         for keep in ('id="moStop"', 'id="moRefresh"', 'id="moLockDevice"',
-                     'id="moRestore"', 'id="moStatus"', 'id="moLockInfo"',
-                     'id="moStage"', 'id="moModeSeg"'):
-            self.assertIn(keep, section, "工具条/画布按 id 取节点，一个都不许改：%s" % keep)
+                     'id="moRestore"', 'id="moStatus"', 'id="moLockInfo"'):
+            self.assertIn(keep, section, "工具条按 id 取节点，一个都不许改：%s" % keep)
+        for keep in ('id="moCards"', 'id="moMatrix"', 'id="moMatrixWrap"', 'id="moFolded"'):
+            self.assertIn(keep, section, "多耳机两档的容器要在这张卡里：%s" % keep)
         self.assertLess(section.index('class="motools"'), section.index('id="moCards"'),
-                        "工具条必须在卡片墙/画布之前")
+                        "工具条必须在卡片墙/矩阵之前")
 
     def test_no_auto_listen_warning_is_shown_any_more(self) -> None:
         """★ 2026-10-18 用户第 6 条：「这种警告就不要出现了」。整块删掉，一条都不许留。
@@ -11456,38 +11497,26 @@ class TestV27Regressions(unittest.TestCase):
         self.assertIn("设备被独占", result["error"])
         self.assertFalse(node.config.multi_lock_active)
 
-    def test_multi_canvas_lives_inside_main_panel(self) -> None:
-        """★ 2026-11-16 用户：不要独立页，画布单独一块放进主面板。"""
+    def test_multi_matrix_lives_inside_main_panel(self) -> None:
+        """★ 2026-11-26 用户：多耳机详细档＝「音源 × 输出设备」矩阵，放在主面板同一张卡里。"""
         import inspect
 
         from audiomixing import webui
 
         html = webui.index_html()
-        self.assertIn("多耳机画布", html)
-        self.assertIn("本机桌面音频", html)
-        self.assertIn("未使用", html)
-        # 两档视图 + 三列（APP / 输出设备 / 远端 AUDIO 音源）
-        self.assertIn('data-mode="simple"', html)
-        self.assertIn('data-mode="detail"', html)
-        self.assertIn("输出音频设备", html)
-        self.assertIn("远端 AUDIO 音源", html)
-        self.assertIn("APP", html)
-        # 画布独立成卡，不和任何配置表单挤在一起（★ v2.42 起也不再有那张配置卡）。
+        self.assertIn("多耳机", html)
         self.assertIn('data-card="multiview" data-pane="multi"', html)
         self.assertNotIn('data-card="multiout"', html, "配置卡整块删除，不许留折叠版")
-        self.assertIn('class="motools"', html, "四样有用控件挪到画布上方工具条")
-        self.assertIn('id="moModeSeg"', html)
-        # 左列与右列不许互相连线：代码里只允许 APP→输出、远端→输出 两种边。
-        self.assertNotIn("['app:desktop', 'remote", html)
-        # 点击放大 = 自己 + 直接相邻
-        self.assertIn("neighborKeys", html)
-        self.assertIn("classList.toggle('moFocus'", html)
-        # 默认设备 = 直出（锁勾选 + 青色虚线 + 不可取消）
+        self.assertIn('class="motools"', html, "四样有用控件挪到多耳机工具条")
+        self.assertIn('id="moCards"', html, "简洁档卡片墙")
+        self.assertIn('id="moMatrix"', html, "详细档矩阵")
+        for token in ("音频全开", "音频全关", "function renderMatrix(",
+                      "foldedDevices", "foldedSources", "remoteSinkRoutes()"):
+            self.assertIn(token, html, "矩阵缺少：%s" % token)
+        # 默认设备 = 直出（不可点灭，只作参考）
         self.assertIn("直出", html)
-        self.assertIn("直出 · 系统在放", html, "直出设备在画布/卡片上仍要写明")
-        self.assertIn("系统默认设备 · 系统原生播放，不再重复放一份", html)
+        self.assertIn("系统默认设备 · 直出", html)
         self.assertIn("isPassthrough", html)
-        self.assertIn("stroke-dasharray", html)
         self.assertIn("（不锁，默认推荐）", html)
         # 独立页彻底下线：路由、页面文件、入口链接都不许留。
         self.assertNotIn('href="/multi"', html)
@@ -11499,60 +11528,65 @@ class TestV27Regressions(unittest.TestCase):
         self.assertNotIn('"/multi"', src, "GET /multi 路由必须删干净")
 
     def test_multi_simple_mode_is_card_wall_not_rings(self) -> None:
-        """★ 2026-11-17 用户：简洁档不要大圆小圆，改成设备卡片墙（蓝＝启用）。"""
+        """★ 2026-11-26：简洁档＝设备卡片墙（点蓝＝放，点暗＝停），详细档＝矩阵。"""
         from audiomixing import webui
 
         html = webui.index_html()
         self.assertIn('id="moCards"', html)
         self.assertIn("function renderCards", html)
         self.assertIn("card.className = 'mocard'", html)
-        self.assertIn("系统原生播放，不再重复放一份", html)
+        self.assertIn("系统默认设备 · 直出", html)
         self.assertIn("点一下开始放", html)
         # 圆 / 环 / 拖拽切环整条路径必须删干净
         for gone in ("putRing", "dropOnRing", "moRingInner", "moRingOuter", "moRingHot"):
             self.assertNotIn(gone, html, "简洁档的圆环残留必须删掉：%s" % gone)
-        # 简洁档在 draw() 里先落卡片、不进入任何连线绘制
-        self.assertIn("renderCards();", html)
-        self.assertIn("if (cvs.mode === 'simple') return { nodes, edges, labels };", html)
+        # 两档共用一个入口：简洁走卡片墙，详细走矩阵。
+        self.assertIn("function simpleMode()", html)
+        self.assertIn("if (simple) renderCards(); else renderMatrix();", html)
 
     def test_multi_complex_edges_only_real_relations(self) -> None:
-        """★ 2026-11-17：复杂档只画真实关系，直出扇面线和"每台都画一条"都不许留。"""
+        """★ 2.46.7：远端音源 → 本机输出设备的格子必须对应真实路由，不是纯画图。"""
         from audiomixing import webui
 
         html = webui.index_html()
-        self.assertNotIn("if (pt) appList.forEach(a => edges.push", html)
-        self.assertNotIn("remList.forEach(r => edges.push", html)
-        self.assertNotIn("kind === 'pass'", html)
         self.assertIn("remoteSinkRoutes()", html)
         self.assertIn("route_id", html)
+        self.assertIn("addRemote(row, device)", html)
+        self.assertIn("removeRemote(row, device)", html)
 
     def test_multi_slider_limits_are_clamped(self) -> None:
-        """★ 2026-11-17：延迟 0–500ms、增益 0–2，越界要夹住而不是溢出。"""
+        """★ 2.46.7：延迟 0–500ms、增益 0–2，越界要夹住而不是溢出。"""
         from audiomixing import webui
 
         html = webui.index_html()
         self.assertIn("d.max = '500'", html)
         self.assertIn("function clampDelay", html)
         self.assertIn("function clampNum", html)
-        self.assertIn("clampDelay(ui.delay_ms)", html)
-        self.assertIn("clampNum(ui.gain, 0, 2, 1.0)", html)
-        # ★ v2.42：设备清单表单整卡删除，唯一入口是卡片墙内联那份。
+        self.assertIn("clampDelay(cfg.delay_ms)", html)
+        self.assertIn("clampNum(cfg.gain, 0, 2, 1.0)", html)
+        # 设备清单表单整卡删除，唯一入口是多耳机卡片/矩阵。
         self.assertNotIn('id="moList"', html)
         self.assertNotIn('id="moApply"', html)
         # 即时生效：锁定目标一改就落盘，没有「应用」按钮
         self.assertIn("lockSel.onchange = () => apply(false);", html)
-        self.assertIn("queueGainApply", html)
-        # 轮询不重建正在拖的表单
-        self.assertIn("const busy = cvs.holding", html)
+        # 音量拖动合并 + 松手落盘（不再有卡片墙内联滑杆）
+        self.assertIn("gainTimer", html)
+        self.assertIn("apply(false, true)", html)
+        # 音量面板打开时不要用服务端数据盖掉本地值
+        self.assertIn("cvs.holding = true;", html)
+        self.assertIn("if (!cvs.holding) renderAll();", html)
         # 不在多耳机页时不轮询（避免每秒枚举蓝牙端点）
         self.assertIn("document.body.dataset.pane !== 'multi'", html)
         # 音源不可用必须写明；2.42.1 起绝不回落桌面混音
         self.assertIn("音源不可用：", html)
         self.assertNotIn("已回落桌面混音", html)
-        self.assertIn("没有音源时这一路静音", html)
+        self.assertIn("没有音源（静音）", html)
         # 纯增益请求不枚举端点（避免拖动时反复碰蓝牙端点）
         self.assertIn("'/api/multiout?gain=1'", html)
-        self.assertIn("if \"gain=1\" in self.path:", (ROOT / "audiomixing" / "webui.py").read_text(encoding="utf-8"))
+        # ★ 2.46.9：服务端也要真的走快速路径（不锁默认设备、不写配置）
+        webui_src = (ROOT / "audiomixing" / "webui.py").read_text(encoding="utf-8")
+        self.assertIn('gain_only = "gain=1" in self.path', webui_src)
+        self.assertIn("set_multi_out(items, gain_only=gain_only)", webui_src)
 
     def test_channel_uses_source_and_output_cards(self) -> None:
         """★ 2026-11-17 用户：广播页的音源/输出改成小卡片，蓝＝开着。"""
@@ -11945,9 +11979,10 @@ class TestPeerCardPresentation(unittest.TestCase):
         self.assertIn("card.onclick", self.body)
         self.assertIn("to: [peer.node_id]", self.body)
 
-    def test_explanation_only_in_detailed_mode(self):
-        self.assertIn("if (!simpleMode)", self.body,
-                      "解释块必须只在详细档出现，简洁档一个字都不加")
+    def test_no_explanation_block_in_peer_cards(self):
+        """★ 2.46.7：对端卡两档都只留设备名 + 状态，不堆解释文字。"""
+        self.assertNotIn("fb.className", self.body)
+        self.assertNotIn("本机扬声器", self.body)
 
 class TestRouteEpochAndSelfLoop(unittest.TestCase):
     """★ 2.44.1（#6 防环最小闭环）：自环丢弃 + 路由 epoch 递增。"""
@@ -11995,6 +12030,17 @@ class TestOpusCapability(unittest.TestCase):
         self.assertEqual(codec_for_target(proto.CODEC_OPUS, "Windows-11", False),
                          proto.CODEC_OPUS)
 
+    def test_android_pcm16_is_pinned_to_480_frame_packets(self):
+        """★ 2.46.3：Android PCM16 只认 480 帧/包；流畅档的 960 帧必须收敛。"""
+        from audiomixing import proto
+        from audiomixing.engine import frames_for_target
+        self.assertEqual(frames_for_target(960, proto.CODEC_PCM_S16, "Android-17"), 480)
+        self.assertEqual(frames_for_target(480, proto.CODEC_PCM_S16, "Android-17"), 480)
+        # Opus 在手机端会解码后重新切块，960 帧仍然可以。
+        self.assertEqual(frames_for_target(960, proto.CODEC_OPUS, "Android-17"), 960)
+        # PC↔PC 不受影响。
+        self.assertEqual(frames_for_target(960, proto.CODEC_PCM_S16, "Windows-11"), 960)
+
     def test_peer_beacon_reports_opus_capability(self):
         from audiomixing.net.discovery import DiscoveryRegistry
         reg = DiscoveryRegistry("self")
@@ -12004,3 +12050,354 @@ class TestOpusCapability(unittest.TestCase):
         self.assertIsNotNone(peer)
         self.assertTrue(peer.opus)
         self.assertTrue(peer.to_json()["opus"])
+
+
+class TestLinkPreference(unittest.TestCase):
+    """★ 2.46.4：点对点链路偏好（有线 / Wi-Fi / USB 网络共享）。"""
+
+    def test_address_rank_prefers_wired_when_asked(self):
+        from audiomixing.net.discovery import address_rank
+
+        local = {"192.168.0.10", "192.168.42.10"}
+        kinds = {"192.168.0.10": "wireless", "192.168.42.10": "usb"}
+        wifi = address_rank("192.168.0.50", local, kinds, "wired")
+        usb = address_rank("192.168.42.50", local, kinds, "wired")
+        self.assertLess(usb, wifi, "USB 网络共享地址必须排在 Wi-Fi 前面")
+        self.assertLess(address_rank("192.168.0.50", local, kinds, "wireless"),
+                        address_rank("192.168.42.50", local, kinds, "wireless"),
+                        "Wi-Fi 优先时排序必须反过来")
+
+    def test_rndis_adapter_is_usb_not_generic_wired(self):
+        from audiomixing.net.discovery import _classify_iface
+        self.assertEqual(_classify_iface(
+            "以太网 3", "Remote NDIS based Internet Sharing Device", "", ""), "usb")
+        self.assertEqual(_classify_iface(
+            "Ethernet", "Realtek Gaming 2.5GbE Family Controller", "802.3", "802.3"), "wired")
+
+    def test_best_local_address_prefers_wired_when_no_peer(self):
+        from audiomixing.webui import _best_local_address
+
+        report = {"interfaces": [
+            {"address": "192.168.0.100", "subnet": "192.168.0.0/24",
+             "kind": "private", "type": "wireless"},
+            {"address": "192.168.42.100", "subnet": "192.168.42.0/24",
+             "kind": "private", "type": "wired"},
+        ]}
+        node = types.SimpleNamespace(
+            config=types.SimpleNamespace(link_preference="wired", manual_peers=[]),
+            registry=types.SimpleNamespace(snapshot=lambda: []))
+        self.assertEqual(_best_local_address(node, report), "192.168.42.100")
+        node.config.link_preference = "wireless"
+        self.assertEqual(_best_local_address(node, report), "192.168.0.100")
+        node.config.link_preference = "auto"
+        self.assertEqual(_best_local_address(node, report), "192.168.42.100")
+
+    def test_best_local_address_still_prefers_peer_subnet(self):
+        from audiomixing.webui import _best_local_address
+
+        report = {"interfaces": [
+            {"address": "192.168.0.100", "subnet": "192.168.0.0/24",
+             "kind": "private", "type": "wireless"},
+            {"address": "192.168.42.100", "subnet": "192.168.42.0/24",
+             "kind": "private", "type": "wired"},
+        ]}
+        node = types.SimpleNamespace(
+            config=types.SimpleNamespace(link_preference="wired", manual_peers=[]),
+            registry=types.SimpleNamespace(snapshot=lambda: [{"host": "192.168.0.50"}]))
+        self.assertEqual(_best_local_address(node, report), "192.168.0.100",
+                         "对端只在 Wi-Fi 网段时必须选 Wi-Fi，不能为了有线把路选丢")
+
+    def test_config_link_preference_defaults_and_normalizes(self):
+        from audiomixing.config import Config
+
+        tmp = _mkdtemp("am-link-") / "config.json"
+        tmp.write_text(json.dumps({"version": 1, "node_id": "old-node"}), encoding="utf-8")
+        cfg = Config.load(tmp, create=False)
+        self.assertEqual(cfg.link_preference, "auto")
+        tmp.write_text(json.dumps({"version": 1, "node_id": "old-node",
+                                   "link_preference": "nonsense"}), encoding="utf-8")
+        cfg = Config.load(tmp, create=False)
+        self.assertEqual(cfg.link_preference, "auto")
+        tmp.write_text(json.dumps({"version": 1, "node_id": "old-node",
+                                   "link_preference": "wired"}), encoding="utf-8")
+        cfg = Config.load(tmp, create=False)
+        self.assertEqual(cfg.link_preference, "wired")
+
+    def test_auto_prefers_usb_over_wired_and_wifi(self):
+        """★ 2.46.5（用户实测：只有「有线优先」能看见手机）：自动必须压过 Wi-Fi。"""
+        from audiomixing.webui import _best_local_address
+
+        report = {"interfaces": [
+            {"address": "192.168.0.100", "subnet": "192.168.0.0/24",
+             "kind": "private", "type": "wireless"},
+            {"address": "192.168.1.100", "subnet": "192.168.1.0/24",
+             "kind": "private", "type": "wired"},
+            {"address": "192.168.42.100", "subnet": "192.168.42.0/24",
+             "kind": "private", "type": "usb"},
+        ]}
+        node = types.SimpleNamespace(
+            config=types.SimpleNamespace(link_preference="auto", manual_peers=[]),
+            registry=types.SimpleNamespace(snapshot=lambda: []))
+        self.assertEqual(_best_local_address(node, report), "192.168.42.100")
+
+    def test_usb_auto_defaults_on(self):
+        from audiomixing.config import Config
+
+        tmp = _mkdtemp("am-usb-") / "config.json"
+        tmp.write_text(json.dumps({"version": 1, "node_id": "old-node"}), encoding="utf-8")
+        cfg = Config.load(tmp, create=False)
+        self.assertTrue(cfg.usb_auto, "插上 USB 自动触发默认应为开")
+        tmp.write_text(json.dumps({"version": 1, "node_id": "old-node",
+                                   "usb_auto": "false"}), encoding="utf-8")
+        cfg = Config.load(tmp, create=False)
+        self.assertFalse(cfg.usb_auto, "字符串 false 必须归一成关")
+
+    def test_local_ip_addresses_never_runs_powershell(self):
+        """★ 2.46.8：信标线程每 2 秒调 local_ip_addresses()，它绝不能跑 PowerShell。
+
+        （本机实测一次 Get-NetIPAddress 约 1 秒，慢机器超时 6 秒；放在信标线程里
+        会把信标卡住，对端 15 秒收不到就判死。）
+        """
+        from audiomixing.net import discovery
+
+        class FakeSocket:
+            def connect(self, addr):
+                pass
+
+            def getsockname(self):
+                return ("192.168.0.10", 12345)
+
+            def close(self):
+                pass
+
+        orig_hostname = discovery.socket.gethostname
+        orig_addrinfo = discovery.socket.getaddrinfo
+        orig_socket = discovery.socket.socket
+        orig_types = discovery.iface_types
+        try:
+            discovery.socket.gethostname = lambda: "host"
+            discovery.socket.getaddrinfo = lambda *a, **k: [
+                (2, 1, 6, "", ("192.168.0.10", 0))]
+            discovery.socket.socket = lambda *a, **k: FakeSocket()
+
+            def must_not_probe(force=False):
+                raise AssertionError("local_ip_addresses 不许触发 PowerShell 探测")
+
+            discovery.iface_types = must_not_probe
+            ips = discovery.local_ip_addresses()
+            self.assertIn("192.168.0.10", ips)
+        finally:
+            discovery.socket.gethostname = orig_hostname
+            discovery.socket.getaddrinfo = orig_addrinfo
+            discovery.socket.socket = orig_socket
+            discovery.iface_types = orig_types
+
+    def test_beacon_service_merges_iface_types_in_background(self):
+        """★ 2.46.8：全量网卡地址的并集放在 BeaconService，而不是信标线程的 local_ip_addresses。"""
+        from audiomixing.net import discovery
+
+        calls = []
+        registry = types.SimpleNamespace(
+            set_local_ips=lambda ips, kinds=None: calls.append((set(ips), dict(kinds or {}))))
+        svc = discovery.BeaconService(
+            registry, "node", "name", 47831, 17800,
+            lambda: [], lambda: [])
+        orig_ips = discovery.local_ip_addresses
+        orig_types = discovery.iface_types
+        try:
+            discovery.local_ip_addresses = lambda: ["192.168.0.10"]
+            discovery.iface_types = lambda force=False: {"192.168.2.100": "wireless"}
+            svc._probe_local_links()
+        finally:
+            discovery.local_ip_addresses = orig_ips
+            discovery.iface_types = orig_types
+        self.assertIn("192.168.2.100", svc._local_ips)
+        self.assertTrue(calls, "探测完成后必须通知 registry")
+        self.assertEqual(calls[-1][1].get("192.168.2.100"), "wireless")
+
+    def test_lan_report_includes_iface_types_addresses(self):
+        """★ 2.46.8：面板的「本机 IP」/二维码也要看到 Get-NetIPAddress 的全部网卡。"""
+        from audiomixing.net import discovery
+
+        orig_ips = discovery.local_ip_addresses
+        orig_cached = discovery.cached_iface_types
+        try:
+            discovery.local_ip_addresses = lambda: ["192.168.0.10"]
+            discovery.cached_iface_types = lambda: {"192.168.2.100": "wireless"}
+            report = discovery.lan_report()
+        finally:
+            discovery.local_ip_addresses = orig_ips
+            discovery.cached_iface_types = orig_cached
+        addrs = [i.get("address") for i in report.get("interfaces") or []]
+        self.assertIn("192.168.2.100", addrs, "第二块网卡必须出现在面板的本机地址里")
+
+    def test_lan_report_does_not_spam_probe_when_cache_fresh_empty(self):
+        """★ 2.46.9：缓存新鲜但结果为空（没有网卡）时，不能每 800ms 再起一次探测。"""
+        from audiomixing.net import discovery
+
+        orig_ips = discovery.local_ip_addresses
+        orig_cached = discovery.cached_iface_types
+        orig_kick = discovery._kick_iface_probe
+        orig_at = discovery._IFACE_TYPES_CACHE.get("at")
+        orig_types = discovery._IFACE_TYPES_CACHE.get("types")
+        kicks = []
+        try:
+            discovery.local_ip_addresses = lambda: ["192.168.0.10"]
+            discovery.cached_iface_types = lambda: {}
+            discovery._kick_iface_probe = lambda: kicks.append(1)
+            discovery._IFACE_TYPES_CACHE["at"] = time.time()
+            discovery._IFACE_TYPES_CACHE["types"] = {}
+            discovery.lan_report()
+        finally:
+            discovery.local_ip_addresses = orig_ips
+            discovery.cached_iface_types = orig_cached
+            discovery._kick_iface_probe = orig_kick
+            discovery._IFACE_TYPES_CACHE["at"] = orig_at
+            discovery._IFACE_TYPES_CACHE["types"] = orig_types
+        self.assertEqual(kicks, [], "缓存新鲜时不许再起探测")
+
+    def test_lan_report_never_runs_powershell(self):
+        """★ 2.46.9：面板高频调用 lan_report，缓存命中时绝不能同步跑 iface_types。"""
+        from audiomixing.net import discovery
+
+        orig_ips = discovery.local_ip_addresses
+        orig_cached = discovery.cached_iface_types
+        orig_types = discovery.iface_types
+        try:
+            discovery.local_ip_addresses = lambda: ["192.168.0.10"]
+            discovery.cached_iface_types = lambda: {"192.168.2.100": "wireless"}
+            discovery.iface_types = lambda force=False: (_ for _ in ()).throw(
+                AssertionError("lan_report 不许同步探测网卡"))
+            report = discovery.lan_report()
+        finally:
+            discovery.local_ip_addresses = orig_ips
+            discovery.cached_iface_types = orig_cached
+            discovery.iface_types = orig_types
+        addrs = [i.get("address") for i in report.get("interfaces") or []]
+        self.assertIn("192.168.2.100", addrs)
+
+
+class TestUsbAutoBridge(unittest.TestCase):
+    """★ 2.46.5：可选 ADB 桥 —— 只碰装了本机手机端的设备，命令固定。"""
+
+    def test_as_bool_normalizes_strings(self):
+        """★ 2.46.8：API/AI 发 "false" 不能把 USB 自动模式打开。"""
+        from audiomixing import usb_auto
+
+        for value in (True, 1, "true", "TRUE", "1", "yes", "on", "开", "是"):
+            self.assertTrue(usb_auto.as_bool(value), value)
+        for value in (False, 0, "false", "FALSE", "0", "no", "off", "", None):
+            self.assertFalse(usb_auto.as_bool(value), value)
+
+    def test_find_adb_next_to_onefile_exe(self):
+        """★ 2.46.8：onefile 下 __file__ 在临时目录，adb.exe 放在 exe 旁边必须能找到。"""
+        from audiomixing import usb_auto
+
+        folder = _mkdtemp("am-adb-")
+        exe = folder / "AudioMixing.exe"
+        exe.write_bytes(b"")
+        adb = folder / "adb.exe"
+        adb.write_bytes(b"")
+        old_argv = usb_auto.sys.argv
+        old_exec = usb_auto.sys.executable
+        try:
+            usb_auto.sys.argv = [str(exe)]
+            usb_auto.sys.executable = str(exe)
+            found = usb_auto.find_adb()
+        finally:
+            usb_auto.sys.argv = old_argv
+            usb_auto.sys.executable = old_exec
+        self.assertEqual(pathlib.Path(found).resolve(), adb.resolve())
+
+    def test_list_devices_parses_authorized_only(self):
+        from audiomixing import usb_auto
+
+        def fake_run(adb, args, timeout=8.0):
+            return 0, "List of devices attached\nS1\tdevice\nS2\tunauthorized\n\n", ""
+
+        old = usb_auto._run
+        usb_auto._run = fake_run
+        try:
+            self.assertEqual(usb_auto.list_devices("adb"), ["S1"])
+        finally:
+            usb_auto._run = old
+
+    def test_device_states_distinguishes_adb_failure_from_no_devices(self):
+        """★ 2.46.8：adb 读取失败要返回 None，不能当成“手机拔掉了”。"""
+        from audiomixing import usb_auto
+
+        old = usb_auto._run
+        usb_auto._run = lambda *a, **k: (1, "", "adb server died")
+        try:
+            self.assertIsNone(usb_auto.device_states("adb"))
+            self.assertEqual(usb_auto.list_devices("adb"), [])
+        finally:
+            usb_auto._run = old
+
+    def test_has_app_requires_package_path(self):
+        from audiomixing import usb_auto
+
+        def found(adb, args, timeout=8.0):
+            return 0, "package:/data/app/com.audiomixing.app/base.apk", ""
+
+        def missing(adb, args, timeout=8.0):
+            return 0, "", "Error: package not found"
+
+        old = usb_auto._run
+        try:
+            usb_auto._run = found
+            self.assertTrue(usb_auto.has_app("adb", "S1"))
+            usb_auto._run = missing
+            self.assertFalse(usb_auto.has_app("adb", "S1"))
+        finally:
+            usb_auto._run = old
+
+    def test_is_usb_serial_skips_wireless_and_emulator(self):
+        """★ 2.46.9：无线调试（host:port）与模拟器不是“插上 USB”，不能执行 USB 命令。"""
+        from audiomixing import usb_auto
+
+        self.assertTrue(usb_auto.is_usb_serial("R58M123ABC"))
+        self.assertFalse(usb_auto.is_usb_serial("192.168.1.5:5555"))
+        self.assertFalse(usb_auto.is_usb_serial("127.0.0.1:5555"))
+        self.assertFalse(usb_auto.is_usb_serial("emulator-5554"))
+        self.assertFalse(usb_auto.is_usb_serial(""))
+
+    def test_prepare_device_stops_when_disabled(self):
+        """★ 2.46.9：关掉开关后，剩下的命令不再继续跑。"""
+        from audiomixing import usb_auto
+
+        calls = []
+
+        def fake_run(adb, args, timeout=8.0):
+            calls.append(list(args))
+            return 0, "ok", ""
+
+        old = usb_auto._run
+        usb_auto._run = fake_run
+        try:
+            usb_auto.prepare_device("adb", "S1",
+                                    should_run=lambda: len(calls) < 1)
+        finally:
+            usb_auto._run = old
+        self.assertEqual(len(calls), 1, "第一条命令之后应立刻停")
+
+    def test_prepare_device_uses_fixed_commands(self):
+        from audiomixing import usb_auto
+
+        calls = []
+
+        def fake_run(adb, args, timeout=8.0):
+            calls.append(list(args))
+            return 0, "ok", ""
+
+        old = usb_auto._run
+        usb_auto._run = fake_run
+        try:
+            out = usb_auto.prepare_device("adb", "S1")
+        finally:
+            usb_auto._run = old
+        joined = [" ".join(item) for item in calls]
+        self.assertTrue(any("am start -n com.audiomixing.app/.MainActivity" in s for s in joined))
+        self.assertTrue(any("tethering start --usb" in s for s in joined))
+        self.assertEqual(out["serial"], "S1")
+        self.assertEqual(len(out["results"]), len(calls))

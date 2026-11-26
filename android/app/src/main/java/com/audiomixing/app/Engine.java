@@ -86,6 +86,14 @@ public final class Engine {
     /** 一个 UDP 端口收，收到几台就混几台 —— 这本来就是个"混音"工具。 */
     private volatile AudioRecv receiver;
     /**
+     * ★ 2.31.2：两个接收器共用的“一台设备同一时刻只播一条流”闸门。
+     *
+     * <p>2.42.2 起广播和点对点分成了两个端口、两个 AudioRecv；如果各用各的
+     * hostActiveSsrc，同一台电脑的广播流和点对点流会同时播，叠在一起削顶/梳状滤波，
+     * 听感就是“沙沙/发毛”。这里必须共用同一份。
+     */
+    private final HostGate hostGate = new HostGate();
+    /**
      * ★ 2.42.2（第 2 条）：广播专用接收器，只绑定 {@link #broadcastPort}（默认 47832）。
      *
      * <p>它和 {@link #receiver} 是两个独立的 UDP socket、两套独立准入：
@@ -278,6 +286,14 @@ public final class Engine {
      * 默认均衡 = 2.42.2 行为。
      */
     private volatile String qualityPreset = "balanced";
+    /** ★ 2.31.4：auto / wired / wireless；手机端默认 auto（有 USB 网络共享就优先）。 */
+    private volatile String linkPreference = "auto";
+    /**
+     * ★ 2.31.5：手动添加的电脑 IP（自动发现被路由器的组播/客户端隔离挡住时的兜底）。
+     * 只作为"信标单播目标"，不直接伪造一台设备 —— 对方回信标后走正常发现流程。
+     */
+    private final List<String> manualPeerHosts = new ArrayList<String>();
+    private static final String KEY_MANUAL_PEERS = "manual_peer_hosts";
     private volatile String lastSendError = "";
 
     private volatile AudioRecv.Stats statsCache;
@@ -345,6 +361,17 @@ public final class Engine {
             }
             // ★ 2.42.3：档位从设置里恢复（第一次装 = 均衡）。
             qualityPreset = savedText("quality_preset", "balanced");
+            // ★ 2.31.4：点对点链路偏好（默认 auto：有 USB 网络共享就优先）。
+            String lp = savedText("link_preference", "auto");
+            linkPreference = ("wired".equals(lp) || "wireless".equals(lp)) ? lp : "auto";
+            // ★ 2.31.5：手动添加的电脑 IP（自动发现被 AP 隔离挡住时的兜底）。
+            manualPeerHosts.clear();
+            for (String item : savedText(KEY_MANUAL_PEERS, "").split("[,;\\s]+")) {
+                String host = normalizeIpv4(item);
+                if (!host.isEmpty() && !manualPeerHosts.contains(host)) {
+                    manualPeerHosts.add(host);
+                }
+            }
             // ★ 接收器这次【不再】一开机就常驻。
             //
             // 上一个版本为了收对端那句"我在给你发声音、请收听我"（T_STATS 的 want_listen），
@@ -362,6 +389,10 @@ public final class Engine {
                 d.setBroadcastPort(broadcastPort);
                 // ★ 2.42.3：档位也随信标公布（两端按较低那档协商）。
                 d.setQuality(qualityPreset);
+                // ★ 2.31.4：把链路偏好交给发现层（USB/有线优先）。
+                d.setLinkPreference(linkPreference);
+                // ★ 2.31.5：手动添加的电脑每轮单播一份信标。
+                d.setManualHosts(new ArrayList<String>(manualPeerHosts));
                 // 回调在发现线程上，这里只做一件事：把列表存下来，别在这里碰界面。
                 d.setListener(new Discovery.Listener() {
                     @Override
@@ -1640,6 +1671,181 @@ public final class Engine {
         return qualityPreset;
     }
 
+    /** ★ 2.31.4：auto / wired / wireless。 */
+    public String linkPreference() {
+        return linkPreference;
+    }
+
+    public String linkPreferenceLabel() {
+        if ("wired".equals(linkPreference)) return "有线优先";
+        if ("wireless".equals(linkPreference)) return "Wi-Fi 优先";
+        return "自动";
+    }
+
+    /** 切换链路偏好；立即写 SharedPreferences 并通知发现层。 */
+    public String setLinkPreference(String value) {
+        String v = value == null ? "" : value.trim().toLowerCase();
+        if (!"wired".equals(v) && !"wireless".equals(v)) {
+            v = "auto";
+        }
+        linkPreference = v;
+        try {
+            app.getSharedPreferences("audiomixing", Context.MODE_PRIVATE)
+                    .edit().putString("link_preference", v).apply();
+        } catch (Throwable ignored) {
+        }
+        Discovery d = discovery;
+        if (d != null) {
+            d.setLinkPreference(v);
+        }
+        return v;
+    }
+
+    // ─────────────────── ★ 2.31.5 手动添加电脑（发现兜底） ───────────────────
+
+    /** 已保存的手动电脑地址（只读副本）。 */
+    public List<String> manualPeerHosts() {
+        synchronized (lock) {
+            return new ArrayList<String>(manualPeerHosts);
+        }
+    }
+
+    /**
+     * 手动添加一台电脑的 IP。
+     *
+     * <p>为什么不是"直接造一台设备"：我们不知道对方的音频端口/广播端口，
+     * 伪造出来的卡片点了也没用。这里只把它当作**信标单播目标**：
+     * 每轮给这个 IP 发一份信标，对方按正常流程回信标，发现层再把真实信息填满。
+     *
+     * @return 归一化后的 IP；格式不对返回空串（界面据此提示）。
+     */
+    public String addManualPeer(String raw) {
+        String host = normalizeIpv4(raw);
+        if (host.isEmpty()) {
+            return "";
+        }
+        synchronized (lock) {
+            if (!manualPeerHosts.contains(host)) {
+                manualPeerHosts.add(host);
+            }
+            persistManualPeersLocked();
+            Discovery d = discovery;
+            if (d != null) {
+                d.setManualHosts(new ArrayList<String>(manualPeerHosts));
+            }
+        }
+        noteManualPeer("已手动添加电脑 " + host + "：每 2 秒给它单播一次信标");
+        return host;
+    }
+
+    /** 清空手动添加的地址（回到纯自动发现）。 */
+    public void clearManualPeers() {
+        synchronized (lock) {
+            manualPeerHosts.clear();
+            persistManualPeersLocked();
+            Discovery d = discovery;
+            if (d != null) {
+                d.setManualHosts(new ArrayList<String>(manualPeerHosts));
+            }
+        }
+        noteManualPeer("已清空手动添加的电脑地址");
+    }
+
+    /** 手动电脑地址的变更只写日志（不冒充"送声错误"，避免界面上误报）。 */
+    private void noteManualPeer(String message) {
+        Log.i(TAG, message);
+    }
+
+    private void persistManualPeersLocked() {
+        StringBuilder sb = new StringBuilder();
+        for (String host : manualPeerHosts) {
+            if (sb.length() > 0) {
+                sb.append(',');
+            }
+            sb.append(host);
+        }
+        try {
+            app.getSharedPreferences("audiomixing", Context.MODE_PRIVATE)
+                    .edit().putString(KEY_MANUAL_PEERS, sb.toString()).apply();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 只接受点分十进制 IPv4；允许误带端口（"192.168.2.100:17830"）。
+     *  只收私网/链路本地地址 —— 本程序只在同一局域网工作，绝不能把信标发到公网。 */
+    private static String normalizeIpv4(String raw) {
+        String s = raw == null ? "" : raw.trim();
+        if (s.isEmpty()) {
+            return "";
+        }
+        int colon = s.indexOf(':');
+        if (colon > 0) {
+            s = s.substring(0, colon);
+        }
+        String[] parts = s.split("\\.");
+        if (parts.length != 4) {
+            return "";
+        }
+        int[] oct = new int[4];
+        for (int i = 0; i < 4; i++) {
+            try {
+                int v = Integer.parseInt(parts[i]);
+                if (v < 0 || v > 255) {
+                    return "";
+                }
+                oct[i] = v;
+            } catch (NumberFormatException e) {
+                return "";
+            }
+        }
+        boolean lan = oct[0] == 10
+                || (oct[0] == 172 && oct[1] >= 16 && oct[1] <= 31)
+                || (oct[0] == 192 && oct[1] == 168)
+                || (oct[0] == 169 && oct[1] == 254);
+        return lan ? s : "";
+    }
+
+    /**
+     * 发现自检的一句话摘要（界面"0 台设备"时显示）。
+     *
+     * <p>把"本机地址 / 发现端口 / 发了几份 / 收了几份 / 收到过自己没有"摊开：
+     * 0 台设备可能是本机没发出去、发出去了没人收到、收到了但不是我们的协议……
+     * 这几个数一比就能定位，不用再让用户猜。
+     */
+    public String discoverySummary() {
+        Discovery d = discovery;
+        if (d == null) {
+            return "发现层未启动";
+        }
+        StringBuilder sb = new StringBuilder(220);
+        sb.append("本机 ").append(d.localIpText())
+                .append(" · 发现端口 ").append(d.boundPort())
+                .append(" · 信标 发 ").append(d.beaconsSent())
+                .append(" / 尝试 ").append(d.beaconRounds())
+                .append(" / 收 ").append(d.beaconsReceived())
+                .append(" / 自己 ").append(d.beaconsSelfReceived());
+        if (!d.manualHosts().isEmpty()) {
+            sb.append(" · 手动 ").append(d.manualHosts().size()).append(" 个");
+        }
+        String err = d.lastError();
+        if (err != null && err.length() > 0) {
+            sb.append("\n最近错误：").append(err);
+        }
+        return sb.toString();
+    }
+
+    /** 收到过多少份别人的信标（0 = 这条路从来没通过）。 */
+    public long discoveryReceived() {
+        Discovery d = discovery;
+        return d == null ? 0 : d.beaconsReceived();
+    }
+
+    /** ★ 2.31.6：信标尝试轮数（含全部发送失败的轮次）。 */
+    public long discoveryAttempts() {
+        Discovery d = discovery;
+        return d == null ? 0 : d.beaconRounds();
+    }
+
     /** 当前协商生效的档位：本机与所有在线对端取最低那档（老对端按均衡）。 */
     public String effectiveQuality() {
         String eff = qualityPreset;
@@ -2129,7 +2335,7 @@ public final class Engine {
         }
         try {
             // 带 Context 的构造会拿 WifiLock：不收包时 Wi-Fi 进省电模式会把抖动缓冲冲垮。
-            AudioRecv r = new AudioRecv(app, audioPort);
+            AudioRecv r = new AudioRecv(app, audioPort, hostGate);
             // ★ 2.42.3（第 1 条）：点对点接收器换口时不许抢占广播口 47832。
             r.setReservedPort(broadcastPort);
             // ★ 2.42.3：抖动目标跟随档位（均衡 = 120ms = 旧默认）。
@@ -2268,7 +2474,7 @@ public final class Engine {
             stopChannelReceiver();
         }
         try {
-            AudioRecv r = new AudioRecv(app, broadcastPort);
+            AudioRecv r = new AudioRecv(app, broadcastPort, hostGate);
             // ★ 2.42.3（第 1 条）：广播接收器换口时不许抢占点对点口 47831。
             r.setReservedPort(audioPort);
             r.setTargetBufferMs(targetMsFor(qualityPreset));
@@ -4353,18 +4559,42 @@ public final class Engine {
 
     /** 去重（同一台设备的第 2 条流被抑制）的情况，给人看的一句话；没有就返回空串。 */
     public String dupRouteStatsText() {
-        AudioRecv.Stats st = recvStats();
-        if (st == null || st.dupRoutePackets <= 0) {
+        AudioRecv.Stats a = recvStats();
+        AudioRecv.Stats b = null;
+        AudioRecv c = channelReceiver;
+        if (c != null) {
+            try {
+                b = c.stats();
+            } catch (Throwable ignored) {
+                b = null;
+            }
+        }
+        long dup = (a == null ? 0 : a.dupRoutePackets) + (b == null ? 0 : b.dupRoutePackets);
+        long cross = (a == null ? 0 : a.crossReceiverDup) + (b == null ? 0 : b.crossReceiverDup);
+        if (dup <= 0 && cross <= 0) {
             return "";
         }
-        StringBuilder sb = new StringBuilder(160);
-        sb.append("已抑制 ").append(st.dupRoutePackets).append(" 个包（同一台设备的第 2 条流，绝不叠加播放）");
-        if (st.dupRouteConfirmed > 0) {
-            sb.append("；其中 ").append(st.dupRouteConfirmed)
+        StringBuilder sb = new StringBuilder(200);
+        sb.append("已抑制 ").append(dup).append(" 个包（同一台设备的第 2 条流，绝不叠加播放）");
+        long confirmed = (a == null ? 0 : a.dupRouteConfirmed) + (b == null ? 0 : b.dupRouteConfirmed);
+        if (confirmed > 0) {
+            sb.append("；其中 ").append(confirmed)
                     .append(" 个包内容指纹相同 → 确认是同一份声音从两条路进来（广播 + 点对点路由）");
         }
-        if (st.dupRouteText != null && st.dupRouteText.length() > 0) {
-            sb.append("；").append(st.dupRouteText);
+        if (cross > 0) {
+            sb.append("；跨接收器（广播 ↔ 点对点）抑制 ").append(cross).append(" 个包");
+            String text = b != null && b.crossReceiverText != null && b.crossReceiverText.length() > 0
+                    ? b.crossReceiverText
+                    : (a == null ? "" : a.crossReceiverText);
+            if (text != null && text.length() > 0) {
+                sb.append("；").append(text);
+            }
+        }
+        String text = b != null && b.dupRouteText != null && b.dupRouteText.length() > 0
+                ? b.dupRouteText
+                : (a == null ? "" : a.dupRouteText);
+        if (text != null && text.length() > 0) {
+            sb.append("；").append(text);
         }
         return sb.toString();
     }

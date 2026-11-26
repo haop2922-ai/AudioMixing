@@ -1030,6 +1030,33 @@ class RawAudioServer(threading.Thread):
         self.stop_event.set()
 
 
+def open_local_file(path) -> str:
+    """用系统默认程序打开本地文件；没有关联程序时依次降级到记事本、资源管理器。
+
+    ★ 2026-11-23 用户现场：这台机器没给 `.json` 关联任何程序，`os.startfile` 抛
+      `WinError -2147221003 找不到应用程序`，面板只弹一条红字，看起来像配置坏了。
+      返回实际用的方式（default / notepad / explorer）；空串表示三条路都没成功。
+    """
+    import subprocess
+
+    p = str(path)
+    attempts: list[tuple[str, Callable[[], Any]]] = []
+    if os.name == "nt":
+        attempts.append(("default", lambda: os.startfile(p)))
+        attempts.append(("notepad", lambda: subprocess.Popen(["notepad.exe", p])))
+        attempts.append(("explorer", lambda: subprocess.Popen(["explorer.exe", "/select,%s" % p])))
+    else:
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
+        attempts.append(("default", lambda: subprocess.Popen([opener, p])))
+    for name, fn in attempts:
+        try:
+            fn()
+            return name
+        except OSError:
+            continue
+    return ""
+
+
 class AudioMixingApi:
     """Thin logic layer; the HTTP handler only parses and serialises."""
 
@@ -1569,7 +1596,11 @@ class AudioMixingApi:
         return self.node.purge_stale_routes()
 
     def devices(self) -> dict[str, Any]:
-        self.node.refresh_devices(force=True)
+        # ★ 2.46.11：这里**不能** force=True。主面板每 800ms 调一次本接口，
+        #   强制枚举会反复打开所有 WASAPI 端点（包括蓝牙 A2DP）读混音格式，
+        #   用户听到的就是蓝牙音频一卡一卡。设备表 4 秒内复用缓存完全够用；
+        #   真正要"刷新设备"的按钮走 /api/multiout?refresh=1（显式强制）。
+        self.node.refresh_devices(force=False)
         return {
             "sources": self.node.source_list(),
             "sinks": self.node.sink_list(),
@@ -3057,6 +3088,78 @@ class AudioMixingApi:
                 self.node.note("手动关闭收听时处理路由失败：%s" % exc)
 
     # -- POST --------------------------------------------------------------
+    def mcp_config(self) -> dict[str, Any]:
+        """★ 2.46.1：给「详细 → 设置 → AI 控制」生成 MCP 客户端配置。
+
+        打包运行时 command 就是当前主 exe + `--mcp`（单 exe，不再有第二个文件）；
+        源码运行时才回退到 python + audiomixing_launcher.py --mcp。
+        配置必须按"当前 exe 路径 + 当前端口"现生成，不能随安装包写死。
+        """
+        import json
+        import os
+        import pathlib
+        import sys
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        main_exe = pathlib.Path(sys.argv[0]).resolve() if sys.argv else pathlib.Path("")
+        port = int(getattr(self.node.config, "web_port", 17800) or 17800)
+        env = {"AUDIOMIXING_URL": "http://127.0.0.1:%d" % port}
+        if main_exe.suffix.lower() == ".exe":
+            # ★ 2.46.1：单 exe —— 主程序自己带 --mcp，不再需要第二个文件。
+            command, args, mode = str(main_exe), ["--mcp"], "self"
+        else:
+            launcher = root / "audiomixing_launcher.py"
+            if not launcher.is_file():
+                return {"ok": False, "error": "找不到 audiomixing_launcher.py"}
+            command, args, mode = sys.executable, [str(launcher), "--mcp"], "python"
+        target = pathlib.Path(command)
+        block = {"mcpServers": {"audiomixing": {
+            "command": command, "args": args, "env": env,
+        }}}
+        return {
+            "ok": True,
+            "mode": mode,
+            "command": command,
+            "args": args,
+            "env": env,
+            "path": str(target),
+            "config": json.dumps(block, ensure_ascii=False, indent=2),
+            "hint": "把下面的配置粘到 AI 客户端的 MCP 设置里（只需一次）。"
+                    "Claude Desktop：设置 → 开发者 → 编辑配置；Trae：设置 → MCP。"
+                    "Audio Mixing 运行时，AI 就能看到 audiomixing 工具，不需要读文档。",
+        }
+
+    def mcp_open(self) -> dict[str, Any]:
+        """★ 2.46.1：把配置写到 %APPDATA%\\AudioMixing\\mcp\\，并尽力帮用户打开。
+
+        ★ 2026-11-23 用户现场：这台机器没有 .json 关联程序，os.startfile 直接报
+          WinError -2147221003。现在降级为 默认程序 → 记事本 → 资源管理器选中，
+          且无论能否打开都把 config 回传，前端可直接预览/复制。
+        """
+        import pathlib
+
+        cfg = self.mcp_config()
+        if not cfg.get("ok"):
+            return cfg
+        root = pathlib.Path(os.environ.get("APPDATA") or pathlib.Path.home()) / "AudioMixing" / "mcp"
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            path = root / "audiomixing-mcp.json"
+            path.write_text(str(cfg.get("config") or ""), encoding="utf-8")
+        except OSError as exc:
+            return {"ok": False, "error": "配置文件写入失败：%s" % exc,
+                    "config": cfg.get("config")}
+        opened = open_local_file(path)
+        if not opened:
+            return {"ok": False, "path": str(path), "config": cfg.get("config"),
+                    "hint": cfg.get("hint"),
+                    "error": "配置已生成，但没能自动打开：%s。可点「复制配置」直接粘贴。" % path}
+        hint = cfg.get("hint")
+        if opened == "notepad":
+            hint = "这台电脑没有给 .json 关联程序，已用记事本打开。" + (hint or "")
+        return {"ok": True, "path": str(path), "config": cfg.get("config"),
+                "hint": hint, "opened_with": opened}
+
     def set_routes(self, payload: dict[str, Any]) -> dict[str, Any]:
         routes = payload.get("routes")
         if routes is None and isinstance(payload.get("route"), dict):
@@ -3167,8 +3270,15 @@ class AudioMixingApi:
                 "%s 不是局域网地址。Audio Mixing 只在同一局域网内工作（不做穿透/中继）。" % host,
                 400,
             )
-        port = int(payload.get("port") or self.node.config.discovery_port)
-        audio_port = int(payload.get("audio_port") or self.node.config.audio_port)
+        # ★ 2.46.10：端口来自外部输入（页面/CLI/MCP）；非数字不能抛 500。
+        try:
+            port = int(payload.get("port") or self.node.config.discovery_port)
+        except (TypeError, ValueError):
+            raise ApiError("发现端口必须是整数", 400)
+        try:
+            audio_port = int(payload.get("audio_port") or self.node.config.audio_port)
+        except (TypeError, ValueError):
+            raise ApiError("音频端口必须是整数", 400)
         peer = self.node.registry.add_manual(host, audio_port, str(payload.get("name") or ""))
         if self.node.beacon is not None:
             self.node.beacon.add_manual_target(host, port)
@@ -3492,6 +3602,17 @@ class AudioMixingApi:
                 node.apply_routes()
             except Exception as exc:
                 node.note("「音质档位」立即生效失败：%s" % exc)
+        if "link_preference" in payload:
+            # ★ 2.46.4：点对点链路偏好（auto / wired / wireless）。
+            want = str(payload["link_preference"] or "").strip().lower()
+            if want not in ("auto", "wired", "wireless"):
+                raise ApiError("link_preference 只能是 auto、wired 或 wireless", 400)
+            node.set_link_preference(want)
+            changed.append("link_preference")
+        if "usb_auto" in payload:
+            # ★ 2.46.8：把原值交给 set_usb_auto 归一（字符串 "false" 不能变成开）。
+            node.set_usb_auto(payload["usb_auto"])
+            changed.append("usb_auto")
         if "channel_sources" in payload:
             raw = payload["channel_sources"]
             if isinstance(raw, str):
@@ -3518,17 +3639,24 @@ class AudioMixingApi:
                 )
             node.config.channel_sources = wanted
             changed.append("channel_sources")
+        # ★ 2.46.9：抖动缓冲必须在这里处理。上一版它被错误地缩进到了下面
+        #   「autoconnect 已下线」的 raise 之后 —— 永远不会执行，设置页里改
+        #   抖动缓冲完全没反应（也没有任何报错）。
+        if "jitter_ms" in payload:
+            try:
+                jitter = float(payload["jitter_ms"])
+            except (TypeError, ValueError):
+                raise ApiError("jitter_ms 必须是数字", 400)
+            jitter = max(rtpaudio.JITTER_MIN_MS,
+                         min(rtpaudio.JITTER_MAX_MS, jitter))
+            node.config.jitter_ms = jitter
+            for buf in node.receiver.buffers.values():
+                buf.target_frames = jitter * 48
+            changed.append("jitter_ms")
         if "autoconnect" in payload:
             # ★ v2.42：蓝牙「智连」已整条下线（和「打开」重复），旧面板/旧脚本再发
             #   这个字段时不再落盘 —— 明确告诉调用方它没了，而不是静默写入一份没人读的配置。
             raise ApiError("蓝牙「智连」已下线：请用蓝牙卡片上的「打开 / 关闭」")
-            if "jitter_ms" in payload:
-                node.config.jitter_ms = float(payload["jitter_ms"])
-                for buf in node.receiver.buffers.values():
-                    buf.target_frames = max(
-                    rtpaudio.JITTER_MIN_MS, min(rtpaudio.JITTER_MAX_MS, float(payload["jitter_ms"]))
-                    ) * 48
-                changed.append("jitter_ms")
         # 端口自定义：别的软件占着端口、或同一局域网多人各用一套时，
         # 用户可以在「设置」页里改成自己机器空闲的端口。
         # ★ 端口在进程启动时就绑死了，所以这里只落盘，返回 restart_required，
@@ -3561,6 +3689,11 @@ class AudioMixingApi:
             current.update(wanted_ports)
             # ★ 2.42.2：广播端口必须与点对点端口分开；改了点对点口就自动跟着 +1。
             if "audio_port" in wanted_ports and "broadcast_port" not in wanted_ports:
+                # ★ 2.46.10：65534 没有下一个端口可作广播端口 —— 不挡住就会把
+                #   broadcast_port 写成 65535，保存"成功"、重启却绑不上。
+                if current["audio_port"] >= 65534:
+                    raise ApiError("音频端口 65534 没有下一个端口可作广播端口，"
+                                   "请改成 65533 或更小", 400)
                 current["broadcast_port"] = current["audio_port"] + 1
                 wanted_ports["broadcast_port"] = current["broadcast_port"]
             if len(set(current.values())) != len(current):
@@ -4159,7 +4292,6 @@ class _Handler(BaseHTTPRequestHandler):
                 info = apk_info()
                 self._json(200, {
                     "available": apk is not None,
-                    "name": apk.name if apk else "",
                     "size_mb": round(apk.stat().st_size / 1048576.0, 1) if apk else 0,
                     "size_kb": round(apk.stat().st_size / 1024.0, 1) if apk else 0,
                     # A stamp on the file itself: "did the web page give me the new build?"
@@ -4254,6 +4386,9 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/api/routes":
                 self._json(200, self.api.routes())
                 return
+            if path == "/api/mcp/config":
+                self._json(200, self.api.mcp_config())
+                return
             if path == "/api/devices":
                 self._json(200, self.api.devices())
                 return
@@ -4324,14 +4459,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200, self.api.netcheck())
                 return
             if path == "/api/monitor/disconnect":
-                # 监控页每行的"断开"。判定统一在 api.monitor_disconnect() 里（见那里的说明），
-                # 这里只负责取参数 + 转发 —— 以前这里和 POST 分支各抄了一份判定，加一种 kind
-                # 就得改两处、必然漏一处。
-                body = self._read_json() if method == "POST" else {}
-                kind = str(body.get("kind") or "")
-                target = str(body.get("id") or "")
-                code, result = self.api.monitor_disconnect(kind, target)
-                self._json(code, result)
+                # ★ 2.46.9：GET 分支曾经引用未定义的 `method`（NameError → 500）。
+                #   断开是写操作，只允许 POST；GET 直接说清楚。
+                self._json(405, {"error": "断开只能用 POST"})
                 return
             if path == "/qr":
                 # 手机上扫一下就进来，省得手输 IP。参数 what=listen|app，
@@ -4362,11 +4492,12 @@ class _Handler(BaseHTTPRequestHandler):
                 # ★ 2026-11-17 蓝牙卡顿：面板每秒轮询原来会把同一份设备清单枚举三次
                 #   （available / endpoints / lock 各一次），每次枚举都会打开所有端点
                 #   （包括蓝牙）读混音格式。这里只枚举一次，三处共用。
+                # ★ 2.46.11：默认走 refresh_devices() 的 4 秒缓存，别再每秒枚举；
+                #   多耳机页的「刷新设备」按钮显式带 ?refresh=1 才强制重扫。
                 devices_now: list = []
                 try:
-                    from .audio import base as audio_base
-
-                    devices_now = audio_base.list_all_devices()
+                    devices_now = node.refresh_devices(
+                        force=("refresh=1" in (parsed.query or "")))
                 except Exception:
                     devices_now = []
                 # ★ Q2：GET 也必须排除「系统默认输出 / 正在采集的那块」。
@@ -4523,12 +4654,15 @@ class _Handler(BaseHTTPRequestHandler):
                         items.append(item)
                 # ★ Q2：页面可以改「锁到哪块设备」；空字符串 = 不锁（默认推荐），
                 #   所以必须允许把它改回空，否则用户永远取消不了锁定。
-                if "lock_device" in body:
+                # ★ 2.46.9：拖音量滑杆的请求（?gain=1）走快速路径：只合并增益，
+                #   不碰锁、不写配置，否则每 180ms 一次会反复枚举端点 + 写盘。
+                gain_only = "gain=1" in self.path
+                if not gain_only and "lock_device" in body:
                     self.api.node.config.multi_lock_device = str(body.get("lock_device") or "").strip()
-                self.api.node.set_multi_out(items)
+                self.api.node.set_multi_out(items, gain_only=gain_only)
                 out = self.api.node.multi_out.stats()
                 out = _multi_view(self.api.node, out)
-                if "gain=1" in self.path:
+                if gain_only:
                     # 拖动滑杆的纯增益请求：不读锁、不再枚举端点。
                     # 否则每 160ms 一次会反复打开所有端点（含蓝牙）。
                     out["lock"] = {}
@@ -4561,6 +4695,20 @@ class _Handler(BaseHTTPRequestHandler):
                 code, result = self.api.monitor_disconnect(
                     str(body.get("kind") or ""), str(body.get("id") or ""))
                 self._json(code, result)
+            elif path == "/api/mcp/open":
+                # 打开文件属于本机动作；局域网里的手机/别的电脑不能触发。
+                import socket
+                host = str(self.client_address[0])
+                local = host in ("127.0.0.1", "::1", "localhost")
+                if not local:
+                    try:
+                        local = host in set(socket.gethostbyname_ex(socket.gethostname())[2])
+                    except OSError:
+                        local = False
+                if not local:
+                    self._json(403, {"ok": False, "error": "AI 控制只允许在本机打开配置文件"})
+                else:
+                    self._json(200, self.api.mcp_open())
             elif path == "/api/routes":
                 self._json(200, self.api.set_routes(body))
             elif path == "/api/routes/add":
@@ -5100,6 +5248,18 @@ def _best_local_address(node, report: dict[str, Any]) -> str:
               and not str(i.get("address")).startswith(("127.", "169.254."))]
     if not usable:
         return "127.0.0.1"
+    pref = "auto"
+    try:
+        pref = str(getattr(node.config, "link_preference", "auto") or "auto").strip().lower()
+    except Exception:
+        pref = "auto"
+    if pref not in ("auto", "wired", "wireless"):
+        pref = "auto"
+    # ★ 2.46.4：虚拟网卡（Hyper-V / WSL / VPN / 蓝牙 PAN）不参与"手机该连哪个"，
+    #   除非整台机器只剩虚拟网卡。
+    real = [i for i in usable if str(i.get("type") or "").lower() != "virtual"]
+    if real:
+        usable = real
     peer_hosts: set[str] = set()
     try:
         for item in (node.registry.snapshot() or []):
@@ -5121,18 +5281,38 @@ def _best_local_address(node, report: dict[str, Any]) -> str:
             peer_nets.add(str(ipaddress.ip_interface("%s/24" % host).network))
         except ValueError:
             continue
-    same_subnet = [i for i in usable if str(i.get("subnet") or "") in peer_nets]
-    if same_subnet:
-        return str(same_subnet[0].get("address"))
 
-    def _rank(item: dict[str, Any]) -> tuple[int, str]:
+    def _link_rank(item: dict[str, Any]) -> int:
+        kind = str(item.get("type") or "other").lower()
+        if pref == "wireless":
+            order = {"wireless": 0, "usb": 1, "wired": 2, "other": 3, "virtual": 4}
+        else:
+            order = {"usb": 0, "wired": 1, "wireless": 2, "other": 3, "virtual": 4}
+        return order.get(kind, 3)
+
+    def _rank(item: dict[str, Any]) -> tuple[int, int, str]:
         addr = str(item.get("address") or "")
         if addr.startswith("192.168."):
-            return (0, addr)
-        if addr.startswith("10."):
-            return (1, addr)
-        return (2, addr)  # 172.16~31 段（WSL / Hyper-V）和其余公网地址排在最后
+            ip_rank = 0
+        elif addr.startswith("10."):
+            ip_rank = 1
+        else:
+            ip_rank = 2  # 172.16~31 段（WSL / Hyper-V）和其余公网地址排在最后
+        return (_link_rank(item), ip_rank, addr)
 
+    same_subnet = [i for i in usable if str(i.get("subnet") or "") in peer_nets]
+    if same_subnet:
+        return str(sorted(same_subnet, key=_rank)[0].get("address"))
+    # 没有已知对端同网段：按偏好过滤。强制有线但一块有线都没有时，仍然回退到全部，
+    # 不能为了"优先"把唯一能用的 Wi-Fi 地址也丢掉。
+    if pref == "wired":
+        preferred = [i for i in usable if str(i.get("type") or "").lower() in ("usb", "wired")]
+    elif pref == "wireless":
+        preferred = [i for i in usable if str(i.get("type") or "").lower() == "wireless"]
+    else:
+        preferred = []
+    if preferred:
+        usable = preferred
     return str(sorted(usable, key=_rank)[0].get("address"))
 
 

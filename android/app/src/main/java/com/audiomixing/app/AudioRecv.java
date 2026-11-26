@@ -137,7 +137,7 @@ public final class AudioRecv {
         public long badShort;
         /** 是我们的包，但编码不是 PCM16（手机只有 PCM16，Opus/浮点都解不了）。 */
         public long badCodec;
-        /** 是我们的 PCM16 包，但帧长不是 480 帧这一档。 */
+        /** 是我们的 PCM16 包，但负载超过 8 块 × 1920 字节（80ms）。 */
         public long badFrames;
         /** 各类最近一个坏包的现场（人话，直接抄进诊断报告）。 */
         public String lastMagicSample = "";
@@ -169,6 +169,10 @@ public final class AudioRecv {
         public long dupRouteConfirmed;
         /** 现场描述：谁的哪两条 ssrc 在打架。 */
         public String dupRouteText = "";
+        /** ★ 2.31.2：被另一个接收器（广播 ↔ 点对点）抑制掉的包数。 */
+        public long crossReceiverDup;
+        /** 跨接收器抑制的现场描述。 */
+        public String crossReceiverText = "";
         /**
          * ★ 对面报的 samples 和负载长度对不上的次数（包照收，不算坏包）。
          * 电脑端历史版本填的是累计帧偏移，就靠这一条看出来。
@@ -216,8 +220,14 @@ public final class AudioRecv {
     // 代价（必须说清楚，不藏着）：如果某一台设备<b>故意</b>同时给你送两路不同的声音
     //   （比如电脑的系统声音 + 电脑的麦克风），这里只会播其中一路 —— 另一路会被抑制，
     //   并在诊断报告里写明"抑制了谁"。宁可少一路，也不要叠着放把音量翻倍。
-    /** 每台设备当前允许出声的那条流（ssrc）。只由收包线程读写。 */
-    private final Map<String, Integer> hostActiveSsrc = new HashMap<>();
+    /**
+     * ★ 2.31.2：跨接收器共享的“一台设备只播一条流”闸门。
+     * 广播接收器和点对点接收器必须用同一份，否则同一台电脑的两条流会叠着播。
+     */
+    private final HostGate hostGate;
+    /** 被另一个接收器抑制掉的包数（跨接收器重复流的直接证据）。 */
+    private volatile long crossReceiverDup;
+    private volatile String crossReceiverText = "";
     /** 被抑制掉的重复流包数 / 其中"内容指纹确认是同一份声音"的包数。 */
     private volatile long dupRoutePackets;
     private volatile long dupRouteConfirmed;
@@ -360,8 +370,17 @@ public final class AudioRecv {
      * 包被攒到 DTIM 周期才一起送上来，抖动缓冲会被瞬间冲垮（听感就是周期性的卡顿）。
      */
     public AudioRecv(Context context, int port) {
+        this(context, port, new HostGate());
+    }
+
+    /**
+     * ★ 2.31.2：传入和另一个接收器共用的 {@link HostGate}。
+     * Engine 给点对点接收器和广播接收器各传同一份，跨端口的重复流才能互相看见。
+     */
+    public AudioRecv(Context context, int port, HostGate gate) {
         this.appCtx = context == null ? null : context.getApplicationContext();
         this.port = port > 0 ? port : Proto.DEFAULT_AUDIO_PORT;
+        this.hostGate = gate == null ? new HostGate() : gate;
     }
 
     // ------------------------------------------------------------------ 对外
@@ -435,6 +454,7 @@ public final class AudioRecv {
             }
         }
         streams.clear();
+        hostGate.releaseAll(this);
         releaseTrack();
         releaseWifiLock();
         peak = 0f;
@@ -602,6 +622,8 @@ public final class AudioRecv {
         st.dupRoutePackets = dupRoutePackets;
         st.dupRouteConfirmed = dupRouteConfirmed;
         st.dupRouteText = dupRouteText;
+        st.crossReceiverDup = crossReceiverDup;
+        st.crossReceiverText = crossReceiverText;
         st.samplesMismatch = samplesMismatch;
         st.lastSamplesNote = lastSamplesNote;
         st.trackErrors = trackErrors;
@@ -879,11 +901,14 @@ public final class AudioRecv {
         // 新判据（只看负载；PCM16 立体声一包 1920 字节 = 480 帧 = 10ms）：
         //   · plen == 1920 → 收下（标准包）
         //   · plen <  1920 → 收下，尾巴补零（短读早就有这个能力，几毫秒静音听不出来）
-        //   · plen >  1920 → 拒绝（这才是真的"一包里塞了不止 480 帧"，我们不做重采样）
+        //   · plen >  1920 → ★ 2.31.2：允许最多 8 块（80ms），接收端自己切成 480 帧
+        //     一块再进抖动缓冲。2.42.3 的「流畅」档一包 960 帧（3840 字节），原来这里
+        //     一律拒收，手机等于全程静音；切成两块后老电脑也能正常播。
         // samples 只作参考：和负载对不上就记一笔、在诊断报告里写人话，绝不因此拒收。
-        if (plen > FRAME_BYTES) {
+        int chunks = (plen + FRAME_BYTES - 1) / FRAME_BYTES;
+        if (chunks > 8) {
             bumpBad(12, host, len);
-            sampleBad(5, buf, len, from, "负载 " + plen + " 字节 > 一包 " + FRAME_BYTES
+            sampleBad(5, buf, len, from, "负载 " + plen + " 字节 > 8×" + FRAME_BYTES
                     + " 字节（samples=" + pkt.samples + "）");
             return;
         }
@@ -908,7 +933,12 @@ public final class AudioRecv {
         // （它们单独记在 dupRoutePackets，报告里分开写，免得"收包很多却没声音"这种假象）。
         bump(0);
         Stream stream = streamFor(host, pkt.ssrc);
-        stream.store(pkt.seq, pkt.payload, plen, (pkt.flags & Proto.FLAG_SILENCE) != 0);
+        boolean silent = (pkt.flags & Proto.FLAG_SILENCE) != 0;
+        if (chunks <= 1) {
+            stream.store(pkt.seq, pkt.payload, plen, silent);
+        } else {
+            stream.storeChunks(pkt.seq, pkt.payload, plen, silent);
+        }
     }
 
     /**
@@ -918,32 +948,17 @@ public final class AudioRecv {
      *         （调用方据此抑制这一包）。
      */
     private Integer acceptStreamFor(String host, int ssrc) {
-        Integer cur = hostActiveSsrc.get(host);
-        if (cur == null) {
-            if (hostActiveSsrc.size() < 32) {      // 上限：防被人乱刷撑爆
-                hostActiveSsrc.put(host, ssrc);
+        long now = SystemClock.elapsedRealtime();
+        Integer cur = hostGate.allow(host, ssrc, this, now);
+        if (cur != null) {
+            Object owner = hostGate.ownerOf(host);
+            if (owner != null && owner != this) {
+                crossReceiverDup++;
+                crossReceiverText = host + "：另一个接收器正在放 ssrc "
+                        + Integer.toHexString(cur) + "，本路已抑制（同一台设备不叠着播）";
             }
-            return null;
-        }
-        if (cur == ssrc) {
-            return null;
-        }
-        // 已经有一条在放：它还在发吗？走了/断了就把位置让给新的这条。
-        Stream act = findStream(host, cur);
-        if (act == null || SystemClock.elapsedRealtime() - act.lastPacketMs > STREAM_IDLE_MS) {
-            hostActiveSsrc.put(host, ssrc);
-            return null;
         }
         return cur;
-    }
-
-    private Stream findStream(String host, int ssrc) {
-        for (Stream s : streams) {
-            if (s.ssrc == ssrc && host.equals(s.host)) {
-                return s;
-            }
-        }
-        return null;
     }
 
     /** 某台设备现在有没有在出声（界面用：显示"实际生效状态"）。 */
@@ -1497,52 +1512,79 @@ public final class AudioRecv {
             lastPacketMs = now;
             received++;
             synchronized (this) {
-                if (codec != Proto.CODEC_PCM_S16) {
-                    resetForCodec(Proto.CODEC_PCM_S16);
+                storeLocked(seq, payload, 0, len, silent, now);
+            }
+        }
+
+        /**
+         * ★ 2.31.2：一包 PCM16 里塞了多块 480 帧（960/2880 帧）时按块拆开。
+         *
+         * <p>老电脑 2.42.3 的「流畅」档发的是 960 帧/包（3840 字节），原来接收端
+         * 直接判 badFrames 丢掉，手机等于全程静音。拆开之后抖动缓冲和播放线程
+         * 完全不用知道原包多大。
+         */
+        void storeChunks(int seq, byte[] payload, int totalLen, boolean silent) {
+            long now = SystemClock.elapsedRealtime();
+            lastPacketMs = now;
+            received++;          // received 按“一包”计一次，不按拆出来的块数
+            int chunks = (totalLen + FRAME_BYTES - 1) / FRAME_BYTES;
+            synchronized (this) {
+                for (int i = 0; i < chunks; i++) {
+                    int off = i * FRAME_BYTES;
+                    int n = Math.min(FRAME_BYTES, totalLen - off);
+                    storeLocked((seq + i) & 0xFFFF, payload, off, n, silent, now);
                 }
-                if (nextSeq < 0) {
-                    // 这条流的第一包：它就是播放的起点，预缓冲计时也从这一刻开始。
-                    nextSeq = seq;
-                    highestSeq = seq;
-                    prebufStartMs = now;
-                } else {
-                    int d = (seq - nextSeq) & 0xFFFF;
-                    if (d >= 0x8000) {
-                        late++;       // 已经播过这个序号了（迟到/重复的老包），不能倒回去播
-                        return;
-                    }
-                    if (d >= SLOTS) {
-                        late++;       // 太超前，缓冲装不下：说明我们这边卡了很久，丢比塞进去更安全
-                        return;
-                    }
-                    if (((seq - nextSeq) & 0xFFFF) > ((highestSeq - nextSeq) & 0xFFFF)) {
-                        highestSeq = seq;
-                    }
-                }
-                int idx = seq & MASK;
-                if (filled[idx]) {
-                    dup++;
+            }
+        }
+
+        /** 已持有 this 锁时调用；offset 用于长包拆块，普通包传 0。 */
+        private void storeLocked(int seq, byte[] payload, int offset, int len,
+                                 boolean silent, long now) {
+            if (codec != Proto.CODEC_PCM_S16) {
+                resetForCodec(Proto.CODEC_PCM_S16);
+            }
+            if (nextSeq < 0) {
+                // 这条流的第一包：它就是播放的起点，预缓冲计时也从这一刻开始。
+                nextSeq = seq;
+                highestSeq = seq;
+                prebufStartMs = now;
+            } else {
+                int d = (seq - nextSeq) & 0xFFFF;
+                if (d >= 0x8000) {
+                    late++;       // 已经播过这个序号了（迟到/重复的老包），不能倒回去播
                     return;
                 }
-                byte[] slot = slots[idx];
-                if (silent || len <= 0) {
-                    // 对端明确标了"静音"：占住槽位但不拷数据，播放时就不会把它算成丢包。
-                    Arrays.fill(slot, (byte) 0);
-                } else if (gain == 1f) {
-                    // 绝大多数情况走这条：原样拷贝，一次乘法都不做。
-                    System.arraycopy(payload, 0, slot, 0, len);
-                    if (len < FRAME_BYTES) {
-                        Arrays.fill(slot, len, FRAME_BYTES, (byte) 0);   // 短包尾巴补零
-                    }
-                } else {
-                    // ★ 这一台自己设了增益（"我听它的"滑杆）：只乘这一路的样本，别的流不受影响。
-                    scalePcm16(payload, slot, len, gain);
-                    if (len < FRAME_BYTES) {
-                        Arrays.fill(slot, len, FRAME_BYTES, (byte) 0);
-                    }
+                if (d >= SLOTS) {
+                    late++;       // 太超前，缓冲装不下：说明我们这边卡了很久，丢比塞进去更安全
+                    return;
                 }
-                filled[idx] = true;
+                if (((seq - nextSeq) & 0xFFFF) > ((highestSeq - nextSeq) & 0xFFFF)) {
+                    highestSeq = seq;
+                }
             }
+            int idx = seq & MASK;
+            if (filled[idx]) {
+                dup++;
+                return;
+            }
+            byte[] slot = slots[idx];
+            if (silent || len <= 0) {
+                // 对端明确标了"静音"：占住槽位但不拷数据，播放时就不会把它算成丢包。
+                Arrays.fill(slot, (byte) 0);
+            } else if (gain == 1f) {
+                // 绝大多数情况走这条：原样拷贝，一次乘法都不做。
+                System.arraycopy(payload, offset, slot, 0, len);
+                if (len < FRAME_BYTES) {
+                    Arrays.fill(slot, len, FRAME_BYTES, (byte) 0);   // 短包尾巴补零
+                }
+            } else {
+                // ★ 这一台自己设了增益（"我听它的"滑杆）：只乘这一路的样本，别的流不受影响。
+                scalePcm16(payload, offset, slot, len, gain);
+                if (len < FRAME_BYTES) {
+                    Arrays.fill(slot, len, FRAME_BYTES, (byte) 0);
+                }
+            }
+            filled[idx] = true;
         }
 
         /**
@@ -1555,8 +1597,13 @@ public final class AudioRecv {
          * <p>超过 32767 必须削顶 —— 回绕会变成刺耳的爆音。
          */
         private void scalePcm16(byte[] src, byte[] dst, int len, float g) {
+            scalePcm16(src, 0, dst, len, g);
+        }
+
+        /** ★ 2.31.2：带源偏移的版本，长包拆块时每块从 offset 开始乘。 */
+        private void scalePcm16(byte[] src, int offset, byte[] dst, int len, float g) {
             for (int i = 0; i + 1 < len; i += 2) {
-                int v = (short) ((src[i] & 0xFF) | ((src[i + 1] & 0xFF) << 8));
+                int v = (short) ((src[offset + i] & 0xFF) | ((src[offset + i + 1] & 0xFF) << 8));
                 int out = Math.round(v * g);
                 if (out > 32767) {
                     out = 32767;

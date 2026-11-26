@@ -810,6 +810,65 @@ html:not(.fullui) .card .body { padding-top: 6px; }
 .mocard .ctr .v{font-size:11px;opacity:.9;min-width:34px;text-align:right}
 .mocard .fb{font-size:10.5px;line-height:1.45;margin-top:5px;color:#fbbf24;
   border-left:2px solid rgba(251,191,36,.55);padding-left:6px}
+/* ★ 2026-11-26：详细档的「音源 × 输出设备」矩阵。
+   格子蓝＝这条音源混进这台设备；最后一行/列折叠；左上全开、右下全关。 */
+.momatrixwrap{margin:0 0 10px;border:1px solid var(--line);border-radius:12px;
+  overflow:auto;max-height:min(60vh,620px)}
+.momatrixwrap[hidden]{display:none}
+.momatrix{border-collapse:separate;border-spacing:0;min-width:max-content;font-size:12px}
+.momatrix th,.momatrix td{border-right:1px solid var(--line);border-bottom:1px solid var(--line);
+  padding:0;height:40px;text-align:center;vertical-align:middle;background:transparent}
+.momatrix tr:last-child th,.momatrix tr:last-child td{border-bottom:0}
+.momatrix th:last-child,.momatrix td:last-child{border-right:0}
+.momatrix thead th{position:sticky;top:0;z-index:3;background:#0b1220;min-width:96px;max-width:150px;
+  padding:0 8px;font-weight:600;color:var(--fg);white-space:nowrap;cursor:pointer}
+.momatrix tbody th.src{position:sticky;left:0;z-index:2;background:#0b1220;min-width:120px;
+  max-width:180px;padding:0 10px;text-align:left;font-weight:600;color:var(--fg);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}
+.momatrix thead th.corner{left:0;z-index:4;background:#151a12;color:#fde68a;
+  border-right:1px solid rgba(251,191,36,.35);cursor:pointer}
+.momatrix thead th.corner:hover{background:#1d2318}
+.momatrix th.dev .gear{float:right;margin-left:6px;background:none;border:0;color:var(--dim);
+  cursor:pointer;font-size:12px;padding:0 2px;line-height:1}
+.momatrix th.dev .gear:hover{color:var(--acc)}
+.momatrix td.cell{width:84px;min-width:84px;cursor:pointer;background:rgba(255,255,255,.018);
+  transition:background .12s}
+.momatrix td.cell:hover{background:rgba(56,189,248,.10)}
+.momatrix td.cell.on{background:linear-gradient(140deg,rgba(56,189,248,.55),rgba(99,102,241,.42));
+  box-shadow:inset 0 0 0 1px rgba(56,189,248,.55)}
+.momatrix td.cell.on::after{content:'✓';color:#04121f;font-weight:700;font-size:12px}
+.momatrix td.cell.pt{background:rgba(56,189,248,.10);cursor:default}
+.momatrix td.cell.off{opacity:.35;cursor:not-allowed;background:transparent}
+.momatrix th.fold{background:rgba(255,255,255,.035);color:var(--dim2);font-weight:500;
+  font-size:11.5px;cursor:pointer;min-width:84px;max-width:120px;padding:0 6px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.momatrix th.fold:hover{color:var(--fg);background:rgba(255,255,255,.07)}
+.momatrix th.fold.empty{cursor:default;background:transparent}
+/* 折叠列贴住右边：设备多的时候不用先滚到底才能折叠 */
+.momatrix tr > th.fold:last-child{position:sticky;right:0;z-index:2;background:#0b1220}
+.momatrix tr > th.corner-off{position:sticky;right:0;z-index:3}
+.momatrix th.corner-off{background:rgba(248,113,113,.12);color:#fca5a5;font-weight:600;
+  cursor:pointer;min-width:96px;padding:0 8px}
+.momatrix th.corner-off:hover{background:rgba(248,113,113,.22)}
+.mofolded{margin-top:8px;font-size:12px;color:var(--dim);display:flex;gap:6px;
+  flex-wrap:wrap;align-items:center}
+.mofolded button{font:inherit;font-size:11.5px;padding:2px 9px;border-radius:999px;
+  border:1px solid var(--line);background:rgba(255,255,255,.04);color:var(--fg);cursor:pointer}
+.mofolded button:hover{border-color:var(--line2)}
+.mopeers{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px;
+  margin-top:12px}
+.mopeers .mohead2{grid-column:1/-1;font-size:12px;color:var(--dim);margin:0 0 -2px}
+.moeditpop{position:fixed;z-index:60;width:260px;padding:12px 14px;border-radius:12px;
+  background:#0b1220;border:1px solid rgba(56,189,248,.4);
+  box-shadow:0 18px 50px rgba(0,0,0,.5);font-size:12px;color:var(--fg)}
+.moeditpop .t{font-weight:600;margin-bottom:8px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
+.moeditpop .r{display:flex;align-items:center;gap:8px;margin:8px 0}
+.moeditpop .r label{width:38px;color:var(--dim);font-size:11.5px;flex:none}
+.moeditpop .r input[type=range]{flex:1;min-width:0;accent-color:#7dd3fc}
+.moeditpop .r input[type=number]{width:64px;font-size:12px;padding:2px 4px}
+.moeditpop .r .v{width:46px;text-align:right;font-size:11.5px;color:var(--dim)}
+.moeditpop .acts{display:flex;justify-content:flex-end;margin-top:8px}
 /* 广播页的「送谁的声音 / 自己再放一份」也用同一套卡片：蓝＝开着，暗＝关着。 */
 .chblock .chhead{font-size:12.5px;color:var(--fg);margin-bottom:8px;display:flex;
   gap:8px;flex-wrap:wrap;align-items:baseline}
@@ -1099,22 +1158,16 @@ html:not(.fullui) .card .body { padding-top: 6px; }
       </div>
     </section>
 
-    <!-- ★ Q2（2026-11-16 用户澄清）：画布单独成一块，不和「多耳机」配置表单挤在一起；
-         进入方式仍然是点「多耳机」标签，不新开页面、不多记一个网址。
-         ★ v2.42：原来下面那张「一台电脑，多个耳机」配置卡整块删掉，
-           只把四样真有用的控件（刷新设备 / 全部停止 / 锁定默认播放到 + 还原 / 状态摘要）
-           挪到画布上方这条紧凑工具条；勾选、改 App、改音量/延迟、锁定都即时生效。 -->
+    <!-- ★ 2026-11-26（用户新需求）：多耳机不再用画布拉线。
+         简洁档＝输出设备卡片墙，点蓝/点暗就是启用/停止（默认放桌面混音）；
+         详细档＝「音源 × 输出设备」矩阵：格子蓝＝这条音源混进这台设备，
+         点行/列表头＝整行/整列接通，最后一行/列折叠，左上全开、右下全关。
+         矩阵只列本机输出设备；系统默认设备是直出，单独一张卡、不可点灭。 -->
     <section class="card" data-card="multiview" data-pane="multi">
-      <h2>多耳机画布<span class="sub">简洁＝卡片墙；复杂＝APP / 输出设备 / 远端音源</span></h2>
+      <h2>多耳机<span class="sub">简洁＝设备卡片；详细＝音源 × 设备矩阵</span></h2>
       <div class="body">
         <div class="mohead" style="margin-top:0">
           <span class="mochip" id="moCanvasSummary">读取中…</span>
-          <!-- ★ 2026-11-16 用户：档位名不能再叫「简洁 / 详细」，会和侧边栏那组撞名；
-               这一组只描述画布密度，改成「简洁 / 复杂」。 -->
-          <div class="moseg" id="moModeSeg">
-            <button data-mode="simple" class="on" type="button">简洁</button>
-            <button data-mode="detail" type="button">复杂</button>
-          </div>
         </div>
         <div class="motools">
           <button id="moStop" class="btn" type="button">全部停止</button>
@@ -1126,21 +1179,20 @@ html:not(.fullui) .card .body { padding-top: 6px; }
           <span id="moStatus" class="mostatus"></span>
         </div>
         <div id="moLockInfo" class="molockinfo"></div>
-        <!-- ★ 2026-11-17 简洁档＝设备卡片墙：蓝＝这一路在放，暗＝没在用。 -->
-        <div id="moCards" class="mocards" hidden></div>
-        <div id="moStage">
-          <div id="moWorld"><svg id="moLines" viewBox="-2000 -2000 4000 4000"></svg></div>
-          <div id="moHint">从 APP / 远端音源的小圆拖到输出设备＝连线（松手即生效）· 点线段的「断开」取消</div>
-          <div id="moZoom">
-            <button class="btn" id="moZOut" type="button">−</button>
-            <button class="btn" id="moZIn" type="button">＋</button>
-            <button class="btn" id="moZFit" type="button">复位</button>
-          </div>
+        <!-- 简洁档：输出设备卡片墙（点蓝＝开始放，点暗＝停）。 -->
+        <div id="moCards" class="mocards"></div>
+        <!-- 详细档：音源（行）× 输出设备（列）矩阵。 -->
+        <div id="moMatrixWrap" class="momatrixwrap" hidden>
+          <div id="moMatrix"></div>
+          <div id="moFolded" class="mofolded" hidden></div>
         </div>
-        <div class="note" style="font-size:12px;margin-top:8px">
-          简洁档＝每个输出设备一张卡：点亮就开始出声，卡内直接调音量/延迟；再点一下停。
-          复杂档＝拉线：APP 或远端声音 → 输出设备（松手即生效），点线段上的「断开」取消。
-          两档都是改完立刻生效，没有「应用」按钮。
+        <!-- 对端设备（把本机声音送给它）：两档都保留；不属于矩阵。 -->
+        <div id="moPeers" class="mopeers"></div>
+        <div class="note" style="font-size:12px;margin-top:8px" id="moNote">
+          <b>简洁：</b>每块输出设备一张卡，点蓝立刻放「桌面混音」，再点一下停。<br>
+          <b>详细：</b>行＝音源，列＝本机输出设备；蓝色格子＝这条音源混进这台设备。
+          点表头＝整行/整列接通，最后一行/列可以折叠，左上「音频全开」、右下「音频全关」。<br>
+          <span class="mini">系统默认设备由 Windows 直出，不在矩阵里；要调某一路音量/延迟，点列头的 🎚。</span>
         </div>
       </div>
     </section>
@@ -1299,6 +1351,43 @@ html:not(.fullui) .card .body { padding-top: 6px; }
           <button id="testBtn" onclick="testTone()" title="在本机默认输出播 2 秒测试音，确认耳机/音箱是通的">测试音箱</button>
         </div>
         <div class="note" style="margin-top:8px">上面是维护工具：连不上先「放行防火墙」；连上但没声音先「恢复声音」；要发问题就点「诊断」。</div>
+        <!-- ★ 2.46.4：点对点链路偏好。有线 = 网线，或手机的「USB 网络共享」。 -->
+        <div class="fields" style="margin-top:12px;align-items:flex-start;gap:8px">
+          <div class="f grow">
+            <label>点对点链路</label>
+            <div class="hint" style="font-size:12px;opacity:.8">
+              自动：<b>USB 网络共享 &gt; 网线 &gt; Wi-Fi</b>（有有线就走有线，没有才走 Wi-Fi）。
+              手动方式：在手机系统里打开「USB 网络共享」即可，不需要 root。
+            </div>
+            <label class="chk" style="margin-top:6px">
+              <input type="checkbox" id="setUsbAuto" style="width:auto">
+              插上 USB 自动触发（需要手机开启 USB 调试 + 电脑有 adb.exe）
+            </label>
+            <div id="setUsbAutoHint" class="hint" style="font-size:11.5px;opacity:.7;margin-top:2px"></div>
+          </div>
+          <span class="tiny" id="linkPrefSeg" style="display:inline-flex;gap:2px;align-items:center">
+            <button class="tiny" data-link="auto" onclick="setLinkPreference('auto')" title="有有线走有线，没有就走 Wi-Fi">自动</button>
+            <button class="tiny" data-link="wired" onclick="setLinkPreference('wired')" title="优先选网线 / USB 网络共享的地址">有线优先</button>
+            <button class="tiny" data-link="wireless" onclick="setLinkPreference('wireless')" title="优先选 Wi-Fi 地址">Wi-Fi 优先</button>
+          </span>
+        </div>
+        <!-- ★ 2.45.1：AI 控制（MCP）。只生成/打开本机配置文件，不联网、不开新端口。 -->
+        <div class="fields" style="margin-top:12px;align-items:flex-start;gap:8px">
+          <div class="f grow">
+            <label>AI 控制（MCP）</label>
+            <div class="hint" style="font-size:12px;opacity:.8">
+              给本机已有的 AI 客户端用（Claude Desktop / Trae / Cursor）。配置里要填这台电脑上
+              exe 的完整路径和当前端口，所以由程序按当前运行位置现生成，不随安装包写死；
+              点「打开配置文件 / 复制配置」，把 mcpServers 段粘到 AI 客户端里，只需登记一次。
+            </div>
+            <div id="mcpConfigBox" style="display:none;margin-top:8px">
+              <pre id="mcpConfigPre" style="white-space:pre-wrap;word-break:break-all;background:#0f1115;border:1px solid #2a2f3a;border-radius:8px;padding:10px;font-size:12px;max-height:220px;overflow:auto"></pre>
+              <div id="mcpConfigHint" class="hint" style="font-size:12px;opacity:.8"></div>
+            </div>
+          </div>
+          <button class="ghost" onclick="openMcpConfig()" title="生成 audiomixing-mcp.json 并用默认程序打开">打开配置文件</button>
+          <button class="ghost" onclick="copyMcpConfig()" title="复制 mcpServers 配置到剪贴板">复制配置</button>
+        </div>
         <!-- ★ 2026-10-16：这里原来还有一个空的 <span id="setMsg">，但 saveSettings()
              走的是 toast()，全页没有任何地方往它写字 —— 一个永远空着的占位，删掉。 -->
         <div class="note" style="margin-top:12px">抖动缓冲越大越抗网络抖动、延迟也越高。有线或 5GHz 可以调到 40ms 以下。</div>
@@ -1427,56 +1516,66 @@ html:not(.fullui) .card .body { padding-top: 6px; }
   </div>
 </div>
 
-      <!-- ★ v2.42：「一台电脑，多个耳机」那张配置卡整块删掉了（用户：「红框内的东西
-           已经没有存在的意义」）。设备清单、勾选行、桌面混音下拉都不再存在；
-           真有用的四样控件已挪进画布卡片的 .motools 工具条。
-           下面这段脚本**必须留在原地**：它按 id 取节点（moStop/moLockDevice/…），
-           节点现在在画布卡片里、文档顺序在它前面，所以照样取得到。 -->
+      <!-- ★ 2026-11-26：多耳机两档（简洁＝设备卡片墙；详细＝音源×设备矩阵）。
+           脚本按 id 取节点（moStop / moLockDevice / moMatrix / …），所以必须留在文档流里；
+           轮询只在「多耳机」页可见时跑，避免每秒枚举蓝牙端点。 -->
       <script>
       (function () {
+        /* ★ 2026-11-26（用户新需求）：多耳机不再用画布拉线。
+           简洁＝输出设备卡片墙：点蓝＝开始放（默认桌面混音），再点一下停。
+           详细＝「音源 × 输出设备」矩阵：格子蓝＝这条音源混进这台设备；
+                  点行/列表头＝整行/整列接通；最后一行/列折叠；左上全开、右下全关。
+           两档共用 cvs.chosen / cvs.routes 这一份数据，改完立刻生效，没有「应用」按钮。 */
         const status = document.getElementById('moStatus');
         const canvasSummary = document.getElementById('moCanvasSummary');
         const lockInfo = document.getElementById('moLockInfo');
         const lockSel = document.getElementById('moLockDevice');
-        // ★ v2.42：那排表单行已删。每一路的音量/延迟/选的 App 都放在 cvs.chosen 这一份
-        //   数据里，卡片墙、画布、apply() 共用它，不再有第二份 DOM 状态。
-        window.addEventListener('pointerup', () => { cvs.holding = false; });
+        const cardsEl = document.getElementById('moCards');
+        const matrixWrap = document.getElementById('moMatrixWrap');
+        const matrixEl = document.getElementById('moMatrix');
+        const foldedEl = document.getElementById('moFolded');
+        const peersEl = document.getElementById('moPeers');
 
-        /* ---------------- 内嵌画布（简洁 / 复杂 两档，同一份数据） ---------------- */
-        const stage = document.getElementById('moStage');
-        const world = document.getElementById('moWorld');
-        const svg = document.getElementById('moLines');
+        const MAX_SOURCES = 8;
+        const FOLD_DEV_KEY = 'am-mo-fold-devices';
+        const FOLD_SRC_KEY = 'am-mo-fold-sources';
+
         const cvs = {
-          // ★ 2026-11-16 用户：画布这组的档位名从「简洁 / 详细」改成「简洁 / 复杂」，
-          //   和侧边栏那组区分开。存储键也换新，避免沿用旧值导致"标签和内容对不上"。
-          mode: (function () {
-            // 直链：?mo=simple / ?mo=detail 覆盖记住的档位（截图核对用）。
-            try {
-              const q = new URLSearchParams(location.search).get('mo');
-              if (q === 'simple' || q === 'detail') return q;
-            } catch (e) {}
-            return localStorage.getItem('am-multi-view') || 'simple';
-          })(),
           order: [], chosen: new Map(), pt: '', capture: {}, peers: [], routes: [],
           selfId: '', selfName: '',
           apps: { supported: false, reason: '', apps: [] },
-          scale: 1, tx: 0, ty: 0,
-          drag: null, pan: null, focus: '', dragged: false,
-          holding: false,
-          link: null, tempLine: null, cut: null,
+          holding: false,       // 音量滑杆拖动中：这一小会儿别用服务端数据盖掉本地值
+          foldedDevices: new Set(loadFold(FOLD_DEV_KEY)),
+          foldedSources: new Set(loadFold(FOLD_SRC_KEY)),
         };
-        if (cvs.mode !== 'simple' && cvs.mode !== 'detail') cvs.mode = 'simple';
 
-        function metrics() {
-          const W = stage.clientWidth || 900;
-          const H = stage.clientHeight || 460;
-          return {
-            // ★ 2026-11-17：简洁档改成卡片墙后，这里只服务复杂档的三列；
-            //   竖向步长低于 100 时 82px 的小圆会叠在一起。
-            colX: Math.max(210, Math.min(400, W * 0.34)),
-            step: (n) => Math.max(100, Math.min(124, (H - 80) / Math.max(1, n))),
-            labelY: -(H / 2) + 26,
-          };
+        function loadFold(key) {
+          try {
+            const v = JSON.parse(localStorage.getItem(key) || '[]');
+            return Array.isArray(v) ? v : [];
+          } catch (e) { return []; }
+        }
+        function saveFold() {
+          try {
+            localStorage.setItem(FOLD_DEV_KEY, JSON.stringify([...cvs.foldedDevices]));
+            localStorage.setItem(FOLD_SRC_KEY, JSON.stringify([...cvs.foldedSources]));
+          } catch (e) {}
+        }
+        /** 和主脚本 uiIsSimple() 同一判据：没有 html.fullui 就是简洁。 */
+        function simpleMode() {
+          const root = document.documentElement;
+          return !(root && root.classList && root.classList.contains('fullui'));
+        }
+        function note(text) {
+          if (status) status.textContent = text;
+        }
+        function clampNum(v, lo, hi, fallback) {
+          const n = Number(v);
+          if (!isFinite(n)) return fallback;
+          return Math.max(lo, Math.min(hi, n));
+        }
+        function clampDelay(v) {
+          return Math.round(clampNum(v, 0, 500, 0) / 10) * 10;
         }
 
         function isPassthrough(name) { return !!name && name === cvs.pt; }
@@ -1486,14 +1585,13 @@ html:not(.fullui) .card .body { padding-top: 6px; }
           const c = cvs.chosen.get(name);
           return !!(c && c.running);
         }
-        /* ★ 2.42.1：一路输出可以接多个音源。
-           cfg.sources 是唯一口径；旧响应只有 app_pid 时在这里兼容成一条。 */
+        /* 一路输出可以接多个音源：cfg.sources 是唯一口径。 */
         function sourcesOf(cfg) {
           if (!cfg) return [];
           if (Array.isArray(cfg.sources)) return cfg.sources;
           const pid = Number(cfg.app_pid || 0);
-          return pid > 0 ? [{kind: 'app', pid, name: cfg.app_name || ''}]
-                         : [{kind: 'desktop'}];
+          return pid > 0 ? [{kind:'app', pid, name: cfg.app_name || ''}]
+                         : [{kind:'desktop'}];
         }
         function sourceKey(s) {
           return (s && s.kind === 'app') ? 'app:' + Number(s.pid || 0) : 'app:desktop';
@@ -1502,13 +1600,14 @@ html:not(.fullui) .card .body { padding-top: 6px; }
           if (!s || s.kind !== 'app') return (cvs.capture && cvs.capture.label) || '桌面混音';
           return s.name || ('PID ' + Number(s.pid || 0));
         }
+        function sameSource(a, b) { return sourceKey(a) === sourceKey(b); }
 
+        /** 本机的音源行：桌面混音 + 正在出声的 App（+ 已经选过但此刻没出声的 App）。 */
         function apps() {
           const cap = cvs.capture || {};
           const label = cap.label || (cap.loopback ? '本机桌面音频' : '麦克风 / 输入');
           const out = [{ key: 'app:desktop', name: label,
                          sub: cap.loopback ? '系统正在播的声音' : '外部输入' }];
-          // ★ 2026-11-16 按 App 采音：左列换成真实正在出声的 App 列表。
           const list = (cvs.apps && cvs.apps.apps) || [];
           const known = new Set();
           list.forEach(a => {
@@ -1517,7 +1616,6 @@ html:not(.fullui) .card .body { padding-top: 6px; }
             out.push({ key, name: a.name || a.exe || ('进程 ' + a.pid),
                        sub: 'App · PID ' + a.pid });
           });
-          // 已经选了、但此刻没在出声的 App 也要画出来，否则用户看不到自己选的那一路。
           cvs.chosen.forEach(c => {
             sourcesOf(c).forEach(s => {
               const pid = Number((s && s.kind === 'app' && s.pid) || 0);
@@ -1531,29 +1629,44 @@ html:not(.fullui) .card .body { padding-top: 6px; }
           return out;
         }
 
-        function remotes() {
-          const out = [];
-          // 已经建了「它 → 本机」真实路由的远端，即使这一刻没在出声也要画出来，
-          // 否则用户刚拉好的那条线会连"起点"都找不到，更没法点线断开。
+        /** 在线、能收本机声音的对端（矩阵的远端音源行 / 下面的「送给它」卡片）。 */
+        function onlinePeers() {
+          return (cvs.peers || []).filter(p => p && p.node_id && p.online !== false);
+        }
+        /**
+         * 矩阵里的远端行：在线对端 + **已经建了路由但当前离线**的对端。
+         *
+         * 后者必须保留：否则那条路由在矩阵里彻底消失，「音频全关」也清不到它。
+         */
+        function matrixPeers() {
           const routed = new Set(remoteSinkRoutes().map(r => r.key));
-          (cvs.peers || []).forEach(p => {
+          return (cvs.peers || []).filter(p => p && p.node_id
+            && (p.online !== false || routed.has('remote:' + p.node_id)));
+        }
+        function remotes() {
+          const routedKeys = new Set(remoteSinkRoutes().map(r => r.key));
+          return matrixPeers().map(p => {
             const f = p.flows || {};
-            const key = 'remote:' + (p.node_id || p.name || 'peer');
-            if (!f.in_route && !routed.has(key)) return;
-            out.push({ key,
-                       name: String(p.name || p.host || '远端设备'),
-                       sub: f.in_receiving ? '正在送来声音' : '已连接 · 暂无声音' });
+            const offline = p.online === false;
+            // ★ 2.46.9：`/api/status` 的 peers 不带 flows（那是主脚本自己按
+            //   sender/receiver 算的），这里必须用路由表判"已连接" —— 否则矩阵里
+            //   明明已经接通了，副标题还写"在线 · 可以拉它的声音"。
+            const routed = routedKeys.has('remote:' + p.node_id);
+            return {
+              key: 'remote:' + p.node_id,
+              name: String(p.name || p.host || '远端设备'),
+              sub: offline ? '离线 · 已断开'
+                   : (f.in_receiving ? '正在送来声音'
+                      : ((f.in_route || routed) ? '已连接 · 暂无声音'
+                         : '在线 · 可以拉它的声音')),
+              offline,
+            };
           });
-          return out;
         }
 
-        /* ★ 2026-11-16 用户：「连线即代表真实生效的路由」。
-           所以远端→输出设备的线不再是对每台已选设备都画一条（那是纯画图），
-           而是逐条读真实路由：route.to 落到本机、route.from 是某个远端、
-           sink_device 就是这条线落在哪块输出设备上（空 = 系统默认设备）。
-           断开时按 route_id 真删那条路由。 */
+        /* 远端 → 本机某块输出的真实路由。断开时按 route_id 真删。 */
         function remoteSinkRoutes() {
-          const rowsOut = [];
+          const out = [];
           const selfId = cvs.selfId || '';
           const selfName = cvs.selfName || '';
           (cvs.routes || []).forEach(r => {
@@ -1565,15 +1678,16 @@ html:not(.fullui) .card .body { padding-top: 6px; }
             if (!fromTok || fromTok === 'self' || fromTok === '*' || fromTok === selfId) return;
             const peer = (cvs.peers || []).find(p => p.node_id === fromTok || p.name === fromTok);
             if (!peer) return;
-            rowsOut.push({
+            out.push({
               key: 'remote:' + (peer.node_id || peer.name || 'peer'),
               device: String(r.sink_device || ''),
               route_id: String(r.id || ''),
             });
           });
-          return rowsOut;
+          return out;
         }
 
+        /** 有远端声音进来的本机输出设备（简洁卡片墙也要把这类设备画成蓝色）。 */
         function remoteSinkNames() {
           const names = new Set();
           remoteSinkRoutes().forEach(r => {
@@ -1583,202 +1697,214 @@ html:not(.fullui) .card .body { padding-top: 6px; }
           return names;
         }
 
-        function nodeKindOf(key) {
-          if (key.startsWith('app:')) return 'app';
-          if (key.startsWith('out:')) return 'out';
-          if (key.startsWith('remote:')) return 'remote';
-          return '';
-        }
-
-        function appLabelOf(key) {
-          const found = apps().find(a => a.key === key);
-          return found ? found.name : key.replace(/^app:/, 'PID ');
-        }
-
         function peerOfKey(key) {
-          return (cvs.peers || []).find(p => ('remote:' + (p.node_id || p.name || 'peer')) === key) || null;
+          const id = String(key || '').replace(/^remote:/, '');
+          return (cvs.peers || []).find(p => String(p.node_id || p.name || '') === id) || null;
         }
 
-        /* 点线段后弹出的「断开」按钮：只做一次，位置跟着点击点走。 */
-        const cutBtn = document.createElement('button');
-        cutBtn.type = 'button';
-        cutBtn.id = 'moCut';
-        cutBtn.textContent = '断开';
-        stage.append(cutBtn);
-        function hideCut() {
-          cvs.cut = null;
-          cutBtn.style.display = 'none';
+        function localRows() {
+          return apps().map(a => ({
+            key: a.key,
+            name: a.name,
+            sub: a.sub,
+            kind: a.key === 'app:desktop' ? 'desktop' : 'app',
+            pid: a.key.startsWith('app:') && a.key !== 'app:desktop'
+              ? Number(a.key.slice(4)) : 0,
+          }));
         }
-        cutBtn.onclick = async (ev) => {
-          ev.stopPropagation();
-          const cut = cvs.cut;
-          hideCut();
-          if (!cut) return;
-          if (cut.kind === 'remote' && cut.meta && cut.meta.route_id) {
-            try {
-              await api('/api/routes/delete', { id: cut.meta.route_id });
-            } catch (e) {
-              status.textContent = '断开失败：' + (e.message || e);
-              return;
+        function allRows() {
+          return localRows().concat(remotes().map(r => ({
+            key: r.key, name: r.name, sub: r.sub, kind: 'remote', pid: 0,
+          })));
+        }
+        function visibleRows() {
+          return allRows().filter(r => !cvs.foldedSources.has(r.key));
+        }
+        function deviceColumns() {
+          return cvs.order.filter(n => n && !isPassthrough(n));
+        }
+        function visibleColumns() {
+          return deviceColumns().filter(n => !cvs.foldedDevices.has(n));
+        }
+
+        function localCellOn(device, row) {
+          if (!isChosen(device)) return false;
+          return sourcesOf(cvs.chosen.get(device)).some(s => sameSource(s, row));
+        }
+        function remoteCellOn(row, device) {
+          return remoteSinkRoutes().some(r => r.key === row.key
+            && String(r.device || cvs.pt) === device);
+        }
+        function cellOn(device, row) {
+          return row.kind === 'remote' ? remoteCellOn(row, device) : localCellOn(device, row);
+        }
+
+        // ───────────────────────── 改本地音源 ─────────────────────────
+
+        function ensureDevice(device) {
+          let cfg = cvs.chosen.get(device);
+          if (!cfg) {
+            cfg = { gain: 1.0, delay_ms: 0, sources: [], running: false, fallback: '' };
+            cvs.chosen.set(device, cfg);
+          }
+          return cfg;
+        }
+        function addLocal(device, row) {
+          const cfg = ensureDevice(device);
+          const list = sourcesOf(cfg);
+          if (list.some(s => sameSource(s, row))) return true;
+          if (list.length >= MAX_SOURCES) {
+            note('一台设备最多接 ' + MAX_SOURCES + ' 条音源');
+            return false;
+          }
+          list.push(row.kind === 'app'
+            ? { kind: 'app', pid: Number(row.pid || 0), name: row.name }
+            : { kind: 'desktop' });
+          cfg.sources = list;
+          return true;
+        }
+        function removeLocal(device, row) {
+          const cfg = cvs.chosen.get(device);
+          if (!cfg) return;
+          const list = sourcesOf(cfg).filter(s => !sameSource(s, row));
+          cfg.sources = list;
+          cfg.app_pid = 0;
+          cfg.app_name = '';
+          if (!list.length) {
+            // 一条本地音源都没有了：这一路停掉。若还有远端路由，由路由自己喂声音，
+            // 不能再留一个空的多路输出端（否则同一块设备会出现两个播放端）。
+            cvs.chosen.delete(device);
+          }
+        }
+
+        // ───────────────────── 改远端音源（真路由） ─────────────────────
+
+        async function addRemote(row, device) {
+          const peer = peerOfKey(row.key);
+          if (!peer || !peer.node_id) { note('找不到这个远端设备'); return false; }
+          if (remoteCellOn(row, device)) return true;
+          try {
+            await api('/api/routes/add', { route: {
+              from: [peer.node_id], to: ['self'], gain: 1.0, codec: 'pcm_s16',
+              sink_device: device } });
+            return true;
+          } catch (e) {
+            note('接通失败：' + (e.message || e));
+            return false;
+          }
+        }
+        async function removeRemote(row, device) {
+          const route = remoteSinkRoutes().find(r => r.key === row.key
+            && String(r.device || cvs.pt) === device);
+          if (!route || !route.route_id) return true;
+          try {
+            await api('/api/routes/delete', { id: route.route_id });
+            return true;
+          } catch (e) {
+            note('断开失败：' + (e.message || e));
+            return false;
+          }
+        }
+        async function setCell(device, row, on) {
+          if (row.kind === 'remote') {
+            return on ? addRemote(row, device) : removeRemote(row, device);
+          }
+          if (on) addLocal(device, row); else removeLocal(device, row);
+          return true;
+        }
+
+        // ───────────────────── 单个格子 / 整行 / 整列 ─────────────────────
+
+        async function toggleCell(device, row) {
+          const on = !cellOn(device, row);
+          await setCell(device, row, on);
+          note((on ? '已接通：' : '已断开：') + row.name + ' → ' + device);
+          await commit();
+        }
+        async function toggleColumn(device) {
+          const rows = visibleRows();
+          if (!rows.length) return;
+          const onlineRows = rows.filter(r => !r.offline);
+          const allOn = onlineRows.length
+            ? onlineRows.every(r => cellOn(device, r))
+            : true;
+          if (allOn) {
+            for (const r of rows) await setCell(device, r, false);
+          } else {
+            // 离线对端不能新接通（路由建了也没声音），只处理在线行。
+            for (const r of onlineRows) await setCell(device, r, true);
+          }
+          note(allOn ? ('已断开「' + device + '」整列') : ('已接通「' + device + '」整列'));
+          await commit();
+        }
+        async function toggleRow(row) {
+          const cols = visibleColumns();
+          if (!cols.length) return;
+          if (row.offline) {
+            let n = 0;
+            for (const d of cols) {
+              if (!cellOn(d, row)) continue;
+              await setCell(d, row, false);
+              n++;
             }
-            status.textContent = '已断开「' + (cut.meta.device || '默认设备') + '」的远端声音';
-            refresh();
+            note(n ? ('已断开离线对端「' + row.name + '」') : ('「' + row.name + '」当前离线'));
+            await commit();
             return;
           }
-          if (cut.kind === 'app' && cut.meta) {
-            // ★ 2.42.1：连线是"某一条音源 → 设备"。断开只摘这一条，
-            //   其它音源不动；摘完没有音源时这一路静音（绝不回落桌面混音）。
-            const cfg = cvs.chosen.get(cut.meta.device);
-            if (!cfg) return;
-            const src = cut.meta.source
-              || {kind: Number(cut.meta.pid || 0) > 0 ? 'app' : 'desktop',
-                  pid: Number(cut.meta.pid || 0)};
-            const list = sourcesOf(cfg).filter(s => sourceKey(s) !== sourceKey(src));
-            cfg.sources = list;
-            cfg.app_pid = 0;
-            cfg.app_name = '';
-            status.textContent = list.length
-              ? '已断开「' + sourceLabel(src) + '」→「' + cut.meta.device + '」'
-              : '已断开「' + cut.meta.device + '」的最后一条音源，这一路现在静音';
-            apply(false);
+          const allOn = cols.every(d => cellOn(d, row));
+          for (const d of cols) await setCell(d, row, !allOn);
+          note(allOn ? ('已断开「' + row.name + '」整行') : ('已接通「' + row.name + '」整行'));
+          await commit();
+        }
+        async function allOn() {
+          const rows = visibleRows().filter(r => !r.offline);
+          const cols = visibleColumns();
+          if (!rows.length || !cols.length) return;
+          for (const d of cols) {
+            for (const r of rows) await setCell(d, r, true);
           }
-        };
-        // 点画布别处就收起「断开」；点按钮本身不能先被收掉（否则永远断不了）。
-        stage.addEventListener('mousedown', (ev) => { if (ev.target !== cutBtn) hideCut(); }, true);
-
-        function positions() {
-          const nodes = [], edges = [], labels = [];
-          const m = metrics();
-          const pt = cvs.pt;
-          const remSink = remoteSinkNames();
-          // ★ 2026-11-17 用户：「简洁模式不要大圆小圆了，改成卡片墙」。
-          //   简洁档不再走画布，这里只服务复杂档的三列；返回空数组给卡片墙兜底。
-          if (cvs.mode === 'simple') return { nodes, edges, labels };
-          {
-            const appList = apps(), remList = remotes();
-            // ★ 2.42.1：复杂档的「输出音频设备」列只显示正在工作的 ——
-            //   直出设备、已勾选设备（含没起来的）、以及被远端路由使用的设备。
-            //   未启用的可用设备不再占位（启用入口在简洁档卡片墙）。
-            const outList = cvs.order.filter(name =>
-              isPassthrough(name) || isChosen(name) || remSink.has(name));
-            const stepApp = m.step(appList.length);
-            const stepOut = m.step(outList.length);
-            const stepRem = m.step(remList.length);
-            appList.forEach((a, i) => {
-              nodes.push({ key: a.key, name: a.name, sub: a.sub, cls: 'moApp',
-                           x: -m.colX, y: (i - (appList.length - 1) / 2) * stepApp });
-            });
-            outList.forEach((name, i) => {
-              const pass = isPassthrough(name);
-              const remoteOnly = remSink.has(name) && !isChosen(name);
-              const cls = pass ? 'moIn moPass'
-                               : ((isChosen(name) || remoteOnly)
-                                  ? (runningOf(name) || remoteOnly ? 'moIn' : 'moDead') : 'moOut');
-              const meta = cvs.chosen.get(name) || {};
-              const srcs = sourcesOf(meta);
-              const fell = meta.fallback ? ' · 有音源不可用' : '';
-              const sub = pass ? '直出 · 系统在放'
-                               : (cls === 'moIn'
-                                  ? (runningOf(name)
-                                      ? (srcs.length > 1 ? ('混音 ' + srcs.length + ' 路') : '正在使用')
-                                      : '正在送远端声音') + fell
-                                  : (cls === 'moDead'
-                                      ? (srcs.length ? '没起来' : '已启用 · 无音源（静音）')
-                                      : '未使用'));
-              nodes.push({ key: 'out:' + name, name, cls, sub,
-                           tip: meta.fallback || '',
-                           x: 0, y: (i - (outList.length - 1) / 2) * stepOut });
-            });
-            remList.forEach((r, i) => {
-              nodes.push({ key: r.key, name: r.name, sub: r.sub, cls: 'moRemote',
-                           x: m.colX, y: (i - (remList.length - 1) / 2) * stepRem });
-            });
-            outList.filter(isChosen).forEach(name => {
-              // ★ 2.42.1：每路把自己接的每一条音源都画出来；一条都没有就不画线。
-              const chosen = cvs.chosen.get(name) || {};
-              sourcesOf(chosen).forEach(src => {
-                const key = sourceKey(src);
-                if (!appList.some(a => a.key === key)) return;
-                edges.push([key, 'out:' + name, 'app',
-                            { device: name, source: src, pid: Number(src.pid || 0) }]);
-              });
-            });
-            // 远端 → 输出设备：只画真实存在的路由（sink_device 决定落在哪块设备）。
-            remoteSinkRoutes().forEach(r => {
-              const dev = r.device || pt;
-              if (!dev) return;
-              if (!outList.includes(dev)) return;
-              edges.push([r.key, 'out:' + dev, 'remote',
-                          { device: dev, route_id: r.route_id }]);
-            });
-            // 直出设备不画任何线：它是系统自己在放，不属于我们建立的路由关系。
-            // ★ 2026-11-17 用户：「这是各种莫名其妙的线」——原来这里给每台已选设备
-            //   都画了远端线、又给直出画了 APP 扇面线，全是展示残留，已全部删除。
-            labels.push({ x: -m.colX, y: m.labelY, text: 'APP' });
-            labels.push({ x: 0, y: m.labelY, text: '输出音频设备' });
-            labels.push({ x: m.colX, y: m.labelY, text: '远端 AUDIO 音源' });
+          note('已接通全部格子（不含折叠 / 离线）');
+          await commit();
+        }
+        async function allOff() {
+          const rows = allRows(), cols = deviceColumns();
+          for (const d of cols) {
+            for (const r of rows) {
+              if (!cellOn(d, r)) continue;
+              await setCell(d, r, false);
+            }
           }
-          return { nodes, edges, labels };
+          note('已断开全部格子');
+          await commit();
         }
 
-        function neighborKeys(key, edges) {
-          const near = new Set();
-          edges.forEach(([a, b]) => {
-            if (a === key) near.add(b);
-            if (b === key) near.add(a);
-          });
-          return near;
+        /** 本地改动先乐观重画，再一次性落盘；apply 成功后会自己拉一次全量状态。 */
+        async function commit() {
+          renderAll();
+          await apply(false);
         }
 
-        function applyFocus(edges) {
-          const focus = cvs.focus;
-          // 简洁档没有连线：点一个圆只放大它自己，不按相邻关系连带、也不压暗其它圆。
-          const simple = cvs.mode === 'simple';
-          const near = (focus && !simple) ? neighborKeys(focus, edges) : new Set();
-          world.querySelectorAll('.moNode[data-key]').forEach(el => {
-            const key = el.dataset.key;
-            el.classList.toggle('moFocus', !!focus && key === focus);
-            el.classList.toggle('moNear', !!focus && !simple && near.has(key));
-            el.classList.toggle('moDim', !!focus && !simple && key !== focus && !near.has(key));
-          });
-        }
+        // ───────────────────────── 渲染：简洁卡片墙 ─────────────────────────
 
-        function applyTransform() {
-          world.style.transform = `translate(${cvs.tx}px, ${cvs.ty}px) scale(${cvs.scale})`;
-        }
-
-        function syncModeChrome() {
-          const simple = cvs.mode === 'simple';
-          const stageEl = document.getElementById('moStage');
-          const cardsEl = document.getElementById('moCards');
-          if (stageEl) stageEl.style.display = simple ? 'none' : 'block';
-          if (cardsEl) cardsEl.hidden = !simple;
-          const zoom = document.getElementById('moZoom');
-          if (zoom) zoom.style.display = simple ? 'none' : 'flex';
-          const hint = document.getElementById('moHint');
-          if (hint) {
-            hint.textContent = '从 APP / 远端音源的小圆拖到输出设备＝连线（松手即生效）· 点线段的「断开」取消 · 拖空白平移 · 滚轮缩放';
-            hint.style.display = simple ? 'none' : 'block';
+        function playingText(name) {
+          const cfg = cvs.chosen.get(name);
+          if (!cfg) return '未启用 · 点一下开始放';
+          const srcs = sourcesOf(cfg);
+          if (!cfg.running) return '已启用，但这一路还没起来';
+          if (!srcs.length) return '已启用 · 没有音源（静音）';
+          if (srcs.length > 1) {
+            return '混音 ' + srcs.length + ' 路：' + srcs.map(sourceLabel).join(' + ');
           }
+          return '正在放 ' + sourceLabel(srcs[0]);
         }
-
-        /* ★ 2026-11-17 用户：简洁档＝每个真实输出设备一张卡片。
-           蓝＝这一路在放（已写进多路输出配置），暗＝没在用；系统默认设备强制蓝、
-           不可点灭（系统原生播放，不重复放一份）。点暗卡＝启用，点蓝卡＝停止。
-           和复杂档共用 cvs.chosen / apply()，不是另一份状态。 */
         function renderCards() {
-          const wrap = document.getElementById('moCards');
-          if (!wrap) return;
-          const focused = document.activeElement;
-          const busy = cvs.holding || (wrap.contains(focused) && focused
-            && /^(INPUT|SELECT|TEXTAREA)$/.test(focused.tagName));
-          if (busy) return;   // 正在拖本卡的音量/延迟时不要整墙重建
-          wrap.innerHTML = '';
+          if (!cardsEl) return;
+          cardsEl.innerHTML = '';
+          const remoteNames = remoteSinkNames();
           cvs.order.forEach(name => {
             const pass = isPassthrough(name);
-            const on = pass || isChosen(name);
-            // ★ v2.42：没有表单行了，这一路的配置直接读 cvs.chosen（卡片墙自己写回去）。
-            const ui = cvs.chosen.get(name);
+            const remoteOn = !pass && remoteNames.has(name);
+            const on = pass || isChosen(name) || remoteOn;
             const card = document.createElement('div');
             card.className = 'mocard' + (on ? ' on' : '') + (pass ? ' pt' : '');
             card.dataset.device = name;
@@ -1787,180 +1913,330 @@ html:not(.fullui) .card .body { padding-top: 6px; }
             nm.textContent = name;
             const st = document.createElement('div');
             st.className = 'st';
-            const run = pass || runningOf(name) || remoteSinkNames().has(name);
-            const srcs = sourcesOf(ui);
             if (pass) {
-              st.textContent = '系统默认设备 · 系统原生播放，不再重复放一份';
-            } else if (on) {
-              if (!run) {
-                st.textContent = '已启用，但这一路还没起来';
-              } else if (!srcs.length) {
-                st.textContent = '已启用 · 没有音源，这一路静音';
-              } else if (srcs.length > 1) {
-                st.textContent = '混音 ' + srcs.length + ' 路：' + srcs.map(sourceLabel).join(' + ');
-              } else {
-                st.textContent = '只放 ' + sourceLabel(srcs[0]);
-              }
+              st.textContent = '系统默认设备 · 直出';
+            } else if (remoteOn && !isChosen(name)) {
+              st.textContent = '正在放远端声音 · 点一下停';
             } else {
-              st.textContent = '未启用 · 点一下开始放';
+              st.textContent = playingText(name);
             }
             card.append(nm, st);
-            // ★ 2.42.1：某条音源打不开时只说这一条，绝不悄悄换成桌面混音。
-            if (on && !pass && ui && ui.fallback) {
-              const warn = document.createElement('div');
-              warn.className = 'fb';
-              warn.textContent = '音源不可用：' + ui.fallback;
-              card.append(warn);
+            if (on && !pass) {
+              const cfg = cvs.chosen.get(name);
+              if (cfg && cfg.fallback) {
+                const fb = document.createElement('div');
+                fb.className = 'fb';
+                fb.textContent = '音源不可用：' + cfg.fallback;
+                card.append(fb);
+              }
             }
             if (!pass) {
-              card.onclick = (ev) => {
-                if (ev.target.closest && ev.target.closest('.ctr')) return;  // 点滑杆不算切换
-                // ★ 2026-11-17 用户：「点蓝启用后滑杆就地出现，不整页刷新跳一下」。
-                //   先乐观更新本地状态并重画卡片墙，再落盘；服务端拒绝时状态行会写原因。
-                if (on) {
-                  cvs.chosen.delete(name);
-                } else {
-                  // ★ 2.42.1：启用后**不自动连任何音源**（空 = 静音）。
-                  //   用户点「音源」那一行自己选；这样断开最后一条音源时
-                  //   绝不会突然变成整个桌面声音。
-                  cvs.chosen.set(name, { gain: 1.0, delay_ms: 0, sources: [],
-                                         running: false, fallback: '' });
+              card.onclick = async () => {
+                // 重新读一次真实状态：这一秒里可能刚被轮询更新过，闭包里的 on 会过期。
+                const localOn = isChosen(name);
+                const remoteRoutes = remoteSinkRoutes()
+                  .filter(r => (r.device || cvs.pt) === name);
+                if (localOn || remoteRoutes.length) {
+                  // 蓝卡再点＝这一路彻底停：本机多路输出 + 所有远端路由一起断。
+                  if (localOn) cvs.chosen.delete(name);
+                  let failed = 0;
+                  for (const r of remoteRoutes) {
+                    try {
+                      await api('/api/routes/delete', { id: r.route_id });
+                    } catch (e) {
+                      failed++;
+                    }
+                  }
+                  await commit();
+                  if (failed) {
+                    note('有 ' + failed + ' 条远端声音没断开，请到「设备与路由」查看');
+                  } else {
+                    note('已停止「' + name + '」');
+                  }
+                  return;
                 }
-                renderCards();
-                apply(false);
+                // ★ 简洁档点蓝＝真的开始放：默认桌面混音。
+                //   详细里配过多路音源的，这里不会走到（on=true，再点就是停）。
+                cvs.chosen.set(name, {
+                  gain: 1.0, delay_ms: 0,
+                  sources: [{ kind: 'desktop' }],
+                  running: false, fallback: '',
+                });
+                await commit();
+                note('已启用「' + name + '」：正在放桌面混音');
               };
             }
-            // 蓝色卡上带这一路的音量/延迟入口：一行音量、一行延迟，卡片里一眼看完。
-            // 默认设备不参与复制，不给这些控件（避免让人以为直出也能单独调）。
-            if (on && !pass && ui) {
-              const gRow = document.createElement('div');
-              gRow.className = 'ctr';
-              const gLb = document.createElement('span');
-              gLb.className = 'lb'; gLb.textContent = '音量';
-              const g = document.createElement('input');
-              g.type = 'range'; g.min = '0'; g.max = '2'; g.step = '0.05';
-              g.value = String(clampNum(ui.gain, 0, 2, 1.0));
-              g.title = '这一份的音量（0–2 倍，1.00 是原声）';
-              const gv = document.createElement('span');
-              gv.className = 'v'; gv.textContent = Number(g.value).toFixed(2) + '×';
-              g.oninput = () => {
-                gv.textContent = Number(g.value).toFixed(2) + '×';
-                // ★ v2.42：即时写入这份配置，不再依赖表单行。
-                const live = cvs.chosen.get(name);
-                if (live) live.gain = Number(g.value);
-                cvs.holding = true;
-                queueGainApply();
-              };
-              g.onchange = () => { cvs.holding = false; flushGainApply(); };
-              gRow.append(gLb, g, gv);
-              const dRow = document.createElement('div');
-              dRow.className = 'ctr';
-              const dLb = document.createElement('span');
-              dLb.className = 'lb'; dLb.textContent = '延迟';
-              const d = document.createElement('input');
-              d.type = 'number'; d.min = '0'; d.max = '500'; d.step = '10';
-              d.value = String(clampDelay(ui.delay_ms));
-              d.title = '延迟补偿（0–500 毫秒，10ms 一格）';
-              const du = document.createElement('span');
-              du.className = 'u'; du.textContent = 'ms';
-              d.onchange = () => {
-                d.value = String(clampDelay(d.value));
-                const live = cvs.chosen.get(name);
-                if (live) live.delay_ms = clampDelay(d.value);
-                apply(false);   // 即时生效
-              };
-              dRow.append(dLb, d, du);
-              // ★ 2.42.1：这一路接了哪几条音源、一条都没接时明确写"静音"。
-              //   卡片不宽，所以音源行单独占一行：上面 chips，下面选择+添加，
-              //   否则多个 App 名会被挤成竖排。
-              const sRow = document.createElement('div');
-              sRow.className = 'ctr srcrow';
-              sRow.style.cssText = 'display:flex;flex-direction:column;align-items:stretch;'
-                + 'gap:4px;margin-top:4px;padding-top:6px;border-top:1px solid rgba(255,255,255,.08)';
-              const sLb = document.createElement('span');
-              sLb.className = 'lb'; sLb.textContent = '音源';
-              const chips = document.createElement('span');
-              chips.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;align-items:center;min-width:0';
-              if (!srcs.length) {
-                const none = document.createElement('span');
-                none.style.cssText = 'font-size:12px;color:var(--warn)';
-                none.textContent = '未连音源 · 这一路静音';
-                chips.append(none);
-              }
-              srcs.forEach(s => {
-                const chip = document.createElement('span');
-                chip.style.cssText = 'display:inline-flex;align-items:center;gap:2px;font-size:12px;'
-                  + 'max-width:100%;min-width:0;padding:1px 4px 1px 7px;'
-                  + 'border:1px solid rgba(255,255,255,.18);border-radius:10px';
-                const txt = document.createElement('span');
-                txt.textContent = sourceLabel(s);
-                txt.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
-                const x = document.createElement('button');
-                x.type = 'button'; x.textContent = '×';
-                x.title = '只断开这一条音源（其它音源不动）';
-                x.style.cssText = 'background:none;border:0;color:inherit;cursor:pointer;font-size:14px;line-height:1;padding:0 2px';
-                x.onclick = (ev) => {
-                  ev.stopPropagation();
-                  const live = cvs.chosen.get(name);
-                  if (!live) return;
-                  live.sources = sourcesOf(live).filter(v => sourceKey(v) !== sourceKey(s));
-                  live.app_pid = 0; live.app_name = '';
-                  renderCards();
-                  apply(false);
-                };
-                chip.append(txt, x);
-                chips.append(chip);
-              });
-              const ctl = document.createElement('span');
-              ctl.style.cssText = 'display:flex;gap:4px;align-items:center;min-width:0';
-              const pick = document.createElement('select');
-              pick.className = 'srcpick';
-              pick.style.cssText = 'flex:1;min-width:0;font-size:12px';
-              const options = apps().filter(a => !srcs.some(s => sourceKey(s) === a.key));
-              options.forEach(a => {
-                const opt = document.createElement('option');
-                opt.value = a.key; opt.textContent = a.name;
-                pick.append(opt);
-              });
-              const add = document.createElement('button');
-              add.type = 'button'; add.className = 'tiny ghost';
-              add.textContent = '添加';
-              add.style.cssText = 'flex:none;white-space:nowrap';
-              add.disabled = !options.length || srcs.length >= 8;
-              add.title = srcs.length >= 8 ? '一台设备最多接 8 条音源' : '把选中的音源接到这一路（可以叠加多条）';
-              add.onclick = (ev) => {
-                ev.stopPropagation();
-                const key = pick.value || '';
-                if (!key) return;
-                const live = cvs.chosen.get(name);
-                if (!live) return;
-                const list = sourcesOf(live);
-                if (list.length >= 8) return;
-                const src = key === 'app:desktop'
-                  ? {kind: 'desktop'}
-                  : {kind: 'app', pid: Number(key.slice(4)) || 0, name: appLabelOf(key)};
-                if (list.some(s => sourceKey(s) === sourceKey(src))) return;
-                list.push(src);
-                live.sources = list;
-                const firstApp = list.find(s => s.kind === 'app');
-                live.app_pid = firstApp ? Number(firstApp.pid || 0) : 0;
-                live.app_name = firstApp ? (firstApp.name || '') : '';
-                renderCards();
-                apply(false);
-              };
-              ctl.append(pick, add);
-              sRow.append(sLb, chips, ctl);
-              card.append(gRow, dRow, sRow);
-            }
-            wrap.append(card);
+            cardsEl.append(card);
           });
-          // ★ 2.42.1：对端的 audio 设备也作为一类卡片纳入（C）。
-          //   只列"真的运行本程序、且上报了 audio 输出设备"的点对点设备；
-          //   能做到的是"它的声音落到本机某个输出 / 本机声音送到它的某块输出"，
-          //   不能远程切换对端 Windows 的默认设备，这一点写在卡片里。
-          renderPeerCards(wrap);
-          cvs.holding = false;
         }
+
+        // ───────────────────────── 渲染：详细矩阵 ─────────────────────────
+
+        function shortName(name) {
+          const s = String(name || '');
+          return s.length > 14 ? s.slice(0, 13) + '…' : s;
+        }
+        function renderMatrix() {
+          if (!matrixEl) return;
+          matrixEl.innerHTML = '';
+          const allDevs = deviceColumns();
+          const cols = visibleColumns();
+          const rows = visibleRows();
+          if (!allDevs.length) {
+            matrixEl.innerHTML = '<div class="note" style="margin:10px">没有可用的输出设备。'
+              + '请到「设备与路由」刷新设备，或先在 Windows 里接上耳机/音箱。</div>';
+            renderFolded();
+            return;
+          }
+          if (!cols.length) {
+            matrixEl.innerHTML = '<div class="note" style="margin:10px">'
+              + '所有设备列都已折叠。点下面的「已折叠」可以恢复。</div>';
+            renderFolded();
+            return;
+          }
+          if (!rows.length) {
+            matrixEl.innerHTML = '<div class="note" style="margin:10px">'
+              + '所有音源行都已折叠。点下面的「已折叠」可以恢复。</div>';
+            renderFolded();
+            return;
+          }
+
+          const table = document.createElement('table');
+          table.className = 'momatrix';
+
+          const thead = document.createElement('thead');
+          const hr = document.createElement('tr');
+          const corner = document.createElement('th');
+          corner.className = 'corner';
+          corner.textContent = '音频全开';
+          corner.title = '把所有音源接到所有输出设备（不含已折叠）';
+          corner.onclick = () => allOn();
+          hr.append(corner);
+          cols.forEach(name => {
+            const th = document.createElement('th');
+            th.className = 'dev';
+            th.title = '点一下：这一列全部接通/断开 · ' + name;
+            const lb = document.createElement('span');
+            lb.textContent = shortName(name);
+            const gear = document.createElement('button');
+            gear.type = 'button';
+            gear.className = 'gear';
+            gear.textContent = '🎚';
+            gear.title = '调这一路的音量 / 延迟';
+            gear.onclick = (ev) => {
+              ev.stopPropagation();
+              if (!isChosen(name)) {
+                note('先点亮这一列任意一格，再调音量/延迟');
+                return;
+              }
+              openDeviceEditor(name, gear);
+            };
+            th.append(lb, gear);
+            th.onclick = () => toggleColumn(name);
+            hr.append(th);
+          });
+          const empty = document.createElement('th');
+          empty.className = 'fold empty';
+          hr.append(empty);
+          thead.append(hr);
+          table.append(thead);
+
+          const tbody = document.createElement('tbody');
+          rows.forEach(row => {
+            const tr = document.createElement('tr');
+            const rh = document.createElement('th');
+            rh.className = 'src';
+            rh.textContent = shortName(row.name);
+            rh.title = row.name + (row.sub ? '（' + row.sub + '）' : '')
+              + (row.offline ? ' · 离线：点一下断开已有连接'
+                             : ' · 点一下：这一行全部接通/断开');
+            rh.onclick = () => toggleRow(row);
+            tr.append(rh);
+            cols.forEach(device => {
+              const td = document.createElement('td');
+              const on = cellOn(device, row);
+              const blocked = !!row.offline && !on;
+              td.className = 'cell' + (on ? ' on' : '') + (blocked ? ' off' : '');
+              td.title = blocked
+                ? row.name + ' 当前离线，不能新接通（已有连接可以先断开）'
+                : row.name + ' → ' + device
+                  + (on ? ' · 点一下断开' : ' · 点一下接通');
+              if (!blocked) td.onclick = () => toggleCell(device, row);
+              tr.append(td);
+            });
+            const fold = document.createElement('th');
+            fold.className = 'fold';
+            fold.textContent = '折叠' + shortName(row.name);
+            fold.title = '收起「' + row.name + '」这一行';
+            fold.onclick = () => {
+              cvs.foldedSources.add(row.key);
+              saveFold();
+              renderAll();
+            };
+            tr.append(fold);
+            tbody.append(tr);
+          });
+
+          const fr = document.createElement('tr');
+          const blank = document.createElement('th');
+          blank.className = 'fold empty';
+          fr.append(blank);
+          cols.forEach(device => {
+            const th = document.createElement('th');
+            th.className = 'fold';
+            th.textContent = '折叠' + shortName(device);
+            th.title = '收起「' + device + '」这一列';
+            th.onclick = () => {
+              cvs.foldedDevices.add(device);
+              saveFold();
+              renderAll();
+            };
+            fr.append(th);
+          });
+          const off = document.createElement('th');
+          off.className = 'corner-off';
+          off.textContent = '音频全关';
+          off.title = '把所有格子断开';
+          off.onclick = () => allOff();
+          fr.append(off);
+          tbody.append(fr);
+          table.append(tbody);
+          matrixEl.append(table);
+          renderFolded();
+        }
+
+        function renderFolded() {
+          if (!foldedEl) return;
+          const devs = [...cvs.foldedDevices].filter(n => cvs.order.includes(n));
+          const srcs = [...cvs.foldedSources];
+          foldedEl.innerHTML = '';
+          if (!devs.length && !srcs.length) {
+            foldedEl.hidden = true;
+            return;
+          }
+          foldedEl.hidden = false;
+          const label = document.createElement('span');
+          label.textContent = '已折叠：';
+          foldedEl.append(label);
+          devs.forEach(name => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.textContent = '设备 ' + name + ' ×';
+            b.title = '展开这一列';
+            b.onclick = () => {
+              cvs.foldedDevices.delete(name);
+              saveFold();
+              renderAll();
+            };
+            foldedEl.append(b);
+          });
+          const rows = allRows();
+          srcs.forEach(key => {
+            const row = rows.find(r => r.key === key);
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.textContent = '音频 ' + (row ? row.name : key) + ' ×';
+            b.title = '展开这一行';
+            b.onclick = () => {
+              cvs.foldedSources.delete(key);
+              saveFold();
+              renderAll();
+            };
+            foldedEl.append(b);
+          });
+        }
+
+        // ─────────────────── 音量/延迟小面板（点列头的 🎚） ───────────────────
+
+        let pop = null;
+        function closeEditor(refreshAfter) {
+          if (!pop) return;
+          pop.remove();
+          pop = null;
+          cvs.holding = false;
+          if (refreshAfter !== false) refresh();
+        }
+        function openDeviceEditor(name, anchor) {
+          closeEditor(false);
+          const cfg = cvs.chosen.get(name);
+          if (!cfg) return;
+          cvs.holding = true;
+          const box = document.createElement('div');
+          box.className = 'moeditpop';
+          const title = document.createElement('div');
+          title.className = 't';
+          title.textContent = name;
+          title.title = name;
+          box.append(title);
+
+          const gr = document.createElement('div');
+          gr.className = 'r';
+          const gl = document.createElement('label');
+          gl.textContent = '音量';
+          const g = document.createElement('input');
+          g.type = 'range';
+          g.min = '0'; g.max = '2'; g.step = '0.05';
+          g.value = String(clampNum(cfg.gain, 0, 2, 1.0));
+          const gv = document.createElement('span');
+          gv.className = 'v';
+          gv.textContent = Number(g.value).toFixed(2) + '×';
+          let gainTimer = null;
+          g.oninput = () => {
+            const v = Number(g.value);
+            gv.textContent = v.toFixed(2) + '×';
+            const live = cvs.chosen.get(name);
+            if (live) live.gain = v;
+            clearTimeout(gainTimer);
+            gainTimer = setTimeout(() => apply(false, true), 180);
+          };
+          g.onchange = () => {
+            clearTimeout(gainTimer);
+            apply(false);
+          };
+          gr.append(gl, g, gv);
+
+          const dr = document.createElement('div');
+          dr.className = 'r';
+          const dl = document.createElement('label');
+          dl.textContent = '延迟';
+          const d = document.createElement('input');
+          d.type = 'number';
+          d.min = '0'; d.max = '500'; d.step = '10';
+          d.value = String(clampDelay(cfg.delay_ms));
+          const du = document.createElement('span');
+          du.className = 'v';
+          du.textContent = 'ms';
+          d.onchange = () => {
+            d.value = String(clampDelay(d.value));
+            const live = cvs.chosen.get(name);
+            if (live) live.delay_ms = clampDelay(d.value);
+            apply(false);
+          };
+          dr.append(dl, d, du);
+
+          const acts = document.createElement('div');
+          acts.className = 'acts';
+          const close = document.createElement('button');
+          close.type = 'button';
+          close.className = 'tiny ghost';
+          close.textContent = '关闭';
+          close.onclick = () => closeEditor(true);
+          acts.append(close);
+
+          box.append(gr, dr, acts);
+          document.body.append(box);
+          const r = anchor.getBoundingClientRect();
+          const left = Math.max(8, Math.min(window.innerWidth - 276, r.left - 120));
+          const top = Math.min(window.innerHeight - 190, r.bottom + 6);
+          box.style.left = left + 'px';
+          box.style.top = Math.max(8, top) + 'px';
+          pop = box;
+        }
+        document.addEventListener('mousedown', (ev) => {
+          if (pop && !pop.contains(ev.target)) closeEditor(true);
+        }, true);
+
+        // ───────────────── 对端设备（送本机声音给它；不属于矩阵） ─────────────────
 
         function isSelfToken(t) {
           t = String(t || '');
@@ -1968,7 +2244,6 @@ html:not(.fullui) .card .body { padding-top: 6px; }
             || t === '本机' || t === '自己';
         }
         function peerRoute(peer) {
-          // ★ 2.42.2（第 4 条）：对端 audio 卡只做「送」——只找本机 → 对端这一方向。
           const id = String(peer.node_id || peer.name || '');
           return (cvs.routes || []).find(r => {
             const frm = r.from || [], to = r.to || [];
@@ -1976,344 +2251,215 @@ html:not(.fullui) .card .body { padding-top: 6px; }
               && frm.some(isSelfToken);
           }) || null;
         }
-
-        function renderPeerCards(wrap) {
-          const peers = (cvs.peers || []).filter(p => {
-            if (!p || !p.node_id || p.online === false) return false;
-            return Array.isArray(p.sinks) && p.sinks.length > 0;
-          });
+        // 对端卡只送不收：本机不做任何收听，也不替它挑扬声器。
+        function renderPeerCards() {
+          if (!peersEl) return;
+          peersEl.innerHTML = '';
+          const peers = onlinePeers().filter(p =>
+            Array.isArray(p.sinks) && p.sinks.length > 0);
           if (!peers.length) return;
           const head = document.createElement('div');
-          head.style.cssText = 'grid-column:1/-1;font-size:12px;color:#8b97a8;margin:6px 0 -2px';
-          head.textContent = '对端 audio 设备（点对点 · 只送）';
-          wrap.append(head);
-          const simpleMode = cvs.mode === 'simple';
+          head.className = 'mohead2';
+          head.textContent = '对端设备（把本机声音送给它）';
+          peersEl.append(head);
           peers.forEach(peer => {
+            const rout = peerRoute(peer);
             const card = document.createElement('div');
-            card.className = 'mocard' + (peerRoute(peer) ? ' on' : '');
+            card.className = 'mocard' + (rout ? ' on' : '');
             const nm = document.createElement('div');
-            nm.className = 'nm'; nm.textContent = String(peer.name || peer.host || '远端设备');
+            nm.className = 'nm';
+            nm.textContent = String(peer.name || peer.host || '远端设备');
             const st = document.createElement('div');
             st.className = 'st';
-            const rout = peerRoute(peer);
-            // ★ 2.42.3（第 2 条）：简洁档只回答一个问题 —— 这台对端设备在不在、是不是在收我们的声音。
-            //   设备名 + 在线/送声状态，别的一律不出现。
-            st.textContent = rout ? '本机正在把声音送给它' : '空闲 · 可以把本机声音送给它';
+            st.textContent = rout ? '本机正在把声音送给它'
+                                  : '空闲 · 点一下把本机声音送给它';
             card.append(nm, st);
-
-            // ★ 2.42.2（第 4 条）：这张卡只做送声 —— 本机不做任何收听。
-            // ★ 2.42.3（第 2 条）：不再让本机去挑「对端哪块扬声器」——声音送到之后放哪由对端决定。
-            //   所以整行下拉与按钮都删掉：点卡片＝把本机声音送给它 / 再点一下停。
-            const toggle = async () => {
+            card.onclick = async () => {
               try {
-                if (rout) await api('/api/routes/delete', {id: rout.id});
-                else await api('/api/routes/add', {route: {
-                  from: ['self'], to: [peer.node_id], gain: 1.0, codec: 'pcm_s16'}});
-                toast(rout ? ('已停止送声音给「' + nm.textContent + '」')
-                           : ('已把本机声音送到「' + nm.textContent + '」'), 'ok');
-                refresh();
-              } catch (e) { toast('操作失败：' + e.message, 'err'); }
+                if (rout) {
+                  await api('/api/routes/delete', { id: rout.id });
+                } else {
+                  await api('/api/routes/add', { route: {
+                    from: ['self'], to: [peer.node_id],
+                    gain: 1.0, codec: 'pcm_s16' } });
+                }
+                note(rout ? ('已停止送声音给「' + nm.textContent + '」')
+                          : ('已把本机声音送到「' + nm.textContent + '」'));
+                await refresh();
+              } catch (e) {
+                note('操作失败：' + (e.message || e));
+              }
             };
-            card.onclick = (ev) => {
-              if (ev.target.closest && ev.target.closest('.ctr')) return;
-              toggle();
-            };
-
-            // ★ 2.42.3（第 2 条）：解释性文字只放详细（复杂）档；简洁档一个字都不加。
-            if (!simpleMode) {
-              const fb = document.createElement('div');
-              fb.className = 'fb';
-              fb.textContent = '点这张卡只会把本机声音送给它；它听不听、具体播到哪块扬声器由对端决定，'
-                + '本机不做任何收听。只列运行本程序且上报了 audio 设备的点对点设备。';
-              card.append(fb);
-            }
-            wrap.append(card);
+            peersEl.append(card);
           });
         }
 
-        function draw() {
-          if (cvs.drag || cvs.link) return;   // 拖拽中不重建节点，免得手一松圆跳回原位
-          Array.from(world.querySelectorAll('.moNode')).forEach(n => n.remove());
-          Array.from(world.querySelectorAll('.moColLabel')).forEach(n => n.remove());
-          const { nodes, edges, labels } = positions();
-          svg.innerHTML = '';
-          syncModeChrome();
-          if (cvs.mode === 'simple') {
-            // ★ 2026-11-17：简洁档彻底不走画布（无 SVG、无环、无拖拽），只渲染卡片墙。
-            renderCards();
-            applyFocus([]);
-            return;
-          }
-          const byKey = new Map();
-          nodes.forEach(n => byKey.set(n.key, n));
-          const NS = 'http://www.w3.org/2000/svg';
-          edges.forEach(([a, b, kind, meta]) => {
-            const na = byKey.get(a), nb = byKey.get(b);
-            if (!na || !nb) return;
-            // 可断开的线（APP→设备、远端→设备）先铺一条透明加粗的命中区；
-            // SVG 根是 pointer-events:none，只有这条命中区单独打开 stroke 命中。
-            if (kind === 'app' || kind === 'remote') {
-              const hit = document.createElementNS(NS, 'line');
-              hit.setAttribute('x1', na.x); hit.setAttribute('y1', na.y);
-              hit.setAttribute('x2', nb.x); hit.setAttribute('y2', nb.y);
-              hit.setAttribute('stroke', 'transparent');
-              hit.setAttribute('stroke-width', '14');
-              hit.setAttribute('class', 'moHit');
-              hit.dataset.a = a; hit.dataset.b = b;
-              hit.onclick = (ev) => {
-                ev.stopPropagation();
-                const r = stage.getBoundingClientRect();
-                cvs.cut = { kind, meta: meta || null };
-                cutBtn.style.left = (ev.clientX - r.left) + 'px';
-                cutBtn.style.top = (ev.clientY - r.top) + 'px';
-                cutBtn.style.display = 'block';
-              };
-              svg.append(hit);
-            }
-            const line = document.createElementNS(NS, 'line');
-            line.setAttribute('x1', na.x); line.setAttribute('y1', na.y);
-            line.setAttribute('x2', nb.x); line.setAttribute('y2', nb.y);
-            if (kind === 'remote') {
-              line.setAttribute('stroke', 'rgba(167,139,250,.45)');
-              line.setAttribute('stroke-width', '1.5');
-            } else {
-              line.setAttribute('stroke', 'rgba(255,255,255,.16)');
-              line.setAttribute('stroke-width', '1.5');
-            }
-            line.dataset.a = a; line.dataset.b = b;
-            svg.append(line);
-          });
-          labels.forEach(l => {
-            const el = document.createElement('div');
-            el.className = 'moColLabel';
-            el.style.left = l.x + 'px'; el.style.top = l.y + 'px';
-            el.textContent = l.text;
-            world.append(el);
-          });
-          nodes.forEach(n => {
-            const el = document.createElement('div');
-            el.className = 'moNode ' + n.cls;
-            el.dataset.key = n.key;
-            el.title = n.name + (n.tip ? ' · ' + n.tip : (n.sub ? ' · ' + n.sub : ''));   // 圆里放不下的长设备名/回落原因看这里
-            el.style.left = n.x + 'px';
-            el.style.top = n.y + 'px';
-            const name = document.createElement('div');
-            name.className = 'n'; name.textContent = n.name;
-            const sub = document.createElement('div');
-            sub.className = 's'; sub.textContent = n.sub || '';
-            el.append(name, sub);
-            el.onclick = (ev) => {
-              ev.stopPropagation();
-              if (cvs.dragged) { cvs.dragged = false; return; }
-              cvs.focus = (cvs.focus === n.key) ? '' : n.key;
-              applyFocus(edges);
-            };
-            el.onmousedown = (ev) => {
-              ev.stopPropagation();
-              cvs.dragged = false;
-              // 简洁档已经换成卡片墙，画布只在复杂档出现：从小圆拖出去就是拉线。
-              cvs.link = { node: n, el, sx: ev.clientX, sy: ev.clientY };
-              cvs.drag = null;
-              ev.preventDefault();
-            };
-            world.append(el);
-          });
-          applyFocus(edges);
-          applyTransform();
+        function renderAll(force) {
+          const sig = stateSignature();
+          if (!force && sig === lastRenderSig) return;
+          lastRenderSig = sig;
+          const simple = simpleMode();
+          if (cardsEl) cardsEl.hidden = !simple;
+          if (matrixWrap) matrixWrap.hidden = simple;
+          if (simple) renderCards(); else renderMatrix();
+          renderPeerCards();
         }
 
-        function moveLines() {
-          const els = new Map();
-          world.querySelectorAll('.moNode[data-key]').forEach(el => els.set(el.dataset.key, el));
-          svg.querySelectorAll('line').forEach(line => {
-            const a = els.get(line.dataset.a), b = els.get(line.dataset.b);
-            if (!a || !b) return;
-            line.setAttribute('x1', parseFloat(a.style.left)); line.setAttribute('y1', parseFloat(a.style.top));
-            line.setAttribute('x2', parseFloat(b.style.left)); line.setAttribute('y2', parseFloat(b.style.top));
-          });
+        /**
+         * 只在"画面真的会变"时重建 DOM。
+         *
+         * 这页每秒轮询一次；每轮都 innerHTML='' 会让用户点格子的那一瞬间正好被换掉
+         * （mousedown 在旧节点、click 落到新节点），看起来就是"点了没反应"。
+         * 信号里只放会影响显示的东西：模式 / 设备顺序 / 每路音源 / 真实路由 /
+         * App 列表 / 对端状态 / 折叠集合。
+         */
+        let lastRenderSig = '';
+        function stateSignature() {
+          const chosen = [...cvs.chosen.entries()].map(([n, c]) =>
+            n + ':' + sourcesOf(c).map(sourceKey).join(',')
+            + ':' + (c.running ? '1' : '0') + ':' + (c.fallback || '')).join('|');
+          const routes = (cvs.routes || []).map(r =>
+            String(r.id || '') + ':' + String(r.sink_device || '') + ':'
+            + (r.from || []).join(',')).join('|');
+          const appList = ((cvs.apps && cvs.apps.apps) || []).map(a =>
+            a.pid + ':' + (a.name || a.exe || '')).join('|');
+          const peers = (cvs.peers || []).map(p => {
+            const f = p.flows || {};
+            return String(p.node_id || '') + ':' + (p.name || '')
+              + ':' + (p.online !== false ? '1' : '0')
+              + ':' + (f.in_route ? '1' : '0') + ':' + (f.in_receiving ? '1' : '0');
+          }).join('|');
+          return [
+            simpleMode() ? 's' : 'd',
+            cvs.pt || '',
+            cvs.order.join(','),
+            chosen, routes, appList, peers,
+            (cvs.capture && cvs.capture.label) || '',
+            [...cvs.foldedDevices].sort().join(','),
+            [...cvs.foldedSources].sort().join(','),
+          ].join('||');
         }
 
-        /* ---------------- 复杂档：拖圆连线 / 点线断开 ---------------- */
-        function canLink(fromKey, toKey) {
-          if (!fromKey || !toKey || fromKey === toKey) return false;
-          const a = nodeKindOf(fromKey), b = nodeKindOf(toKey);
-          return (a === 'app' && b === 'out') || (a === 'out' && b === 'app')
-              || (a === 'remote' && b === 'out') || (a === 'out' && b === 'remote');
-        }
+        // ───────────────────────── 取数 / 落盘 ─────────────────────────
 
-        function worldPoint(ev) {
-          const r = stage.getBoundingClientRect();
-          return {
-            x: (ev.clientX - r.left - r.width / 2 - cvs.tx) / cvs.scale,
-            y: (ev.clientY - r.top - r.height / 2 - cvs.ty) / cvs.scale,
-          };
-        }
-
-        function highlightLinkTarget(ev, fromKey) {
-          world.querySelectorAll('.moNode.moLinkHit').forEach(x => x.classList.remove('moLinkHit'));
-          const hit = document.elementFromPoint(ev.clientX, ev.clientY);
-          const el = hit && hit.closest ? hit.closest('.moNode[data-key]') : null;
-          if (el && canLink(fromKey, el.dataset.key)) el.classList.add('moLinkHit');
-        }
-
-        function finishLink(ev) {
-          const l = cvs.link;
-          cvs.link = null;
-          if (cvs.tempLine) { cvs.tempLine.remove(); cvs.tempLine = null; }
-          world.querySelectorAll('.moNode.moLinkHit').forEach(x => x.classList.remove('moLinkHit'));
-          if (!l) return;
-          const hit = document.elementFromPoint(ev.clientX, ev.clientY);
-          const el = hit && hit.closest ? hit.closest('.moNode[data-key]') : null;
-          if (el && canLink(l.node.key, el.dataset.key)) {
-            cvs.dragged = true;   // 紧随其后的 click 不算"点圆放大"
-            connectNodes(l.node.key, el.dataset.key);
-          }
-        }
-
-        async function connectNodes(fromKey, toKey) {
-          const a = nodeKindOf(fromKey), b = nodeKindOf(toKey);
-          let appKey = '', remoteKey = '', outKey = '';
-          if (a === 'app' && b === 'out') { appKey = fromKey; outKey = toKey; }
-          else if (a === 'out' && b === 'app') { appKey = toKey; outKey = fromKey; }
-          else if (a === 'remote' && b === 'out') { remoteKey = fromKey; outKey = toKey; }
-          else if (a === 'out' && b === 'remote') { remoteKey = toKey; outKey = fromKey; }
-          else return;
-          const name = outKey.slice(4);
-          if (name === cvs.pt) {
-            status.textContent = '「' + name + '」是系统默认设备（直出），系统自己放，不需要连线';
-            return;
-          }
-          if (appKey) {
-            // APP → 输出设备：**追加**一条音源（2.42.1 起一路可以接多个源）。
-            // ★ v2.42：复杂档是唯一操作面，直接写 cvs.chosen，不依赖下拉行。
-            const pid = Number(appKey.slice(4)) || 0;
-            const info = cvs.apps || {};
-            if (pid > 0 && info.supported === false) {
-              status.textContent = '这台系统不支持按 App 采音，只能用桌面混音';
-              return;
-            }
-            const label = appLabelOf(appKey);
-            const cfg = cvs.chosen.get(name) || { gain: 1.0, delay_ms: 0,
-                                                  sources: [], running: false, fallback: '' };
-            const src = pid > 0 ? {kind: 'app', pid, name: label} : {kind: 'desktop'};
-            const list = sourcesOf(cfg).filter(s => sourceKey(s) !== sourceKey(src));
-            if (list.length >= 8) {
-              status.textContent = '一台设备最多接 8 条音源';
-              return;
-            }
-            list.push(src);
-            cfg.sources = list;
-            cfg.app_pid = pid;
-            cfg.app_name = pid ? label : '';
-            cvs.chosen.set(name, cfg);
-            status.textContent = '已把「' + label + '」接到「' + name + '」（现在 '
-              + list.length + ' 条音源）';
-            apply(false);
-            return;
-          }
-          // 远端音源 → 输出设备：真的建一条 对端→本机、sink_device=这台设备 的路由。
-          const peer = peerOfKey(remoteKey);
-          if (!peer || !peer.node_id) { status.textContent = '找不到这个远端音源'; return; }
-          const dup = (cvs.routes || []).find(r => {
-            const tok = String((r.from || [])[0] || '');
-            const tos = r.to || [];
-            const mine = tos.some(t => t === 'self' || t === cvs.selfId || t === cvs.selfName);
-            return mine && tok === peer.node_id && String(r.sink_device || '') === name;
-          });
-          if (dup) { status.textContent = '这条连线已经存在'; return; }
-          status.textContent = '正在把「' + peer.name + '」接到「' + name + '」…';
+        async function refresh(force) {
           try {
-            await api('/api/routes/add', { route: {
-              from: [peer.node_id], to: ['self'], gain: 1.0, codec: 'pcm_s16',
-              sink_device: name } });
-          } catch (e) {
-            status.textContent = '连线失败：' + (e.message || e);
-            return;
+            // ★ 2.46.11：每秒轮询走服务端 4 秒缓存；只有点「刷新设备」才强制重扫
+            //   —— 反复枚举蓝牙端点会让正在播的蓝牙音频一卡一卡。
+            const [r, sr] = await Promise.all([
+              fetch('/api/multiout' + (force ? '?refresh=1' : '')),
+              fetch('/api/status').catch(() => null),
+            ]);
+            const data = await r.json();
+            try {
+              const st = sr ? await sr.json() : null;
+              cvs.peers = (st && st.peers) || [];
+              cvs.routes = (st && st.routes) || [];
+              cvs.selfId = (st && st.node && st.node.id) || '';
+              cvs.selfName = (st && st.node && st.node.name) || '';
+            } catch (_) {
+              cvs.peers = [];
+              cvs.routes = [];
+              cvs.selfId = '';
+              cvs.selfName = '';
+            }
+            const ptName = data.passthrough || '';
+            const chosen = new Map((data.devices || [])
+              .filter(d => !(d.passthrough || d.name === ptName))
+              .map(d => [d.name, Object.assign({}, d, { sources: sourcesOf(d) })]));
+            const all = [];
+            if (ptName) all.push(ptName);
+            chosen.forEach((_d, n) => all.push(n));
+            (data.available || []).forEach(n => {
+              if (n && n !== ptName && !all.includes(n)) all.push(n);
+            });
+
+            const copies = (data.devices || []).filter(d => d.running && !d.passthrough);
+            const dead = (data.devices || []).filter(d => !d.running && !d.passthrough);
+            let txt = ptName ? '默认设备「' + ptName + '」直出' : '';
+            if (copies.length) {
+              txt += (txt ? '　｜　' : '') + '复制到 ' + copies.map(d => {
+                const list = sourcesOf(d);
+                if (list.length > 1) return d.name + '（混音 ' + list.length + ' 路）';
+                if (list.length === 1) return d.name + '（' + sourceLabel(list[0]) + '）';
+                return d.name;
+              }).join('、');
+            }
+            if (!txt) txt = data.note || '未开启';
+            if (dead.length) {
+              txt += '　｜　没起来：' + dead
+                .map(d => d.name + '（'
+                  + (d.error || '设备没打开，检查它是否已连接 / 是否被别的程序独占') + '）')
+                .join('、');
+            }
+            const fell = (data.devices || []).filter(d => d.fallback);
+            if (fell.length) {
+              txt += '　｜　音源不可用：' + fell
+                .map(d => d.name + '（' + d.fallback + '）').join('、');
+            }
+            if (canvasSummary) canvasSummary.textContent = txt;
+            renderLock(data.lock);
+            cvs.apps = data.apps || { supported: false, reason: '', apps: [] };
+            cvs.pt = ptName;
+            cvs.order = all;
+            if (!cvs.holding) cvs.chosen = chosen;
+            cvs.capture = data.capture || {};
+
+            // 折叠项如果设备/音源已经不在了，自动清掉（避免永远留着一条恢复不了的记录）。
+            [...cvs.foldedDevices].forEach(n => {
+              if (!all.includes(n)) cvs.foldedDevices.delete(n);
+            });
+            const keys = new Set(allRows().map(r => r.key));
+            [...cvs.foldedSources].forEach(k => {
+              if (!keys.has(k)) cvs.foldedSources.delete(k);
+            });
+            if (!cvs.holding) renderAll();
+          } catch (err) {
+            if (canvasSummary) canvasSummary.textContent = '读不到状态';
           }
-          status.textContent = '已连通：' + peer.name + ' → ' + name;
-          refresh();
         }
 
-        document.querySelectorAll('#moModeSeg button').forEach(btn => {
-          btn.classList.toggle('on', btn.dataset.mode === cvs.mode);
-          btn.onclick = () => {
-            cvs.mode = btn.dataset.mode;
-            localStorage.setItem('am-multi-view', cvs.mode);
-            document.querySelectorAll('#moModeSeg button').forEach(b => b.classList.toggle('on', b === btn));
-            cvs.focus = '';
-            draw();
-            refresh();   // 换档后行内控件（复杂档才有音量/延迟）要按新档位重建
-          };
-        });
-
-        stage.addEventListener('mousedown', (ev) => {
-          if (ev.target !== stage) return;
-          cvs.pan = { x: ev.clientX - cvs.tx, y: ev.clientY - cvs.ty };
-          stage.classList.add('moPanning');
-        });
-        window.addEventListener('mousemove', (ev) => {
-          if (cvs.pan) {
-            cvs.tx = ev.clientX - cvs.pan.x;
-            cvs.ty = ev.clientY - cvs.pan.y;
-            applyTransform();
-            return;
+        async function apply(stop, quiet) {
+          const devices = [];
+          if (!stop) {
+            cvs.chosen.forEach((cfg, name) => {
+              if (isPassthrough(name)) return;
+              devices.push({
+                device: name,
+                gain: clampNum(cfg.gain, 0, 2, 1.0),
+                delay_ms: clampDelay(cfg.delay_ms),
+                sources: sourcesOf(cfg).map(s => (
+                  s.kind === 'app'
+                    ? { kind: 'app', pid: Number(s.pid || 0), name: String(s.name || '') }
+                    : { kind: 'desktop' }
+                )),
+              });
+            });
           }
-          if (cvs.link) {
-            const dx = ev.clientX - cvs.link.sx, dy = ev.clientY - cvs.link.sy;
-            if (Math.abs(dx) + Math.abs(dy) > 3) cvs.dragged = true;
-            const p = worldPoint(ev);
-            if (!cvs.tempLine) {
-              const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-              line.setAttribute('class', 'moLinkTemp');
-              line.setAttribute('x1', cvs.link.node.x);
-              line.setAttribute('y1', cvs.link.node.y);
-              svg.append(line);
-              cvs.tempLine = line;
+          const payload = { devices };
+          if (!stop && lockSel) payload.lock_device = lockSel.value || '';
+          if (!quiet) note('正在应用…');
+          try {
+            const r = await fetch(quiet ? '/api/multiout?gain=1' : '/api/multiout', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            });
+            const data = await r.json();
+            if (!r.ok || data.error) {
+              note('没生效：' + (data.error || ('HTTP ' + r.status)));
+              return;
             }
-            cvs.tempLine.setAttribute('x2', p.x);
-            cvs.tempLine.setAttribute('y2', p.y);
-            highlightLinkTarget(ev, cvs.link.node.key);
-            return;
+            const lock = data.lock || {};
+            if (!quiet) note(lock.error || data.note || '已生效');
+            if (!quiet) await refresh();
+          } catch (err) {
+            note('没生效：' + (err && err.message ? err.message : err));
           }
-          if (cvs.drag) {
-            const dx = (ev.clientX - cvs.drag.startX) / cvs.scale;
-            const dy = (ev.clientY - cvs.drag.startY) / cvs.scale;
-            if (Math.abs(dx) + Math.abs(dy) > 3) cvs.dragged = true;
-            const pos = { x: cvs.drag.base.x + dx, y: cvs.drag.base.y + dy };
-            cvs.drag.el.style.left = pos.x + 'px';
-            cvs.drag.el.style.top = pos.y + 'px';
-            moveLines();
-          }
-        });
-        window.addEventListener('mouseup', (ev) => {
-          cvs.pan = null;
-          stage.classList.remove('moPanning');
-          cvs.drag = null;
-          if (cvs.link) finishLink(ev);
-          // click 紧跟 mouseup 触发：先让它看到 dragged=true，再把标记放掉，
-          // 否则"拖完落到空白处"会把这个标记永久留着，下一次点圆就没反应。
-          setTimeout(() => { cvs.dragged = false; }, 0);
-        });
-        stage.addEventListener('wheel', (ev) => {
-          ev.preventDefault();
-          const prev = cvs.scale;
-          cvs.scale = Math.max(0.5, Math.min(1.6, cvs.scale * (ev.deltaY < 0 ? 1.1 : 1 / 1.1)));
-          cvs.tx *= cvs.scale / prev;
-          cvs.ty *= cvs.scale / prev;
-          applyTransform();
-        }, {passive: false});
-        document.getElementById('moZIn').onclick = () => {
-          cvs.scale = Math.min(1.6, cvs.scale * 1.15); applyTransform();
-        };
-        document.getElementById('moZOut').onclick = () => {
-          cvs.scale = Math.max(0.5, cvs.scale / 1.15); applyTransform();
-        };
-        document.getElementById('moZFit').onclick = () => {
-          cvs.scale = 1; cvs.tx = 0; cvs.ty = 0; draw();
-        };
-        if (window.ResizeObserver) new ResizeObserver(() => draw()).observe(stage);
+        }
 
         function renderLock(lock) {
+          if (!lockInfo || !lockSel) return;
           lock = lock || {};
           const cur = (lock.current || {}).name || '未知';
           const name = String(lock.device || '').trim();
@@ -2323,13 +2469,14 @@ html:not(.fullui) .card .body { padding-top: 6px; }
           line1.textContent = '系统默认播放：' + cur
             + '　｜　锁定目标：' + (name || '不锁（默认）')
             + (name ? (targetName ? '（找到：' + targetName + '）' : '（系统里没有这块设备）') : '')
-            + '　｜　状态：' + (lock.locked_now ? '已锁定' : (lock.active ? '已记录、但当前不在目标设备' : '未锁定'));
+            + '　｜　状态：' + (lock.locked_now ? '已锁定'
+              : (lock.active ? '已记录、但当前不在目标设备' : '未锁定'));
           lockInfo.append(line1);
           if (!name) {
-            const note = document.createElement('div');
-            note.textContent = '默认不锁（推荐）：默认设备按「直出」处理，系统自己放、我们不再复制；'
-              + '其余勾选的设备才走回环复制。';
-            lockInfo.append(note);
+            const noteEl = document.createElement('div');
+            noteEl.textContent = '默认不锁（推荐）：默认设备按「直出」处理，系统自己放、我们不再复制；'
+              + '其余点亮的设备才走回环复制。';
+            lockInfo.append(noteEl);
           } else if (!targetName) {
             const warn = document.createElement('div');
             warn.style.color = 'var(--warn)';
@@ -2350,7 +2497,9 @@ html:not(.fullui) .card .body { padding-top: 6px; }
             lockInfo.append(tip);
           }
           const names = [''];
-          (lock.candidates || []).forEach(n => { if (n && !names.includes(n)) names.push(n); });
+          (lock.candidates || []).forEach(n => {
+            if (n && !names.includes(n)) names.push(n);
+          });
           if (name && !names.includes(name)) names.push(name);
           const current = [...lockSel.options].map(o => o.value);
           if (current.join('\u0000') !== names.join('\u0000')) {
@@ -2365,177 +2514,46 @@ html:not(.fullui) .card .body { padding-top: 6px; }
           lockSel.value = name;
         }
 
-        /* 数值一律夹在声明的上下限里：滑杆/手输/后端三处口径一致。 */
-        function clampNum(v, lo, hi, fallback) {
-          const n = Number(v);
-          if (!isFinite(n)) return fallback;
-          return Math.max(lo, Math.min(hi, n));
-        }
-        function clampDelay(v) {
-          return Math.round(clampNum(v, 0, 500, 0) / 10) * 10;
-        }
-
-        /* ★ 2026-11-17：拖动滑杆时的增益更新。
-           服务端现在只改目标增益（块内平滑过渡），不重开设备、不影响另一路；
-           这里 160ms 合并一次，松手立刻落盘。 */
-        let gainTimer = null;
-        function queueGainApply() {
-          clearTimeout(gainTimer);
-          gainTimer = setTimeout(() => { apply(false, true); }, 160);
-        }
-        function flushGainApply() {
-          clearTimeout(gainTimer);
-          apply(false);
-        }
-
-        async function refresh() {
-          try {
-            const [r, sr] = await Promise.all([
-              fetch('/api/multiout'),
-              fetch('/api/status').catch(() => null),
-            ]);
-            const data = await r.json();
-            // ★ 2026-11-16：复杂档的线必须是真实路由，所以这里顺手带上路由表和本机身份：
-            //   route.to 落到本机 id、route.from 是远端 id、sink_device 决定线落在哪台设备。
-            try {
-              const st = sr ? await sr.json() : null;
-              cvs.peers = (st && st.peers) || [];
-              cvs.routes = (st && st.routes) || [];
-              cvs.selfId = (st && st.node && st.node.id) || '';
-              cvs.selfName = (st && st.node && st.node.name) || '';
-            } catch (_) {
-              cvs.peers = [];
-              cvs.routes = [];
-              cvs.selfId = '';
-              cvs.selfName = '';
-            }
-            const ptName = data.passthrough || '';
-            const chosen = new Map((data.devices || [])
-              .filter(d => !(d.passthrough || d.name === ptName))
-              .map(d => [d.name, Object.assign({}, d, {sources: sourcesOf(d)})]));
-            const all = [];
-            if (ptName) all.push(ptName);
-            chosen.forEach((_d, n) => all.push(n));
-            (data.available || []).forEach(n => {
-              if (n && n !== ptName && !all.includes(n)) all.push(n);
-            });
-            const copies = (data.devices || []).filter(d => d.running && !d.passthrough);
-            // 起不来的那几路必须说出来。以前这里只说"正在送往 N 个设备"，
-            // 某一路静默失败时界面上什么都看不到 —— 现场就变成"勾了、点了、
-            // 没反应、也没报错"，只能靠人去猜（2026-10-11 踩过）。
-            const dead = (data.devices || []).filter(d => !d.running && !d.passthrough);
-            let txt = ptName ? '默认设备「' + ptName + '」直出' : '';
-            if (copies.length) {
-              txt += (txt ? '　｜　' : '') + '复制到 ' + copies.map(d => {
-                const list = sourcesOf(d);
-                if (list.length > 1) return d.name + '（混音 ' + list.length + ' 路：'
-                  + list.map(sourceLabel).join(' + ') + '）';
-                if (list.length === 1 && list[0].kind === 'app') {
-                  return d.name + '（' + sourceLabel(list[0]) + '）';
-                }
-                return d.name;
-              }).join('、');
-            }
-            if (!txt) txt = data.note || '未开启';
-            if (dead.length) {
-              txt += '　｜　没起来：' + dead
-                .map(d => d.name + '（' + (d.error || '设备没打开，检查它是否已连接 / 是否被别的程序独占') + '）')
-                .join('、');
-            }
-            const fell = (data.devices || []).filter(d => d.fallback);
-            if (fell.length) {
-              // 音源不可用不能静默：说清哪一路、哪条音源、为什么。
-              txt += '　｜　音源不可用：' + fell
-                .map(d => d.name + '（' + d.fallback + '）').join('、');
-            }
-            if (canvasSummary) canvasSummary.textContent = txt;
-            renderLock(data.lock);
-            // ★ 2026-11-16 按 App 采音：这一份真实 App 列表给复杂档左列和连线用。
-            cvs.apps = data.apps || { supported: false, reason: '', apps: [] };
-            // ★ v2.42：那排表单行已经删了，不再重建任何 DOM。正在拖音量时先不要把
-            //   服务端数据盖到本地（否则数值会跳），松手落盘后的下一轮轮询自然同步。
-            cvs.pt = ptName;
-            cvs.order = all;
-            if (!cvs.holding) cvs.chosen = chosen;
-            cvs.capture = data.capture || {};
-            draw();
-          } catch (err) {
-            if (canvasSummary) canvasSummary.textContent = '读不到状态';
-          }
-        }
-
-        async function apply(stop, quiet) {
-          const devices = [];
-          if (!stop) {
-            // ★ v2.42：设备清单表单已删，直接按 cvs.chosen 里这一份配置逐路落盘。
-            //   卡片墙与复杂档连线都改这份数据，所以这里不需要读任何 DOM。
-            cvs.order.forEach(name => {
-              if (isPassthrough(name)) return;
-              const cfg = cvs.chosen.get(name);
-              if (!cfg) return;
-              const entry = { device: name,
-                              gain: clampNum(cfg.gain, 0, 2, 1.0),
-                              delay_ms: clampDelay(cfg.delay_ms),
-                              // ★ 2.42.1：显式音源集合。空数组 = 这一路静音。
-                              sources: sourcesOf(cfg).map(s => (
-                                s.kind === 'app'
-                                  ? {kind: 'app', pid: Number(s.pid || 0), name: String(s.name || '')}
-                                  : {kind: 'desktop'}
-                              )) };
-              devices.push(entry);
-            });
-          }
-          // ★ Q2：应用时把「锁到哪块」一起发过去；空字符串 = 不锁（默认）。
-          const payload = { devices };
-          if (!stop) payload.lock_device = lockSel.value || '';
-          status.textContent = '正在应用…';
-          try {
-            // 拖动中的"只改增益"请求不要锁/端点那两轮设备枚举：那条路径只动增益，
-            // 每秒/每 160ms 去枚举蓝牙端点只会把刚修掉的问题又带回来。
-            const r = await fetch(quiet ? '/api/multiout?gain=1' : '/api/multiout', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payload)
-            });
-            const data = await r.json();
-            // ★ v2.42：失败不许静默 —— HTTP 非 2xx 或服务端带 error 都写进状态行。
-            if (!r.ok || data.error) {
-              status.textContent = '没生效：' + (data.error || ('HTTP ' + r.status));
-              return;
-            }
-            const lock = data.lock || {};
-            status.textContent = (lock.error || data.note || '已生效');
-            // 拖动中的合并请求不再回头拉全量状态：卡片已经在本地乐观更新，
-            // 每秒轮询本来也会补一次，避免拖动时整页跳。
-            if (!quiet) refresh();
-          } catch (err) {
-            status.textContent = '没生效：' + (err && err.message ? err.message : err);
-          }
-        }
+        // ───────────────────────── 工具条 / 轮询 ─────────────────────────
 
         document.getElementById('moRestore').onclick = async () => {
-          status.textContent = '正在还原默认播放…';
+          note('正在还原默认播放…');
           try {
             const r = await fetch('/api/multiout/restore_default', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: '{}',
             });
             const d = await r.json();
-            status.textContent = d.error || d.note || '已还原';
+            note(d.error || d.note || '已还原');
             refresh();
           } catch (err) {
-            status.textContent = '还原失败：' + err;
+            note('还原失败：' + err);
           }
         };
-
-        // ★ v2.42：没有「应用」按钮了。锁定目标一改就即时落盘（apply 会带上
-        //   lock_device；失败中文原因写进状态行）。
         lockSel.onchange = () => apply(false);
-        document.getElementById('moStop').onclick = () => { cvs.chosen.clear(); apply(true); };
-        document.getElementById('moRefresh').onclick = () => refresh();
+        document.getElementById('moStop').onclick = async () => {
+          cvs.chosen.clear();
+          // ★ 2.46.8：「全部停止」必须连远端→本机的路由一起停；
+          //   否则矩阵里的远端格子还蓝着、声音还在放，按钮名不副实。
+          for (const r of remoteSinkRoutes()) {
+            try {
+              await api('/api/routes/delete', { id: r.route_id });
+            } catch (e) {
+              note('断开远端声音失败：' + (e.message || e));
+            }
+          }
+          apply(true);
+        };
+        document.getElementById('moRefresh').onclick = () => refresh(true);
+
+        // 侧边栏 简洁/详细 切换时立刻换版式（不用等下一轮 1 秒轮询）。
+        window.addEventListener('am-ui-mode', () => {
+          closeEditor(false);
+          renderAll();
+        });
+
         refresh();
-        // ★ 2026-11-01：对端调音量后，旧版 4 秒轮询让这一端要 3–5 秒才动。
-        //   缩到 1 秒；本地拖滑杆另有 200ms 防抖，所以"另一边看见"最迟约 1 秒。
-        // ★ 2026-11-17 蓝牙卡顿：只在「多耳机」页可见时轮询。这一页的每秒请求会
-        //   枚举全部播放端点（含蓝牙）读格式；用户只是听歌/看状态时不该去碰它们。
         setInterval(() => {
           if (document.hidden) return;
           if (document.body.dataset.pane !== 'multi') return;
@@ -2543,6 +2561,7 @@ html:not(.fullui) .card .body { padding-top: 6px; }
         }, 1000);
       })();
       </script>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const state = {self:null, peers:[], routes:[], status:null, settingsLoaded:false, logOpen:false, detail:null};
@@ -3139,6 +3158,10 @@ function deviceCard(n, routes){
   //   仍然不生成：平台 / IP / 版本、档位与 vol 长句、设置入口、诊断面板。
   if(uiIsSimple()){
     const cap = [];
+    // ★ 2.46.6（issue #1）：手动添加的设备原来和自动发现的卡片长得一模一样，
+    //   用户会以为"电脑已经发现手机了"，其实只是自己填了一个 IP。
+    //   这里显式标出来，排查时第一眼就能分清是"发现成功"还是"手动兜底"。
+    if(!self && n.manual) cap.push('手动添加');
     if(!self && (n.sources || []).length) cap.push('可采声音');
     if((n.sinks || []).length) cap.push('可当音响');
     const live = [];
@@ -5479,6 +5502,47 @@ function relInitEvents(){
 }
 
 /* ---------------- settings ---------------- */
+/* ★ 2.45.1：AI 控制（MCP）。配置由后端按当前 exe/端口生成，前端只预览/复制/打开。 */
+async function loadMcpConfig(show){
+  const r = await api('/api/mcp/config');
+  if(!r.ok) throw new Error(r.error || '生成 MCP 配置失败');
+  if(show !== false){
+    const box = $('mcpConfigBox'), pre = $('mcpConfigPre'), hint = $('mcpConfigHint');
+    if(box) box.style.display = '';
+    if(pre) pre.textContent = r.config || '';
+    if(hint) hint.textContent = r.hint || '';
+  }
+  return r;
+}
+async function openMcpConfig(){
+  try{
+    const r = await api('/api/mcp/open', {});
+    if(!r.ok) throw new Error(r.error || '打开失败');
+    await loadMcpConfig(true);
+    const how = r.opened_with === 'notepad' ? '（没有 .json 关联程序，已用记事本打开）' : '';
+    toast('已打开 MCP 配置文件' + how + '：' + r.path, 'ok');
+  }catch(e){
+    /* 打不开也要把配置显示出来，用户至少能点「复制配置」。 */
+    try{ await loadMcpConfig(true); }catch(_){}
+    toast('打开 MCP 配置失败：' + e.message + '（配置仍可复制）', 'err');
+  }
+}
+async function copyMcpConfig(){
+  try{
+    const r = await loadMcpConfig(true);
+    const text = r.config || '';
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      await navigator.clipboard.writeText(text);
+    }else{
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.left = '-9999px';
+      document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); ta.remove();
+    }
+    toast('MCP 配置已复制，粘到 AI 客户端的 MCP 设置里即可', 'ok');
+  }catch(e){ toast('复制 MCP 配置失败：' + e.message, 'err'); }
+}
+
 /* 端口设置：端口在进程启动那一刻就绑死了，所以保存后由服务端**自动重启**（2026-11-01 用户要求）。
    不在这里手动刷新：页面马上会断开/重连；面板端口变了时启动器会打开新窗口。 */
 async function savePorts(){
@@ -5573,6 +5637,24 @@ async function setQualityPreset(name){
   }catch(e){ toast('切换档位失败：' + e.message, 'err'); }
 }
 
+/* ★ 2.46.4：点对点链路（自动 / 有线优先 / Wi-Fi 优先） */
+function renderLinkPreference(pref){
+  const seg = $('linkPrefSeg'); if(!seg) return;
+  const cur = pref || 'auto';
+  seg.querySelectorAll('button[data-link]').forEach(b => {
+    b.classList.toggle('on', b.getAttribute('data-link') === cur);
+  });
+}
+async function setLinkPreference(name){
+  try{
+    await api('/api/settings', { link_preference: name });
+    toast(name === 'wired' ? '已切到有线优先：有网线 / USB 网络共享就走它'
+      : (name === 'wireless' ? '已切到 Wi-Fi 优先'
+                             : '已切回自动：有有线走有线，没有走 Wi-Fi'), 'ok');
+    refreshAll();
+  }catch(e){ toast('切换链路失败：' + e.message, 'err'); }
+}
+
 async function toggleLaunchAtLogin(){  const on = !!(autostartState && autostartState.enabled);
   const btn = $('topLaunchBtn'); if(btn) btn.disabled = true;
   try{
@@ -5596,6 +5678,7 @@ async function saveSettings(){
       phone_silent_vol_policy: 'last_nonzero',
       launch_at_login: $('setLaunchAtLogin') ? $('setLaunchAtLogin').checked : false,
       autostart_method: $('setAutostartMethod') ? $('setAutostartMethod').value : 'registry',
+      usb_auto: $('setUsbAuto') ? $('setUsbAuto').checked : false,
     });
     toast('已保存：' + (r.changed||[]).join('、'), 'ok');
     // 保存后立刻回读注册表，让下面那行提示反映"这次真的写进去了没有"。
@@ -5679,6 +5762,7 @@ async function refreshAll(){
     renderPickers();
     renderStatus();
     renderQualityPreset(status && status.quality_preset);
+    renderLinkPreference(status && status.link_preference);
     renderStreams();
     // ★ 第 4 条：回环警告是**全局**的（每一页都看得见），所以放在这里、不放在关系图那一页里。
     renderLoopWarn();
@@ -5702,6 +5786,14 @@ async function refreshAll(){
         // 静音档乘数固定为 last_nonzero（跟随手机音量），设置页只显示生效值，没有可写控件。
         if($('setLaunchAtLogin')) $('setLaunchAtLogin').checked = !!cfg.launch_at_login;
         if($('setAutostartMethod')) $('setAutostartMethod').value = cfg.autostart_method || 'registry';
+        if($('setUsbAuto')) $('setUsbAuto').checked = !!cfg.usb_auto;
+        if($('setUsbAutoHint')){
+          const ua = (state.status && state.status.usb_auto) || {};
+          $('setUsbAutoHint').textContent = ua.adb
+            ? (ua.error ? ('adb 已找到；最近错误：' + ua.error)
+                        : 'adb 已找到：插上手机后自动尝试启动 App 和 USB 网络共享')
+            : '未找到 adb.exe：装 Android SDK Platform-Tools，或把 adb.exe 放到程序目录';
+        }
         // ★ 2026-11-06（第 5 条）：把注册表实际状态写出来 —— "勾了但没写进去"要看得见。
         renderAutostartHint(c.autostart || {});
         renderTopLaunch(c.autostart || {});
@@ -5767,6 +5859,8 @@ function setUiMode(mode){
     try { localStorage.setItem('wl-pane', lastTab); } catch (e) {}
   }
   initUiMode();
+  // ★ 2026-11-26：多耳机页要立刻在「卡片墙 / 矩阵」之间切换，不用等下一轮 1 秒轮询。
+  try { window.dispatchEvent(new Event('am-ui-mode')); } catch (e) {}
   if (typeof refreshAll === 'function') refreshAll();
 }
 function initUiMode(){
